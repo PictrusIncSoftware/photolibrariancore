@@ -1,0 +1,57 @@
+namespace photolibrariancore {
+    // Initialize the catalogue database at the given path
+    // Returns true if successful, false on error
+    [Async]
+    boolean initialize_catalogue(string catalogue_path);
+
+    // Ingest a batch of image metadata records into the catalogue
+    // Returns the number of records successfully inserted
+    [Async]
+    u32 ingest_metadata(sequence<ImageMetadata> metadata);
+
+    // Get the total count of images in the catalogue
+    [Async]
+    u64 get_image_count();
+};
+
+// Represents the metadata for a single image file
+// Populated by Swift/ImageIO, consumed by Rust/DuckDB
+dictionary ImageMetadata {
+    string file_path;
+    u64 file_size;
+    string file_name;
+    string? file_extension;
+    i64 created_timestamp;
+    i64 modified_timestamp;
+
+    // Camera/capture metadata
+    string? camera_make;
+    string? camera_model;
+    string? lens_model;
+    f64? focal_length;
+    f64? aperture;
+    f64? shutter_speed;
+    u32? iso;
+    string? capture_datetime;
+
+    // Image properties
+    u32? pixel_width;
+    u32? pixel_height;
+    string? color_space;
+    u32? bit_depth;
+
+    // GPS coordinates (if present)
+    f64? gps_latitude;
+    f64? gps_longitude;
+    f64? gps_altitude;
+
+    // IPTC/copyright
+    string? copyright;
+    string? creator;
+    string? description;
+
+    // Organization metadata
+    u8? rating;
+    string? flag;
+    string? color_label;
+};

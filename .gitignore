@@ -1,1 +1,20 @@
+# Rust build artifacts
 /target
+
+# Xcode integration artifacts
+/xcode-libs
+/swift-bindings
+
+# DuckDB test databases
+*.db
+*.db.wal
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
