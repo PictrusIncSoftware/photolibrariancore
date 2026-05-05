@@ -109,8 +109,8 @@ The Rust code runs in-process as a static library. No separate daemon, helper bi
 - [x] Core dependencies compiling clean (DuckDB, LanceDB, Arrow, Tokio)
 - [x] GitHub repo created and pushed
 - [x] Both dev machines in sync
-- [ ] UniFFI bridge — **next priority**
-- [ ] DuckDB schema for image catalogue
+- [x] UniFFI bridge — Rust side complete; Swift bindings generated and wired into Xcode
+- [x] DuckDB schema for image catalogue
 - [ ] SwiftUI directory picker
 - [ ] Recursive image scanner (Swift)
 - [ ] EXIF extraction via ImageIO

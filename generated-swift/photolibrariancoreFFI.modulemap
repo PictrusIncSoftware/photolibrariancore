@@ -1,0 +1,4 @@
+module photolibrariancoreFFI {
+    header "photolibrariancoreFFI.h"
+    export *
+}
