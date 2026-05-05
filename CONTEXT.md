@@ -146,4 +146,11 @@ A SwiftUI interface that allows the user to select a directory (or the entire ma
 
 ---
 
+## 11. Known Limitations (To Address Later)
+
+- **DuckDB connection handling:** Global `CATALOGUE` using 
+  `Arc<Mutex<Option<Connection>>>` is adequate for Milestone 1 
+  sequential batch inserts but will bottleneck under concurrent 
+  writes. Replace with a connection pool in a later milestone.
+
 *End of CONTEXT.md*
