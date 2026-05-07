@@ -281,7 +281,7 @@ private func makeRustCall<T, E: Swift.Error>(
     _ callback: (UnsafeMutablePointer<RustCallStatus>) -> T,
     errorHandler: ((RustBuffer) throws -> E)?
 ) throws -> T {
-    uniffiEnsureInitialized()
+    uniffiEnsurePhotolibrariancoreInitialized()
     var callStatus = RustCallStatus.init()
     let returnedVal = callback(&callStatus)
     try uniffiCheckCallStatus(callStatus: callStatus, errorHandler: errorHandler)
@@ -352,18 +352,29 @@ private func uniffiTraitInterfaceCallWithError<T, E>(
         callStatus.pointee.errorBuf = FfiConverterString.lower(String(describing: error))
     }
 }
-fileprivate class UniffiHandleMap<T> {
-    private var map: [UInt64: T] = [:]
+// Initial value and increment amount for handles. 
+// These ensure that SWIFT handles always have the lowest bit set
+fileprivate let UNIFFI_HANDLEMAP_INITIAL: UInt64 = 1
+fileprivate let UNIFFI_HANDLEMAP_DELTA: UInt64 = 2
+
+fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
+    // All mutation happens with this lock held, which is why we implement @unchecked Sendable.
     private let lock = NSLock()
-    private var currentHandle: UInt64 = 1
+    private var map: [UInt64: T] = [:]
+    private var currentHandle: UInt64 = UNIFFI_HANDLEMAP_INITIAL
 
     func insert(obj: T) -> UInt64 {
         lock.withLock {
-            let handle = currentHandle
-            currentHandle += 1
-            map[handle] = obj
-            return handle
+            return doInsert(obj)
         }
+    }
+
+    // Low-level insert function, this assumes `lock` is held.
+    private func doInsert(_ obj: T) -> UInt64 {
+        let handle = currentHandle
+        currentHandle += UNIFFI_HANDLEMAP_DELTA
+        map[handle] = obj
+        return handle
     }
 
      func get(handle: UInt64) throws -> T {
@@ -372,6 +383,15 @@ fileprivate class UniffiHandleMap<T> {
                 throw UniffiInternalError.unexpectedStaleHandle
             }
             return obj
+        }
+    }
+
+     func clone(handle: UInt64) throws -> UInt64 {
+        try lock.withLock {
+            guard let obj = map[handle] else {
+                throw UniffiInternalError.unexpectedStaleHandle
+            }
+            return doInsert(obj)
         }
     }
 
@@ -542,7 +562,7 @@ fileprivate struct FfiConverterString: FfiConverter {
 }
 
 
-public struct ImageMetadata {
+public struct ImageMetadata: Equatable, Hashable {
     public var filePath: String
     public var fileSize: UInt64
     public var fileName: String
@@ -602,127 +622,15 @@ public struct ImageMetadata {
         self.flag = flag
         self.colorLabel = colorLabel
     }
+
+    
+
+    
 }
 
-
-
-extension ImageMetadata: Equatable, Hashable {
-    public static func ==(lhs: ImageMetadata, rhs: ImageMetadata) -> Bool {
-        if lhs.filePath != rhs.filePath {
-            return false
-        }
-        if lhs.fileSize != rhs.fileSize {
-            return false
-        }
-        if lhs.fileName != rhs.fileName {
-            return false
-        }
-        if lhs.fileExtension != rhs.fileExtension {
-            return false
-        }
-        if lhs.createdTimestamp != rhs.createdTimestamp {
-            return false
-        }
-        if lhs.modifiedTimestamp != rhs.modifiedTimestamp {
-            return false
-        }
-        if lhs.cameraMake != rhs.cameraMake {
-            return false
-        }
-        if lhs.cameraModel != rhs.cameraModel {
-            return false
-        }
-        if lhs.lensModel != rhs.lensModel {
-            return false
-        }
-        if lhs.focalLength != rhs.focalLength {
-            return false
-        }
-        if lhs.aperture != rhs.aperture {
-            return false
-        }
-        if lhs.shutterSpeed != rhs.shutterSpeed {
-            return false
-        }
-        if lhs.iso != rhs.iso {
-            return false
-        }
-        if lhs.captureDatetime != rhs.captureDatetime {
-            return false
-        }
-        if lhs.pixelWidth != rhs.pixelWidth {
-            return false
-        }
-        if lhs.pixelHeight != rhs.pixelHeight {
-            return false
-        }
-        if lhs.colorSpace != rhs.colorSpace {
-            return false
-        }
-        if lhs.bitDepth != rhs.bitDepth {
-            return false
-        }
-        if lhs.gpsLatitude != rhs.gpsLatitude {
-            return false
-        }
-        if lhs.gpsLongitude != rhs.gpsLongitude {
-            return false
-        }
-        if lhs.gpsAltitude != rhs.gpsAltitude {
-            return false
-        }
-        if lhs.copyright != rhs.copyright {
-            return false
-        }
-        if lhs.creator != rhs.creator {
-            return false
-        }
-        if lhs.description != rhs.description {
-            return false
-        }
-        if lhs.rating != rhs.rating {
-            return false
-        }
-        if lhs.flag != rhs.flag {
-            return false
-        }
-        if lhs.colorLabel != rhs.colorLabel {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(filePath)
-        hasher.combine(fileSize)
-        hasher.combine(fileName)
-        hasher.combine(fileExtension)
-        hasher.combine(createdTimestamp)
-        hasher.combine(modifiedTimestamp)
-        hasher.combine(cameraMake)
-        hasher.combine(cameraModel)
-        hasher.combine(lensModel)
-        hasher.combine(focalLength)
-        hasher.combine(aperture)
-        hasher.combine(shutterSpeed)
-        hasher.combine(iso)
-        hasher.combine(captureDatetime)
-        hasher.combine(pixelWidth)
-        hasher.combine(pixelHeight)
-        hasher.combine(colorSpace)
-        hasher.combine(bitDepth)
-        hasher.combine(gpsLatitude)
-        hasher.combine(gpsLongitude)
-        hasher.combine(gpsAltitude)
-        hasher.combine(copyright)
-        hasher.combine(creator)
-        hasher.combine(description)
-        hasher.combine(rating)
-        hasher.combine(flag)
-        hasher.combine(colorLabel)
-    }
-}
-
+#if compiler(>=6)
+extension ImageMetadata: Sendable {}
+#endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -805,6 +713,168 @@ public func FfiConverterTypeImageMetadata_lift(_ buf: RustBuffer) throws -> Imag
 #endif
 public func FfiConverterTypeImageMetadata_lower(_ value: ImageMetadata) -> RustBuffer {
     return FfiConverterTypeImageMetadata.lower(value)
+}
+
+
+public struct ImageRecord: Equatable, Hashable {
+    public var id: Int64
+    public var indexedTimestamp: String
+    public var filePath: String
+    public var fileSize: UInt64
+    public var fileName: String
+    public var fileExtension: String?
+    public var createdTimestamp: Int64
+    public var modifiedTimestamp: Int64
+    public var cameraMake: String?
+    public var cameraModel: String?
+    public var lensModel: String?
+    public var focalLength: Double?
+    public var aperture: Double?
+    public var shutterSpeed: Double?
+    public var iso: UInt32?
+    public var captureDatetime: String?
+    public var pixelWidth: UInt32?
+    public var pixelHeight: UInt32?
+    public var colorSpace: String?
+    public var bitDepth: UInt32?
+    public var gpsLatitude: Double?
+    public var gpsLongitude: Double?
+    public var gpsAltitude: Double?
+    public var copyright: String?
+    public var creator: String?
+    public var description: String?
+    public var rating: UInt8?
+    public var flag: String?
+    public var colorLabel: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: Int64, indexedTimestamp: String, filePath: String, fileSize: UInt64, fileName: String, fileExtension: String?, createdTimestamp: Int64, modifiedTimestamp: Int64, cameraMake: String?, cameraModel: String?, lensModel: String?, focalLength: Double?, aperture: Double?, shutterSpeed: Double?, iso: UInt32?, captureDatetime: String?, pixelWidth: UInt32?, pixelHeight: UInt32?, colorSpace: String?, bitDepth: UInt32?, gpsLatitude: Double?, gpsLongitude: Double?, gpsAltitude: Double?, copyright: String?, creator: String?, description: String?, rating: UInt8?, flag: String?, colorLabel: String?) {
+        self.id = id
+        self.indexedTimestamp = indexedTimestamp
+        self.filePath = filePath
+        self.fileSize = fileSize
+        self.fileName = fileName
+        self.fileExtension = fileExtension
+        self.createdTimestamp = createdTimestamp
+        self.modifiedTimestamp = modifiedTimestamp
+        self.cameraMake = cameraMake
+        self.cameraModel = cameraModel
+        self.lensModel = lensModel
+        self.focalLength = focalLength
+        self.aperture = aperture
+        self.shutterSpeed = shutterSpeed
+        self.iso = iso
+        self.captureDatetime = captureDatetime
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+        self.colorSpace = colorSpace
+        self.bitDepth = bitDepth
+        self.gpsLatitude = gpsLatitude
+        self.gpsLongitude = gpsLongitude
+        self.gpsAltitude = gpsAltitude
+        self.copyright = copyright
+        self.creator = creator
+        self.description = description
+        self.rating = rating
+        self.flag = flag
+        self.colorLabel = colorLabel
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ImageRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeImageRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ImageRecord {
+        return
+            try ImageRecord(
+                id: FfiConverterInt64.read(from: &buf), 
+                indexedTimestamp: FfiConverterString.read(from: &buf), 
+                filePath: FfiConverterString.read(from: &buf), 
+                fileSize: FfiConverterUInt64.read(from: &buf), 
+                fileName: FfiConverterString.read(from: &buf), 
+                fileExtension: FfiConverterOptionString.read(from: &buf), 
+                createdTimestamp: FfiConverterInt64.read(from: &buf), 
+                modifiedTimestamp: FfiConverterInt64.read(from: &buf), 
+                cameraMake: FfiConverterOptionString.read(from: &buf), 
+                cameraModel: FfiConverterOptionString.read(from: &buf), 
+                lensModel: FfiConverterOptionString.read(from: &buf), 
+                focalLength: FfiConverterOptionDouble.read(from: &buf), 
+                aperture: FfiConverterOptionDouble.read(from: &buf), 
+                shutterSpeed: FfiConverterOptionDouble.read(from: &buf), 
+                iso: FfiConverterOptionUInt32.read(from: &buf), 
+                captureDatetime: FfiConverterOptionString.read(from: &buf), 
+                pixelWidth: FfiConverterOptionUInt32.read(from: &buf), 
+                pixelHeight: FfiConverterOptionUInt32.read(from: &buf), 
+                colorSpace: FfiConverterOptionString.read(from: &buf), 
+                bitDepth: FfiConverterOptionUInt32.read(from: &buf), 
+                gpsLatitude: FfiConverterOptionDouble.read(from: &buf), 
+                gpsLongitude: FfiConverterOptionDouble.read(from: &buf), 
+                gpsAltitude: FfiConverterOptionDouble.read(from: &buf), 
+                copyright: FfiConverterOptionString.read(from: &buf), 
+                creator: FfiConverterOptionString.read(from: &buf), 
+                description: FfiConverterOptionString.read(from: &buf), 
+                rating: FfiConverterOptionUInt8.read(from: &buf), 
+                flag: FfiConverterOptionString.read(from: &buf), 
+                colorLabel: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ImageRecord, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.id, into: &buf)
+        FfiConverterString.write(value.indexedTimestamp, into: &buf)
+        FfiConverterString.write(value.filePath, into: &buf)
+        FfiConverterUInt64.write(value.fileSize, into: &buf)
+        FfiConverterString.write(value.fileName, into: &buf)
+        FfiConverterOptionString.write(value.fileExtension, into: &buf)
+        FfiConverterInt64.write(value.createdTimestamp, into: &buf)
+        FfiConverterInt64.write(value.modifiedTimestamp, into: &buf)
+        FfiConverterOptionString.write(value.cameraMake, into: &buf)
+        FfiConverterOptionString.write(value.cameraModel, into: &buf)
+        FfiConverterOptionString.write(value.lensModel, into: &buf)
+        FfiConverterOptionDouble.write(value.focalLength, into: &buf)
+        FfiConverterOptionDouble.write(value.aperture, into: &buf)
+        FfiConverterOptionDouble.write(value.shutterSpeed, into: &buf)
+        FfiConverterOptionUInt32.write(value.iso, into: &buf)
+        FfiConverterOptionString.write(value.captureDatetime, into: &buf)
+        FfiConverterOptionUInt32.write(value.pixelWidth, into: &buf)
+        FfiConverterOptionUInt32.write(value.pixelHeight, into: &buf)
+        FfiConverterOptionString.write(value.colorSpace, into: &buf)
+        FfiConverterOptionUInt32.write(value.bitDepth, into: &buf)
+        FfiConverterOptionDouble.write(value.gpsLatitude, into: &buf)
+        FfiConverterOptionDouble.write(value.gpsLongitude, into: &buf)
+        FfiConverterOptionDouble.write(value.gpsAltitude, into: &buf)
+        FfiConverterOptionString.write(value.copyright, into: &buf)
+        FfiConverterOptionString.write(value.creator, into: &buf)
+        FfiConverterOptionString.write(value.description, into: &buf)
+        FfiConverterOptionUInt8.write(value.rating, into: &buf)
+        FfiConverterOptionString.write(value.flag, into: &buf)
+        FfiConverterOptionString.write(value.colorLabel, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImageRecord_lift(_ buf: RustBuffer) throws -> ImageRecord {
+    return try FfiConverterTypeImageRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImageRecord_lower(_ value: ImageRecord) -> RustBuffer {
+    return FfiConverterTypeImageRecord.lower(value)
 }
 
 #if swift(>=5.8)
@@ -927,8 +997,33 @@ fileprivate struct FfiConverterSequenceTypeImageMetadata: FfiConverterRustBuffer
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeImageRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [ImageRecord]
+
+    public static func write(_ value: [ImageRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeImageRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ImageRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ImageRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeImageRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
-private let UNIFFI_RUST_FUTURE_POLL_MAYBE_READY: Int8 = 1
+private let UNIFFI_RUST_FUTURE_POLL_WAKE: Int8 = 1
 
 fileprivate let uniffiContinuationHandleMap = UniffiHandleMap<UnsafeContinuation<Int8, Never>>()
 
@@ -940,9 +1035,9 @@ fileprivate func uniffiRustCallAsync<F, T>(
     liftFunc: (F) throws -> T,
     errorHandler: ((RustBuffer) throws -> Swift.Error)?
 ) async throws -> T {
-    // Make sure to call uniffiEnsureInitialized() since future creation doesn't have a
+    // Make sure to call the ensure init function since future creation doesn't have a
     // RustCallStatus param, so doesn't use makeRustCall()
-    uniffiEnsureInitialized()
+    uniffiEnsurePhotolibrariancoreInitialized()
     let rustFuture = rustFutureFunc()
     defer {
         freeFunc(rustFuture)
@@ -952,7 +1047,9 @@ fileprivate func uniffiRustCallAsync<F, T>(
         pollResult = await withUnsafeContinuation {
             pollFunc(
                 rustFuture,
-                uniffiFutureContinuationCallback,
+                { handle, pollResult in
+                    uniffiFutureContinuationCallback(handle: handle, pollResult: pollResult)
+                },
                 uniffiContinuationHandleMap.insert(obj: $0)
             )
         }
@@ -973,7 +1070,22 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
         print("uniffiFutureContinuationCallback invalid handle")
     }
 }
-public func getImageCount()async  -> UInt64 {
+public func getAllImages()async  -> [ImageRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_get_all_images(
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeImageRecord.lift,
+            errorHandler: nil
+            
+        )
+}
+public func getImageCount()async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
@@ -988,7 +1100,7 @@ public func getImageCount()async  -> UInt64 {
             
         )
 }
-public func ingestMetadata(metadata: [ImageMetadata])async  -> UInt32 {
+public func ingestMetadata(metadata: [ImageMetadata])async  -> UInt32  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
@@ -1003,7 +1115,7 @@ public func ingestMetadata(metadata: [ImageMetadata])async  -> UInt32 {
             
         )
 }
-public func initializeCatalogue(cataloguePath: String)async  -> Bool {
+public func initializeCatalogue(cataloguePath: String)async  -> Bool  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
@@ -1026,13 +1138,16 @@ private enum InitializationResult {
 }
 // Use a global variable to perform the versioning checks. Swift ensures that
 // the code inside is only computed once.
-private var initializationResult: InitializationResult = {
+private let initializationResult: InitializationResult = {
     // Get the bindings contract version from our ComponentInterface
-    let bindings_contract_version = 26
+    let bindings_contract_version = 30
     // Get the scaffolding contract version by calling the into the dylib
     let scaffolding_contract_version = ffi_photolibrariancore_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_get_all_images() != 61078) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_image_count() != 3228) {
         return InitializationResult.apiChecksumMismatch
@@ -1047,7 +1162,9 @@ private var initializationResult: InitializationResult = {
     return InitializationResult.ok
 }()
 
-private func uniffiEnsureInitialized() {
+// Make the ensure init function public so that other modules which have external type references to
+// our types can call it.
+public func uniffiEnsurePhotolibrariancoreInitialized() {
     switch initializationResult {
     case .ok:
         break

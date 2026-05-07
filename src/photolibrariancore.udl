@@ -12,6 +12,11 @@ namespace photolibrariancore {
     // Get the total count of images in the catalogue
     [Async]
     u64 get_image_count();
+
+    // Get all images from the catalogue (for browse/debug view)
+    // Returns all image records ordered by ID
+    [Async]
+    sequence<ImageRecord> get_all_images();
 };
 
 // Represents the metadata for a single image file
@@ -41,6 +46,53 @@ dictionary ImageMetadata {
     u32? bit_depth;
 
     // GPS coordinates (if present)
+    f64? gps_latitude;
+    f64? gps_longitude;
+    f64? gps_altitude;
+
+    // IPTC/copyright
+    string? copyright;
+    string? creator;
+    string? description;
+
+    // Organization metadata
+    u8? rating;
+    string? flag;
+    string? color_label;
+};
+
+// Represents a complete image record from the database
+// Includes database-generated fields (id, indexed_timestamp)
+dictionary ImageRecord {
+    // Database-generated fields
+    i64 id;
+    string indexed_timestamp;
+
+    // File system properties
+    string file_path;
+    u64 file_size;
+    string file_name;
+    string? file_extension;
+    i64 created_timestamp;
+    i64 modified_timestamp;
+
+    // Camera/capture metadata
+    string? camera_make;
+    string? camera_model;
+    string? lens_model;
+    f64? focal_length;
+    f64? aperture;
+    f64? shutter_speed;
+    u32? iso;
+    string? capture_datetime;
+
+    // Image properties
+    u32? pixel_width;
+    u32? pixel_height;
+    string? color_space;
+    u32? bit_depth;
+
+    // GPS coordinates
     f64? gps_latitude;
     f64? gps_longitude;
     f64? gps_altitude;

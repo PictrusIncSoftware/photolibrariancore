@@ -4,6 +4,16 @@
 # PhotoLibrarian Core - Xcode Build Helper
 # ============================================================================
 #
+# This script performs a complete build pipeline:
+# 1. Builds the Rust static library (aarch64-apple-darwin)
+# 2. Regenerates UniFFI Swift bindings from the .udl file
+# 3. Copies all artifacts to the Xcode-active location
+#
+# The UniFFI bindings are regenerated on every build to ensure they stay
+# in sync with the .udl interface definition.
+#
+# ============================================================================
+#
 # DIRECTORY LAYOUT (CRITICAL - READ THIS):
 #
 # This project has THREE "Libraries" locations that historically caused confusion:
@@ -41,6 +51,11 @@ rustup target add aarch64-apple-darwin
 echo "Building release build..."
 cargo build --release --target aarch64-apple-darwin
 
+echo ""
+echo "🔄 Generating UniFFI Swift bindings..."
+cargo run --bin uniffi-bindgen generate src/photolibrariancore.udl \
+    --language swift --out-dir generated-swift
+
 # Define paths
 RUST_LIB="target/aarch64-apple-darwin/release/libphotolibrariancore.a"
 GENERATED_SWIFT_DIR="generated-swift"
@@ -75,6 +90,11 @@ echo "→ Copying photolibrariancoreFFI.modulemap..."
 cp "$GENERATED_SWIFT_DIR/photolibrariancoreFFI.modulemap" "$LOCAL_OUTPUT/"
 cp "$GENERATED_SWIFT_DIR/photolibrariancoreFFI.modulemap" "$PROJECT_ROOT_LIBS/"
 cp "$GENERATED_SWIFT_DIR/photolibrariancoreFFI.modulemap" "$XCODE_LIBS/"  # ⭐ PRIMARY
+
+echo "→ Copying photolibrariancore.swift..."
+cp "$GENERATED_SWIFT_DIR/photolibrariancore.swift" "$LOCAL_OUTPUT/"
+cp "$GENERATED_SWIFT_DIR/photolibrariancore.swift" "$PROJECT_ROOT_LIBS/"
+cp "$GENERATED_SWIFT_DIR/photolibrariancore.swift" "$XCODE_LIBS/"  # ⭐ PRIMARY
 
 echo ""
 echo "✅ Build complete!"

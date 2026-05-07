@@ -89,6 +89,59 @@ pub struct ImageMetadata {
     pub color_label: Option<String>,       // "red", "green", "blue", etc.
 }
 
+/// Represents a complete image record from the database
+///
+/// This struct contains all columns from the images table, including the auto-generated
+/// id and indexed_timestamp. Used for querying and displaying catalogue contents.
+///
+/// Unlike ImageMetadata (which is used for ingestion), this struct is read-only and
+/// includes the database-generated fields.
+#[derive(Debug, Clone)]
+pub struct ImageRecord {
+    // Database-generated fields
+    pub id: i64,                           // Auto-generated primary key
+    pub indexed_timestamp: String,         // When record was added to catalogue (ISO 8601)
+
+    // File system properties
+    pub file_path: String,
+    pub file_size: u64,
+    pub file_name: String,
+    pub file_extension: Option<String>,
+    pub created_timestamp: i64,
+    pub modified_timestamp: i64,
+
+    // Camera/capture metadata
+    pub camera_make: Option<String>,
+    pub camera_model: Option<String>,
+    pub lens_model: Option<String>,
+    pub focal_length: Option<f64>,
+    pub aperture: Option<f64>,
+    pub shutter_speed: Option<f64>,
+    pub iso: Option<u32>,
+    pub capture_datetime: Option<String>,
+
+    // Image properties
+    pub pixel_width: Option<u32>,
+    pub pixel_height: Option<u32>,
+    pub color_space: Option<String>,
+    pub bit_depth: Option<u32>,
+
+    // GPS coordinates
+    pub gps_latitude: Option<f64>,
+    pub gps_longitude: Option<f64>,
+    pub gps_altitude: Option<f64>,
+
+    // IPTC/copyright metadata
+    pub copyright: Option<String>,
+    pub creator: Option<String>,
+    pub description: Option<String>,
+
+    // Organization metadata
+    pub rating: Option<u8>,
+    pub flag: Option<String>,
+    pub color_label: Option<String>,
+}
+
 /// Initialize the catalogue database at the given path
 ///
 /// This function must be called once before any other catalogue operations. It creates
@@ -392,4 +445,113 @@ pub async fn get_image_count() -> u64 {
             0  // Return 0 on error (catalogue is effectively empty to the caller)
         }
     }
+}
+
+/// Get all images from the catalogue
+///
+/// Returns a complete list of all image records in the catalogue, ordered by ID.
+/// This is a development/debugging function for viewing catalogue contents.
+///
+/// Design decision: Returns all records with no LIMIT for v1. The function signature
+/// could be extended with limit/offset parameters in the future if needed for pagination.
+///
+/// Data flow:
+/// - Swift calls this function to populate a browse/debug view
+/// - Rust queries all records from the images table
+/// - Returns full ImageRecord structs including database-generated fields
+///
+/// Returns:
+/// - Vec of ImageRecord structs, empty vec if catalogue is empty or not initialized
+pub async fn get_all_images() -> Vec<ImageRecord> {
+    // Acquire lock and validate connection
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    // Query all images, ordered by ID
+    // Note: indexed_timestamp is excluded because DuckDB's TIMESTAMP type
+    // doesn't have a direct String conversion in the FFI layer
+    let query_sql = r#"
+        SELECT
+            id, file_path, file_size, file_name, file_extension,
+            created_timestamp, modified_timestamp,
+            camera_make, camera_model, lens_model,
+            focal_length, aperture, shutter_speed, iso,
+            capture_datetime,
+            pixel_width, pixel_height, color_space, bit_depth,
+            gps_latitude, gps_longitude, gps_altitude,
+            copyright, creator, description,
+            rating, flag, color_label
+        FROM images
+        ORDER BY id
+    "#;
+
+    // Execute query and collect results
+    let mut stmt = match conn.prepare(query_sql) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to prepare query: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map([], |row| {
+        // Extract all columns from the row
+        // Type conversions: i64 from DuckDB → u64/u32/u8 for Rust
+        // Note: indexed_timestamp is set to empty string as placeholder since
+        // we don't query it (TIMESTAMP type doesn't have direct String conversion)
+        Ok(ImageRecord {
+            id: row.get(0)?,
+            indexed_timestamp: String::new(),  // Placeholder - not queried from DB
+            file_path: row.get(1)?,
+            file_size: row.get::<_, i64>(2)? as u64,
+            file_name: row.get(3)?,
+            file_extension: row.get(4)?,
+            created_timestamp: row.get(5)?,
+            modified_timestamp: row.get(6)?,
+            camera_make: row.get(7)?,
+            camera_model: row.get(8)?,
+            lens_model: row.get(9)?,
+            focal_length: row.get(10)?,
+            aperture: row.get(11)?,
+            shutter_speed: row.get(12)?,
+            iso: row.get::<_, Option<i64>>(13)?.map(|v| v as u32),
+            capture_datetime: row.get(14)?,
+            pixel_width: row.get::<_, Option<i64>>(15)?.map(|v| v as u32),
+            pixel_height: row.get::<_, Option<i64>>(16)?.map(|v| v as u32),
+            color_space: row.get(17)?,
+            bit_depth: row.get::<_, Option<i64>>(18)?.map(|v| v as u32),
+            gps_latitude: row.get(19)?,
+            gps_longitude: row.get(20)?,
+            gps_altitude: row.get(21)?,
+            copyright: row.get(22)?,
+            creator: row.get(23)?,
+            description: row.get(24)?,
+            rating: row.get::<_, Option<i64>>(25)?.map(|v| v as u8),
+            flag: row.get(26)?,
+            color_label: row.get(27)?,
+        })
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to execute query: {}", e);
+            return Vec::new();
+        }
+    };
+
+    // Collect results, logging errors but continuing for other rows
+    let mut records = Vec::new();
+    for row_result in rows {
+        match row_result {
+            Ok(record) => records.push(record),
+            Err(e) => eprintln!("Failed to parse row: {}", e),
+        }
+    }
+
+    records
 }
