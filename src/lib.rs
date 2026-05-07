@@ -447,6 +447,63 @@ pub async fn get_image_count() -> u64 {
     }
 }
 
+/// Format Unix epoch seconds to ISO 8601 string format
+///
+/// Converts DuckDB epoch timestamp (i64 seconds since Unix epoch) to
+/// human-readable format: "YYYY-MM-DD HH:MM:SS"
+///
+/// This is a helper for the TIMESTAMP→String conversion pattern used throughout
+/// this project, since UniFFI has no native TIMESTAMP type support.
+fn format_epoch_to_iso8601(epoch_secs: i64) -> String {
+    // Convert to local time components
+    // Note: This uses a simple calculation assuming UTC
+    let total_secs = epoch_secs;
+    let days_since_epoch = total_secs / 86400;
+    let seconds_today = total_secs % 86400;
+
+    let hours = (seconds_today / 3600) % 24;
+    let minutes = (seconds_today / 60) % 60;
+    let seconds = seconds_today % 60;
+
+    // Calculate year, month, day from days since epoch (1970-01-01)
+    // Simplified calculation for demonstration
+    let mut year = 1970;
+    let mut remaining_days = days_since_epoch;
+
+    loop {
+        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        year += 1;
+    }
+
+    let month_days = if is_leap_year(year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut month = 1;
+    for days in month_days.iter() {
+        if remaining_days < *days {
+            break;
+        }
+        remaining_days -= days;
+        month += 1;
+    }
+
+    let day = remaining_days + 1;
+
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            year, month, day, hours, minutes, seconds)
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
 /// Get all images from the catalogue
 ///
 /// Returns a complete list of all image records in the catalogue, ordered by ID.
@@ -474,11 +531,13 @@ pub async fn get_all_images() -> Vec<ImageRecord> {
     };
 
     // Query all images, ordered by ID
-    // Note: indexed_timestamp is excluded because DuckDB's TIMESTAMP type
-    // doesn't have a direct String conversion in the FFI layer
+    // Note: DuckDB TIMESTAMP columns must be cast to epoch seconds in SQL,
+    // then formatted to String in Rust, because the UniFFI bridge has no
+    // TIMESTAMP type. This is the standard pattern for all TIMESTAMP columns.
     let query_sql = r#"
         SELECT
-            id, file_path, file_size, file_name, file_extension,
+            id, epoch(indexed_timestamp) as indexed_ts_epoch,
+            file_path, file_size, file_name, file_extension,
             created_timestamp, modified_timestamp,
             camera_make, camera_model, lens_model,
             focal_length, aperture, shutter_speed, iso,
@@ -503,38 +562,41 @@ pub async fn get_all_images() -> Vec<ImageRecord> {
     let rows = match stmt.query_map([], |row| {
         // Extract all columns from the row
         // Type conversions: i64 from DuckDB → u64/u32/u8 for Rust
-        // Note: indexed_timestamp is set to empty string as placeholder since
-        // we don't query it (TIMESTAMP type doesn't have direct String conversion)
+
+        // Format indexed_timestamp from Unix epoch seconds to ISO 8601 string
+        let epoch_secs: i64 = row.get(1)?;
+        let indexed_ts = format_epoch_to_iso8601(epoch_secs);
+
         Ok(ImageRecord {
             id: row.get(0)?,
-            indexed_timestamp: String::new(),  // Placeholder - not queried from DB
-            file_path: row.get(1)?,
-            file_size: row.get::<_, i64>(2)? as u64,
-            file_name: row.get(3)?,
-            file_extension: row.get(4)?,
-            created_timestamp: row.get(5)?,
-            modified_timestamp: row.get(6)?,
-            camera_make: row.get(7)?,
-            camera_model: row.get(8)?,
-            lens_model: row.get(9)?,
-            focal_length: row.get(10)?,
-            aperture: row.get(11)?,
-            shutter_speed: row.get(12)?,
-            iso: row.get::<_, Option<i64>>(13)?.map(|v| v as u32),
-            capture_datetime: row.get(14)?,
-            pixel_width: row.get::<_, Option<i64>>(15)?.map(|v| v as u32),
-            pixel_height: row.get::<_, Option<i64>>(16)?.map(|v| v as u32),
-            color_space: row.get(17)?,
-            bit_depth: row.get::<_, Option<i64>>(18)?.map(|v| v as u32),
-            gps_latitude: row.get(19)?,
-            gps_longitude: row.get(20)?,
-            gps_altitude: row.get(21)?,
-            copyright: row.get(22)?,
-            creator: row.get(23)?,
-            description: row.get(24)?,
-            rating: row.get::<_, Option<i64>>(25)?.map(|v| v as u8),
-            flag: row.get(26)?,
-            color_label: row.get(27)?,
+            indexed_timestamp: indexed_ts,
+            file_path: row.get(2)?,
+            file_size: row.get::<_, i64>(3)? as u64,
+            file_name: row.get(4)?,
+            file_extension: row.get(5)?,
+            created_timestamp: row.get(6)?,
+            modified_timestamp: row.get(7)?,
+            camera_make: row.get(8)?,
+            camera_model: row.get(9)?,
+            lens_model: row.get(10)?,
+            focal_length: row.get(11)?,
+            aperture: row.get(12)?,
+            shutter_speed: row.get(13)?,
+            iso: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
+            capture_datetime: row.get(15)?,
+            pixel_width: row.get::<_, Option<i64>>(16)?.map(|v| v as u32),
+            pixel_height: row.get::<_, Option<i64>>(17)?.map(|v| v as u32),
+            color_space: row.get(18)?,
+            bit_depth: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
+            gps_latitude: row.get(20)?,
+            gps_longitude: row.get(21)?,
+            gps_altitude: row.get(22)?,
+            copyright: row.get(23)?,
+            creator: row.get(24)?,
+            description: row.get(25)?,
+            rating: row.get::<_, Option<i64>>(26)?.map(|v| v as u8),
+            flag: row.get(27)?,
+            color_label: row.get(28)?,
         })
     }) {
         Ok(r) => r,
