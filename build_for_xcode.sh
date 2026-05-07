@@ -29,8 +29,15 @@
 #    - The .xcodeproj references this location in its Library Search Paths
 #    - Files here MUST be kept up-to-date or Xcode uses stale binaries
 #
+# 4. ~/DeveloperProjects/PhotoLibrarian/PhotoLibrarian/PhotoLibrarian/
+#    - Swift bindings source file location (photolibrariancore.swift only)
+#    - Xcode compiles the Swift bindings directly as source code
+#    - Only the .swift file goes here; binary artifacts (.a, .h, .modulemap)
+#      stay in location #3 (Libraries/)
+#
 # This script ensures location #3 (the Xcode-active location) always gets
-# fresh builds. We also copy to #1 and #2 for compatibility.
+# fresh builds. We also copy to #1 and #2 for compatibility, and the Swift
+# bindings to #4 for Xcode to compile.
 #
 # WHY THIS MATTERS:
 # If you run `cargo build` but don't run this script, Xcode will continue
@@ -64,6 +71,7 @@ GENERATED_SWIFT_DIR="generated-swift"
 LOCAL_OUTPUT="xcode-libs"
 PROJECT_ROOT_LIBS="../Libraries"
 XCODE_LIBS="../PhotoLibrarian/Libraries"  # ⭐ PRIMARY - Xcode links here
+XCODE_SWIFT="../PhotoLibrarian/PhotoLibrarian/photolibrariancore.swift"  # Swift source location
 
 # Create output directories if they don't exist
 mkdir -p "$LOCAL_OUTPUT"
@@ -95,6 +103,7 @@ echo "→ Copying photolibrariancore.swift..."
 cp "$GENERATED_SWIFT_DIR/photolibrariancore.swift" "$LOCAL_OUTPUT/"
 cp "$GENERATED_SWIFT_DIR/photolibrariancore.swift" "$PROJECT_ROOT_LIBS/"
 cp "$GENERATED_SWIFT_DIR/photolibrariancore.swift" "$XCODE_LIBS/"  # ⭐ PRIMARY
+cp "$GENERATED_SWIFT_DIR/photolibrariancore.swift" "$XCODE_SWIFT"  # Swift source for Xcode
 
 echo ""
 echo "✅ Build complete!"
@@ -111,6 +120,9 @@ echo "🔄 Also copied to (for compatibility):"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  • $(cd "$LOCAL_OUTPUT" && pwd)"
 echo "  • $(cd "$PROJECT_ROOT_LIBS" && pwd)"
+echo ""
+echo "Swift bindings source (photolibrariancore.swift) also copied to:"
+echo "  • $(cd "$(dirname "$XCODE_SWIFT")" && pwd)/$(basename "$XCODE_SWIFT")"
 echo ""
 echo "⏰ All files updated at: $(date '+%Y-%m-%d %H:%M:%S')"
 echo ""
