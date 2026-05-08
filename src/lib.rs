@@ -213,7 +213,7 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             -- UNIQUE constraint on file_path prevents duplicate imports
             -- This allows INSERT OR IGNORE to silently skip duplicates during batch ingestion
             file_path TEXT NOT NULL UNIQUE,
-            file_size INTEGER NOT NULL,
+            file_size BIGINT NOT NULL,  -- BIGINT (64-bit) required: large TIFFs and PSDs can exceed 2.1GB INT32 limit
             file_name TEXT NOT NULL,
             file_extension TEXT,
             created_timestamp INTEGER NOT NULL,  -- Unix epoch seconds
