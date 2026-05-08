@@ -1,0 +1,9 @@
+# Cargo build configuration for PhotoLibrarian Core
+#
+# This file configures the Rust build environment to match the
+# macOS deployment target used by the DuckDB bundled library.
+
+[env]
+# Set macOS deployment target to 26.2 to match DuckDB bundled library
+# This eliminates linker warnings about object files built for newer macOS versions
+MACOSX_DEPLOYMENT_TARGET = "26.2"
