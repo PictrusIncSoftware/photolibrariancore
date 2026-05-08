@@ -13,10 +13,12 @@ namespace photolibrariancore {
     [Async]
     u64 get_image_count();
 
-    // Get all images from the catalogue (for browse/debug view)
-    // Returns all image records ordered by ID
+    // Get images from the catalogue with pagination support
+    // Returns a paginated list of image records ordered by ID
+    // limit: maximum number of records to return (page size)
+    // offset: number of records to skip (page_number * page_size)
     [Async]
-    sequence<ImageRecord> get_all_images();
+    sequence<ImageRecord> get_all_images(u32 limit, u32 offset);
 };
 
 // Represents the metadata for a single image file

@@ -1070,11 +1070,11 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
         print("uniffiFutureContinuationCallback invalid handle")
     }
 }
-public func getAllImages()async  -> [ImageRecord]  {
+public func getAllImages(limit: UInt32, offset: UInt32)async  -> [ImageRecord]  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_photolibrariancore_fn_func_get_all_images(
+                uniffi_photolibrariancore_fn_func_get_all_images(FfiConverterUInt32.lower(limit),FfiConverterUInt32.lower(offset)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
@@ -1146,7 +1146,7 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_photolibrariancore_checksum_func_get_all_images() != 61078) {
+    if (uniffi_photolibrariancore_checksum_func_get_all_images() != 59615) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_image_count() != 3228) {

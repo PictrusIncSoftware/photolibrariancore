@@ -504,22 +504,30 @@ fn is_leap_year(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
-/// Get all images from the catalogue
+/// Get images from the catalogue with pagination support
 ///
-/// Returns a complete list of all image records in the catalogue, ordered by ID.
-/// This is a development/debugging function for viewing catalogue contents.
+/// Returns a paginated list of image records in the catalogue, ordered by ID.
+/// This enables the Swift UI layer to load large catalogues incrementally without
+/// freezing the interface.
 ///
-/// Design decision: Returns all records with no LIMIT for v1. The function signature
-/// could be extended with limit/offset parameters in the future if needed for pagination.
+/// Pagination pattern:
+/// - First page: get_all_images(limit: 500, offset: 0)
+/// - Second page: get_all_images(limit: 500, offset: 500)
+/// - Third page: get_all_images(limit: 500, offset: 1000)
+/// - Continue until returned Vec is empty or smaller than limit
 ///
 /// Data flow:
-/// - Swift calls this function to populate a browse/debug view
-/// - Rust queries all records from the images table
+/// - Swift calls this function to populate the browse view, loading pages on demand
+/// - Rust queries a window of records using LIMIT and OFFSET
 /// - Returns full ImageRecord structs including database-generated fields
+///
+/// Parameters:
+/// - limit: Maximum number of records to return (page size)
+/// - offset: Number of records to skip (page_number * page_size)
 ///
 /// Returns:
 /// - Vec of ImageRecord structs, empty vec if catalogue is empty or not initialized
-pub async fn get_all_images() -> Vec<ImageRecord> {
+pub async fn get_all_images(limit: u32, offset: u32) -> Vec<ImageRecord> {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
     let conn = match catalogue.as_ref() {
@@ -530,10 +538,11 @@ pub async fn get_all_images() -> Vec<ImageRecord> {
         }
     };
 
-    // Query all images, ordered by ID
+    // Query images with pagination, ordered by ID
     // Note: DuckDB TIMESTAMP columns must be cast to epoch seconds in SQL,
     // then formatted to String in Rust, because the UniFFI bridge has no
     // TIMESTAMP type. This is the standard pattern for all TIMESTAMP columns.
+    // LIMIT ?1 OFFSET ?2 enables paginated loading for large catalogues
     let query_sql = r#"
         SELECT
             id, epoch(indexed_timestamp) as indexed_ts_epoch,
@@ -548,9 +557,10 @@ pub async fn get_all_images() -> Vec<ImageRecord> {
             rating, flag, color_label
         FROM images
         ORDER BY id
+        LIMIT ?1 OFFSET ?2
     "#;
 
-    // Execute query and collect results
+    // Execute query with limit and offset parameters
     let mut stmt = match conn.prepare(query_sql) {
         Ok(s) => s,
         Err(e) => {
@@ -559,7 +569,7 @@ pub async fn get_all_images() -> Vec<ImageRecord> {
         }
     };
 
-    let rows = match stmt.query_map([], |row| {
+    let rows = match stmt.query_map(params![limit as i64, offset as i64], |row| {
         // Extract all columns from the row
         // Type conversions: i64 from DuckDB → u64/u32/u8 for Rust
 

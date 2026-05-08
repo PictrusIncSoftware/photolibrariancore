@@ -245,8 +245,7 @@ typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t, UniffiForeignFutureRes
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_ALL_IMAGES
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_ALL_IMAGES
-uint64_t uniffi_photolibrariancore_fn_func_get_all_images(void
-    
+uint64_t uniffi_photolibrariancore_fn_func_get_all_images(uint32_t limit, uint32_t offset
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_IMAGE_COUNT
