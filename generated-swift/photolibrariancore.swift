@@ -1100,6 +1100,21 @@ public func getImageCount()async  -> UInt64  {
             
         )
 }
+public func getImagesSorted(limit: UInt32, offset: UInt32)async  -> [ImageRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_get_images_sorted(FfiConverterUInt32.lower(limit),FfiConverterUInt32.lower(offset)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeImageRecord.lift,
+            errorHandler: nil
+            
+        )
+}
 public func ingestMetadata(metadata: [ImageMetadata])async  -> UInt32  {
     return
         try!  await uniffiRustCallAsync(
@@ -1150,6 +1165,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_image_count() != 3228) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_get_images_sorted() != 18023) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_ingest_metadata() != 1621) {

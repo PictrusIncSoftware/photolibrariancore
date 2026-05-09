@@ -19,6 +19,13 @@ namespace photolibrariancore {
     // offset: number of records to skip (page_number * page_size)
     [Async]
     sequence<ImageRecord> get_all_images(u32 limit, u32 offset);
+
+    // Get images from the catalogue with pagination and proper global sort order
+    // Returns a paginated list of image records ordered by capture_datetime DESC NULLS LAST, created_timestamp DESC
+    // limit: maximum number of records to return (page size)
+    // offset: number of records to skip (page_number * page_size)
+    [Async]
+    sequence<ImageRecord> get_images_sorted(u32 limit, u32 offset);
 };
 
 // Represents the metadata for a single image file

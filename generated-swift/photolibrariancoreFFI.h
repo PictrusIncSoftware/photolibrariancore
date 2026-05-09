@@ -254,6 +254,11 @@ uint64_t uniffi_photolibrariancore_fn_func_get_image_count(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_IMAGES_SORTED
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_IMAGES_SORTED
+uint64_t uniffi_photolibrariancore_fn_func_get_images_sorted(uint32_t limit, uint32_t offset
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_INGEST_METADATA
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_INGEST_METADATA
 uint64_t uniffi_photolibrariancore_fn_func_ingest_metadata(RustBuffer metadata
@@ -533,6 +538,12 @@ uint16_t uniffi_photolibrariancore_checksum_func_get_all_images(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_IMAGE_COUNT
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_IMAGE_COUNT
 uint16_t uniffi_photolibrariancore_checksum_func_get_image_count(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_IMAGES_SORTED
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_IMAGES_SORTED
+uint16_t uniffi_photolibrariancore_checksum_func_get_images_sorted(void
     
 );
 #endif

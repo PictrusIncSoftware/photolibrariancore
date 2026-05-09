@@ -627,3 +627,131 @@ pub async fn get_all_images(limit: u32, offset: u32) -> Vec<ImageRecord> {
 
     records
 }
+
+/// Get images from the catalogue with pagination and proper global sort order
+///
+/// Returns a paginated list of image records in the catalogue, ordered by capture_datetime
+/// descending (newest first) with NULL dates at the end, then by created_timestamp descending.
+/// This provides a consistent global sort order that matches user expectations for browsing
+/// their photo library chronologically.
+///
+/// Sort order:
+/// - Primary: capture_datetime DESC NULLS LAST (images with dates first, newest to oldest)
+/// - Secondary: created_timestamp DESC (for images without capture dates)
+///
+/// Pagination pattern:
+/// - First page: get_images_sorted(limit: 50, offset: 0)
+/// - Second page: get_images_sorted(limit: 50, offset: 50)
+/// - Third page: get_images_sorted(limit: 50, offset: 100)
+/// - Continue until returned Vec is empty or smaller than limit
+///
+/// Data flow:
+/// - Swift calls this function to populate the Photos view with thumbnails
+/// - Rust queries a window of records using LIMIT and OFFSET with global sort
+/// - Returns full ImageRecord structs including database-generated fields
+///
+/// Parameters:
+/// - limit: Maximum number of records to return (page size)
+/// - offset: Number of records to skip (page_number * page_size)
+///
+/// Returns:
+/// - Vec of ImageRecord structs sorted by date, empty vec if catalogue is empty or not initialized
+pub async fn get_images_sorted(limit: u32, offset: u32) -> Vec<ImageRecord> {
+    // Acquire lock and validate connection
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    // Query images with pagination and global sort order
+    // ORDER BY capture_datetime DESC NULLS LAST ensures images with dates appear first,
+    // sorted newest to oldest, with undated images at the end.
+    // Secondary sort by created_timestamp DESC for images without capture dates.
+    let query_sql = r#"
+        SELECT
+            id, epoch(indexed_timestamp) as indexed_ts_epoch,
+            file_path, file_size, file_name, file_extension,
+            created_timestamp, modified_timestamp,
+            camera_make, camera_model, lens_model,
+            focal_length, aperture, shutter_speed, iso,
+            capture_datetime,
+            pixel_width, pixel_height, color_space, bit_depth,
+            gps_latitude, gps_longitude, gps_altitude,
+            copyright, creator, description,
+            rating, flag, color_label
+        FROM images
+        ORDER BY capture_datetime DESC NULLS LAST, created_timestamp DESC
+        LIMIT ?1 OFFSET ?2
+    "#;
+
+    // Execute query with limit and offset parameters
+    let mut stmt = match conn.prepare(query_sql) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to prepare query: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map(params![limit as i64, offset as i64], |row| {
+        // Extract all columns from the row
+        // Type conversions: i64 from DuckDB → u64/u32/u8 for Rust
+
+        // Format indexed_timestamp from Unix epoch seconds to ISO 8601 string
+        let epoch_secs: i64 = row.get(1)?;
+        let indexed_ts = format_epoch_to_iso8601(epoch_secs);
+
+        Ok(ImageRecord {
+            id: row.get(0)?,
+            indexed_timestamp: indexed_ts,
+            file_path: row.get(2)?,
+            file_size: row.get::<_, i64>(3)? as u64,
+            file_name: row.get(4)?,
+            file_extension: row.get(5)?,
+            created_timestamp: row.get(6)?,
+            modified_timestamp: row.get(7)?,
+            camera_make: row.get(8)?,
+            camera_model: row.get(9)?,
+            lens_model: row.get(10)?,
+            focal_length: row.get(11)?,
+            aperture: row.get(12)?,
+            shutter_speed: row.get(13)?,
+            iso: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
+            capture_datetime: row.get(15)?,
+            pixel_width: row.get::<_, Option<i64>>(16)?.map(|v| v as u32),
+            pixel_height: row.get::<_, Option<i64>>(17)?.map(|v| v as u32),
+            color_space: row.get(18)?,
+            bit_depth: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
+            gps_latitude: row.get(20)?,
+            gps_longitude: row.get(21)?,
+            gps_altitude: row.get(22)?,
+            copyright: row.get(23)?,
+            creator: row.get(24)?,
+            description: row.get(25)?,
+            rating: row.get::<_, Option<i64>>(26)?.map(|v| v as u8),
+            flag: row.get(27)?,
+            color_label: row.get(28)?,
+        })
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to execute query: {}", e);
+            return Vec::new();
+        }
+    };
+
+    // Collect results, logging errors but continuing for other rows
+    let mut records = Vec::new();
+    for row_result in rows {
+        match row_result {
+            Ok(record) => records.push(record),
+            Err(e) => eprintln!("Failed to parse row: {}", e),
+        }
+    }
+
+    records
+}
