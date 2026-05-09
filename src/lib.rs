@@ -818,3 +818,259 @@ pub async fn update_image_rating(file_path: String, rating: u32) -> bool {
         }
     }
 }
+
+/// Get all distinct date strings from the catalogue
+///
+/// Returns the date-only prefixes (first 10 characters: "YYYY:MM:DD") from
+/// capture_datetime for all images in the catalogue. Used to populate the date
+/// navigation tree in the Photos view.
+///
+/// Data flow:
+/// - Swift calls this function to populate the date navigation sidebar
+/// - Rust queries distinct date prefixes from capture_datetime
+/// - Returns sorted list (newest first) for Swift to build the tree hierarchy
+///
+/// Returns:
+/// - Vec of date strings in "YYYY:MM:DD" format, sorted descending
+/// - Empty vec if catalogue is empty or not initialized
+pub async fn get_distinct_date_strings() -> Vec<String> {
+    // Acquire lock and validate connection
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    // Query distinct date prefixes from capture_datetime
+    // SUBSTRING extracts first 10 characters (YYYY:MM:DD format)
+    // Filter out NULL and empty strings
+    let query_sql = r#"
+        SELECT DISTINCT SUBSTRING(capture_datetime, 1, 10) as date_str
+        FROM images
+        WHERE capture_datetime IS NOT NULL AND capture_datetime != ''
+        ORDER BY date_str DESC
+    "#;
+
+    let mut stmt = match conn.prepare(query_sql) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to prepare query: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map([], |row| {
+        row.get::<_, String>(0)
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to execute query: {}", e);
+            return Vec::new();
+        }
+    };
+
+    // Collect results, logging errors but continuing for other rows
+    let mut dates = Vec::new();
+    for row_result in rows {
+        match row_result {
+            Ok(date_str) => dates.push(date_str),
+            Err(e) => eprintln!("Failed to parse row: {}", e),
+        }
+    }
+
+    dates
+}
+
+/// Get images from the catalogue with pagination and optional date filtering
+///
+/// Returns a paginated list of image records, optionally filtered by date prefix.
+/// When date_prefix is empty, returns all images. When non-empty, filters to images
+/// whose capture_datetime starts with the given prefix.
+///
+/// Date prefix format:
+/// - "" (empty): All images
+/// - "2026:": All images from year 2026
+/// - "2026:01:": All images from January 2026
+/// - "2026:01:09": All images from January 9, 2026
+///
+/// Sort order: capture_datetime DESC NULLS LAST, created_timestamp DESC
+///
+/// Parameters:
+/// - limit: Maximum number of records to return (page size)
+/// - offset: Number of records to skip (page_number * page_size)
+/// - date_prefix: Date filter prefix (empty string for no filter)
+///
+/// Returns:
+/// - Vec of ImageRecord structs sorted by date, empty vec if catalogue is empty or not initialized
+pub async fn get_images_filtered(limit: i64, offset: i64, date_prefix: String) -> Vec<ImageRecord> {
+    // Acquire lock and validate connection
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    // Build query with optional WHERE clause
+    let query_sql = if date_prefix.is_empty() {
+        // No filter - return all images
+        r#"
+            SELECT
+                id, epoch(indexed_timestamp) as indexed_ts_epoch,
+                file_path, file_size, file_name, file_extension,
+                created_timestamp, modified_timestamp,
+                camera_make, camera_model, lens_model,
+                focal_length, aperture, shutter_speed, iso,
+                capture_datetime,
+                pixel_width, pixel_height, color_space, bit_depth,
+                gps_latitude, gps_longitude, gps_altitude,
+                copyright, creator, description,
+                rating, flag, color_label
+            FROM images
+            ORDER BY capture_datetime DESC NULLS LAST, created_timestamp DESC
+            LIMIT ?1 OFFSET ?2
+        "#.to_string()
+    } else {
+        // Filter by date prefix using LIKE
+        format!(r#"
+            SELECT
+                id, epoch(indexed_timestamp) as indexed_ts_epoch,
+                file_path, file_size, file_name, file_extension,
+                created_timestamp, modified_timestamp,
+                camera_make, camera_model, lens_model,
+                focal_length, aperture, shutter_speed, iso,
+                capture_datetime,
+                pixel_width, pixel_height, color_space, bit_depth,
+                gps_latitude, gps_longitude, gps_altitude,
+                copyright, creator, description,
+                rating, flag, color_label
+            FROM images
+            WHERE capture_datetime LIKE '{}%'
+            ORDER BY capture_datetime DESC NULLS LAST, created_timestamp DESC
+            LIMIT ?1 OFFSET ?2
+        "#, date_prefix)
+    };
+
+    // Execute query with limit and offset parameters
+    let mut stmt = match conn.prepare(&query_sql) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to prepare query: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map(params![limit, offset], |row| {
+        // Extract all columns from the row
+        // Type conversions: i64 from DuckDB → u64/u32/u8 for Rust
+
+        // Format indexed_timestamp from Unix epoch seconds to ISO 8601 string
+        let epoch_secs: i64 = row.get(1)?;
+        let indexed_ts = format_epoch_to_iso8601(epoch_secs);
+
+        Ok(ImageRecord {
+            id: row.get(0)?,
+            indexed_timestamp: indexed_ts,
+            file_path: row.get(2)?,
+            file_size: row.get::<_, i64>(3)? as u64,
+            file_name: row.get(4)?,
+            file_extension: row.get(5)?,
+            created_timestamp: row.get(6)?,
+            modified_timestamp: row.get(7)?,
+            camera_make: row.get(8)?,
+            camera_model: row.get(9)?,
+            lens_model: row.get(10)?,
+            focal_length: row.get(11)?,
+            aperture: row.get(12)?,
+            shutter_speed: row.get(13)?,
+            iso: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
+            capture_datetime: row.get(15)?,
+            pixel_width: row.get::<_, Option<i64>>(16)?.map(|v| v as u32),
+            pixel_height: row.get::<_, Option<i64>>(17)?.map(|v| v as u32),
+            color_space: row.get(18)?,
+            bit_depth: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
+            gps_latitude: row.get(20)?,
+            gps_longitude: row.get(21)?,
+            gps_altitude: row.get(22)?,
+            copyright: row.get(23)?,
+            creator: row.get(24)?,
+            description: row.get(25)?,
+            rating: row.get::<_, Option<i64>>(26)?.map(|v| v as u8),
+            flag: row.get(27)?,
+            color_label: row.get(28)?,
+        })
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to execute query: {}", e);
+            return Vec::new();
+        }
+    };
+
+    // Collect results, logging errors but continuing for other rows
+    let mut records = Vec::new();
+    for row_result in rows {
+        match row_result {
+            Ok(record) => records.push(record),
+            Err(e) => eprintln!("Failed to parse row: {}", e),
+        }
+    }
+
+    records
+}
+
+/// Get the count of images matching the date filter
+///
+/// Returns the total number of images in the catalogue, optionally filtered by
+/// date prefix. Used for pagination calculations in the Photos view.
+///
+/// Date prefix format:
+/// - "" (empty): Count all images
+/// - "2026:": Count images from year 2026
+/// - "2026:01:": Count images from January 2026
+/// - "2026:01:09": Count images from January 9, 2026
+///
+/// Parameters:
+/// - date_prefix: Date filter prefix (empty string for no filter)
+///
+/// Returns:
+/// - Total number of image records matching the filter
+/// - 0 if catalogue not initialized or query fails
+pub async fn get_filtered_image_count(date_prefix: String) -> i64 {
+    // Acquire lock and validate connection
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    // Build query with optional WHERE clause
+    let query_sql = if date_prefix.is_empty() {
+        "SELECT COUNT(*) FROM images".to_string()
+    } else {
+        format!("SELECT COUNT(*) FROM images WHERE capture_datetime LIKE '{}%'", date_prefix)
+    };
+
+    // Execute COUNT query
+    let count_result: Result<i64, _> = conn.query_row(
+        &query_sql,
+        [],
+        |row| row.get(0),
+    );
+
+    match count_result {
+        Ok(count) => count,
+        Err(e) => {
+            eprintln!("Failed to query filtered image count: {}", e);
+            0
+        }
+    }
+}

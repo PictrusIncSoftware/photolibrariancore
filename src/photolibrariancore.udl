@@ -32,6 +32,22 @@ namespace photolibrariancore {
     // Returns true on success, false on failure
     [Async]
     boolean update_image_rating(string file_path, u32 rating);
+
+    // Get all distinct date strings from capture_datetime for date navigation
+    // Returns date prefixes in "YYYY:MM:DD" format, sorted descending (newest first)
+    [Async]
+    sequence<string> get_distinct_date_strings();
+
+    // Get images with pagination and optional date filtering
+    // date_prefix: Empty string for all images, or "YYYY:", "YYYY:MM:", "YYYY:MM:DD" for filtering
+    // Returns paginated list ordered by capture_datetime DESC NULLS LAST, created_timestamp DESC
+    [Async]
+    sequence<ImageRecord> get_images_filtered(i64 limit, i64 offset, string date_prefix);
+
+    // Get count of images matching the date filter
+    // date_prefix: Empty string for all images, or "YYYY:", "YYYY:MM:", "YYYY:MM:DD" for filtering
+    [Async]
+    i64 get_filtered_image_count(string date_prefix);
 };
 
 // Represents the metadata for a single image file
