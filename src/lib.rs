@@ -851,7 +851,7 @@ pub async fn get_distinct_date_strings() -> Vec<String> {
         SELECT DISTINCT SUBSTRING(capture_datetime, 1, 10) as date_str
         FROM images
         WHERE capture_datetime IS NOT NULL AND capture_datetime != ''
-        ORDER BY date_str DESC
+        ORDER BY date_str ASC
     "#;
 
     let mut stmt = match conn.prepare(query_sql) {
