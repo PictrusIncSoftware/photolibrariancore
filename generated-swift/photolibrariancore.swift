@@ -976,6 +976,31 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
+    typealias SwiftType = [String]
+
+    public static func write(_ value: [String], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterString.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [String] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [String]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterString.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeImageMetadata: FfiConverterRustBuffer {
     typealias SwiftType = [ImageMetadata]
 
@@ -1085,6 +1110,36 @@ public func getAllImages(limit: UInt32, offset: UInt32)async  -> [ImageRecord]  
             
         )
 }
+public func getDistinctDateStrings()async  -> [String]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_get_distinct_date_strings(
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceString.lift,
+            errorHandler: nil
+            
+        )
+}
+public func getFilteredImageCount(datePrefix: String)async  -> Int64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_get_filtered_image_count(FfiConverterString.lower(datePrefix)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_i64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_i64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_i64,
+            liftFunc: FfiConverterInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func getImageCount()async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
@@ -1096,6 +1151,21 @@ public func getImageCount()async  -> UInt64  {
             completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+public func getImagesFiltered(limit: Int64, offset: Int64, datePrefix: String)async  -> [ImageRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_get_images_filtered(FfiConverterInt64.lower(limit),FfiConverterInt64.lower(offset),FfiConverterString.lower(datePrefix)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeImageRecord.lift,
             errorHandler: nil
             
         )
@@ -1179,7 +1249,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_get_all_images() != 59615) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_get_distinct_date_strings() != 13981) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_get_filtered_image_count() != 37271) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_get_image_count() != 3228) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_get_images_filtered() != 61854) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_images_sorted() != 18023) {

@@ -248,10 +248,26 @@ typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t, UniffiForeignFutureRes
 uint64_t uniffi_photolibrariancore_fn_func_get_all_images(uint32_t limit, uint32_t offset
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_DISTINCT_DATE_STRINGS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_DISTINCT_DATE_STRINGS
+uint64_t uniffi_photolibrariancore_fn_func_get_distinct_date_strings(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_FILTERED_IMAGE_COUNT
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_FILTERED_IMAGE_COUNT
+uint64_t uniffi_photolibrariancore_fn_func_get_filtered_image_count(RustBuffer date_prefix
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_IMAGE_COUNT
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_IMAGE_COUNT
 uint64_t uniffi_photolibrariancore_fn_func_get_image_count(void
     
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_IMAGES_FILTERED
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_IMAGES_FILTERED
+uint64_t uniffi_photolibrariancore_fn_func_get_images_filtered(int64_t limit, int64_t offset, RustBuffer date_prefix
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_IMAGES_SORTED
@@ -540,9 +556,27 @@ uint16_t uniffi_photolibrariancore_checksum_func_get_all_images(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_DISTINCT_DATE_STRINGS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_DISTINCT_DATE_STRINGS
+uint16_t uniffi_photolibrariancore_checksum_func_get_distinct_date_strings(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_FILTERED_IMAGE_COUNT
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_FILTERED_IMAGE_COUNT
+uint16_t uniffi_photolibrariancore_checksum_func_get_filtered_image_count(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_IMAGE_COUNT
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_IMAGE_COUNT
 uint16_t uniffi_photolibrariancore_checksum_func_get_image_count(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_IMAGES_FILTERED
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_IMAGES_FILTERED
+uint16_t uniffi_photolibrariancore_checksum_func_get_images_filtered(void
     
 );
 #endif
