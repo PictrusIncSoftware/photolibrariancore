@@ -26,6 +26,12 @@ namespace photolibrariancore {
     // offset: number of records to skip (page_number * page_size)
     [Async]
     sequence<ImageRecord> get_images_sorted(u32 limit, u32 offset);
+
+    // Update the rating for an image identified by file path
+    // rating: Star rating from 0-5 (0 clears the rating)
+    // Returns true on success, false on failure
+    [Async]
+    boolean update_image_rating(string file_path, u32 rating);
 };
 
 // Represents the metadata for a single image file

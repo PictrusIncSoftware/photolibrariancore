@@ -755,3 +755,66 @@ pub async fn get_images_sorted(limit: u32, offset: u32) -> Vec<ImageRecord> {
 
     records
 }
+
+/// Update the rating for an image
+///
+/// Sets the star rating (0-5) for an image identified by its file path.
+/// A rating of 0 clears the rating (sets it to NULL in the database).
+///
+/// Design decision: Uses file_path as the key because it's the unique identifier
+/// available to the Swift layer when a user interacts with a thumbnail. The id field
+/// is database-internal and not surfaced in the UI context.
+///
+/// Data flow:
+/// - User taps a star in the Photos view thumbnail
+/// - Swift calls this function with the file path and new rating
+/// - Rust updates the database
+/// - Swift updates its local ImageRecord to reflect the change
+///
+/// Parameters:
+/// - file_path: Absolute path to the image file (must match a record in catalogue)
+/// - rating: Star rating from 0-5 (0 clears the rating)
+///
+/// Returns:
+/// - true if update succeeded
+/// - false if catalogue not initialized, file not found, or query failed
+pub async fn update_image_rating(file_path: String, rating: u32) -> bool {
+    // Acquire lock and validate connection
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return false;
+        }
+    };
+
+    // Convert rating to Option<i64> for database
+    // Rating of 0 means clear the rating (set to NULL)
+    let rating_value: Option<i64> = if rating == 0 {
+        None
+    } else {
+        Some(rating as i64)
+    };
+
+    // Update the rating for the specified file path
+    let update_sql = "UPDATE images SET rating = ? WHERE file_path = ?";
+
+    match conn.execute(update_sql, params![rating_value, file_path]) {
+        Ok(changed) => {
+            if changed == 0 {
+                // No rows updated - file path not found
+                eprintln!("No image found with file_path: {}", file_path);
+                false
+            } else {
+                // Successfully updated
+                true
+            }
+        }
+        Err(e) => {
+            // Log error but don't crash
+            eprintln!("Failed to update rating for {}: {}", file_path, e);
+            false
+        }
+    }
+}
