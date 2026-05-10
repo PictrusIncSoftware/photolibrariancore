@@ -451,6 +451,22 @@ fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterInt32: FfiConverterPrimitive {
+    typealias FfiType = Int32
+    typealias SwiftType = Int32
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int32 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int32, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
     typealias FfiType = UInt64
     typealias SwiftType = UInt64
@@ -746,10 +762,11 @@ public struct ImageRecord: Equatable, Hashable {
     public var rating: UInt8?
     public var flag: String?
     public var colorLabel: String?
+    public var rotation: Int32
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: Int64, indexedTimestamp: String, filePath: String, fileSize: UInt64, fileName: String, fileExtension: String?, createdTimestamp: Int64, modifiedTimestamp: Int64, cameraMake: String?, cameraModel: String?, lensModel: String?, focalLength: Double?, aperture: Double?, shutterSpeed: Double?, iso: UInt32?, captureDatetime: String?, pixelWidth: UInt32?, pixelHeight: UInt32?, colorSpace: String?, bitDepth: UInt32?, gpsLatitude: Double?, gpsLongitude: Double?, gpsAltitude: Double?, copyright: String?, creator: String?, description: String?, rating: UInt8?, flag: String?, colorLabel: String?) {
+    public init(id: Int64, indexedTimestamp: String, filePath: String, fileSize: UInt64, fileName: String, fileExtension: String?, createdTimestamp: Int64, modifiedTimestamp: Int64, cameraMake: String?, cameraModel: String?, lensModel: String?, focalLength: Double?, aperture: Double?, shutterSpeed: Double?, iso: UInt32?, captureDatetime: String?, pixelWidth: UInt32?, pixelHeight: UInt32?, colorSpace: String?, bitDepth: UInt32?, gpsLatitude: Double?, gpsLongitude: Double?, gpsAltitude: Double?, copyright: String?, creator: String?, description: String?, rating: UInt8?, flag: String?, colorLabel: String?, rotation: Int32) {
         self.id = id
         self.indexedTimestamp = indexedTimestamp
         self.filePath = filePath
@@ -779,6 +796,7 @@ public struct ImageRecord: Equatable, Hashable {
         self.rating = rating
         self.flag = flag
         self.colorLabel = colorLabel
+        self.rotation = rotation
     }
 
     
@@ -825,7 +843,8 @@ public struct FfiConverterTypeImageRecord: FfiConverterRustBuffer {
                 description: FfiConverterOptionString.read(from: &buf), 
                 rating: FfiConverterOptionUInt8.read(from: &buf), 
                 flag: FfiConverterOptionString.read(from: &buf), 
-                colorLabel: FfiConverterOptionString.read(from: &buf)
+                colorLabel: FfiConverterOptionString.read(from: &buf), 
+                rotation: FfiConverterInt32.read(from: &buf)
         )
     }
 
@@ -859,6 +878,7 @@ public struct FfiConverterTypeImageRecord: FfiConverterRustBuffer {
         FfiConverterOptionUInt8.write(value.rating, into: &buf)
         FfiConverterOptionString.write(value.flag, into: &buf)
         FfiConverterOptionString.write(value.colorLabel, into: &buf)
+        FfiConverterInt32.write(value.rotation, into: &buf)
     }
 }
 
@@ -1230,6 +1250,21 @@ public func updateImageRating(filePath: String, rating: UInt32)async  -> Bool  {
             
         )
 }
+public func updateImageRotation(filePath: String, degrees: Int32)async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_update_image_rotation(FfiConverterString.lower(filePath),FfiConverterInt32.lower(degrees)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_i8,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_i8,
+            freeFunc: ffi_photolibrariancore_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
+        )
+}
 
 private enum InitializationResult {
     case ok
@@ -1271,6 +1306,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_image_rating() != 15118) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_update_image_rotation() != 63730) {
         return InitializationResult.apiChecksumMismatch
     }
 

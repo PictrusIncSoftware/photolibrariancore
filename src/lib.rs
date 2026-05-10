@@ -140,6 +140,7 @@ pub struct ImageRecord {
     pub rating: Option<u8>,
     pub flag: Option<String>,
     pub color_label: Option<String>,
+    pub rotation: i32,
 }
 
 /// Initialize the catalogue database at the given path
@@ -249,6 +250,7 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             rating INTEGER,      -- 0-5 stars
             flag TEXT,           -- "pick", "reject", or NULL
             color_label TEXT,    -- "red", "green", "blue", etc.
+            rotation INTEGER DEFAULT 0,  -- Image rotation in degrees: 0, 90, 180, or 270
 
             -- Audit timestamp: when this record was added to the catalogue
             indexed_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -554,7 +556,7 @@ pub async fn get_all_images(limit: u32, offset: u32) -> Vec<ImageRecord> {
             pixel_width, pixel_height, color_space, bit_depth,
             gps_latitude, gps_longitude, gps_altitude,
             copyright, creator, description,
-            rating, flag, color_label
+            rating, flag, color_label, rotation
         FROM images
         ORDER BY id
         LIMIT ?1 OFFSET ?2
@@ -607,6 +609,7 @@ pub async fn get_all_images(limit: u32, offset: u32) -> Vec<ImageRecord> {
             rating: row.get::<_, Option<i64>>(26)?.map(|v| v as u8),
             flag: row.get(27)?,
             color_label: row.get(28)?,
+            rotation: row.get::<_, i64>(29)? as i32,
         })
     }) {
         Ok(r) => r,
@@ -682,7 +685,7 @@ pub async fn get_images_sorted(limit: u32, offset: u32) -> Vec<ImageRecord> {
             pixel_width, pixel_height, color_space, bit_depth,
             gps_latitude, gps_longitude, gps_altitude,
             copyright, creator, description,
-            rating, flag, color_label
+            rating, flag, color_label, rotation
         FROM images
         ORDER BY capture_datetime DESC NULLS LAST, created_timestamp DESC
         LIMIT ?1 OFFSET ?2
@@ -735,6 +738,7 @@ pub async fn get_images_sorted(limit: u32, offset: u32) -> Vec<ImageRecord> {
             rating: row.get::<_, Option<i64>>(26)?.map(|v| v as u8),
             flag: row.get(27)?,
             color_label: row.get(28)?,
+            rotation: row.get::<_, i64>(29)? as i32,
         })
     }) {
         Ok(r) => r,
@@ -814,6 +818,70 @@ pub async fn update_image_rating(file_path: String, rating: u32) -> bool {
         Err(e) => {
             // Log error but don't crash
             eprintln!("Failed to update rating for {}: {}", file_path, e);
+            false
+        }
+    }
+}
+
+/// Update the rotation angle for an image
+///
+/// Sets the rotation angle (0, 90, 180, or 270 degrees) for an image identified by its file path.
+/// The rotation angle represents how many degrees clockwise the image should be rotated for display.
+///
+/// Design decision: Uses file_path as the key for the same reasons as update_image_rating -
+/// it's the unique identifier available to the Swift layer when a user interacts with a thumbnail.
+///
+/// Data flow:
+/// - User taps a rotation button in the Photos view thumbnail
+/// - Swift calculates new rotation value (current + 90 or current - 90, wrapping at 360)
+/// - Swift calls this function with the file path and new rotation angle
+/// - Rust updates the database
+/// - Swift regenerates and caches the rotated thumbnail
+///
+/// Parameters:
+/// - file_path: Absolute path to the image file (must match a record in catalogue)
+/// - degrees: Rotation angle in degrees (0, 90, 180, or 270)
+///
+/// Returns:
+/// - true if update succeeded
+/// - false if catalogue not initialized, file not found, or query failed
+pub async fn update_image_rotation(file_path: String, degrees: i32) -> bool
+{
+    // Acquire lock and validate connection
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return false;
+        }
+    };
+
+    // Update the rotation for the specified file path
+    let update_sql = "UPDATE images SET rotation = ? WHERE file_path = ?";
+
+    match conn.execute(update_sql, params![degrees, file_path])
+    {
+        Ok(changed) =>
+        {
+            if changed == 0
+            {
+                // No rows updated - file path not found
+                eprintln!("No image found with file_path: {}", file_path);
+                false
+            }
+            else
+            {
+                // Successfully updated
+                true
+            }
+        }
+        Err(e) =>
+        {
+            // Log error but don't crash
+            eprintln!("Failed to update rotation for {}: {}", file_path, e);
             false
         }
     }
@@ -930,7 +998,7 @@ pub async fn get_images_filtered(limit: i64, offset: i64, date_prefix: String) -
                 pixel_width, pixel_height, color_space, bit_depth,
                 gps_latitude, gps_longitude, gps_altitude,
                 copyright, creator, description,
-                rating, flag, color_label
+                rating, flag, color_label, rotation
             FROM images
             ORDER BY capture_datetime DESC NULLS LAST, created_timestamp DESC
             LIMIT ?1 OFFSET ?2
@@ -948,7 +1016,7 @@ pub async fn get_images_filtered(limit: i64, offset: i64, date_prefix: String) -
                 pixel_width, pixel_height, color_space, bit_depth,
                 gps_latitude, gps_longitude, gps_altitude,
                 copyright, creator, description,
-                rating, flag, color_label
+                rating, flag, color_label, rotation
             FROM images
             WHERE capture_datetime LIKE '{}%'
             ORDER BY capture_datetime DESC NULLS LAST, created_timestamp DESC
@@ -1003,6 +1071,7 @@ pub async fn get_images_filtered(limit: i64, offset: i64, date_prefix: String) -
             rating: row.get::<_, Option<i64>>(26)?.map(|v| v as u8),
             flag: row.get(27)?,
             color_label: row.get(28)?,
+            rotation: row.get::<_, i64>(29)? as i32,
         })
     }) {
         Ok(r) => r,
