@@ -980,12 +980,17 @@ pub async fn get_distinct_directory_paths() -> Vec<String>
     };
 
     // Query distinct directory paths
-    // Extract directory by finding last '/' and taking substring before it
+    // Extract directory by finding the last '/' and taking everything before it.
+    //
+    // INSTR(REVERSE(file_path), '/') returns the 1-indexed position of the last '/'
+    // counted from the END of the original string. The directory portion is therefore
+    // the first (LENGTH(file_path) - INSTR(REVERSE(file_path), '/')) characters, which
+    // is everything up to but not including that last '/'.
     let query_sql = r#"
         SELECT DISTINCT
-            SUBSTRING(file_path, 1, LENGTH(file_path) - LENGTH(SUBSTRING(file_path, INSTR(REVERSE(file_path), '/') + 1))) as dir_path
+            SUBSTRING(file_path, 1, LENGTH(file_path) - INSTR(REVERSE(file_path), '/')) as dir_path
         FROM images
-        WHERE file_path IS NOT NULL AND file_path != ''
+        WHERE file_path IS NOT NULL AND file_path LIKE '%/%'
         ORDER BY dir_path ASC
     "#;
 
@@ -1213,6 +1218,248 @@ pub async fn get_filtered_image_count(date_prefix: String) -> i64 {
         Ok(count) => count,
         Err(e) => {
             eprintln!("Failed to query filtered image count: {}", e);
+            0
+        }
+    }
+}
+
+/// Get the count of images in a directory (matching path prefix)
+///
+/// Returns the total number of images whose file_path starts with the given
+/// path prefix. Used for displaying image counts in the source locations tree.
+///
+/// Parameters:
+/// - path_prefix: Directory path prefix (e.g., "/Users/richard/Photos/")
+///
+/// Returns:
+/// - Total number of image records in the directory tree
+/// - 0 if catalogue not initialized or query fails
+pub async fn get_image_count_for_path_prefix(path_prefix: String) -> i64
+{
+    // Acquire lock and validate connection
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    // Build query with path prefix filter
+    // Escape single quotes in path to prevent SQL injection
+    let escaped_prefix = path_prefix.replace("'", "''");
+    let query_sql = format!("SELECT COUNT(*) FROM images WHERE file_path LIKE '{}%'", escaped_prefix);
+
+    // Execute COUNT query
+    let count_result: Result<i64, _> = conn.query_row(
+        &query_sql,
+        [],
+        |row| row.get(0),
+    );
+
+    match count_result
+    {
+        Ok(count) => count,
+        Err(e) =>
+        {
+            eprintln!("Failed to query image count for path prefix: {}", e);
+            0
+        }
+    }
+}
+
+/// Get images from a directory with pagination (matching path prefix)
+///
+/// Returns a paginated list of image records whose file_path starts with the
+/// given path prefix. Used for filtering the photo grid by selected directory.
+///
+/// Sort order: capture_datetime DESC NULLS LAST, created_timestamp DESC
+///
+/// Parameters:
+/// - limit: Maximum number of records to return (page size)
+/// - offset: Number of records to skip (page_number * page_size)
+/// - path_prefix: Directory path prefix (empty string for no filter)
+/// - date_prefix: Date filter prefix (empty string for no filter)
+///
+/// Returns:
+/// - Vec of ImageRecord structs sorted by date, empty vec if catalogue is empty or not initialized
+pub async fn get_images_for_path_prefix(limit: i64, offset: i64, path_prefix: String, date_prefix: String) -> Vec<ImageRecord>
+{
+    // Acquire lock and validate connection
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    // Build WHERE clause based on filters
+    // Escape single quotes to prevent SQL injection
+    let escaped_path = path_prefix.replace("'", "''");
+    let escaped_date = date_prefix.replace("'", "''");
+
+    let where_clause = match (path_prefix.is_empty(), date_prefix.is_empty())
+    {
+        (true, true) => String::new(),
+        (false, true) => format!("WHERE file_path LIKE '{}%'", escaped_path),
+        (true, false) => format!("WHERE capture_datetime LIKE '{}%'", escaped_date),
+        (false, false) => format!("WHERE file_path LIKE '{}%' AND capture_datetime LIKE '{}%'", escaped_path, escaped_date),
+    };
+
+    let query_sql = format!(r#"
+        SELECT
+            id, epoch(indexed_timestamp) as indexed_ts_epoch,
+            file_path, file_size, file_name, file_extension,
+            created_timestamp, modified_timestamp,
+            camera_make, camera_model, lens_model,
+            focal_length, aperture, shutter_speed, iso,
+            capture_datetime,
+            pixel_width, pixel_height, color_space, bit_depth,
+            gps_latitude, gps_longitude, gps_altitude,
+            copyright, creator, description,
+            rating, flag, color_label, rotation
+        FROM images
+        {}
+        ORDER BY capture_datetime DESC NULLS LAST, created_timestamp DESC
+        LIMIT ?1 OFFSET ?2
+    "#, where_clause);
+
+    // Execute query with limit and offset parameters
+    let mut stmt = match conn.prepare(&query_sql)
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("Failed to prepare query: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map(params![limit, offset], |row|
+    {
+        // Extract all columns from the row
+        // Type conversions: i64 from DuckDB → u64/u32/u8 for Rust
+
+        // Format indexed_timestamp from Unix epoch seconds to ISO 8601 string
+        let epoch_secs: i64 = row.get(1)?;
+        let indexed_ts = format_epoch_to_iso8601(epoch_secs);
+
+        Ok(ImageRecord {
+            id: row.get(0)?,
+            indexed_timestamp: indexed_ts,
+            file_path: row.get(2)?,
+            file_size: row.get::<_, i64>(3)? as u64,
+            file_name: row.get(4)?,
+            file_extension: row.get(5)?,
+            created_timestamp: row.get(6)?,
+            modified_timestamp: row.get(7)?,
+            camera_make: row.get(8)?,
+            camera_model: row.get(9)?,
+            lens_model: row.get(10)?,
+            focal_length: row.get(11)?,
+            aperture: row.get(12)?,
+            shutter_speed: row.get(13)?,
+            iso: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
+            capture_datetime: row.get(15)?,
+            pixel_width: row.get::<_, Option<i64>>(16)?.map(|v| v as u32),
+            pixel_height: row.get::<_, Option<i64>>(17)?.map(|v| v as u32),
+            color_space: row.get(18)?,
+            bit_depth: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
+            gps_latitude: row.get(20)?,
+            gps_longitude: row.get(21)?,
+            gps_altitude: row.get(22)?,
+            copyright: row.get(23)?,
+            creator: row.get(24)?,
+            description: row.get(25)?,
+            rating: row.get::<_, Option<i64>>(26)?.map(|v| v as u8),
+            flag: row.get(27)?,
+            color_label: row.get(28)?,
+            rotation: row.get::<_, i64>(29)? as i32,
+        })
+    })
+    {
+        Ok(r) => r,
+        Err(e) =>
+        {
+            eprintln!("Failed to execute query: {}", e);
+            return Vec::new();
+        }
+    };
+
+    // Collect results, logging errors but continuing for other rows
+    let mut records = Vec::new();
+    for row_result in rows
+    {
+        match row_result
+        {
+            Ok(record) => records.push(record),
+            Err(e) => eprintln!("Failed to parse row: {}", e),
+        }
+    }
+
+    records
+}
+
+/// Get count of images matching both path prefix and date filter
+///
+/// Returns the total number of images whose file_path starts with the given
+/// path prefix AND whose capture_datetime starts with the date prefix.
+/// Used for pagination calculations when both filters are active.
+///
+/// Parameters:
+/// - path_prefix: Directory path prefix (empty string for no filter)
+/// - date_prefix: Date filter prefix (empty string for no filter)
+///
+/// Returns:
+/// - Total number of image records matching both filters
+/// - 0 if catalogue not initialized or query fails
+pub async fn get_image_count_for_filters(path_prefix: String, date_prefix: String) -> i64
+{
+    // Acquire lock and validate connection
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    // Build WHERE clause based on filters
+    // Escape single quotes to prevent SQL injection
+    let escaped_path = path_prefix.replace("'", "''");
+    let escaped_date = date_prefix.replace("'", "''");
+
+    let query_sql = match (path_prefix.is_empty(), date_prefix.is_empty())
+    {
+        (true, true) => "SELECT COUNT(*) FROM images".to_string(),
+        (false, true) => format!("SELECT COUNT(*) FROM images WHERE file_path LIKE '{}%'", escaped_path),
+        (true, false) => format!("SELECT COUNT(*) FROM images WHERE capture_datetime LIKE '{}%'", escaped_date),
+        (false, false) => format!("SELECT COUNT(*) FROM images WHERE file_path LIKE '{}%' AND capture_datetime LIKE '{}%'", escaped_path, escaped_date),
+    };
+
+    // Execute COUNT query
+    let count_result: Result<i64, _> = conn.query_row(
+        &query_sql,
+        [],
+        |row| row.get(0),
+    );
+
+    match count_result
+    {
+        Ok(count) => count,
+        Err(e) =>
+        {
+            eprintln!("Failed to query image count for filters: {}", e);
             0
         }
     }

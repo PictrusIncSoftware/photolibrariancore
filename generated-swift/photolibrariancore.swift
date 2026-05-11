@@ -1190,11 +1190,56 @@ public func getImageCount()async  -> UInt64  {
             
         )
 }
+public func getImageCountForFilters(pathPrefix: String, datePrefix: String)async  -> Int64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_get_image_count_for_filters(FfiConverterString.lower(pathPrefix),FfiConverterString.lower(datePrefix)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_i64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_i64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_i64,
+            liftFunc: FfiConverterInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+public func getImageCountForPathPrefix(pathPrefix: String)async  -> Int64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_get_image_count_for_path_prefix(FfiConverterString.lower(pathPrefix)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_i64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_i64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_i64,
+            liftFunc: FfiConverterInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func getImagesFiltered(limit: Int64, offset: Int64, datePrefix: String)async  -> [ImageRecord]  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_photolibrariancore_fn_func_get_images_filtered(FfiConverterInt64.lower(limit),FfiConverterInt64.lower(offset),FfiConverterString.lower(datePrefix)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeImageRecord.lift,
+            errorHandler: nil
+            
+        )
+}
+public func getImagesForPathPrefix(limit: Int64, offset: Int64, pathPrefix: String, datePrefix: String)async  -> [ImageRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_get_images_for_path_prefix(FfiConverterInt64.lower(limit),FfiConverterInt64.lower(offset),FfiConverterString.lower(pathPrefix),FfiConverterString.lower(datePrefix)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
@@ -1311,7 +1356,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_get_image_count() != 3228) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_get_image_count_for_filters() != 17778) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_get_image_count_for_path_prefix() != 9167) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_get_images_filtered() != 61854) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_get_images_for_path_prefix() != 22286) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_images_sorted() != 18023) {

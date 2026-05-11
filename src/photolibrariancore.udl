@@ -59,6 +59,20 @@ namespace photolibrariancore {
     // date_prefix: Empty string for all images, or "YYYY:", "YYYY:MM:", "YYYY:MM:DD" for filtering
     [Async]
     i64 get_filtered_image_count(string date_prefix);
+
+    // Get count of images in a directory (matching path prefix)
+    // path_prefix: Directory path prefix (e.g., "/Users/richard/Photos/")
+    [Async]
+    i64 get_image_count_for_path_prefix(string path_prefix);
+
+    // Get images from a directory with pagination (matching path prefix)
+    // Supports both path and date filtering simultaneously
+    [Async]
+    sequence<ImageRecord> get_images_for_path_prefix(i64 limit, i64 offset, string path_prefix, string date_prefix);
+
+    // Get count of images matching both path prefix and date filter
+    [Async]
+    i64 get_image_count_for_filters(string path_prefix, string date_prefix);
 };
 
 // Represents the metadata for a single image file
