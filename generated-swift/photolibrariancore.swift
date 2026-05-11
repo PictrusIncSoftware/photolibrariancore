@@ -1145,6 +1145,21 @@ public func getDistinctDateStrings()async  -> [String]  {
             
         )
 }
+public func getDistinctDirectoryPaths()async  -> [String]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_get_distinct_directory_paths(
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceString.lift,
+            errorHandler: nil
+            
+        )
+}
 public func getFilteredImageCount(datePrefix: String)async  -> Int64  {
     return
         try!  await uniffiRustCallAsync(
@@ -1285,6 +1300,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_distinct_date_strings() != 13981) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_get_distinct_directory_paths() != 54232) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_filtered_image_count() != 37271) {

@@ -254,6 +254,12 @@ uint64_t uniffi_photolibrariancore_fn_func_get_distinct_date_strings(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_DISTINCT_DIRECTORY_PATHS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_DISTINCT_DIRECTORY_PATHS
+uint64_t uniffi_photolibrariancore_fn_func_get_distinct_directory_paths(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_FILTERED_IMAGE_COUNT
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_FILTERED_IMAGE_COUNT
 uint64_t uniffi_photolibrariancore_fn_func_get_filtered_image_count(RustBuffer date_prefix
@@ -564,6 +570,12 @@ uint16_t uniffi_photolibrariancore_checksum_func_get_all_images(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_DISTINCT_DATE_STRINGS
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_DISTINCT_DATE_STRINGS
 uint16_t uniffi_photolibrariancore_checksum_func_get_distinct_date_strings(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_DISTINCT_DIRECTORY_PATHS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_DISTINCT_DIRECTORY_PATHS
+uint16_t uniffi_photolibrariancore_checksum_func_get_distinct_directory_paths(void
     
 );
 #endif

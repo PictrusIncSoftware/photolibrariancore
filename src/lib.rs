@@ -952,6 +952,80 @@ pub async fn get_distinct_date_strings() -> Vec<String> {
     dates
 }
 
+/// Get all distinct parent directory paths from catalogued images
+///
+/// Returns a sorted list of all unique parent directory paths that contain catalogued images.
+/// This is used to build the source locations tree in the UI, showing the directory structure
+/// of scanned locations.
+///
+/// Implementation: Uses DISTINCT on the directory portion of file_path. DuckDB doesn't have
+/// a built-in dirname() function, so we extract the directory path by finding the last '/'
+/// and taking everything before it.
+///
+/// Returns:
+/// - Vec of directory path strings, sorted alphabetically
+/// - Empty vec if catalogue is empty or not initialized
+pub async fn get_distinct_directory_paths() -> Vec<String>
+{
+    // Acquire lock and validate connection
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    // Query distinct directory paths
+    // Extract directory by finding last '/' and taking substring before it
+    let query_sql = r#"
+        SELECT DISTINCT
+            SUBSTRING(file_path, 1, LENGTH(file_path) - LENGTH(SUBSTRING(file_path, INSTR(REVERSE(file_path), '/') + 1))) as dir_path
+        FROM images
+        WHERE file_path IS NOT NULL AND file_path != ''
+        ORDER BY dir_path ASC
+    "#;
+
+    let mut stmt = match conn.prepare(query_sql)
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("Failed to prepare query: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map([], |row|
+    {
+        row.get::<_, String>(0)
+    })
+    {
+        Ok(r) => r,
+        Err(e) =>
+        {
+            eprintln!("Failed to execute query: {}", e);
+            return Vec::new();
+        }
+    };
+
+    // Collect results, logging errors but continuing for other rows
+    let mut paths = Vec::new();
+    for row_result in rows
+    {
+        match row_result
+        {
+            Ok(path) => paths.push(path),
+            Err(e) => eprintln!("Failed to parse row: {}", e),
+        }
+    }
+
+    paths
+}
+
 /// Get images from the catalogue with pagination and optional date filtering
 ///
 /// Returns a paginated list of image records, optionally filtered by date prefix.

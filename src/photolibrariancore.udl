@@ -44,6 +44,11 @@ namespace photolibrariancore {
     [Async]
     sequence<string> get_distinct_date_strings();
 
+    // Get all distinct parent directory paths from catalogued images
+    // Returns directory paths sorted alphabetically, used for source locations tree
+    [Async]
+    sequence<string> get_distinct_directory_paths();
+
     // Get images with pagination and optional date filtering
     // date_prefix: Empty string for all images, or "YYYY:", "YYYY:MM:", "YYYY:MM:DD" for filtering
     // Returns paginated list ordered by capture_datetime DESC NULLS LAST, created_timestamp DESC
