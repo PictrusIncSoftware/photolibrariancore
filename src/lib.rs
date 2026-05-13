@@ -143,6 +143,106 @@ pub struct ImageRecord {
     pub rotation: i32,
 }
 
+/// Recognized RAW image file extensions
+///
+/// Compile-time list of file extensions (lowercase, no leading dot) that
+/// PhotoLibrarian classifies as RAW images. RAW images are the camera-original
+/// negative; in JPEG+RAW pair workflows the RAW is the authoritative source
+/// and the JPEG is a preview.
+///
+/// Design decision: `const &[&str]` rather than `static` or runtime list:
+/// - Compile-time known, zero runtime overhead, thread-safe by construction.
+/// - These are facts about the world (formats we recognize), not user state.
+/// - Single source of truth at the Rust layer; SQL queries fetch candidates
+///   and classify in Rust rather than encoding the list in SQL.
+///
+/// Adding a new RAW format = one-line edit here. User-configurable lists are
+/// an explicit non-goal of the current design.
+const RAW_EXTENSIONS: &[&str] = &[
+    "nef",  // Nikon
+    "cr2",  // Canon (older)
+    "cr3",  // Canon (newer)
+    "arw",  // Sony
+    "dng",  // Adobe / Pentax / Leica / etc.
+    "raf",  // Fujifilm
+    "rw2",  // Panasonic
+    "orf",  // Olympus / OM System
+];
+
+/// Recognized JPEG image file extensions
+///
+/// Companion to RAW_EXTENSIONS. Two-element list because the JPEG ecosystem
+/// has settled on these two spellings in the workflows this app targets.
+const JPEG_EXTENSIONS: &[&str] = &["jpg", "jpeg"];
+
+/// Image classification categories for JPEG+RAW pair handling
+///
+/// Used by classify_extension to answer "what kind of image is this?" and by
+/// find_counterpart_image (added separately) to decide whether a counterpart
+/// query makes sense — Other-kind images have no JPEG+RAW counterpart by
+/// definition.
+///
+/// Three variants chosen deliberately over a boolean is_raw:
+/// - `Other` is a real category (PNG, TIFF, HEIC, etc.), not a "not RAW"
+///   bucket. These formats don't participate in pair workflows and should
+///   be classified explicitly.
+/// - Pattern-matching on three variants in Swift is clearer than chained
+///   booleans, and future format categories extend the enum without
+///   changing call-site shape.
+///
+/// This is the first enum exposed across the UniFFI boundary in this
+/// project. UniFFI generates a Swift enum with cases `.jpeg`, `.raw`,
+/// `.other` (lowercased first character). Verify casing after binding
+/// generation; surface any deviation before changing call sites.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageKind
+{
+    Jpeg,
+    Raw,
+    Other,
+}
+
+/// Classify a file extension into JPEG, RAW, or Other
+///
+/// Pure string-to-enum lookup. Case-insensitive: lowercases the input before
+/// checking the constant tables.
+///
+/// **Synchronous** — this is the project's first synchronous UniFFI export.
+/// All prior exports are `[Async]`. The semantic match is correct: no I/O,
+/// no shared state, no DuckDB. Forcing it async would push the Swift-side
+/// consumer (a SwiftUI computed property that cannot `await`) into awkward
+/// shapes.
+///
+/// The function takes the extension as a separate parameter (not parsed from
+/// a path) because the catalogue already stores `file_extension` as a
+/// separate, lowercase-normalized column. Callers pass it directly without
+/// further preprocessing.
+///
+/// Parameters:
+/// - ext: File extension without leading dot (e.g., "jpg", "NEF", "Cr3");
+///        empty string returns ImageKind::Other.
+///
+/// Returns:
+/// - ImageKind::Jpeg if ext (lowercased) matches JPEG_EXTENSIONS
+/// - ImageKind::Raw if ext (lowercased) matches RAW_EXTENSIONS
+/// - ImageKind::Other otherwise
+pub fn classify_extension(ext: String) -> ImageKind
+{
+    let lower = ext.to_lowercase();
+    if JPEG_EXTENSIONS.contains(&lower.as_str())
+    {
+        ImageKind::Jpeg
+    }
+    else if RAW_EXTENSIONS.contains(&lower.as_str())
+    {
+        ImageKind::Raw
+    }
+    else
+    {
+        ImageKind::Other
+    }
+}
+
 /// Initialize the catalogue database at the given path
 ///
 /// This function must be called once before any other catalogue operations. It creates
@@ -1463,4 +1563,237 @@ pub async fn get_image_count_for_filters(path_prefix: String, date_prefix: Strin
             0
         }
     }
+}
+
+/// Find the JPEG+RAW counterpart of an image in the catalogue
+///
+/// Given a JPEG file path, returns the matching RAW image record (same parent
+/// directory + same filename stem). Given a RAW, returns the matching JPEG.
+/// Returns None if the input is Other-kind (not JPEG, not RAW), if the input
+/// is malformed (no parent directory or no extension), or if no counterpart
+/// record exists in the catalogue.
+///
+/// Approach:
+/// - Parse parent directory and stem from the input string using pure string
+///   operations. No filesystem I/O, no canonicalization. The function trusts
+///   the input string and does not look up the input file's own catalogue
+///   record. The catalogue stores file_path verbatim from Swift, so byte-
+///   exact equality is the matching contract.
+/// - Classify the input extension via classify_extension. Other-kind inputs
+///   return None immediately — they have no counterpart concept.
+/// - SQL fetches all parent+stem candidates EXCLUDING the input's own path,
+///   ordered ASC by file_extension. Parent-directory derivation in SQL uses
+///   the standard SUBSTRING + LENGTH + INSTR + REVERSE idiom matching
+///   get_distinct_directory_paths. Stem derivation in SQL strips
+///   file_extension and the dot separator from file_name.
+/// - Rust iterates the returned rows in the SQL-imposed order, classifies
+///   each candidate's extension, and returns the first row whose kind is
+///   the opposite of the input's kind. The LIMIT-1 semantic is enforced
+///   at the Rust layer, not the SQL layer: applying SQL LIMIT 1 to the
+///   unclassified candidate set would return a same-kind sibling in the
+///   multi-RAW edge case (e.g., NEF + ARW with no JPEG) rather than the
+///   opposite-kind counterpart we want. Determinism comes from the SQL
+///   ORDER BY file_extension ASC.
+/// - Parameterized SQL bindings throughout. No format! interpolation, no
+///   quote escaping.
+///
+/// Case sensitivity: SQL `=` comparison is byte-exact. If the same-stem
+/// counterpart was indexed under a different filename case than the input,
+/// the match will not succeed. Matches existing pair-handling behavior;
+/// revisit if real users hit case-mismatch issues.
+///
+/// Stem derivation in SQL assumes file_extension's stored length matches the
+/// literal suffix of file_name. This holds because the scanner normalizes
+/// file_extension from file_name's last-dot suffix at ingest; if that
+/// invariant is ever weakened, stem derivation will silently produce wrong
+/// results.
+///
+/// This function holds CATALOGUE.lock() across the entire query and row
+/// iteration; concurrent async callers serialize on the global mutex.
+/// Consistent with all other catalogue query functions in this file.
+/// Tracked in STATUS.md for a pre-v1 refactor.
+///
+/// Parameters:
+/// - file_path: Absolute path of the image to find a counterpart for
+///
+/// Returns:
+/// - Some(ImageRecord) for the opposite-kind counterpart, deterministically
+///   chosen as the alphabetically-first matching file_extension
+/// - None if input is Other-kind, malformed, or has no counterpart in the
+///   catalogue
+pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord>
+{
+    // 1. Parse parent directory and basename from the input path.
+    //    Pure string operation — no filesystem I/O, no canonicalization.
+    //    Trusts the input. Risk 3 in DESIGN-image-classification.md.
+    let last_slash = match file_path.rfind('/')
+    {
+        Some(pos) => pos,
+        None =>
+        {
+            // No slash → no parent directory. Cannot be a real file path.
+            return None;
+        }
+    };
+
+    let parent_dir = &file_path[..last_slash];
+    let basename = &file_path[(last_slash + 1)..];
+
+    // 2. Parse stem and extension from the basename.
+    //    rfind('.') finds the LAST dot, which handles multi-dot filenames
+    //    such as IMG.2024-05-13.NEF correctly (stem = "IMG.2024-05-13").
+    let last_dot = match basename.rfind('.')
+    {
+        Some(pos) => pos,
+        None =>
+        {
+            // No extension → cannot be classified as JPEG or RAW.
+            return None;
+        }
+    };
+
+    let stem = &basename[..last_dot];
+    let ext = &basename[(last_dot + 1)..];
+
+    // 3. Classify the input extension; Other-kind inputs have no counterpart.
+    let input_kind = classify_extension(ext.to_string());
+    let target_kind = match input_kind
+    {
+        ImageKind::Jpeg => ImageKind::Raw,
+        ImageKind::Raw => ImageKind::Jpeg,
+        ImageKind::Other => return None,
+    };
+
+    // 4. Acquire lock and validate connection.
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return None;
+        }
+    };
+
+    // 5. Parameterized query for parent+stem candidates.
+    //    Parent-directory derivation in SQL: SUBSTRING + LENGTH + INSTR +
+    //    REVERSE — matches the project idiom in get_distinct_directory_paths.
+    //    Stem derivation in SQL: strip file_extension + 1 (the dot) from
+    //    file_name; guarded by IS NOT NULL and != '' so the arithmetic is
+    //    well-defined.
+    //    Exclude-self via file_path != ?3 (exact-path equality).
+    //    ORDER BY file_extension ASC gives deterministic resolution when
+    //    multiple opposite-kind candidates share the stem.
+    let query_sql = r#"
+        SELECT
+            id, epoch(indexed_timestamp) as indexed_ts_epoch,
+            file_path, file_size, file_name, file_extension,
+            created_timestamp, modified_timestamp,
+            camera_make, camera_model, lens_model,
+            focal_length, aperture, shutter_speed, iso,
+            capture_datetime,
+            pixel_width, pixel_height, color_space, bit_depth,
+            gps_latitude, gps_longitude, gps_altitude,
+            copyright, creator, description,
+            rating, flag, color_label, rotation
+        FROM images
+        WHERE SUBSTRING(file_path, 1, LENGTH(file_path) - INSTR(REVERSE(file_path), '/')) = ?1
+          AND file_extension IS NOT NULL
+          AND file_extension != ''
+          AND SUBSTRING(file_name, 1, LENGTH(file_name) - LENGTH(file_extension) - 1) = ?2
+          AND file_path != ?3
+        ORDER BY file_extension ASC
+    "#;
+
+    let mut stmt = match conn.prepare(query_sql)
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("Failed to prepare counterpart query: {}", e);
+            return None;
+        }
+    };
+
+    let rows = match stmt.query_map(params![parent_dir, stem, file_path], |row|
+    {
+        // Standard ImageRecord row decode — mirrors get_images_for_path_prefix.
+        // Format indexed_timestamp from Unix epoch seconds to ISO 8601 string.
+        let epoch_secs: i64 = row.get(1)?;
+        let indexed_ts = format_epoch_to_iso8601(epoch_secs);
+
+        Ok(ImageRecord {
+            id: row.get(0)?,
+            indexed_timestamp: indexed_ts,
+            file_path: row.get(2)?,
+            file_size: row.get::<_, i64>(3)? as u64,
+            file_name: row.get(4)?,
+            file_extension: row.get(5)?,
+            created_timestamp: row.get(6)?,
+            modified_timestamp: row.get(7)?,
+            camera_make: row.get(8)?,
+            camera_model: row.get(9)?,
+            lens_model: row.get(10)?,
+            focal_length: row.get(11)?,
+            aperture: row.get(12)?,
+            shutter_speed: row.get(13)?,
+            iso: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
+            capture_datetime: row.get(15)?,
+            pixel_width: row.get::<_, Option<i64>>(16)?.map(|v| v as u32),
+            pixel_height: row.get::<_, Option<i64>>(17)?.map(|v| v as u32),
+            color_space: row.get(18)?,
+            bit_depth: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
+            gps_latitude: row.get(20)?,
+            gps_longitude: row.get(21)?,
+            gps_altitude: row.get(22)?,
+            copyright: row.get(23)?,
+            creator: row.get(24)?,
+            description: row.get(25)?,
+            rating: row.get::<_, Option<i64>>(26)?.map(|v| v as u8),
+            flag: row.get(27)?,
+            color_label: row.get(28)?,
+            rotation: row.get::<_, i64>(29)? as i32,
+        })
+    })
+    {
+        Ok(r) => r,
+        Err(e) =>
+        {
+            eprintln!("Failed to execute counterpart query: {}", e);
+            return None;
+        }
+    };
+
+    // 6. Iterate candidates in alphabetical-by-extension order; return the
+    //    first record whose extension classifies as the opposite kind of
+    //    the input. The SQL ORDER BY guarantees determinism across runs;
+    //    the Rust-side filter ensures we don't accidentally return a same-
+    //    kind sibling (multi-RAW edge case).
+    for row_result in rows
+    {
+        match row_result
+        {
+            Ok(record) =>
+            {
+                // file_extension is filtered NOT NULL/non-empty in SQL,
+                // but match defensively in case future schema changes
+                // weaken that guard.
+                let candidate_ext = match &record.file_extension
+                {
+                    Some(e) => e.clone(),
+                    None => continue,
+                };
+
+                if classify_extension(candidate_ext) == target_kind
+                {
+                    return Some(record);
+                }
+            }
+            Err(e) => eprintln!("Failed to parse counterpart row: {}", e),
+        }
+    }
+
+    // No opposite-kind candidate found.
+    None
 }

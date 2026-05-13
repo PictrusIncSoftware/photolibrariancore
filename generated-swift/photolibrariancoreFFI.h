@@ -243,6 +243,16 @@ typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t, UniffiForeignFutureRes
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_CLASSIFY_EXTENSION
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_CLASSIFY_EXTENSION
+RustBuffer uniffi_photolibrariancore_fn_func_classify_extension(RustBuffer ext, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_FIND_COUNTERPART_IMAGE
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_FIND_COUNTERPART_IMAGE
+uint64_t uniffi_photolibrariancore_fn_func_find_counterpart_image(RustBuffer file_path
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_ALL_IMAGES
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_ALL_IMAGES
 uint64_t uniffi_photolibrariancore_fn_func_get_all_images(uint32_t limit, uint32_t offset
@@ -574,6 +584,18 @@ void ffi_photolibrariancore_rust_future_free_void(uint64_t handle
 #ifndef UNIFFI_FFIDEF_FFI_PHOTOLIBRARIANCORE_RUST_FUTURE_COMPLETE_VOID
 #define UNIFFI_FFIDEF_FFI_PHOTOLIBRARIANCORE_RUST_FUTURE_COMPLETE_VOID
 void ffi_photolibrariancore_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_CLASSIFY_EXTENSION
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_CLASSIFY_EXTENSION
+uint16_t uniffi_photolibrariancore_checksum_func_classify_extension(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_FIND_COUNTERPART_IMAGE
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_FIND_COUNTERPART_IMAGE
+uint16_t uniffi_photolibrariancore_checksum_func_find_counterpart_image(void
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_ALL_IMAGES

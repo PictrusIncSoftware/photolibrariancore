@@ -73,6 +73,36 @@ namespace photolibrariancore {
     // Get count of images matching both path prefix and date filter
     [Async]
     i64 get_image_count_for_filters(string path_prefix, string date_prefix);
+
+    // Find the JPEG<->RAW counterpart for an image identified by file_path.
+    // Returns the opposite-kind sibling sharing the same parent directory and
+    // file-name stem (e.g. given /Pics/IMG_1234.NEF, returns /Pics/IMG_1234.JPG
+    // if present in the catalogue). Returns null when:
+    //   - no opposite-kind sibling exists,
+    //   - the input is classified as Other,
+    //   - the input path lacks a parent directory or extension,
+    //   - the catalogue is not initialized.
+    // Comparison is byte-exact and case-sensitive for v1.
+    [Async]
+    ImageRecord? find_counterpart_image(string file_path);
+
+    // Classify a file extension into JPEG, RAW, or Other.
+    // SYNCHRONOUS — first sync export in this project. Pure string-to-enum
+    // lookup; no I/O, no DuckDB access. Forcing it async would push the
+    // Swift-side consumer (a SwiftUI computed property that cannot await)
+    // into awkward shapes.
+    // ext: file extension without leading dot, case-insensitive (e.g., "jpg", "NEF").
+    ImageKind classify_extension(string ext);
+};
+
+// Image classification categories for JPEG+RAW pair handling.
+// Three variants — Jpeg, Raw, Other — chosen deliberately over a boolean.
+// Other is a real category (PNG, TIFF, HEIC, etc.), not a "not RAW" bucket.
+// First enum exposed across the UniFFI boundary in this project.
+enum ImageKind {
+    "Jpeg",
+    "Raw",
+    "Other",
 };
 
 // Represents the metadata for a single image file

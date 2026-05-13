@@ -897,6 +897,80 @@ public func FfiConverterTypeImageRecord_lower(_ value: ImageRecord) -> RustBuffe
     return FfiConverterTypeImageRecord.lower(value)
 }
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum ImageKind: Equatable, Hashable {
+    
+    case jpeg
+    case raw
+    case other
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ImageKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeImageKind: FfiConverterRustBuffer {
+    typealias SwiftType = ImageKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ImageKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .jpeg
+        
+        case 2: return .raw
+        
+        case 3: return .other
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ImageKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .jpeg:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .raw:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .other:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImageKind_lift(_ buf: RustBuffer) throws -> ImageKind {
+    return try FfiConverterTypeImageKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImageKind_lower(_ value: ImageKind) -> RustBuffer {
+    return FfiConverterTypeImageKind.lower(value)
+}
+
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -988,6 +1062,30 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeImageRecord: FfiConverterRustBuffer {
+    typealias SwiftType = ImageRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeImageRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeImageRecord.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -1114,6 +1212,28 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
     } else {
         print("uniffiFutureContinuationCallback invalid handle")
     }
+}
+public func classifyExtension(ext: String) -> ImageKind  {
+    return try!  FfiConverterTypeImageKind_lift(try! rustCall() {
+    uniffi_photolibrariancore_fn_func_classify_extension(
+        FfiConverterString.lower(ext),$0
+    )
+})
+}
+public func findCounterpartImage(filePath: String)async  -> ImageRecord?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_find_counterpart_image(FfiConverterString.lower(filePath)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeImageRecord.lift,
+            errorHandler: nil
+            
+        )
 }
 public func getAllImages(limit: UInt32, offset: UInt32)async  -> [ImageRecord]  {
     return
@@ -1340,6 +1460,12 @@ private let initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_photolibrariancore_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_classify_extension() != 38346) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_find_counterpart_image() != 51699) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_all_images() != 59615) {
         return InitializationResult.apiChecksumMismatch
