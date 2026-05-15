@@ -4,6 +4,19 @@ use duckdb::{Connection, params};
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 
+// CatalogueService / with_connection migration (Phase 1a).
+// See `Docs/DESIGN-async-catalogue-serialization.md` and the doc
+// comment at the top of `src/catalogue.rs` for the design rationale.
+//
+// During Phase 1a the legacy `static CATALOGUE` (below) and the new
+// `CatalogueService` share the same `Arc<Mutex<Option<Connection>>>`,
+// so unmigrated functions calling `CATALOGUE.lock()` directly and
+// migrated methods routed through `with_connection` serialize on the
+// same mutex. Phase 1b will drop the legacy static once every
+// function is migrated.
+mod catalogue;
+use catalogue::{CatalogueError, CatalogueService, DEFAULT_SERVICE, default_service};
+
 // UniFFI scaffolding — generates the Rust-to-Swift FFI layer
 // This macro reads the .udl file and creates the necessary C-compatible interface code
 uniffi::include_scaffolding!("photolibrariancore");
@@ -388,8 +401,31 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
     // Store the connection in the global state
     // This connection will be reused by all subsequent catalogue operations
     // Mutex ensures thread-safe access when called from multiple Swift async tasks
-    let mut catalogue = CATALOGUE.lock().unwrap();
-    *catalogue = Some(conn);
+    {
+        let mut catalogue = CATALOGUE.lock().unwrap();
+        *catalogue = Some(conn);
+    } // drop the guard before constructing the service so its inner
+      // Arc::clone doesn't compete with the just-released lock.
+
+    // Phase 1a service publication.
+    //
+    // The legacy static `CATALOGUE` (populated above) and the new
+    // `CatalogueService` share the same `Arc<Mutex<Option<Connection>>>`.
+    // Unmigrated functions continue to call `CATALOGUE.lock()` directly;
+    // migrated methods go through `default_service().with_connection(...)`.
+    // Both code paths contend on the same mutex, so serialization holds
+    // across the migration window.
+    //
+    // `DEFAULT_SERVICE.set` returns Err if the cell is already populated.
+    // Map that to `CatalogueError::AlreadyInitialized`, log it, and
+    // return `false` to preserve the bool sentinel contract of this
+    // shim — Swift's UniFFI binding cannot tell that anything changed.
+    let service = CatalogueService::with_arc(Arc::clone(&CATALOGUE));
+    if DEFAULT_SERVICE.set(service).is_err()
+    {
+        eprintln!("{}", CatalogueError::AlreadyInitialized);
+        return false;
+    }
 
     true
 }
@@ -519,34 +555,12 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
 /// Returns:
 /// - Total number of image records in the catalogue
 /// - 0 if catalogue not initialized or query fails
-pub async fn get_image_count() -> u64 {
-    // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref() {
-        Some(c) => c,
-        None => {
-            eprintln!("Catalogue not initialized");
-            return 0;
-        }
-    };
-
-    // Execute COUNT(*) query
-    // query_row is used for single-row results (more ergonomic than query + fetch)
-    // The closure |row| row.get(0) extracts the first column (the count)
-    let count_result: Result<i64, _> = conn.query_row(
-        "SELECT COUNT(*) FROM images",
-        [],           // No query parameters
-        |row| row.get(0),
-    );
-
-    match count_result {
-        // DuckDB returns i64, cast to u64 for the unsigned count semantic
-        Ok(count) => count as u64,
-        Err(e) => {
-            eprintln!("Failed to query image count: {}", e);
-            0  // Return 0 on error (catalogue is effectively empty to the caller)
-        }
-    }
+pub async fn get_image_count() -> u64
+{
+    // Phase 1a shim: delegate to the migrated instance method on the
+    // process-wide default service. Body lives in
+    // `impl CatalogueService` further down this file.
+    default_service().get_image_count().await
 }
 
 /// Format Unix epoch seconds to ISO 8601 string format
@@ -629,106 +643,12 @@ fn is_leap_year(year: i64) -> bool {
 ///
 /// Returns:
 /// - Vec of ImageRecord structs, empty vec if catalogue is empty or not initialized
-pub async fn get_all_images(limit: u32, offset: u32) -> Vec<ImageRecord> {
-    // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref() {
-        Some(c) => c,
-        None => {
-            eprintln!("Catalogue not initialized");
-            return Vec::new();
-        }
-    };
-
-    // Query images with pagination, ordered by ID
-    // Note: DuckDB TIMESTAMP columns must be cast to epoch seconds in SQL,
-    // then formatted to String in Rust, because the UniFFI bridge has no
-    // TIMESTAMP type. This is the standard pattern for all TIMESTAMP columns.
-    // LIMIT ?1 OFFSET ?2 enables paginated loading for large catalogues
-    let query_sql = r#"
-        SELECT
-            id, epoch(indexed_timestamp) as indexed_ts_epoch,
-            file_path, file_size, file_name, file_extension,
-            created_timestamp, modified_timestamp,
-            camera_make, camera_model, lens_model,
-            focal_length, aperture, shutter_speed, iso,
-            capture_datetime,
-            pixel_width, pixel_height, color_space, bit_depth,
-            gps_latitude, gps_longitude, gps_altitude,
-            copyright, creator, description,
-            rating, flag, color_label, rotation
-        FROM images
-        ORDER BY id
-        LIMIT ?1 OFFSET ?2
-    "#;
-
-    // Execute query with limit and offset parameters
-    let mut stmt = match conn.prepare(query_sql) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to prepare query: {}", e);
-            return Vec::new();
-        }
-    };
-
-    let rows = match stmt.query_map(params![limit as i64, offset as i64], |row| {
-        // Extract all columns from the row
-        // Type conversions: i64 from DuckDB → u64/u32/u8 for Rust
-
-        // Format indexed_timestamp from Unix epoch seconds to ISO 8601 string
-        let epoch_secs: i64 = row.get(1)?;
-        let indexed_ts = format_epoch_to_iso8601(epoch_secs);
-
-        Ok(ImageRecord {
-            id: row.get(0)?,
-            indexed_timestamp: indexed_ts,
-            file_path: row.get(2)?,
-            file_size: row.get::<_, i64>(3)? as u64,
-            file_name: row.get(4)?,
-            file_extension: row.get(5)?,
-            created_timestamp: row.get(6)?,
-            modified_timestamp: row.get(7)?,
-            camera_make: row.get(8)?,
-            camera_model: row.get(9)?,
-            lens_model: row.get(10)?,
-            focal_length: row.get(11)?,
-            aperture: row.get(12)?,
-            shutter_speed: row.get(13)?,
-            iso: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
-            capture_datetime: row.get(15)?,
-            pixel_width: row.get::<_, Option<i64>>(16)?.map(|v| v as u32),
-            pixel_height: row.get::<_, Option<i64>>(17)?.map(|v| v as u32),
-            color_space: row.get(18)?,
-            bit_depth: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
-            gps_latitude: row.get(20)?,
-            gps_longitude: row.get(21)?,
-            gps_altitude: row.get(22)?,
-            copyright: row.get(23)?,
-            creator: row.get(24)?,
-            description: row.get(25)?,
-            rating: row.get::<_, Option<i64>>(26)?.map(|v| v as u8),
-            flag: row.get(27)?,
-            color_label: row.get(28)?,
-            rotation: row.get::<_, i64>(29)? as i32,
-        })
-    }) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Failed to execute query: {}", e);
-            return Vec::new();
-        }
-    };
-
-    // Collect results, logging errors but continuing for other rows
-    let mut records = Vec::new();
-    for row_result in rows {
-        match row_result {
-            Ok(record) => records.push(record),
-            Err(e) => eprintln!("Failed to parse row: {}", e),
-        }
-    }
-
-    records
+pub async fn get_all_images(limit: u32, offset: u32) -> Vec<ImageRecord>
+{
+    // Phase 1a shim: delegate to the migrated instance method on the
+    // process-wide default service. Body lives in
+    // `impl CatalogueService` further down this file.
+    default_service().get_all_images(limit, offset).await
 }
 
 /// Get images from the catalogue with pagination and proper global sort order
@@ -882,45 +802,12 @@ pub async fn get_images_sorted(limit: u32, offset: u32) -> Vec<ImageRecord> {
 /// Returns:
 /// - true if update succeeded
 /// - false if catalogue not initialized, file not found, or query failed
-pub async fn update_image_rating(file_path: String, rating: u32) -> bool {
-    // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref() {
-        Some(c) => c,
-        None => {
-            eprintln!("Catalogue not initialized");
-            return false;
-        }
-    };
-
-    // Convert rating to Option<i64> for database
-    // Rating of 0 means clear the rating (set to NULL)
-    let rating_value: Option<i64> = if rating == 0 {
-        None
-    } else {
-        Some(rating as i64)
-    };
-
-    // Update the rating for the specified file path
-    let update_sql = "UPDATE images SET rating = ? WHERE file_path = ?";
-
-    match conn.execute(update_sql, params![rating_value, file_path]) {
-        Ok(changed) => {
-            if changed == 0 {
-                // No rows updated - file path not found
-                eprintln!("No image found with file_path: {}", file_path);
-                false
-            } else {
-                // Successfully updated
-                true
-            }
-        }
-        Err(e) => {
-            // Log error but don't crash
-            eprintln!("Failed to update rating for {}: {}", file_path, e);
-            false
-        }
-    }
+pub async fn update_image_rating(file_path: String, rating: u32) -> bool
+{
+    // Phase 1a shim: delegate to the migrated instance method on the
+    // process-wide default service. Body lives in
+    // `impl CatalogueService` further down this file.
+    default_service().update_image_rating(file_path, rating).await
 }
 
 /// Update the rotation angle for an image
@@ -1289,38 +1176,12 @@ pub async fn get_images_filtered(limit: i64, offset: i64, date_prefix: String) -
 /// Returns:
 /// - Total number of image records matching the filter
 /// - 0 if catalogue not initialized or query fails
-pub async fn get_filtered_image_count(date_prefix: String) -> i64 {
-    // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref() {
-        Some(c) => c,
-        None => {
-            eprintln!("Catalogue not initialized");
-            return 0;
-        }
-    };
-
-    // Build query with optional WHERE clause
-    let query_sql = if date_prefix.is_empty() {
-        "SELECT COUNT(*) FROM images".to_string()
-    } else {
-        format!("SELECT COUNT(*) FROM images WHERE capture_datetime LIKE '{}%'", date_prefix)
-    };
-
-    // Execute COUNT query
-    let count_result: Result<i64, _> = conn.query_row(
-        &query_sql,
-        [],
-        |row| row.get(0),
-    );
-
-    match count_result {
-        Ok(count) => count,
-        Err(e) => {
-            eprintln!("Failed to query filtered image count: {}", e);
-            0
-        }
-    }
+pub async fn get_filtered_image_count(date_prefix: String) -> i64
+{
+    // Phase 1a shim: delegate to the migrated instance method on the
+    // process-wide default service. Body lives in
+    // `impl CatalogueService` further down this file.
+    default_service().get_filtered_image_count(date_prefix).await
 }
 
 /// Get the count of images in a directory (matching path prefix)
@@ -1623,177 +1484,366 @@ pub async fn get_image_count_for_filters(path_prefix: String, date_prefix: Strin
 ///   catalogue
 pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord>
 {
-    // 1. Parse parent directory and basename from the input path.
-    //    Pure string operation — no filesystem I/O, no canonicalization.
-    //    Trusts the input. Risk 3 in DESIGN-image-classification.md.
-    let last_slash = match file_path.rfind('/')
+    // Phase 1a shim: delegate to the migrated instance method on the
+    // process-wide default service. Body lives in
+    // `impl CatalogueService` further down this file.
+    default_service().find_counterpart_image(file_path).await
+}
+
+// ============================================================================
+// CatalogueService inherent-impl block (Phase 1a migrated methods).
+//
+// Five representative public functions live as instance methods on
+// CatalogueService below; the module-level public functions further up
+// in this file are now one-line shims that delegate here through
+// `default_service()`. The shim signatures are unchanged so Swift's
+// UniFFI bindings see no difference.
+//
+// All methods route through `self.with_connection(...)`. The closure
+// body is plain synchronous DuckDB code with `?` over a `Result<_,
+// CatalogueError>`; the `From<duckdb::Error>` impl on `CatalogueError`
+// (see `catalogue.rs`) makes the conversion automatic.
+//
+// Error handling matches the pre-refactor behaviour: each method
+// catches the `Result` from `with_connection`, logs failures via
+// `eprintln!`, and returns the original sentinel value (`false`, `0`,
+// `Vec::new()`, `None`, etc.) so the public surface is byte-identical.
+// ============================================================================
+
+impl CatalogueService
+{
+    /// Shape 5: simple `query_row` returning a single u64.
+    /// Migrated from the module-level `get_image_count` at the
+    /// pre-refactor line 522.
+    pub async fn get_image_count(&self) -> u64
     {
-        Some(pos) => pos,
-        None =>
+        let result = self.with_connection(|conn|
         {
-            // No slash → no parent directory. Cannot be a real file path.
-            return None;
-        }
-    };
-
-    let parent_dir = &file_path[..last_slash];
-    let basename = &file_path[(last_slash + 1)..];
-
-    // 2. Parse stem and extension from the basename.
-    //    rfind('.') finds the LAST dot, which handles multi-dot filenames
-    //    such as IMG.2024-05-13.NEF correctly (stem = "IMG.2024-05-13").
-    let last_dot = match basename.rfind('.')
-    {
-        Some(pos) => pos,
-        None =>
-        {
-            // No extension → cannot be classified as JPEG or RAW.
-            return None;
-        }
-    };
-
-    let stem = &basename[..last_dot];
-    let ext = &basename[(last_dot + 1)..];
-
-    // 3. Classify the input extension; Other-kind inputs have no counterpart.
-    let input_kind = classify_extension(ext.to_string());
-    let target_kind = match input_kind
-    {
-        ImageKind::Jpeg => ImageKind::Raw,
-        ImageKind::Raw => ImageKind::Jpeg,
-        ImageKind::Other => return None,
-    };
-
-    // 4. Acquire lock and validate connection.
-    let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
-        Some(c) => c,
-        None =>
-        {
-            eprintln!("Catalogue not initialized");
-            return None;
-        }
-    };
-
-    // 5. Parameterized query for parent+stem candidates.
-    //    Parent-directory derivation in SQL: SUBSTRING + LENGTH + INSTR +
-    //    REVERSE — matches the project idiom in get_distinct_directory_paths.
-    //    Stem derivation in SQL: strip file_extension + 1 (the dot) from
-    //    file_name; guarded by IS NOT NULL and != '' so the arithmetic is
-    //    well-defined.
-    //    Exclude-self via file_path != ?3 (exact-path equality).
-    //    ORDER BY file_extension ASC gives deterministic resolution when
-    //    multiple opposite-kind candidates share the stem.
-    let query_sql = r#"
-        SELECT
-            id, epoch(indexed_timestamp) as indexed_ts_epoch,
-            file_path, file_size, file_name, file_extension,
-            created_timestamp, modified_timestamp,
-            camera_make, camera_model, lens_model,
-            focal_length, aperture, shutter_speed, iso,
-            capture_datetime,
-            pixel_width, pixel_height, color_space, bit_depth,
-            gps_latitude, gps_longitude, gps_altitude,
-            copyright, creator, description,
-            rating, flag, color_label, rotation
-        FROM images
-        WHERE SUBSTRING(file_path, 1, LENGTH(file_path) - INSTR(REVERSE(file_path), '/')) = ?1
-          AND file_extension IS NOT NULL
-          AND file_extension != ''
-          AND SUBSTRING(file_name, 1, LENGTH(file_name) - LENGTH(file_extension) - 1) = ?2
-          AND file_path != ?3
-        ORDER BY file_extension ASC
-    "#;
-
-    let mut stmt = match conn.prepare(query_sql)
-    {
-        Ok(s) => s,
-        Err(e) =>
-        {
-            eprintln!("Failed to prepare counterpart query: {}", e);
-            return None;
-        }
-    };
-
-    let rows = match stmt.query_map(params![parent_dir, stem, file_path], |row|
-    {
-        // Standard ImageRecord row decode — mirrors get_images_for_path_prefix.
-        // Format indexed_timestamp from Unix epoch seconds to ISO 8601 string.
-        let epoch_secs: i64 = row.get(1)?;
-        let indexed_ts = format_epoch_to_iso8601(epoch_secs);
-
-        Ok(ImageRecord {
-            id: row.get(0)?,
-            indexed_timestamp: indexed_ts,
-            file_path: row.get(2)?,
-            file_size: row.get::<_, i64>(3)? as u64,
-            file_name: row.get(4)?,
-            file_extension: row.get(5)?,
-            created_timestamp: row.get(6)?,
-            modified_timestamp: row.get(7)?,
-            camera_make: row.get(8)?,
-            camera_model: row.get(9)?,
-            lens_model: row.get(10)?,
-            focal_length: row.get(11)?,
-            aperture: row.get(12)?,
-            shutter_speed: row.get(13)?,
-            iso: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
-            capture_datetime: row.get(15)?,
-            pixel_width: row.get::<_, Option<i64>>(16)?.map(|v| v as u32),
-            pixel_height: row.get::<_, Option<i64>>(17)?.map(|v| v as u32),
-            color_space: row.get(18)?,
-            bit_depth: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
-            gps_latitude: row.get(20)?,
-            gps_longitude: row.get(21)?,
-            gps_altitude: row.get(22)?,
-            copyright: row.get(23)?,
-            creator: row.get(24)?,
-            description: row.get(25)?,
-            rating: row.get::<_, Option<i64>>(26)?.map(|v| v as u8),
-            flag: row.get(27)?,
-            color_label: row.get(28)?,
-            rotation: row.get::<_, i64>(29)? as i32,
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM images",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok(count as u64)
         })
-    })
-    {
-        Ok(r) => r,
-        Err(e) =>
-        {
-            eprintln!("Failed to execute counterpart query: {}", e);
-            return None;
-        }
-    };
+        .await;
 
-    // 6. Iterate candidates in alphabetical-by-extension order; return the
-    //    first record whose extension classifies as the opposite kind of
-    //    the input. The SQL ORDER BY guarantees determinism across runs;
-    //    the Rust-side filter ensures we don't accidentally return a same-
-    //    kind sibling (multi-RAW edge case).
-    for row_result in rows
-    {
-        match row_result
+        match result
         {
-            Ok(record) =>
+            Ok(count) => count,
+            Err(e) =>
             {
-                // file_extension is filtered NOT NULL/non-empty in SQL,
-                // but match defensively in case future schema changes
-                // weaken that guard.
-                let candidate_ext = match &record.file_extension
-                {
-                    Some(e) => e.clone(),
-                    None => continue,
-                };
-
-                if classify_extension(candidate_ext) == target_kind
-                {
-                    return Some(record);
-                }
+                eprintln!("Failed to query image count: {}", e);
+                0
             }
-            Err(e) => eprintln!("Failed to parse counterpart row: {}", e),
         }
     }
 
-    // No opposite-kind candidate found.
-    None
+    /// Shape 3: `prepare` + `query_map`. Migrated from the
+    /// module-level `get_all_images` at the pre-refactor line 632.
+    pub async fn get_all_images(&self, limit: u32, offset: u32) -> Vec<ImageRecord>
+    {
+        // Owned captures only — the closure is `Send + 'static` and
+        // cannot borrow from local scope. `limit` and `offset` are
+        // Copy, no clone needed.
+        let result = self.with_connection(move |conn|
+        {
+            let query_sql = r#"
+                SELECT
+                    id, epoch(indexed_timestamp) as indexed_ts_epoch,
+                    file_path, file_size, file_name, file_extension,
+                    created_timestamp, modified_timestamp,
+                    camera_make, camera_model, lens_model,
+                    focal_length, aperture, shutter_speed, iso,
+                    capture_datetime,
+                    pixel_width, pixel_height, color_space, bit_depth,
+                    gps_latitude, gps_longitude, gps_altitude,
+                    copyright, creator, description,
+                    rating, flag, color_label, rotation
+                FROM images
+                ORDER BY id
+                LIMIT ?1 OFFSET ?2
+            "#;
+
+            let mut stmt = conn.prepare(query_sql)?;
+            let rows = stmt.query_map(params![limit as i64, offset as i64], |row|
+            {
+                let epoch_secs: i64 = row.get(1)?;
+                let indexed_ts = format_epoch_to_iso8601(epoch_secs);
+
+                Ok(ImageRecord {
+                    id: row.get(0)?,
+                    indexed_timestamp: indexed_ts,
+                    file_path: row.get(2)?,
+                    file_size: row.get::<_, i64>(3)? as u64,
+                    file_name: row.get(4)?,
+                    file_extension: row.get(5)?,
+                    created_timestamp: row.get(6)?,
+                    modified_timestamp: row.get(7)?,
+                    camera_make: row.get(8)?,
+                    camera_model: row.get(9)?,
+                    lens_model: row.get(10)?,
+                    focal_length: row.get(11)?,
+                    aperture: row.get(12)?,
+                    shutter_speed: row.get(13)?,
+                    iso: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
+                    capture_datetime: row.get(15)?,
+                    pixel_width: row.get::<_, Option<i64>>(16)?.map(|v| v as u32),
+                    pixel_height: row.get::<_, Option<i64>>(17)?.map(|v| v as u32),
+                    color_space: row.get(18)?,
+                    bit_depth: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
+                    gps_latitude: row.get(20)?,
+                    gps_longitude: row.get(21)?,
+                    gps_altitude: row.get(22)?,
+                    copyright: row.get(23)?,
+                    creator: row.get(24)?,
+                    description: row.get(25)?,
+                    rating: row.get::<_, Option<i64>>(26)?.map(|v| v as u8),
+                    flag: row.get(27)?,
+                    color_label: row.get(28)?,
+                    rotation: row.get::<_, i64>(29)? as i32,
+                })
+            })?;
+
+            // Per-row decode failures are logged but don't abort the
+            // result — preserves the pre-refactor partial-success
+            // behaviour.
+            let mut records = Vec::new();
+            for row_result in rows
+            {
+                match row_result
+                {
+                    Ok(record) => records.push(record),
+                    Err(e) => eprintln!("Failed to parse row: {}", e),
+                }
+            }
+            Ok(records)
+        })
+        .await;
+
+        result.unwrap_or_else(|e|
+        {
+            eprintln!("Failed to query images: {}", e);
+            Vec::new()
+        })
+    }
+
+    /// Shape 2: simple `execute` write. Migrated from the
+    /// module-level `update_image_rating` at the pre-refactor line
+    /// 885.
+    pub async fn update_image_rating(&self, file_path: String, rating: u32) -> bool
+    {
+        // Rating 0 clears the field; non-zero values store as i64.
+        let rating_value: Option<i64> = if rating == 0
+        {
+            None
+        }
+        else
+        {
+            Some(rating as i64)
+        };
+
+        // Clone the path so the closure can take ownership of one
+        // copy while the post-await branch still has a copy for the
+        // log message.
+        let path_for_log = file_path.clone();
+
+        let result = self.with_connection(move |conn|
+        {
+            let changed = conn.execute(
+                "UPDATE images SET rating = ? WHERE file_path = ?",
+                params![rating_value, file_path],
+            )?;
+            Ok(changed)
+        })
+        .await;
+
+        match result
+        {
+            Ok(0) =>
+            {
+                eprintln!("No image found with file_path: {}", path_for_log);
+                false
+            }
+            Ok(_) => true,
+            Err(e) =>
+            {
+                eprintln!("Failed to update rating for {}: {}", path_for_log, e);
+                false
+            }
+        }
+    }
+
+    /// Shape 4: count via `query_row` returning i64. Migrated from
+    /// the module-level `get_filtered_image_count` at the
+    /// pre-refactor line 1292.
+    pub async fn get_filtered_image_count(&self, date_prefix: String) -> i64
+    {
+        let result = self.with_connection(move |conn|
+        {
+            // Build query with optional WHERE clause. The date_prefix
+            // is owned and moved into the closure; format! produces
+            // an owned String for the parameterless query_row call.
+            let query_sql = if date_prefix.is_empty()
+            {
+                "SELECT COUNT(*) FROM images".to_string()
+            }
+            else
+            {
+                format!(
+                    "SELECT COUNT(*) FROM images WHERE capture_datetime LIKE '{}%'",
+                    date_prefix
+                )
+            };
+
+            let count: i64 = conn.query_row(&query_sql, [], |row| row.get(0))?;
+            Ok(count)
+        })
+        .await;
+
+        match result
+        {
+            Ok(c) => c,
+            Err(e) =>
+            {
+                eprintln!("Failed to query filtered image count: {}", e);
+                0
+            }
+        }
+    }
+
+    /// Shape 1: `query_row` returning `Option<T>` (via per-row
+    /// iteration). Migrated from the module-level
+    /// `find_counterpart_image` at the pre-refactor line 1624.
+    pub async fn find_counterpart_image(&self, file_path: String) -> Option<ImageRecord>
+    {
+        // Pre-lock work: string parsing + classification. No DB
+        // access here, so it stays outside `with_connection` to keep
+        // the locked section tight.
+
+        let last_slash = match file_path.rfind('/')
+        {
+            Some(pos) => pos,
+            None => return None,
+        };
+        let parent_dir = file_path[..last_slash].to_string();
+        let basename = &file_path[(last_slash + 1)..];
+
+        let last_dot = match basename.rfind('.')
+        {
+            Some(pos) => pos,
+            None => return None,
+        };
+        let stem = basename[..last_dot].to_string();
+        let ext = &basename[(last_dot + 1)..];
+
+        let input_kind = classify_extension(ext.to_string());
+        let target_kind = match input_kind
+        {
+            ImageKind::Jpeg => ImageKind::Raw,
+            ImageKind::Raw => ImageKind::Jpeg,
+            ImageKind::Other => return None,
+        };
+
+        // Move owned captures into the closure: parent_dir, stem,
+        // file_path, target_kind.
+        let result = self.with_connection(move |conn|
+        {
+            let query_sql = r#"
+                SELECT
+                    id, epoch(indexed_timestamp) as indexed_ts_epoch,
+                    file_path, file_size, file_name, file_extension,
+                    created_timestamp, modified_timestamp,
+                    camera_make, camera_model, lens_model,
+                    focal_length, aperture, shutter_speed, iso,
+                    capture_datetime,
+                    pixel_width, pixel_height, color_space, bit_depth,
+                    gps_latitude, gps_longitude, gps_altitude,
+                    copyright, creator, description,
+                    rating, flag, color_label, rotation
+                FROM images
+                WHERE SUBSTRING(file_path, 1, LENGTH(file_path) - INSTR(REVERSE(file_path), '/')) = ?1
+                  AND file_extension IS NOT NULL
+                  AND file_extension != ''
+                  AND SUBSTRING(file_name, 1, LENGTH(file_name) - LENGTH(file_extension) - 1) = ?2
+                  AND file_path != ?3
+                ORDER BY file_extension ASC
+            "#;
+
+            let mut stmt = conn.prepare(query_sql)?;
+            let rows = stmt.query_map(params![parent_dir, stem, file_path], |row|
+            {
+                let epoch_secs: i64 = row.get(1)?;
+                let indexed_ts = format_epoch_to_iso8601(epoch_secs);
+
+                Ok(ImageRecord {
+                    id: row.get(0)?,
+                    indexed_timestamp: indexed_ts,
+                    file_path: row.get(2)?,
+                    file_size: row.get::<_, i64>(3)? as u64,
+                    file_name: row.get(4)?,
+                    file_extension: row.get(5)?,
+                    created_timestamp: row.get(6)?,
+                    modified_timestamp: row.get(7)?,
+                    camera_make: row.get(8)?,
+                    camera_model: row.get(9)?,
+                    lens_model: row.get(10)?,
+                    focal_length: row.get(11)?,
+                    aperture: row.get(12)?,
+                    shutter_speed: row.get(13)?,
+                    iso: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
+                    capture_datetime: row.get(15)?,
+                    pixel_width: row.get::<_, Option<i64>>(16)?.map(|v| v as u32),
+                    pixel_height: row.get::<_, Option<i64>>(17)?.map(|v| v as u32),
+                    color_space: row.get(18)?,
+                    bit_depth: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
+                    gps_latitude: row.get(20)?,
+                    gps_longitude: row.get(21)?,
+                    gps_altitude: row.get(22)?,
+                    copyright: row.get(23)?,
+                    creator: row.get(24)?,
+                    description: row.get(25)?,
+                    rating: row.get::<_, Option<i64>>(26)?.map(|v| v as u8),
+                    flag: row.get(27)?,
+                    color_label: row.get(28)?,
+                    rotation: row.get::<_, i64>(29)? as i32,
+                })
+            })?;
+
+            // Iterate candidates in deterministic order; return the
+            // first record classifying as the target kind. The
+            // SQL ORDER BY guarantees stable resolution across runs.
+            for row_result in rows
+            {
+                match row_result
+                {
+                    Ok(record) =>
+                    {
+                        let candidate_ext = match &record.file_extension
+                        {
+                            Some(e) => e.clone(),
+                            None => continue,
+                        };
+                        if classify_extension(candidate_ext) == target_kind
+                        {
+                            return Ok(Some(record));
+                        }
+                    }
+                    Err(e) => eprintln!("Failed to parse counterpart row: {}", e),
+                }
+            }
+            Ok(None)
+        })
+        .await;
+
+        match result
+        {
+            Ok(opt) => opt,
+            Err(e) =>
+            {
+                eprintln!("Failed to query counterpart: {}", e);
+                None
+            }
+        }
+    }
 }
