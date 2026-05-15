@@ -1,3 +1,5 @@
+# DESIGN: Async Catalogue Serialization
+
 **Status:** Approved for implementation
 **Session introduced:** Session 15
 **Scope:** `photolibrariancore` — catalogue access layer
@@ -26,6 +28,8 @@ This is currently latent. PhotoLibrarian's UI is largely sequential today, but a
 2. **Use `std::sync::Mutex`, not `tokio::sync::Mutex`.** DuckDB is a blocking C library underneath; an async-aware mutex offers no benefit and risks holding the lock across `.await` points.
 3. **Run all DuckDB work inside `tokio::task::spawn_blocking`.** This moves the blocking call off the async runtime's worker threads and onto the blocking thread pool, where it belongs.
 4. **Expose access only through a `with_connection<F, R>` helper.** Call sites never touch the mutex or the connection directly. This is the abstraction layer that makes a future swap to a connection pool a localized change rather than a project-wide refactor.
+5. **Migrate from the current module-level static to a `CatalogueService` struct.** The service struct owns the connection, holds the mutex, and exposes catalogue operations as instance methods. This replaces the current `static CATALOGUE: Lazy<Arc<Mutex<Option<Connection>>>>` pattern.
+6. **Use a shim layer during migration to keep the app working continuously.** The existing module-level public functions are preserved as thin shims that forward to a process-wide default `CatalogueService` instance. This lets the Rust-side refactor and the Swift-side migration land in separate sessions without ever leaving the app in a broken state.
 
 ---
 
@@ -56,16 +60,39 @@ Call sites grab the lock themselves: `self.connection.lock().unwrap().execute(..
 - Couples every call site to the concrete implementation. A future migration to a pool, to a read/write split, or to per-table connections would require touching every call site.
 - Makes lock-held duration harder to audit — easy to accidentally hold the lock across slow work.
 
+### Alternative D — Keep the global static, add `with_connection` as a module-level function
+
+Preserve the existing `static CATALOGUE: Lazy<Arc<Mutex<Option<Connection>>>>` pattern. Add a `with_connection` free function that closures over it. Migrate the ~20 existing call sites to use the helper but keep the public API as bare module-level functions.
+
+**Rejected because:**
+- Global statics are a known anti-pattern in Rust. They persist across test cases, preventing isolated unit tests of catalogue logic.
+- The pattern forecloses on having more than one catalogue open simultaneously — a constraint that may matter for future features (multiple libraries, library import preview, A/B catalogue migration).
+- Statics cannot be passed as dependencies to subsystems that need catalogue access. Subsystems are forced to reach into the global, which couples them to the catalogue's storage mechanism.
+- The work to migrate from the global to a service struct only gets harder as the codebase grows. Doing it now, while we are already touching every catalogue call site, is strictly cheaper than doing it later as a dedicated refactor.
+- The shim layer (see migration plan below) means we get the benefits of the service struct without paying the Swift-side migration cost in the same session.
+
 ---
 
 ## Design
 
-### The `with_connection` helper
-
-A single method on the catalogue service that owns the connection:
+### The `CatalogueService` struct
 
 ```rust
+pub struct CatalogueService {
+    connection: Arc<Mutex<Option<Connection>>>,
+}
+
 impl CatalogueService {
+    /// Create a new service backed by the database at `db_path`.
+    /// Runs schema migrations and pragmas during initialization.
+    pub fn new(db_path: &Path) -> Result<Self> {
+        let conn = Connection::open(db_path)?;
+        // schema migrations, pragmas, etc. run here, single-threaded
+        Ok(Self {
+            connection: Arc::new(Mutex::new(Some(conn))),
+        })
+    }
+
     pub async fn with_connection<F, R>(&self, f: F) -> Result<R>
     where
         F: FnOnce(&mut Connection) -> Result<R> + Send + 'static,
@@ -74,15 +101,22 @@ impl CatalogueService {
         let conn = Arc::clone(&self.connection);
         tokio::task::spawn_blocking(move || {
             let mut guard = conn.lock().expect("catalogue mutex poisoned");
-            f(&mut *guard)
+            match guard.as_mut() {
+                Some(connection) => f(connection),
+                None => Err(CatalogueError::NotInitialized),
+            }
         })
         .await
-        .map_err(|join_err| CatalogueError::TaskJoin(join_err))?
+        .map_err(CatalogueError::TaskJoin)?
     }
+
+    // All catalogue methods are thin wrappers around with_connection.
 }
 ```
 
-Properties:
+**The `Option<Connection>` is retained** because the current code expects "may not yet be initialized" semantics. `with_connection` returns `CatalogueError::NotInitialized` if the connection slot is `None`. This matches existing error-handling expectations.
+
+### Properties of `with_connection`
 
 - **`F: FnOnce`** — closure is consumed, runs once. Forces call sites to be explicit about what they capture.
 - **`Send + 'static`** — required by `spawn_blocking`. Closures cannot borrow from local scope, which is intentional: it forces inputs to be owned data, which keeps the locked section self-contained.
@@ -95,40 +129,19 @@ Properties:
 Every catalogue operation looks like:
 
 ```rust
-pub async fn get_photo_by_id(&self, id: PhotoId) -> Result<Option<Photo>> {
-    self.with_connection(move |conn| {
-        let mut stmt = conn.prepare("SELECT ... FROM photos WHERE id = ?")?;
-        let row = stmt.query_row([id.0], |r| Photo::try_from_row(r)).optional()?;
-        Ok(row)
-    })
-    .await
+impl CatalogueService {
+    pub async fn get_photo_by_id(&self, id: PhotoId) -> Result<Option<Photo>> {
+        self.with_connection(move |conn| {
+            let mut stmt = conn.prepare("SELECT ... FROM photos WHERE id = ?")?;
+            let row = stmt.query_row([id.0], |r| Photo::try_from_row(r)).optional()?;
+            Ok(row)
+        })
+        .await
+    }
 }
 ```
 
 The closure body is plain synchronous DuckDB code. No `.await` inside it (the closure isn't async). No lock management at the call site. The async boundary is at `with_connection`'s edge.
-
-### What the service struct looks like
-
-```rust
-pub struct CatalogueService {
-    connection: Arc<Mutex<Connection>>,
-    // ... other fields: paths, config, etc.
-}
-
-impl CatalogueService {
-    pub fn new(db_path: &Path) -> Result<Self> {
-        let conn = Connection::open(db_path)?;
-        // schema migrations, pragmas, etc. run here, single-threaded
-        Ok(Self {
-            connection: Arc::new(Mutex::new(conn)),
-        })
-    }
-
-    pub async fn with_connection<F, R>(&self, f: F) -> Result<R> { /* as above */ }
-
-    // All public catalogue methods are thin wrappers around with_connection.
-}
-```
 
 ### Rules for call sites
 
@@ -139,11 +152,86 @@ impl CatalogueService {
 
 ---
 
+## Migration plan: the shim layer
+
+The migration from the current global-static design to the service-struct design must keep the app continuously runnable. A flag-day rewrite is rejected on risk grounds — there is no point at which the team can be confident the app works as expected if every Rust and Swift call site changes simultaneously.
+
+The strategy: introduce the `CatalogueService` struct, expose its functionality through a process-wide default instance, and preserve the existing module-level public functions as thin shims that forward to that default instance. This decouples the Rust-side refactor from the Swift-side migration in time, so each phase ends with a fully working, testable application.
+
+### Phase 1 — Rust-side refactor (Session 15b)
+
+At the end of Phase 1, the Rust code looks like:
+
+```rust
+// New: the proper service struct
+pub struct CatalogueService { /* as designed above */ }
+
+impl CatalogueService {
+    pub fn new(db_path: &Path) -> Result<Self> { ... }
+    pub async fn with_connection<F, R>(&self, f: F) -> Result<R> { ... }
+
+    // All ~20 catalogue methods, as instance methods.
+    pub async fn get_photos(&self, ...) -> Result<...> { ... }
+    pub async fn update_rating(&self, ...) -> Result<...> { ... }
+    // ... etc.
+}
+
+// Process-wide default instance, initialized on first use.
+static DEFAULT_SERVICE: OnceCell<CatalogueService> = OnceCell::new();
+
+fn default_service() -> &'static CatalogueService {
+    DEFAULT_SERVICE.get().expect("catalogue not initialized")
+}
+
+// Old public API preserved as shims.
+pub async fn init_catalogue(path: &str) -> Result<()> {
+    let service = CatalogueService::new(Path::new(path))?;
+    DEFAULT_SERVICE.set(service).map_err(|_| CatalogueError::AlreadyInitialized)?;
+    Ok(())
+}
+
+pub async fn get_photos(...) -> Result<...> {
+    default_service().get_photos(...).await
+}
+// ... shim for every existing public function.
+```
+
+**Swift does not change in Phase 1.** Every existing Swift call site continues to call the same module-level function. Under the hood, those calls now flow through the new service struct. UniFFI bindings are unchanged because the exported function signatures are unchanged.
+
+### Phase 1 verification gate
+
+Before Phase 1 is considered complete:
+
+- App launches without error
+- Catalogue loads existing records (currently 32,855 in the development library)
+- Thumbnails display in BrowseView
+- Rating a photo persists across relaunch (write path)
+- Rotating a photo persists across relaunch (write path)
+- Right-click context menu works (read path — reads JPEG/RAW counterparts)
+- Scanning a small directory adds records to the catalogue (full ingest path)
+- Quit and relaunch — state preserved (catalogue persistence intact)
+
+If all of the above pass, Phase 1 is complete and the Rust core is verified working through the existing API surface.
+
+### Phase 2 — Swift-side migration (Session 16)
+
+Swift call sites move from the module-level shim functions to direct instance-method calls on a held `CatalogueService`. The migration happens in logical groups (e.g., all rating calls together, all scan calls together), with verification after each group.
+
+During Phase 2, the shim functions remain in place — migrated and unmigrated Swift call sites coexist, both routing to the same underlying `CatalogueService` instance through different paths. The app stays runnable throughout.
+
+When every Swift call site is migrated, the shim functions on the Rust side are deleted in a final cleanup commit.
+
+### Why this sequencing works
+
+At every commit between now and the end of Session 16, the app is in a working state. There is no "broken for a week while we refactor" window. The Rust-side refactor in Phase 1 is verifiable on its own merits before any Swift work begins, which means a Phase 2 regression can be localized to Phase 2 with confidence.
+
+---
+
 ## Migration path to a pool, if ever needed
 
 The design preserves the option to upgrade without disruption. If future profiling shows real contention (e.g., long classification jobs blocking interactive reads), the upgrade is:
 
-1. Replace the `Arc<Mutex<Connection>>` field with a pool type (e.g., `r2d2` or a custom one).
+1. Replace the `Arc<Mutex<Option<Connection>>>` field with a pool type (e.g., `r2d2` or a custom one).
 2. Rewrite `with_connection` to check out a connection from the pool, run the closure, return it.
 3. Call sites are unchanged.
 
@@ -158,15 +246,33 @@ A read/write split is similarly localized: split into `with_read_connection` and
 - **Transaction support.** v1 doesn't expose explicit transactions across multiple `with_connection` calls. If a future feature needs cross-call transactional semantics, we'll need either a `with_transaction` variant (closure runs inside a single transaction) or a way to hand out a borrowed `Transaction<'_>` from inside the closure. Punt until needed.
 - **Cancellation.** `spawn_blocking` tasks cannot be cancelled. If a long-running catalogue query needs to be interruptible (e.g., user cancels a slow filter), we'll need to either chunk the query at the SQL level or accept that cancellation lands after the current query completes. Not relevant for v1.
 - **Metrics / observability.** No instrumentation on `with_connection` for v1. If contention becomes suspected, adding a histogram of lock-wait duration is a one-line change in the helper.
+- **Multiple catalogue instances.** The service-struct design makes this possible architecturally, but Phase 1 still uses a process-wide singleton via `DEFAULT_SERVICE`. True multi-catalogue support would require Swift to hold and route between multiple instances, which is out of scope for the Phase 1/2 migration.
 
 ---
 
-## Implementation checklist (Session 15)
+## Implementation checklist
 
-- [ ] Add `Arc<Mutex<Connection>>` field to `CatalogueService` (or whichever struct currently owns the connection).
+### Phase 1 (Session 15b)
+
+- [ ] Define `CatalogueService` struct with `Arc<Mutex<Option<Connection>>>` field.
+- [ ] Implement `CatalogueService::new(db_path)` performing init, migrations, pragmas.
 - [ ] Implement `with_connection<F, R>` as specified.
-- [ ] Migrate existing catalogue methods to route through `with_connection`. Each one becomes a thin async wrapper around a sync closure.
-- [ ] Add a `CatalogueError::TaskJoin` variant for `spawn_blocking` join failures.
+- [ ] Add `CatalogueError::NotInitialized` and `CatalogueError::TaskJoin` variants.
+- [ ] Add `CatalogueError::AlreadyInitialized` variant for re-init attempts.
+- [ ] Migrate all ~20 catalogue functions from module-level to `impl CatalogueService` methods.
+- [ ] Each migrated method routes through `self.with_connection(...)`.
+- [ ] Add `DEFAULT_SERVICE: OnceCell<CatalogueService>` and `default_service()` accessor.
+- [ ] Rewrite the existing module-level public functions as shims that delegate to `default_service()`.
 - [ ] Verify no `.await` calls remain inside locked sections (should be impossible by construction, but worth a manual pass).
-- [ ] Run the existing test suite. Add at least one test that fires multiple concurrent `with_connection` calls and verifies serialized behavior.
-- [ ] Update `CLAUDE.md` (Rust side) with the "all catalogue access through `with_connection`" rule.
+- [ ] Verify no nested `with_connection` calls exist among the migrated methods.
+- [ ] Run the existing test suite.
+- [ ] Add a concurrency test: fire multiple concurrent `with_connection` calls and verify serialized behavior (e.g., interleaved writes to a counter table produce the expected final value).
+- [ ] Execute the Phase 1 verification gate checklist (eight items above).
+- [ ] Update Rust-side `CLAUDE.md` with the "all catalogue access through `with_connection`" rule and the "no nested `with_connection`" rule.
+
+### Phase 2 (Session 16)
+
+- [ ] Introduce a Swift-side holder for the `CatalogueService` instance (decision: app-level singleton vs `@StateObject` — to be designed in Session 16 kickoff).
+- [ ] Migrate Swift call sites in logical groups, with verification between groups.
+- [ ] Delete the Rust-side shim functions once all Swift call sites are migrated.
+- [ ] Final verification pass on the eight-item checklist.
