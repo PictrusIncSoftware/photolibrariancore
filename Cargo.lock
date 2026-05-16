@@ -4289,7 +4289,6 @@ dependencies = [
  "once_cell",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
  "uniffi",
 ]
