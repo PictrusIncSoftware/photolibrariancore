@@ -316,6 +316,11 @@ uint64_t uniffi_photolibrariancore_fn_func_ingest_metadata(RustBuffer metadata
 uint64_t uniffi_photolibrariancore_fn_func_initialize_catalogue(RustBuffer catalogue_path
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_PARSE_FILENAME
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_PARSE_FILENAME
+RustBuffer uniffi_photolibrariancore_fn_func_parse_filename(RustBuffer file_name, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_UPDATE_IMAGE_RATING
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_UPDATE_IMAGE_RATING
 uint64_t uniffi_photolibrariancore_fn_func_update_image_rating(RustBuffer file_path, uint32_t rating
@@ -667,6 +672,12 @@ uint16_t uniffi_photolibrariancore_checksum_func_ingest_metadata(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_INITIALIZE_CATALOGUE
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_INITIALIZE_CATALOGUE
 uint16_t uniffi_photolibrariancore_checksum_func_initialize_catalogue(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_PARSE_FILENAME
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_PARSE_FILENAME
+uint16_t uniffi_photolibrariancore_checksum_func_parse_filename(void
     
 );
 #endif

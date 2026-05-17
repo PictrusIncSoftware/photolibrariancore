@@ -141,6 +141,20 @@ pub struct ImageRecord {
     pub flag: Option<String>,
     pub color_label: Option<String>,
     pub rotation: i32,
+
+    // Cross-directory duplicate consolidation (DESIGN-Duplicate-Consolidation.md)
+    //
+    // Computed at query time via window function. For each row in the result set,
+    // duplicate_group_id is:
+    //   - NULL if capture_datetime IS NULL (singletons by exemption rule)
+    //   - NULL if the row is the only row in its (capture_datetime, camera_model,
+    //     pixel_width, pixel_height) group (singletons)
+    //   - Otherwise, the id of the row in the group with the lexicographically
+    //     smallest file_path (the canonical/representative row)
+    //
+    // Consumed by Swift `PhotosView.displayedImages` filter: when "Show duplicates"
+    // is OFF, rows where `Int64(id) != duplicate_group_id` are hidden.
+    pub duplicate_group_id: Option<i64>,
 }
 
 /// Recognized RAW image file extensions
@@ -243,6 +257,136 @@ pub fn classify_extension(ext: String) -> ImageKind
     }
 }
 
+/// Parsed components of a filename
+///
+/// Returned by `parse_filename` — owns the canonical filename-parsing contract
+/// for the catalogue (DESIGN-Duplicate-Consolidation.md §7).
+///
+/// Fields:
+/// - `stem`: everything before the last `.` in the filename, in its **original
+///   case**. The duplicate-detection partition compares stems case-insensitively
+///   via `LOWER(file_stem)` at the SQL boundary (Section 12), so the stored
+///   form preserves display case while comparison applies case-folding.
+/// - `extension_lower`: everything after the last `.`, **always lowercased**.
+///   Set to the synthetic placeholder `"metype"` (a DOS-8.3-era mnemonic for
+///   "missing extension type") when the filename is malformed — no dot, leading
+///   dot, or trailing dot — per Section 7's parsing rule.
+/// - `kind`: result of `classify_extension(extension_lower)`. Always
+///   `ImageKind::Other` for the malformed cases (since `"metype"` is in neither
+///   JPEG_EXTENSIONS nor RAW_EXTENSIONS).
+///
+/// Why the Rust field is `extension_lower` rather than `extension`: `extension`
+/// is a reserved keyword in Swift, and UniFFI's generated Swift binding would
+/// either require backtick-escaping at every call site or surface a binding
+/// error. The renamed field is unambiguous about its case-folded contract and
+/// keeps both call sides clean. The lowercased contract is documented by the
+/// field name itself.
+#[derive(Debug, Clone)]
+pub struct ParsedFilename
+{
+    pub stem: String,
+    pub extension_lower: String,
+    pub kind: ImageKind,
+}
+
+/// Parse a filename into its stem, lowercased extension, and ImageKind.
+///
+/// **Synchronous** — same rationale as `classify_extension`: no I/O, no DuckDB
+/// access, no shared state. Forcing async would force Swift consumers into
+/// awkward shapes.
+///
+/// This is the canonical filename-parsing entry point for the catalogue.
+/// Composes on top of `classify_extension`:
+/// - `classify_extension` is the canonical extension-string → kind mapping.
+/// - `parse_filename` is the higher-level entry point that accepts a full
+///   filename, parses it, and delegates extension classification to
+///   `classify_extension`.
+///
+/// Parsing rule (DESIGN-Duplicate-Consolidation.md §7):
+/// 1. Find the LAST occurrence of `.` in `file_name`.
+/// 2. If no dot exists, OR the dot is at position 0, OR everything after the
+///    dot is empty:
+///       stem = file_name (or "metype" if file_name is empty)
+///       extension_lower = "metype"
+///       kind = ImageKind::Other
+/// 3. Otherwise:
+///       stem = everything before the last dot (original case)
+///       extension_lower = everything after the last dot, lowercased
+///       kind = classify_extension(extension_lower)
+///
+/// Examples:
+/// - `"IMG_1234.NEF"` → stem `"IMG_1234"`, ext `"nef"`, kind Raw
+/// - `"photo.jpg"`    → stem `"photo"`,    ext `"jpg"`, kind Jpeg
+/// - `"foo.bar.baz"`  → stem `"foo.bar"`,  ext `"baz"`, kind Other
+/// - `".DS_Store"`    → stem `".DS_Store"`, ext `"metype"`, kind Other
+/// - `"README"`       → stem `"README"`,    ext `"metype"`, kind Other
+/// - `"foo."`         → stem `"foo."`,      ext `"metype"`, kind Other
+/// - `""`             → stem `"metype"`,    ext `"metype"`, kind Other
+///
+/// Parameters:
+/// - file_name: The filename to parse (no path components). Caller is expected
+///   to pass just the file name, not a full path; the function does not strip
+///   directory components.
+///
+/// Returns:
+/// - ParsedFilename with the three derived fields populated per the rule.
+pub fn parse_filename(file_name: String) -> ParsedFilename
+{
+    // Empty filename: synthetic stem so the stored column is never empty.
+    if file_name.is_empty()
+    {
+        return ParsedFilename
+        {
+            stem: "metype".to_string(),
+            extension_lower: "metype".to_string(),
+            kind: ImageKind::Other,
+        };
+    }
+
+    match file_name.rfind('.')
+    {
+        // No dot at all — case 2.
+        None => ParsedFilename
+        {
+            stem: file_name,
+            extension_lower: "metype".to_string(),
+            kind: ImageKind::Other,
+        },
+        // Leading dot, e.g. ".DS_Store" — case 2.
+        // The whole name is treated as the stem; there is no extension to parse.
+        Some(0) => ParsedFilename
+        {
+            stem: file_name,
+            extension_lower: "metype".to_string(),
+            kind: ImageKind::Other,
+        },
+        // Trailing dot, e.g. "foo." — case 2.
+        // Note: idx is a byte offset; for the trailing-dot test we compare against
+        // file_name.len() - 1. Byte offsets are safe here because '.' is single-byte
+        // ASCII; rfind on a multi-byte string still returns a byte offset on a code
+        // unit boundary.
+        Some(idx) if idx == file_name.len() - 1 => ParsedFilename
+        {
+            stem: file_name,
+            extension_lower: "metype".to_string(),
+            kind: ImageKind::Other,
+        },
+        // Normal case: split at the last dot.
+        Some(idx) =>
+        {
+            let stem = file_name[..idx].to_string();
+            let ext = file_name[idx + 1..].to_lowercase();
+            let kind = classify_extension(ext.clone());
+            ParsedFilename
+            {
+                stem,
+                extension_lower: ext,
+                kind,
+            }
+        }
+    }
+}
+
 /// Initialize the catalogue database at the given path
 ///
 /// This function must be called once before any other catalogue operations. It creates
@@ -317,6 +461,16 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             file_size BIGINT NOT NULL,  -- BIGINT (64-bit) required: large TIFFs and PSDs can exceed 2.1GB INT32 limit
             file_name TEXT NOT NULL,
             file_extension TEXT,
+            -- Filename-derived columns for cross-directory duplicate consolidation
+            -- (DESIGN-Duplicate-Consolidation.md §5). Populated at ingest by
+            -- parse_filename(). Nullable in DDL — the non-null invariant is enforced
+            -- at the populate-time contract (new-record ingest + one-time backfill),
+            -- the same pattern as `rotation INTEGER DEFAULT 0`. file_stem preserves
+            -- original case (display); image_kind is always lowercase ("jpeg" /
+            -- "raw" / "other"). Comparisons that need case-folding apply LOWER() at
+            -- the boundary (see Section 12, Canonical Case for String Comparisons).
+            file_stem VARCHAR,
+            image_kind VARCHAR,
             created_timestamp INTEGER NOT NULL,  -- Unix epoch seconds
             modified_timestamp INTEGER NOT NULL, -- Unix epoch seconds
 
@@ -356,6 +510,17 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             indexed_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
+        -- Schema upgrade for pre-existing catalogues
+        -- (DESIGN-Duplicate-Consolidation.md §5, decision C1 from the Step (a')
+        -- read-and-confirm pass). CREATE TABLE IF NOT EXISTS is a no-op when the
+        -- images table already exists, so it cannot add columns to pre-existing
+        -- catalogues. The ALTER TABLE ADD COLUMN IF NOT EXISTS pair below is the
+        -- migration path: on a fresh database these are no-ops (the columns were
+        -- just defined above); on an existing 32,855-record catalogue these add
+        -- the columns the backfill migration then populates.
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS file_stem VARCHAR;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS image_kind VARCHAR;
+
         -- Indexes for efficient filtering and querying
         -- These columns are commonly used in WHERE clauses and ORDER BY operations
         -- Rationale: Photographers frequently filter by camera, date, rating, and organization markers
@@ -384,6 +549,103 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         Ok(actual_schema) => eprintln!("Actual schema created:\n{}", actual_schema),
         Err(e) => eprintln!("Failed to query schema: {}", e),
     }
+
+    // --- Backfill migration (DESIGN-Duplicate-Consolidation.md §8) ----------
+    //
+    // Runs once at app launch, after schema creation (CREATE TABLE + ALTER
+    // TABLE IF NOT EXISTS), before the catalogue connection is stored in
+    // the CATALOGUE singleton. Atomic-with-init from the app's perspective —
+    // no UI query can race the migration because the singleton is the only
+    // public access path and is set only after this block returns.
+    //
+    // Two responsibilities, both wrapped in a single transaction:
+    //   1. Populate file_stem and image_kind for any row where either column
+    //      is NULL. On a fresh database this loop is a no-op (no rows). On
+    //      an existing 32,855-record catalogue this is a one-time cost.
+    //      The estimate per Section 14 is well under a second.
+    //   2. Idempotent lowercase normalization of file_extension. The current
+    //      catalogue spot-check shows file_extension is already lowercase,
+    //      but the design wants a belt-and-braces UPDATE to enforce the
+    //      lowercase-canonical convention even on data ingested before
+    //      it was a stated invariant.
+    //
+    // Idempotency: the WHERE clauses on both steps mean that running this
+    // block a second time has no work to do — rows with non-NULL file_stem
+    // and image_kind are skipped, and rows whose file_extension already
+    // matches LOWER(file_extension) are skipped.
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("[migration] Failed to begin transaction: {}", e);
+        return false;
+    }
+
+    // Step 1: backfill file_stem and image_kind.
+    let rows_needing_backfill: Vec<(i64, String)> = match conn.prepare(
+        "SELECT id, file_name FROM images WHERE file_stem IS NULL OR image_kind IS NULL"
+    )
+    {
+        Ok(mut stmt) =>
+        {
+            match stmt.query_map([], |row|
+            {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            {
+                Ok(mapped) => mapped.filter_map(Result::ok).collect(),
+                Err(e) =>
+                {
+                    eprintln!("[migration] Failed to query rows needing backfill: {}", e);
+                    Vec::new()
+                }
+            }
+        }
+        Err(e) =>
+        {
+            eprintln!("[migration] Failed to prepare backfill query: {}", e);
+            Vec::new()
+        }
+    };
+
+    let mut backfilled_count = 0u64;
+    for (row_id, file_name) in &rows_needing_backfill
+    {
+        let parsed = parse_filename(file_name.clone());
+        let kind_str = match parsed.kind
+        {
+            ImageKind::Jpeg => "jpeg",
+            ImageKind::Raw  => "raw",
+            ImageKind::Other => "other",
+        };
+        match conn.execute(
+            "UPDATE images SET file_stem = ?1, image_kind = ?2 WHERE id = ?3",
+            params![parsed.stem, kind_str, row_id],
+        )
+        {
+            Ok(_) => backfilled_count += 1,
+            Err(e) => eprintln!("[migration] Failed to update row id={}: {}", row_id, e),
+        }
+    }
+    eprintln!("[migration] backfilled file_stem/image_kind for {} rows", backfilled_count);
+
+    // Step 2: idempotent lowercase normalization of file_extension.
+    // The WHERE clause restricts the UPDATE to rows that actually differ;
+    // DuckDB returns the count of changed rows in `changed`.
+    match conn.execute(
+        "UPDATE images SET file_extension = LOWER(file_extension) \
+         WHERE file_extension IS NOT NULL AND file_extension != LOWER(file_extension)",
+        [],
+    )
+    {
+        Ok(changed) => eprintln!("[migration] file_extension lowercased: {} rows", changed),
+        Err(e) => eprintln!("[migration] Failed to normalize file_extension: {}", e),
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("[migration] Failed to commit migration transaction: {}", e);
+        return false;
+    }
+    // --- End backfill migration --------------------------------------------
 
     // Store the connection in the global state
     // This connection will be reused by all subsequent catalogue operations
@@ -435,9 +697,16 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
     // Prepared statement with positional parameters (?1, ?2, ...)
     // INSERT OR IGNORE: Skip records where file_path already exists (UNIQUE constraint)
     // The id column is omitted and auto-filled by DuckDB using the DEFAULT nextval() clause
+    //
+    // file_stem and image_kind are positioned immediately after file_extension to
+    // keep the filename-parsing family (file_name → file_extension → file_stem →
+    // image_kind) visually grouped (decision C6 from the Step (a')
+    // read-and-confirm pass). They are populated per-record by parse_filename()
+    // below.
     let insert_sql = r#"
         INSERT OR IGNORE INTO images (
             file_path, file_size, file_name, file_extension,
+            file_stem, image_kind,
             created_timestamp, modified_timestamp,
             camera_make, camera_model, lens_model,
             focal_length, aperture, shutter_speed, iso,
@@ -448,8 +717,8 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
             rating, flag, color_label
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-            ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+            ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
         )
     "#;
 
@@ -458,6 +727,18 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
     // Iterate through each metadata record and insert individually
     // Per-record approach: Better error isolation at the cost of slightly lower throughput
     for record in metadata {
+        // Derive filename-parsing columns via the canonical parser. The Rust core
+        // owns this logic so Swift can be ignorant of the "metype" placeholder
+        // and the case-folding convention; both are enforced here at write time.
+        // (DESIGN-Duplicate-Consolidation.md §5, §7.)
+        let parsed = parse_filename(record.file_name.clone());
+        let image_kind_str = match parsed.kind
+        {
+            ImageKind::Jpeg => "jpeg",
+            ImageKind::Raw  => "raw",
+            ImageKind::Other => "other",
+        };
+
         // Execute the prepared statement with positional parameters
         // Type conversions: u32/u64 → i64 for DuckDB INTEGER columns
         // Option<T> fields are passed directly — DuckDB handles NULL for None
@@ -468,29 +749,31 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
                 record.file_size as i64,                    // ?2  (u64 → i64 cast safe for file sizes < 9 exabytes)
                 record.file_name,                           // ?3
                 record.file_extension,                      // ?4
-                record.created_timestamp,                   // ?5
-                record.modified_timestamp,                  // ?6
-                record.camera_make,                         // ?7
-                record.camera_model,                        // ?8
-                record.lens_model,                          // ?9
-                record.focal_length,                        // ?10
-                record.aperture,                            // ?11
-                record.shutter_speed,                       // ?12
-                record.iso.map(|v| v as i64),              // ?13 (u32 → i64)
-                record.capture_datetime,                    // ?14
-                record.pixel_width.map(|v| v as i64),      // ?15 (u32 → i64)
-                record.pixel_height.map(|v| v as i64),     // ?16 (u32 → i64)
-                record.color_space,                         // ?17
-                record.bit_depth.map(|v| v as i64),        // ?18 (u32 → i64)
-                record.gps_latitude,                        // ?19
-                record.gps_longitude,                       // ?20
-                record.gps_altitude,                        // ?21
-                record.copyright,                           // ?22
-                record.creator,                             // ?23
-                record.description,                         // ?24
-                record.rating.map(|v| v as i64),           // ?25 (u8 → i64)
-                record.flag,                                // ?26
-                record.color_label,                         // ?27
+                parsed.stem,                                // ?5  file_stem (original case preserved)
+                image_kind_str,                             // ?6  image_kind (always lowercase: "jpeg"/"raw"/"other")
+                record.created_timestamp,                   // ?7
+                record.modified_timestamp,                  // ?8
+                record.camera_make,                         // ?9
+                record.camera_model,                        // ?10
+                record.lens_model,                          // ?11
+                record.focal_length,                        // ?12
+                record.aperture,                            // ?13
+                record.shutter_speed,                       // ?14
+                record.iso.map(|v| v as i64),              // ?15 (u32 → i64)
+                record.capture_datetime,                    // ?16
+                record.pixel_width.map(|v| v as i64),      // ?17 (u32 → i64)
+                record.pixel_height.map(|v| v as i64),     // ?18 (u32 → i64)
+                record.color_space,                         // ?19
+                record.bit_depth.map(|v| v as i64),        // ?20 (u32 → i64)
+                record.gps_latitude,                        // ?21
+                record.gps_longitude,                       // ?22
+                record.gps_altitude,                        // ?23
+                record.copyright,                           // ?24
+                record.creator,                             // ?25
+                record.description,                         // ?26
+                record.rating.map(|v| v as i64),           // ?27 (u8 → i64)
+                record.flag,                                // ?28
+                record.color_label,                         // ?29
             ],
         );
 
@@ -656,7 +939,30 @@ pub async fn get_all_images(limit: u32, offset: u32) -> Vec<ImageRecord> {
             pixel_width, pixel_height, color_space, bit_depth,
             gps_latitude, gps_longitude, gps_altitude,
             copyright, creator, description,
-            rating, flag, color_label, rotation
+            rating, flag, color_label, rotation,
+            CASE
+                WHEN capture_datetime IS NULL THEN NULL
+                WHEN COUNT(*) OVER (
+                    PARTITION BY
+                        capture_datetime,
+                        camera_model,
+                        pixel_width,
+                        pixel_height,
+                        image_kind,
+                        LOWER(file_stem)
+                ) = 1 THEN NULL
+                ELSE FIRST_VALUE(id) OVER (
+                    PARTITION BY
+                        capture_datetime,
+                        camera_model,
+                        pixel_width,
+                        pixel_height,
+                        image_kind,
+                        LOWER(file_stem)
+                    ORDER BY file_path ASC
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                )
+            END AS duplicate_group_id
         FROM images
         ORDER BY id
         LIMIT ?1 OFFSET ?2
@@ -710,6 +1016,7 @@ pub async fn get_all_images(limit: u32, offset: u32) -> Vec<ImageRecord> {
             flag: row.get(27)?,
             color_label: row.get(28)?,
             rotation: row.get::<_, i64>(29)? as i32,
+            duplicate_group_id: row.get::<_, Option<i64>>(30)?,
         })
     }) {
         Ok(r) => r,
@@ -785,7 +1092,30 @@ pub async fn get_images_sorted(limit: u32, offset: u32) -> Vec<ImageRecord> {
             pixel_width, pixel_height, color_space, bit_depth,
             gps_latitude, gps_longitude, gps_altitude,
             copyright, creator, description,
-            rating, flag, color_label, rotation
+            rating, flag, color_label, rotation,
+            CASE
+                WHEN capture_datetime IS NULL THEN NULL
+                WHEN COUNT(*) OVER (
+                    PARTITION BY
+                        capture_datetime,
+                        camera_model,
+                        pixel_width,
+                        pixel_height,
+                        image_kind,
+                        LOWER(file_stem)
+                ) = 1 THEN NULL
+                ELSE FIRST_VALUE(id) OVER (
+                    PARTITION BY
+                        capture_datetime,
+                        camera_model,
+                        pixel_width,
+                        pixel_height,
+                        image_kind,
+                        LOWER(file_stem)
+                    ORDER BY file_path ASC
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                )
+            END AS duplicate_group_id
         FROM images
         ORDER BY capture_datetime DESC NULLS LAST, created_timestamp DESC
         LIMIT ?1 OFFSET ?2
@@ -839,6 +1169,7 @@ pub async fn get_images_sorted(limit: u32, offset: u32) -> Vec<ImageRecord> {
             flag: row.get(27)?,
             color_label: row.get(28)?,
             rotation: row.get::<_, i64>(29)? as i32,
+            duplicate_group_id: row.get::<_, Option<i64>>(30)?,
         })
     }) {
         Ok(r) => r,
@@ -1177,7 +1508,30 @@ pub async fn get_images_filtered(limit: i64, offset: i64, date_prefix: String) -
                 pixel_width, pixel_height, color_space, bit_depth,
                 gps_latitude, gps_longitude, gps_altitude,
                 copyright, creator, description,
-                rating, flag, color_label, rotation
+                rating, flag, color_label, rotation,
+                CASE
+                    WHEN capture_datetime IS NULL THEN NULL
+                    WHEN COUNT(*) OVER (
+                        PARTITION BY
+                            capture_datetime,
+                            camera_model,
+                            pixel_width,
+                            pixel_height,
+                            image_kind,
+                            LOWER(file_stem)
+                    ) = 1 THEN NULL
+                    ELSE FIRST_VALUE(id) OVER (
+                        PARTITION BY
+                            capture_datetime,
+                            camera_model,
+                            pixel_width,
+                            pixel_height,
+                            image_kind,
+                            LOWER(file_stem)
+                        ORDER BY file_path ASC
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                    )
+                END AS duplicate_group_id
             FROM images
             ORDER BY capture_datetime DESC NULLS LAST, created_timestamp DESC
             LIMIT ?1 OFFSET ?2
@@ -1195,7 +1549,30 @@ pub async fn get_images_filtered(limit: i64, offset: i64, date_prefix: String) -
                 pixel_width, pixel_height, color_space, bit_depth,
                 gps_latitude, gps_longitude, gps_altitude,
                 copyright, creator, description,
-                rating, flag, color_label, rotation
+                rating, flag, color_label, rotation,
+                CASE
+                    WHEN capture_datetime IS NULL THEN NULL
+                    WHEN COUNT(*) OVER (
+                        PARTITION BY
+                            capture_datetime,
+                            camera_model,
+                            pixel_width,
+                            pixel_height,
+                            image_kind,
+                            LOWER(file_stem)
+                    ) = 1 THEN NULL
+                    ELSE FIRST_VALUE(id) OVER (
+                        PARTITION BY
+                            capture_datetime,
+                            camera_model,
+                            pixel_width,
+                            pixel_height,
+                            image_kind,
+                            LOWER(file_stem)
+                        ORDER BY file_path ASC
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                    )
+                END AS duplicate_group_id
             FROM images
             WHERE capture_datetime LIKE '{}%'
             ORDER BY capture_datetime DESC NULLS LAST, created_timestamp DESC
@@ -1251,6 +1628,7 @@ pub async fn get_images_filtered(limit: i64, offset: i64, date_prefix: String) -
             flag: row.get(27)?,
             color_label: row.get(28)?,
             rotation: row.get::<_, i64>(29)? as i32,
+            duplicate_group_id: row.get::<_, Option<i64>>(30)?,
         })
     }) {
         Ok(r) => r,
@@ -1424,7 +1802,30 @@ pub async fn get_images_for_path_prefix(limit: i64, offset: i64, path_prefix: St
             pixel_width, pixel_height, color_space, bit_depth,
             gps_latitude, gps_longitude, gps_altitude,
             copyright, creator, description,
-            rating, flag, color_label, rotation
+            rating, flag, color_label, rotation,
+            CASE
+                WHEN capture_datetime IS NULL THEN NULL
+                WHEN COUNT(*) OVER (
+                    PARTITION BY
+                        capture_datetime,
+                        camera_model,
+                        pixel_width,
+                        pixel_height,
+                        image_kind,
+                        LOWER(file_stem)
+                ) = 1 THEN NULL
+                ELSE FIRST_VALUE(id) OVER (
+                    PARTITION BY
+                        capture_datetime,
+                        camera_model,
+                        pixel_width,
+                        pixel_height,
+                        image_kind,
+                        LOWER(file_stem)
+                    ORDER BY file_path ASC
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                )
+            END AS duplicate_group_id
         FROM images
         {}
         ORDER BY capture_datetime DESC NULLS LAST, created_timestamp DESC
@@ -1482,6 +1883,7 @@ pub async fn get_images_for_path_prefix(limit: i64, offset: i64, path_prefix: St
             flag: row.get(27)?,
             color_label: row.get(28)?,
             rotation: row.get::<_, i64>(29)? as i32,
+            duplicate_group_id: row.get::<_, Option<i64>>(30)?,
         })
     })
     {
@@ -1696,7 +2098,30 @@ pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord>
             pixel_width, pixel_height, color_space, bit_depth,
             gps_latitude, gps_longitude, gps_altitude,
             copyright, creator, description,
-            rating, flag, color_label, rotation
+            rating, flag, color_label, rotation,
+            CASE
+                WHEN capture_datetime IS NULL THEN NULL
+                WHEN COUNT(*) OVER (
+                    PARTITION BY
+                        capture_datetime,
+                        camera_model,
+                        pixel_width,
+                        pixel_height,
+                        image_kind,
+                        LOWER(file_stem)
+                ) = 1 THEN NULL
+                ELSE FIRST_VALUE(id) OVER (
+                    PARTITION BY
+                        capture_datetime,
+                        camera_model,
+                        pixel_width,
+                        pixel_height,
+                        image_kind,
+                        LOWER(file_stem)
+                    ORDER BY file_path ASC
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                )
+            END AS duplicate_group_id
         FROM images
         WHERE SUBSTRING(file_path, 1, LENGTH(file_path) - INSTR(REVERSE(file_path), '/')) = ?1
           AND file_extension IS NOT NULL
@@ -1754,6 +2179,7 @@ pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord>
             flag: row.get(27)?,
             color_label: row.get(28)?,
             rotation: row.get::<_, i64>(29)? as i32,
+            duplicate_group_id: row.get::<_, Option<i64>>(30)?,
         })
     })
     {

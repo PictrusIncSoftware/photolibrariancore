@@ -93,6 +93,14 @@ namespace photolibrariancore {
     // into awkward shapes.
     // ext: file extension without leading dot, case-insensitive (e.g., "jpg", "NEF").
     ImageKind classify_extension(string ext);
+
+    // Parse a filename into stem, lowercased extension, and ImageKind.
+    // SYNCHRONOUS — same rationale as classify_extension. Composes on top of
+    // classify_extension; see DESIGN-Duplicate-Consolidation.md §7 for the
+    // canonical parsing rule and the "metype" placeholder convention for
+    // malformed/missing extensions.
+    // file_name: a filename without directory components (no slashes).
+    ParsedFilename parse_filename(string file_name);
 };
 
 // Image classification categories for JPEG+RAW pair handling.
@@ -103,6 +111,27 @@ enum ImageKind {
     "Jpeg",
     "Raw",
     "Other",
+};
+
+// Parsed components of a filename, returned by parse_filename.
+// See DESIGN-Duplicate-Consolidation.md §7 for the parsing contract.
+//
+// stem: everything before the last '.' in the filename, ORIGINAL CASE preserved.
+//   The duplicate-detection partition applies LOWER() at the SQL boundary
+//   (Section 12), so the stored form keeps display case while comparison is
+//   case-folded.
+// extension_lower: everything after the last '.', ALWAYS LOWERCASE. Set to
+//   the synthetic placeholder "metype" (DOS-8.3-era mnemonic for "missing
+//   extension type") when the filename is malformed (no dot, leading dot,
+//   trailing dot, or empty filename).
+//   Named extension_lower rather than extension because "extension" is a
+//   reserved keyword in Swift and would require backtick-escaping at every
+//   call site of the generated binding.
+// kind: classify_extension(extension_lower). Always Other for malformed cases.
+dictionary ParsedFilename {
+    string stem;
+    string extension_lower;
+    ImageKind kind;
 };
 
 // Represents the metadata for a single image file
@@ -193,4 +222,13 @@ dictionary ImageRecord {
     string? flag;
     string? color_label;
     i32 rotation;
+
+    // Cross-directory duplicate consolidation (DESIGN-Duplicate-Consolidation.md).
+    // Computed at query time via window function over the result set.
+    // NULL for singletons (no duplicates in catalogue) and rows whose
+    // capture_datetime IS NULL (exempt). For duplicate groups, equal to the
+    // id of the row with the lexicographically smallest file_path. The Swift
+    // gallery filter shows only rows where Int64(id) == duplicate_group_id
+    // when "Show duplicates" is OFF.
+    i64? duplicate_group_id;
 };

@@ -763,10 +763,11 @@ public struct ImageRecord: Equatable, Hashable {
     public var flag: String?
     public var colorLabel: String?
     public var rotation: Int32
+    public var duplicateGroupId: Int64?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: Int64, indexedTimestamp: String, filePath: String, fileSize: UInt64, fileName: String, fileExtension: String?, createdTimestamp: Int64, modifiedTimestamp: Int64, cameraMake: String?, cameraModel: String?, lensModel: String?, focalLength: Double?, aperture: Double?, shutterSpeed: Double?, iso: UInt32?, captureDatetime: String?, pixelWidth: UInt32?, pixelHeight: UInt32?, colorSpace: String?, bitDepth: UInt32?, gpsLatitude: Double?, gpsLongitude: Double?, gpsAltitude: Double?, copyright: String?, creator: String?, description: String?, rating: UInt8?, flag: String?, colorLabel: String?, rotation: Int32) {
+    public init(id: Int64, indexedTimestamp: String, filePath: String, fileSize: UInt64, fileName: String, fileExtension: String?, createdTimestamp: Int64, modifiedTimestamp: Int64, cameraMake: String?, cameraModel: String?, lensModel: String?, focalLength: Double?, aperture: Double?, shutterSpeed: Double?, iso: UInt32?, captureDatetime: String?, pixelWidth: UInt32?, pixelHeight: UInt32?, colorSpace: String?, bitDepth: UInt32?, gpsLatitude: Double?, gpsLongitude: Double?, gpsAltitude: Double?, copyright: String?, creator: String?, description: String?, rating: UInt8?, flag: String?, colorLabel: String?, rotation: Int32, duplicateGroupId: Int64?) {
         self.id = id
         self.indexedTimestamp = indexedTimestamp
         self.filePath = filePath
@@ -797,6 +798,7 @@ public struct ImageRecord: Equatable, Hashable {
         self.flag = flag
         self.colorLabel = colorLabel
         self.rotation = rotation
+        self.duplicateGroupId = duplicateGroupId
     }
 
     
@@ -844,7 +846,8 @@ public struct FfiConverterTypeImageRecord: FfiConverterRustBuffer {
                 rating: FfiConverterOptionUInt8.read(from: &buf), 
                 flag: FfiConverterOptionString.read(from: &buf), 
                 colorLabel: FfiConverterOptionString.read(from: &buf), 
-                rotation: FfiConverterInt32.read(from: &buf)
+                rotation: FfiConverterInt32.read(from: &buf), 
+                duplicateGroupId: FfiConverterOptionInt64.read(from: &buf)
         )
     }
 
@@ -879,6 +882,7 @@ public struct FfiConverterTypeImageRecord: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.flag, into: &buf)
         FfiConverterOptionString.write(value.colorLabel, into: &buf)
         FfiConverterInt32.write(value.rotation, into: &buf)
+        FfiConverterOptionInt64.write(value.duplicateGroupId, into: &buf)
     }
 }
 
@@ -895,6 +899,64 @@ public func FfiConverterTypeImageRecord_lift(_ buf: RustBuffer) throws -> ImageR
 #endif
 public func FfiConverterTypeImageRecord_lower(_ value: ImageRecord) -> RustBuffer {
     return FfiConverterTypeImageRecord.lower(value)
+}
+
+
+public struct ParsedFilename: Equatable, Hashable {
+    public var stem: String
+    public var extensionLower: String
+    public var kind: ImageKind
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(stem: String, extensionLower: String, kind: ImageKind) {
+        self.stem = stem
+        self.extensionLower = extensionLower
+        self.kind = kind
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ParsedFilename: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeParsedFilename: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ParsedFilename {
+        return
+            try ParsedFilename(
+                stem: FfiConverterString.read(from: &buf), 
+                extensionLower: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterTypeImageKind.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ParsedFilename, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.stem, into: &buf)
+        FfiConverterString.write(value.extensionLower, into: &buf)
+        FfiConverterTypeImageKind.write(value.kind, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeParsedFilename_lift(_ buf: RustBuffer) throws -> ParsedFilename {
+    return try FfiConverterTypeParsedFilename.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeParsedFilename_lower(_ value: ParsedFilename) -> RustBuffer {
+    return FfiConverterTypeParsedFilename.lower(value)
 }
 
 // Note that we don't yet support `indirect` for enums.
@@ -1014,6 +1076,30 @@ fileprivate struct FfiConverterOptionUInt32: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterUInt32.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
+    typealias SwiftType = Int64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterInt64.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -1415,6 +1501,13 @@ public func initializeCatalogue(cataloguePath: String)async  -> Bool  {
             
         )
 }
+public func parseFilename(fileName: String) -> ParsedFilename  {
+    return try!  FfiConverterTypeParsedFilename_lift(try! rustCall() {
+    uniffi_photolibrariancore_fn_func_parse_filename(
+        FfiConverterString.lower(fileName),$0
+    )
+})
+}
 public func updateImageRating(filePath: String, rating: UInt32)async  -> Bool  {
     return
         try!  await uniffiRustCallAsync(
@@ -1501,6 +1594,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_initialize_catalogue() != 29822) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_parse_filename() != 30612) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_image_rating() != 15118) {
