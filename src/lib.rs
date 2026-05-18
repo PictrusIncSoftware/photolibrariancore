@@ -471,6 +471,17 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             -- the boundary (see Section 12, Canonical Case for String Comparisons).
             file_stem VARCHAR,
             image_kind VARCHAR,
+            -- Stored parent-directory derivation for filter-aware pagination
+            -- (DESIGN-Filter-Aware-Pagination.md §4). Populated at ingest from
+            -- file_path via the canonical SUBSTRING/INSTR/REVERSE expression
+            -- (see get_distinct_directory_paths for the canonical form, and the
+            -- "Directory-Path Extraction SQL — Gotcha" note in CLAUDE.md for the
+            -- alternative left-anchored form that must NOT be used). Nullable in
+            -- DDL — the non-null invariant is enforced at the populate-time
+            -- contract (new-record ingest + one-time backfill), same pattern as
+            -- file_stem / image_kind above. Consumed by the RAW+JPEG pair-collapse
+            -- subquery introduced in Session 19 Step 4.
+            directory_path VARCHAR,
             created_timestamp INTEGER NOT NULL,  -- Unix epoch seconds
             modified_timestamp INTEGER NOT NULL, -- Unix epoch seconds
 
@@ -512,14 +523,16 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
 
         -- Schema upgrade for pre-existing catalogues
         -- (DESIGN-Duplicate-Consolidation.md §5, decision C1 from the Step (a')
-        -- read-and-confirm pass). CREATE TABLE IF NOT EXISTS is a no-op when the
-        -- images table already exists, so it cannot add columns to pre-existing
-        -- catalogues. The ALTER TABLE ADD COLUMN IF NOT EXISTS pair below is the
-        -- migration path: on a fresh database these are no-ops (the columns were
-        -- just defined above); on an existing 32,855-record catalogue these add
-        -- the columns the backfill migration then populates.
+        -- read-and-confirm pass; DESIGN-Filter-Aware-Pagination.md §4 added
+        -- directory_path in Session 19 Step 1). CREATE TABLE IF NOT EXISTS is a
+        -- no-op when the images table already exists, so it cannot add columns
+        -- to pre-existing catalogues. The ALTER TABLE ADD COLUMN IF NOT EXISTS
+        -- trio below is the migration path: on a fresh database these are no-ops
+        -- (the columns were just defined above); on an existing catalogue these
+        -- add the columns the backfill migration then populates.
         ALTER TABLE images ADD COLUMN IF NOT EXISTS file_stem VARCHAR;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS image_kind VARCHAR;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS directory_path VARCHAR;
 
         -- Indexes for efficient filtering and querying
         -- These columns are commonly used in WHERE clauses and ORDER BY operations
@@ -550,7 +563,8 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         Err(e) => eprintln!("Failed to query schema: {}", e),
     }
 
-    // --- Backfill migration (DESIGN-Duplicate-Consolidation.md §8) ----------
+    // --- Backfill migration (DESIGN-Duplicate-Consolidation.md §8;
+    // --- DESIGN-Filter-Aware-Pagination.md §4 added Step 3 in Session 19) ----
     //
     // Runs once at app launch, after schema creation (CREATE TABLE + ALTER
     // TABLE IF NOT EXISTS), before the catalogue connection is stored in
@@ -558,7 +572,7 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
     // no UI query can race the migration because the singleton is the only
     // public access path and is set only after this block returns.
     //
-    // Two responsibilities, both wrapped in a single transaction:
+    // Three responsibilities, all wrapped in a single transaction:
     //   1. Populate file_stem and image_kind for any row where either column
     //      is NULL. On a fresh database this loop is a no-op (no rows). On
     //      an existing 32,855-record catalogue this is a one-time cost.
@@ -568,11 +582,16 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
     //      but the design wants a belt-and-braces UPDATE to enforce the
     //      lowercase-canonical convention even on data ingested before
     //      it was a stated invariant.
+    //   3. Populate directory_path for any row where it is NULL, using the
+    //      canonical SUBSTRING/INSTR/REVERSE extraction (mirrors
+    //      get_distinct_directory_paths). Pure SQL UPDATE — no Rust
+    //      round-trip per row. On a fresh database this is a no-op.
     //
-    // Idempotency: the WHERE clauses on both steps mean that running this
+    // Idempotency: the WHERE clauses on all three steps mean that running this
     // block a second time has no work to do — rows with non-NULL file_stem
-    // and image_kind are skipped, and rows whose file_extension already
-    // matches LOWER(file_extension) are skipped.
+    // and image_kind are skipped, rows whose file_extension already matches
+    // LOWER(file_extension) are skipped, and rows with non-NULL directory_path
+    // are skipped.
     if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
     {
         eprintln!("[migration] Failed to begin transaction: {}", e);
@@ -640,6 +659,25 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         Err(e) => eprintln!("[migration] Failed to normalize file_extension: {}", e),
     }
 
+    // Step 3: backfill directory_path for any row where it is NULL.
+    // Pure SQL UPDATE — directory_path is derived directly from file_path
+    // via the canonical SUBSTRING/INSTR/REVERSE extraction (mirrors
+    // get_distinct_directory_paths; see also the "Directory-Path Extraction
+    // SQL — Gotcha" note in CLAUDE.md for the left-anchored form that must
+    // NOT be used). Idempotent via WHERE directory_path IS NULL; the
+    // file_path LIKE '%/%' guard mirrors get_distinct_directory_paths'
+    // safety convention against pathological rows lacking a slash.
+    match conn.execute(
+        "UPDATE images \
+         SET directory_path = SUBSTRING(file_path, 1, LENGTH(file_path) - INSTR(REVERSE(file_path), '/')) \
+         WHERE directory_path IS NULL AND file_path LIKE '%/%'",
+        [],
+    )
+    {
+        Ok(changed) => eprintln!("[migration] backfilled directory_path for {} rows", changed),
+        Err(e) => eprintln!("[migration] Failed to backfill directory_path: {}", e),
+    }
+
     if let Err(e) = conn.execute_batch("COMMIT;")
     {
         eprintln!("[migration] Failed to commit migration transaction: {}", e);
@@ -703,10 +741,20 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
     // image_kind) visually grouped (decision C6 from the Step (a')
     // read-and-confirm pass). They are populated per-record by parse_filename()
     // below.
+    //
+    // directory_path (Session 19 Step 1, DESIGN-Filter-Aware-Pagination.md §4)
+    // sits adjacent to image_kind for the same visual-grouping reason — it is
+    // another stored derivation consumed by the filter-aware SQL added later
+    // in Session 19. Unlike file_stem / image_kind, its value is derived
+    // entirely from file_path with no Rust-side enrichment, so the VALUES
+    // clause embeds the canonical SUBSTRING/INSTR/REVERSE expression directly
+    // on ?1 (file_path) rather than binding a separately-computed parameter.
+    // This guarantees byte-for-byte identical logic between ingest and the
+    // backfill UPDATE in initialize_catalogue's migration block.
     let insert_sql = r#"
         INSERT OR IGNORE INTO images (
             file_path, file_size, file_name, file_extension,
-            file_stem, image_kind,
+            file_stem, image_kind, directory_path,
             created_timestamp, modified_timestamp,
             camera_make, camera_model, lens_model,
             focal_length, aperture, shutter_speed, iso,
@@ -716,7 +764,9 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
             copyright, creator, description,
             rating, flag, color_label
         ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+            ?1, ?2, ?3, ?4, ?5, ?6,
+            SUBSTRING(?1, 1, LENGTH(?1) - INSTR(REVERSE(?1), '/')),
+            ?7, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
             ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
         )
@@ -813,23 +863,9 @@ pub async fn get_image_count() -> u64 {
         }
     };
 
-    // Execute COUNT(*) query
-    // query_row is used for single-row results (more ergonomic than query + fetch)
-    // The closure |row| row.get(0) extracts the first column (the count)
-    let count_result: Result<i64, _> = conn.query_row(
-        "SELECT COUNT(*) FROM images",
-        [],           // No query parameters
-        |row| row.get(0),
-    );
-
-    match count_result {
-        // DuckDB returns i64, cast to u64 for the unsigned count semantic
-        Ok(count) => count as u64,
-        Err(e) => {
-            eprintln!("Failed to query image count: {}", e);
-            0  // Return 0 on error (catalogue is effectively empty to the caller)
-        }
-    }
+    // Unfiltered COUNT(*). DuckDB returns i64; cast to u64 at the call
+    // site for the unsigned count semantic (decision C5).
+    execute_image_count_query(conn, "") as u64
 }
 
 /// Format Unix epoch seconds to ISO 8601 string format
@@ -889,46 +925,57 @@ fn is_leap_year(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
-/// Get images from the catalogue with pagination support
+/// Execute a paginated `ImageRecord`-returning query against the catalogue.
 ///
-/// Returns a paginated list of image records in the catalogue, ordered by ID.
-/// This enables the Swift UI layer to load large catalogues incrementally without
-/// freezing the interface.
+/// Single source of truth for the 32-column SELECT projection (including the
+/// window-function CASE that emits `duplicate_group_id`) and the row decode
+/// shared by the four paginating `ImageRecord` query functions:
+/// `get_all_images`, `get_images_sorted`, `get_images_filtered`, and
+/// `get_images_for_path_prefix`. Each caller builds its own WHERE clause
+/// text and ORDER BY expression and delegates the projection, prepare,
+/// bind, row decode, and error logging to this helper.
 ///
-/// Pagination pattern:
-/// - First page: get_all_images(limit: 500, offset: 0)
-/// - Second page: get_all_images(limit: 500, offset: 500)
-/// - Third page: get_all_images(limit: 500, offset: 1000)
-/// - Continue until returned Vec is empty or smaller than limit
+/// `find_counterpart_image` is deliberately NOT routed through this helper
+/// (Session 19 Step 2 decision C1; STATUS.md's prior framing of "five
+/// ImageRecord-returning query functions" was imprecise — the helper covers
+/// the four paginating Vec<ImageRecord> callers, not the Option-returning
+/// counterpart lookup which uses parameterized binds, no LIMIT/OFFSET, and
+/// Rust-side iteration with early-exit).
 ///
-/// Data flow:
-/// - Swift calls this function to populate the browse view, loading pages on demand
-/// - Rust queries a window of records using LIMIT and OFFSET
-/// - Returns full ImageRecord structs including database-generated fields
+/// WHERE-clause parameterization is preserved as-is from the call sites:
+/// `get_images_filtered` and `get_images_for_path_prefix` use `format!`
+/// interpolation with manual single-quote escape. Queue item 4 (Chunk 6)
+/// will parameterize these as a separate change. This helper deliberately
+/// stays neutral on that question — it accepts already-interpolated WHERE
+/// text, so the Chunk 6 work touches call sites without disturbing the
+/// projection.
 ///
 /// Parameters:
-/// - limit: Maximum number of records to return (page size)
-/// - offset: Number of records to skip (page_number * page_size)
+/// - conn: borrowed catalogue connection (caller holds the MutexGuard)
+/// - where_clause: already-interpolated WHERE clause text including the
+///   "WHERE" keyword when non-empty; empty string for no filter
+/// - order_by: ORDER BY expression text only (no "ORDER BY" keyword);
+///   helper prepends the keyword
+/// - limit: LIMIT value, bound as ?1
+/// - offset: OFFSET value, bound as ?2
 ///
 /// Returns:
-/// - Vec of ImageRecord structs, empty vec if catalogue is empty or not initialized
-pub async fn get_all_images(limit: u32, offset: u32) -> Vec<ImageRecord> {
-    // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref() {
-        Some(c) => c,
-        None => {
-            eprintln!("Catalogue not initialized");
-            return Vec::new();
-        }
-    };
-
-    // Query images with pagination, ordered by ID
-    // Note: DuckDB TIMESTAMP columns must be cast to epoch seconds in SQL,
-    // then formatted to String in Rust, because the UniFFI bridge has no
-    // TIMESTAMP type. This is the standard pattern for all TIMESTAMP columns.
-    // LIMIT ?1 OFFSET ?2 enables paginated loading for large catalogues
-    let query_sql = r#"
+/// - Vec of `ImageRecord` structs in the order specified by `order_by`.
+/// - Empty Vec if prepare or query_map fails; errors logged via eprintln!
+///   to match the pre-extraction call-site behavior.
+fn execute_image_record_query(
+    conn: &Connection,
+    where_clause: &str,
+    order_by: &str,
+    limit: i64,
+    offset: i64,
+) -> Vec<ImageRecord>
+{
+    // Assemble the SQL via two positional {} slots (decision C7): the WHERE
+    // clause and the ORDER BY expression. The SELECT projection and the
+    // window-function CASE are byte-identical to the pre-extraction text in
+    // each of the four callers.
+    let query_sql = format!(r#"
         SELECT
             id, epoch(indexed_timestamp) as indexed_ts_epoch,
             file_path, file_size, file_name, file_extension,
@@ -964,23 +1011,23 @@ pub async fn get_all_images(limit: u32, offset: u32) -> Vec<ImageRecord> {
                 )
             END AS duplicate_group_id
         FROM images
-        ORDER BY id
+        {}
+        ORDER BY {}
         LIMIT ?1 OFFSET ?2
-    "#;
+    "#, where_clause, order_by);
 
-    // Execute query with limit and offset parameters
-    let mut stmt = match conn.prepare(query_sql) {
+    let mut stmt = match conn.prepare(&query_sql)
+    {
         Ok(s) => s,
-        Err(e) => {
+        Err(e) =>
+        {
             eprintln!("Failed to prepare query: {}", e);
             return Vec::new();
         }
     };
 
-    let rows = match stmt.query_map(params![limit as i64, offset as i64], |row| {
-        // Extract all columns from the row
-        // Type conversions: i64 from DuckDB → u64/u32/u8 for Rust
-
+    let rows = match stmt.query_map(params![limit, offset], |row|
+    {
         // Format indexed_timestamp from Unix epoch seconds to ISO 8601 string
         let epoch_secs: i64 = row.get(1)?;
         let indexed_ts = format_epoch_to_iso8601(epoch_secs);
@@ -1018,24 +1065,125 @@ pub async fn get_all_images(limit: u32, offset: u32) -> Vec<ImageRecord> {
             rotation: row.get::<_, i64>(29)? as i32,
             duplicate_group_id: row.get::<_, Option<i64>>(30)?,
         })
-    }) {
+    })
+    {
         Ok(r) => r,
-        Err(e) => {
+        Err(e) =>
+        {
             eprintln!("Failed to execute query: {}", e);
             return Vec::new();
         }
     };
 
-    // Collect results, logging errors but continuing for other rows
     let mut records = Vec::new();
-    for row_result in rows {
-        match row_result {
+    for row_result in rows
+    {
+        match row_result
+        {
             Ok(record) => records.push(record),
             Err(e) => eprintln!("Failed to parse row: {}", e),
         }
     }
 
     records
+}
+
+/// Execute a `COUNT(*)` query against the `images` table.
+///
+/// Single source of truth for the `SELECT COUNT(*) FROM images …` shape
+/// shared by the four count functions: `get_image_count`,
+/// `get_filtered_image_count`, `get_image_count_for_path_prefix`, and
+/// `get_image_count_for_filters`. Each caller builds its own WHERE clause
+/// text (including the "WHERE" keyword when non-empty) and delegates the
+/// prepare, query, and error logging to this helper.
+///
+/// Symmetrical with `execute_image_record_query` but minimal: COUNT has
+/// no projection, no ORDER BY, no LIMIT/OFFSET, and no bound parameters.
+/// WHERE-clause parameterization is preserved as-is at the call sites
+/// (`format!` interpolation with manual single-quote escape). Queue
+/// item 4 (Chunk 6) will parameterize these as a separate change.
+///
+/// Implementation-log note: Session 19 Step 3 decision C1 — STATUS.md's
+/// prior framing of "three count functions" was imprecise. The helper
+/// covers four count functions; `get_image_count` was overlooked because
+/// it is the only one returning `u64` (cast at the call site) rather
+/// than `i64`.
+///
+/// Parameters:
+/// - conn: borrowed catalogue connection (caller holds the MutexGuard)
+/// - where_clause: already-interpolated WHERE clause text including the
+///   "WHERE" keyword when non-empty; empty string for no filter. A
+///   trailing space appears in the assembled SQL when `where_clause`
+///   is empty (decision C6); DuckDB handles trailing whitespace identically.
+///
+/// Returns:
+/// - i64 count of matching rows.
+/// - 0 if prepare or query fails; errors logged via eprintln! to match
+///   the pre-extraction call-site behavior.
+fn execute_image_count_query(
+    conn: &Connection,
+    where_clause: &str,
+) -> i64
+{
+    let query_sql = format!("SELECT COUNT(*) FROM images {}", where_clause);
+
+    let count_result: Result<i64, _> = conn.query_row(
+        &query_sql,
+        [],
+        |row| row.get(0),
+    );
+
+    match count_result
+    {
+        Ok(count) => count,
+        Err(e) =>
+        {
+            eprintln!("Failed to query image count: {}", e);
+            0
+        }
+    }
+}
+
+/// Get images from the catalogue with pagination support
+///
+/// Returns a paginated list of image records in the catalogue, ordered by ID.
+/// This enables the Swift UI layer to load large catalogues incrementally without
+/// freezing the interface.
+///
+/// Pagination pattern:
+/// - First page: get_all_images(limit: 500, offset: 0)
+/// - Second page: get_all_images(limit: 500, offset: 500)
+/// - Third page: get_all_images(limit: 500, offset: 1000)
+/// - Continue until returned Vec is empty or smaller than limit
+///
+/// Data flow:
+/// - Swift calls this function to populate the browse view, loading pages on demand
+/// - Rust queries a window of records using LIMIT and OFFSET
+/// - Returns full ImageRecord structs including database-generated fields
+///
+/// Parameters:
+/// - limit: Maximum number of records to return (page size)
+/// - offset: Number of records to skip (page_number * page_size)
+///
+/// Returns:
+/// - Vec of ImageRecord structs, empty vec if catalogue is empty or not initialized
+pub async fn get_all_images(limit: u32, offset: u32) -> Vec<ImageRecord> {
+    // Acquire lock and validate connection
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    // Delegate projection, prepare, bind, row decode, and error logging to
+    // execute_image_record_query. No WHERE clause; ORDER BY id (insertion
+    // order, not the date-sorted order used by the other three paginating
+    // callers — get_all_images preserves the original "browse by id"
+    // semantic for the Browse view).
+    execute_image_record_query(conn, "", "id", limit as i64, offset as i64)
 }
 
 /// Get images from the catalogue with pagination and proper global sort order
@@ -1077,118 +1225,17 @@ pub async fn get_images_sorted(limit: u32, offset: u32) -> Vec<ImageRecord> {
         }
     };
 
-    // Query images with pagination and global sort order
-    // ORDER BY capture_datetime DESC NULLS LAST ensures images with dates appear first,
-    // sorted newest to oldest, with undated images at the end.
-    // Secondary sort by created_timestamp DESC for images without capture dates.
-    let query_sql = r#"
-        SELECT
-            id, epoch(indexed_timestamp) as indexed_ts_epoch,
-            file_path, file_size, file_name, file_extension,
-            created_timestamp, modified_timestamp,
-            camera_make, camera_model, lens_model,
-            focal_length, aperture, shutter_speed, iso,
-            capture_datetime,
-            pixel_width, pixel_height, color_space, bit_depth,
-            gps_latitude, gps_longitude, gps_altitude,
-            copyright, creator, description,
-            rating, flag, color_label, rotation,
-            CASE
-                WHEN capture_datetime IS NULL THEN NULL
-                WHEN COUNT(*) OVER (
-                    PARTITION BY
-                        capture_datetime,
-                        camera_model,
-                        pixel_width,
-                        pixel_height,
-                        image_kind,
-                        LOWER(file_stem)
-                ) = 1 THEN NULL
-                ELSE FIRST_VALUE(id) OVER (
-                    PARTITION BY
-                        capture_datetime,
-                        camera_model,
-                        pixel_width,
-                        pixel_height,
-                        image_kind,
-                        LOWER(file_stem)
-                    ORDER BY file_path ASC
-                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-                )
-            END AS duplicate_group_id
-        FROM images
-        ORDER BY capture_datetime DESC NULLS LAST, created_timestamp DESC
-        LIMIT ?1 OFFSET ?2
-    "#;
-
-    // Execute query with limit and offset parameters
-    let mut stmt = match conn.prepare(query_sql) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to prepare query: {}", e);
-            return Vec::new();
-        }
-    };
-
-    let rows = match stmt.query_map(params![limit as i64, offset as i64], |row| {
-        // Extract all columns from the row
-        // Type conversions: i64 from DuckDB → u64/u32/u8 for Rust
-
-        // Format indexed_timestamp from Unix epoch seconds to ISO 8601 string
-        let epoch_secs: i64 = row.get(1)?;
-        let indexed_ts = format_epoch_to_iso8601(epoch_secs);
-
-        Ok(ImageRecord {
-            id: row.get(0)?,
-            indexed_timestamp: indexed_ts,
-            file_path: row.get(2)?,
-            file_size: row.get::<_, i64>(3)? as u64,
-            file_name: row.get(4)?,
-            file_extension: row.get(5)?,
-            created_timestamp: row.get(6)?,
-            modified_timestamp: row.get(7)?,
-            camera_make: row.get(8)?,
-            camera_model: row.get(9)?,
-            lens_model: row.get(10)?,
-            focal_length: row.get(11)?,
-            aperture: row.get(12)?,
-            shutter_speed: row.get(13)?,
-            iso: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
-            capture_datetime: row.get(15)?,
-            pixel_width: row.get::<_, Option<i64>>(16)?.map(|v| v as u32),
-            pixel_height: row.get::<_, Option<i64>>(17)?.map(|v| v as u32),
-            color_space: row.get(18)?,
-            bit_depth: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
-            gps_latitude: row.get(20)?,
-            gps_longitude: row.get(21)?,
-            gps_altitude: row.get(22)?,
-            copyright: row.get(23)?,
-            creator: row.get(24)?,
-            description: row.get(25)?,
-            rating: row.get::<_, Option<i64>>(26)?.map(|v| v as u8),
-            flag: row.get(27)?,
-            color_label: row.get(28)?,
-            rotation: row.get::<_, i64>(29)? as i32,
-            duplicate_group_id: row.get::<_, Option<i64>>(30)?,
-        })
-    }) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Failed to execute query: {}", e);
-            return Vec::new();
-        }
-    };
-
-    // Collect results, logging errors but continuing for other rows
-    let mut records = Vec::new();
-    for row_result in rows {
-        match row_result {
-            Ok(record) => records.push(record),
-            Err(e) => eprintln!("Failed to parse row: {}", e),
-        }
-    }
-
-    records
+    // Delegate to execute_image_record_query. No WHERE clause; ORDER BY
+    // capture_datetime DESC NULLS LAST then created_timestamp DESC — the
+    // "global sort" semantic used by the Photos view (images with dates
+    // first, newest to oldest, with undated images at the end).
+    execute_image_record_query(
+        conn,
+        "",
+        "capture_datetime DESC NULLS LAST, created_timestamp DESC",
+        limit as i64,
+        offset as i64,
+    )
 }
 
 /// Update the rating for an image
@@ -1494,160 +1541,23 @@ pub async fn get_images_filtered(limit: i64, offset: i64, date_prefix: String) -
         }
     };
 
-    // Build query with optional WHERE clause
-    let query_sql = if date_prefix.is_empty() {
-        // No filter - return all images
-        r#"
-            SELECT
-                id, epoch(indexed_timestamp) as indexed_ts_epoch,
-                file_path, file_size, file_name, file_extension,
-                created_timestamp, modified_timestamp,
-                camera_make, camera_model, lens_model,
-                focal_length, aperture, shutter_speed, iso,
-                capture_datetime,
-                pixel_width, pixel_height, color_space, bit_depth,
-                gps_latitude, gps_longitude, gps_altitude,
-                copyright, creator, description,
-                rating, flag, color_label, rotation,
-                CASE
-                    WHEN capture_datetime IS NULL THEN NULL
-                    WHEN COUNT(*) OVER (
-                        PARTITION BY
-                            capture_datetime,
-                            camera_model,
-                            pixel_width,
-                            pixel_height,
-                            image_kind,
-                            LOWER(file_stem)
-                    ) = 1 THEN NULL
-                    ELSE FIRST_VALUE(id) OVER (
-                        PARTITION BY
-                            capture_datetime,
-                            camera_model,
-                            pixel_width,
-                            pixel_height,
-                            image_kind,
-                            LOWER(file_stem)
-                        ORDER BY file_path ASC
-                        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-                    )
-                END AS duplicate_group_id
-            FROM images
-            ORDER BY capture_datetime DESC NULLS LAST, created_timestamp DESC
-            LIMIT ?1 OFFSET ?2
-        "#.to_string()
+    // Build optional WHERE clause. Preserves the pre-extraction format!
+    // interpolation pattern verbatim (decision C6) — Queue item 4
+    // (Chunk 6) will parameterize this as a separate change. Empty
+    // date_prefix → no WHERE; non-empty → LIKE filter.
+    let where_clause = if date_prefix.is_empty() {
+        String::new()
     } else {
-        // Filter by date prefix using LIKE
-        format!(r#"
-            SELECT
-                id, epoch(indexed_timestamp) as indexed_ts_epoch,
-                file_path, file_size, file_name, file_extension,
-                created_timestamp, modified_timestamp,
-                camera_make, camera_model, lens_model,
-                focal_length, aperture, shutter_speed, iso,
-                capture_datetime,
-                pixel_width, pixel_height, color_space, bit_depth,
-                gps_latitude, gps_longitude, gps_altitude,
-                copyright, creator, description,
-                rating, flag, color_label, rotation,
-                CASE
-                    WHEN capture_datetime IS NULL THEN NULL
-                    WHEN COUNT(*) OVER (
-                        PARTITION BY
-                            capture_datetime,
-                            camera_model,
-                            pixel_width,
-                            pixel_height,
-                            image_kind,
-                            LOWER(file_stem)
-                    ) = 1 THEN NULL
-                    ELSE FIRST_VALUE(id) OVER (
-                        PARTITION BY
-                            capture_datetime,
-                            camera_model,
-                            pixel_width,
-                            pixel_height,
-                            image_kind,
-                            LOWER(file_stem)
-                        ORDER BY file_path ASC
-                        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-                    )
-                END AS duplicate_group_id
-            FROM images
-            WHERE capture_datetime LIKE '{}%'
-            ORDER BY capture_datetime DESC NULLS LAST, created_timestamp DESC
-            LIMIT ?1 OFFSET ?2
-        "#, date_prefix)
+        format!("WHERE capture_datetime LIKE '{}%'", date_prefix)
     };
 
-    // Execute query with limit and offset parameters
-    let mut stmt = match conn.prepare(&query_sql) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to prepare query: {}", e);
-            return Vec::new();
-        }
-    };
-
-    let rows = match stmt.query_map(params![limit, offset], |row| {
-        // Extract all columns from the row
-        // Type conversions: i64 from DuckDB → u64/u32/u8 for Rust
-
-        // Format indexed_timestamp from Unix epoch seconds to ISO 8601 string
-        let epoch_secs: i64 = row.get(1)?;
-        let indexed_ts = format_epoch_to_iso8601(epoch_secs);
-
-        Ok(ImageRecord {
-            id: row.get(0)?,
-            indexed_timestamp: indexed_ts,
-            file_path: row.get(2)?,
-            file_size: row.get::<_, i64>(3)? as u64,
-            file_name: row.get(4)?,
-            file_extension: row.get(5)?,
-            created_timestamp: row.get(6)?,
-            modified_timestamp: row.get(7)?,
-            camera_make: row.get(8)?,
-            camera_model: row.get(9)?,
-            lens_model: row.get(10)?,
-            focal_length: row.get(11)?,
-            aperture: row.get(12)?,
-            shutter_speed: row.get(13)?,
-            iso: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
-            capture_datetime: row.get(15)?,
-            pixel_width: row.get::<_, Option<i64>>(16)?.map(|v| v as u32),
-            pixel_height: row.get::<_, Option<i64>>(17)?.map(|v| v as u32),
-            color_space: row.get(18)?,
-            bit_depth: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
-            gps_latitude: row.get(20)?,
-            gps_longitude: row.get(21)?,
-            gps_altitude: row.get(22)?,
-            copyright: row.get(23)?,
-            creator: row.get(24)?,
-            description: row.get(25)?,
-            rating: row.get::<_, Option<i64>>(26)?.map(|v| v as u8),
-            flag: row.get(27)?,
-            color_label: row.get(28)?,
-            rotation: row.get::<_, i64>(29)? as i32,
-            duplicate_group_id: row.get::<_, Option<i64>>(30)?,
-        })
-    }) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Failed to execute query: {}", e);
-            return Vec::new();
-        }
-    };
-
-    // Collect results, logging errors but continuing for other rows
-    let mut records = Vec::new();
-    for row_result in rows {
-        match row_result {
-            Ok(record) => records.push(record),
-            Err(e) => eprintln!("Failed to parse row: {}", e),
-        }
-    }
-
-    records
+    execute_image_record_query(
+        conn,
+        &where_clause,
+        "capture_datetime DESC NULLS LAST, created_timestamp DESC",
+        limit,
+        offset,
+    )
 }
 
 /// Get the count of images matching the date filter
@@ -1678,27 +1588,16 @@ pub async fn get_filtered_image_count(date_prefix: String) -> i64 {
         }
     };
 
-    // Build query with optional WHERE clause
-    let query_sql = if date_prefix.is_empty() {
-        "SELECT COUNT(*) FROM images".to_string()
+    // Build optional WHERE clause. Single-quote escape preserved verbatim
+    // from the pre-extraction code (decision C6) — Queue item 4 (Chunk 6)
+    // will parameterize this as a separate change.
+    let where_clause = if date_prefix.is_empty() {
+        String::new()
     } else {
-        format!("SELECT COUNT(*) FROM images WHERE capture_datetime LIKE '{}%'", date_prefix)
+        format!("WHERE capture_datetime LIKE '{}%'", date_prefix)
     };
 
-    // Execute COUNT query
-    let count_result: Result<i64, _> = conn.query_row(
-        &query_sql,
-        [],
-        |row| row.get(0),
-    );
-
-    match count_result {
-        Ok(count) => count,
-        Err(e) => {
-            eprintln!("Failed to query filtered image count: {}", e);
-            0
-        }
-    }
+    execute_image_count_query(conn, &where_clause)
 }
 
 /// Get the count of images in a directory (matching path prefix)
@@ -1726,27 +1625,13 @@ pub async fn get_image_count_for_path_prefix(path_prefix: String) -> i64
         }
     };
 
-    // Build query with path prefix filter
-    // Escape single quotes in path to prevent SQL injection
+    // Build WHERE clause with single-quote escape preserved verbatim
+    // from the pre-extraction code (decision C6) — Queue item 4 (Chunk 6)
+    // will parameterize this as a separate change.
     let escaped_prefix = path_prefix.replace("'", "''");
-    let query_sql = format!("SELECT COUNT(*) FROM images WHERE file_path LIKE '{}%'", escaped_prefix);
+    let where_clause = format!("WHERE file_path LIKE '{}%'", escaped_prefix);
 
-    // Execute COUNT query
-    let count_result: Result<i64, _> = conn.query_row(
-        &query_sql,
-        [],
-        |row| row.get(0),
-    );
-
-    match count_result
-    {
-        Ok(count) => count,
-        Err(e) =>
-        {
-            eprintln!("Failed to query image count for path prefix: {}", e);
-            0
-        }
-    }
+    execute_image_count_query(conn, &where_clause)
 }
 
 /// Get images from a directory with pagination (matching path prefix)
@@ -1778,8 +1663,10 @@ pub async fn get_images_for_path_prefix(limit: i64, offset: i64, path_prefix: St
         }
     };
 
-    // Build WHERE clause based on filters
-    // Escape single quotes to prevent SQL injection
+    // Build WHERE clause from the four (path empty?, date empty?)
+    // combinations. Single-quote escape preserved verbatim from the
+    // pre-extraction code (decision C6) — Queue item 4 (Chunk 6) will
+    // parameterize this as a separate change.
     let escaped_path = path_prefix.replace("'", "''");
     let escaped_date = date_prefix.replace("'", "''");
 
@@ -1791,122 +1678,13 @@ pub async fn get_images_for_path_prefix(limit: i64, offset: i64, path_prefix: St
         (false, false) => format!("WHERE file_path LIKE '{}%' AND capture_datetime LIKE '{}%'", escaped_path, escaped_date),
     };
 
-    let query_sql = format!(r#"
-        SELECT
-            id, epoch(indexed_timestamp) as indexed_ts_epoch,
-            file_path, file_size, file_name, file_extension,
-            created_timestamp, modified_timestamp,
-            camera_make, camera_model, lens_model,
-            focal_length, aperture, shutter_speed, iso,
-            capture_datetime,
-            pixel_width, pixel_height, color_space, bit_depth,
-            gps_latitude, gps_longitude, gps_altitude,
-            copyright, creator, description,
-            rating, flag, color_label, rotation,
-            CASE
-                WHEN capture_datetime IS NULL THEN NULL
-                WHEN COUNT(*) OVER (
-                    PARTITION BY
-                        capture_datetime,
-                        camera_model,
-                        pixel_width,
-                        pixel_height,
-                        image_kind,
-                        LOWER(file_stem)
-                ) = 1 THEN NULL
-                ELSE FIRST_VALUE(id) OVER (
-                    PARTITION BY
-                        capture_datetime,
-                        camera_model,
-                        pixel_width,
-                        pixel_height,
-                        image_kind,
-                        LOWER(file_stem)
-                    ORDER BY file_path ASC
-                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-                )
-            END AS duplicate_group_id
-        FROM images
-        {}
-        ORDER BY capture_datetime DESC NULLS LAST, created_timestamp DESC
-        LIMIT ?1 OFFSET ?2
-    "#, where_clause);
-
-    // Execute query with limit and offset parameters
-    let mut stmt = match conn.prepare(&query_sql)
-    {
-        Ok(s) => s,
-        Err(e) =>
-        {
-            eprintln!("Failed to prepare query: {}", e);
-            return Vec::new();
-        }
-    };
-
-    let rows = match stmt.query_map(params![limit, offset], |row|
-    {
-        // Extract all columns from the row
-        // Type conversions: i64 from DuckDB → u64/u32/u8 for Rust
-
-        // Format indexed_timestamp from Unix epoch seconds to ISO 8601 string
-        let epoch_secs: i64 = row.get(1)?;
-        let indexed_ts = format_epoch_to_iso8601(epoch_secs);
-
-        Ok(ImageRecord {
-            id: row.get(0)?,
-            indexed_timestamp: indexed_ts,
-            file_path: row.get(2)?,
-            file_size: row.get::<_, i64>(3)? as u64,
-            file_name: row.get(4)?,
-            file_extension: row.get(5)?,
-            created_timestamp: row.get(6)?,
-            modified_timestamp: row.get(7)?,
-            camera_make: row.get(8)?,
-            camera_model: row.get(9)?,
-            lens_model: row.get(10)?,
-            focal_length: row.get(11)?,
-            aperture: row.get(12)?,
-            shutter_speed: row.get(13)?,
-            iso: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
-            capture_datetime: row.get(15)?,
-            pixel_width: row.get::<_, Option<i64>>(16)?.map(|v| v as u32),
-            pixel_height: row.get::<_, Option<i64>>(17)?.map(|v| v as u32),
-            color_space: row.get(18)?,
-            bit_depth: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
-            gps_latitude: row.get(20)?,
-            gps_longitude: row.get(21)?,
-            gps_altitude: row.get(22)?,
-            copyright: row.get(23)?,
-            creator: row.get(24)?,
-            description: row.get(25)?,
-            rating: row.get::<_, Option<i64>>(26)?.map(|v| v as u8),
-            flag: row.get(27)?,
-            color_label: row.get(28)?,
-            rotation: row.get::<_, i64>(29)? as i32,
-            duplicate_group_id: row.get::<_, Option<i64>>(30)?,
-        })
-    })
-    {
-        Ok(r) => r,
-        Err(e) =>
-        {
-            eprintln!("Failed to execute query: {}", e);
-            return Vec::new();
-        }
-    };
-
-    // Collect results, logging errors but continuing for other rows
-    let mut records = Vec::new();
-    for row_result in rows
-    {
-        match row_result
-        {
-            Ok(record) => records.push(record),
-            Err(e) => eprintln!("Failed to parse row: {}", e),
-        }
-    }
-
-    records
+    execute_image_record_query(
+        conn,
+        &where_clause,
+        "capture_datetime DESC NULLS LAST, created_timestamp DESC",
+        limit,
+        offset,
+    )
 }
 
 /// Get count of images matching both path prefix and date filter
@@ -1936,35 +1714,22 @@ pub async fn get_image_count_for_filters(path_prefix: String, date_prefix: Strin
         }
     };
 
-    // Build WHERE clause based on filters
-    // Escape single quotes to prevent SQL injection
+    // Build WHERE clause from the four (path empty?, date empty?)
+    // combinations. Single-quote escape preserved verbatim from the
+    // pre-extraction code (decision C6) — Queue item 4 (Chunk 6) will
+    // parameterize this as a separate change.
     let escaped_path = path_prefix.replace("'", "''");
     let escaped_date = date_prefix.replace("'", "''");
 
-    let query_sql = match (path_prefix.is_empty(), date_prefix.is_empty())
+    let where_clause = match (path_prefix.is_empty(), date_prefix.is_empty())
     {
-        (true, true) => "SELECT COUNT(*) FROM images".to_string(),
-        (false, true) => format!("SELECT COUNT(*) FROM images WHERE file_path LIKE '{}%'", escaped_path),
-        (true, false) => format!("SELECT COUNT(*) FROM images WHERE capture_datetime LIKE '{}%'", escaped_date),
-        (false, false) => format!("SELECT COUNT(*) FROM images WHERE file_path LIKE '{}%' AND capture_datetime LIKE '{}%'", escaped_path, escaped_date),
+        (true, true) => String::new(),
+        (false, true) => format!("WHERE file_path LIKE '{}%'", escaped_path),
+        (true, false) => format!("WHERE capture_datetime LIKE '{}%'", escaped_date),
+        (false, false) => format!("WHERE file_path LIKE '{}%' AND capture_datetime LIKE '{}%'", escaped_path, escaped_date),
     };
 
-    // Execute COUNT query
-    let count_result: Result<i64, _> = conn.query_row(
-        &query_sql,
-        [],
-        |row| row.get(0),
-    );
-
-    match count_result
-    {
-        Ok(count) => count,
-        Err(e) =>
-        {
-            eprintln!("Failed to query image count for filters: {}", e);
-            0
-        }
-    }
+    execute_image_count_query(conn, &where_clause)
 }
 
 /// Find the JPEG+RAW counterpart of an image in the catalogue
