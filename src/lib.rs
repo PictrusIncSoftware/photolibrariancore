@@ -846,13 +846,23 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
 /// Simple utility function for UI display and validation. Used by Swift to show
 /// "X images in catalogue" status or verify ingestion results.
 ///
+/// Step 4a (Session 20) — Filter-Aware Pagination: accepts the two
+/// filter booleans (`apply_duplicate_filter`, `apply_raw_jpeg_collapse`)
+/// and forwards them to `execute_image_count_query`. When both are
+/// false the helper emits the unfiltered `SELECT COUNT(*) FROM images`
+/// form, preserving the previous behavior bit-for-bit.
+///
 /// Data flow:
 /// Swift calls this after ingestion or on app launch to populate UI statistics
 ///
 /// Returns:
-/// - Total number of image records in the catalogue
+/// - Total number of image records in the catalogue (subject to the
+///   two filter booleans)
 /// - 0 if catalogue not initialized or query fails
-pub async fn get_image_count() -> u64 {
+pub async fn get_image_count(
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+) -> u64 {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
     let conn = match catalogue.as_ref() {
@@ -863,9 +873,15 @@ pub async fn get_image_count() -> u64 {
         }
     };
 
-    // Unfiltered COUNT(*). DuckDB returns i64; cast to u64 at the call
-    // site for the unsigned count semantic (decision C5).
-    execute_image_count_query(conn, "") as u64
+    // Forward predicate-only WHERE (empty) and the two filter booleans.
+    // DuckDB returns i64; cast to u64 at the call site for the unsigned
+    // count semantic (decision C5).
+    execute_image_count_query(
+        conn,
+        "",
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+    ) as u64
 }
 
 /// Format Unix epoch seconds to ISO 8601 string format
@@ -925,96 +941,241 @@ fn is_leap_year(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
+/// Window-function `CASE` expression that computes `duplicate_group_id` for
+/// each row in the result set.
+///
+/// Returns `NULL` for singletons (groups of size 1) and for rows whose
+/// `capture_datetime` IS NULL (exempt from deduplication). For multi-row
+/// groups, returns the `id` of the row with the lexicographically smallest
+/// `file_path` — the canonical "group winner" referenced by the duplicate
+/// filter predicate.
+///
+/// The 6-field partition (capture_datetime, camera_model, pixel_width,
+/// pixel_height, image_kind, LOWER(file_stem)) is ordered high-to-low per
+/// the Session 18 partition-ordering principle so looser future variants
+/// remain structural prefixes of the strict current variant.
+///
+/// Embedded into the inner SELECT projection of both
+/// `execute_image_record_query` (always) and `execute_image_count_query`
+/// (only when the duplicate filter is active). Single source of truth —
+/// both helpers reference this constant rather than duplicating the
+/// expression inline.
+const DUPLICATE_GROUP_ID_CASE: &str = "\
+            CASE \
+                WHEN capture_datetime IS NULL THEN NULL \
+                WHEN COUNT(*) OVER ( \
+                    PARTITION BY \
+                        capture_datetime, \
+                        camera_model, \
+                        pixel_width, \
+                        pixel_height, \
+                        image_kind, \
+                        LOWER(file_stem) \
+                ) = 1 THEN NULL \
+                ELSE FIRST_VALUE(id) OVER ( \
+                    PARTITION BY \
+                        capture_datetime, \
+                        camera_model, \
+                        pixel_width, \
+                        pixel_height, \
+                        image_kind, \
+                        LOWER(file_stem) \
+                    ORDER BY file_path ASC \
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING \
+                ) \
+            END AS duplicate_group_id";
+
+/// Outer-WHERE predicate that keeps duplicate-group winners and singletons.
+///
+/// Applied at the OUTER WHERE level (after the projection wraps the inner
+/// SELECT in a subquery) when `apply_duplicate_filter == true`. Swift sets
+/// the flag from `!showDuplicates`. References the `duplicate_group_id`
+/// projection alias produced by `DUPLICATE_GROUP_ID_CASE`.
+///
+/// Semantics: keep rows where the group_id is NULL (singletons or
+/// capture_datetime-NULL exempts) OR where the row's `id` equals the
+/// group winner. Non-winner duplicates are dropped.
+///
+/// Single source of truth — both helpers reference this constant. See
+/// DESIGN-Filter-Aware-Pagination.md §6.
+const DUPLICATE_FILTER_PREDICATE: &str =
+    "(duplicate_group_id IS NULL OR id = duplicate_group_id)";
+
+/// Inner-WHERE predicate that collapses RAW+JPEG counterpart pairs to the
+/// JPEG.
+///
+/// Applied at the INNER WHERE level (alongside the existing path/date
+/// predicate, where `images` is the FROM table and the column references
+/// resolve directly) when `apply_raw_jpeg_collapse == true`. Swift sets
+/// the flag from `showRawJpegPairsAsOne`. References only stored columns
+/// (`image_kind`, `file_stem`, `directory_path`); no projection-alias
+/// dependency.
+///
+/// Semantics: drop a record if it is a RAW and a JPEG counterpart exists
+/// in the same directory with the same stem. The JPEG record is kept;
+/// the RAW counterpart is hidden.
+///
+/// Note: `image_kind` literal comparisons use lowercase per the project-
+/// wide lowercase canonical-case convention (Session 18). Verified in
+/// `ingest_metadata` — image_kind is always stored as "jpeg" / "raw" /
+/// "other".
+///
+/// Single source of truth — both helpers reference this constant. See
+/// DESIGN-Filter-Aware-Pagination.md §6.
+const RAW_JPEG_COLLAPSE_PREDICATE: &str = "\
+    NOT (image_kind = 'raw' AND EXISTS ( \
+        SELECT 1 FROM images j \
+        WHERE j.image_kind = 'jpeg' \
+          AND j.file_stem = images.file_stem \
+          AND j.directory_path = images.directory_path \
+    ))";
+
 /// Execute a paginated `ImageRecord`-returning query against the catalogue.
 ///
-/// Single source of truth for the 32-column SELECT projection (including the
-/// window-function CASE that emits `duplicate_group_id`) and the row decode
-/// shared by the four paginating `ImageRecord` query functions:
-/// `get_all_images`, `get_images_sorted`, `get_images_filtered`, and
-/// `get_images_for_path_prefix`. Each caller builds its own WHERE clause
-/// text and ORDER BY expression and delegates the projection, prepare,
-/// bind, row decode, and error logging to this helper.
+/// Single source of truth for the 32-column SELECT projection (including
+/// the window-function `CASE` from `DUPLICATE_GROUP_ID_CASE` that emits
+/// `duplicate_group_id`) and the row decode shared by the four paginating
+/// `ImageRecord` query functions: `get_all_images`, `get_images_sorted`,
+/// `get_images_filtered`, and `get_images_for_path_prefix`. Each caller
+/// builds its own predicate text and ORDER BY expression and delegates the
+/// projection, prepare, bind, row decode, and error logging here.
 ///
 /// `find_counterpart_image` is deliberately NOT routed through this helper
-/// (Session 19 Step 2 decision C1; STATUS.md's prior framing of "five
-/// ImageRecord-returning query functions" was imprecise — the helper covers
-/// the four paginating Vec<ImageRecord> callers, not the Option-returning
-/// counterpart lookup which uses parameterized binds, no LIMIT/OFFSET, and
-/// Rust-side iteration with early-exit).
+/// (Session 19 Step 2 decision C1): it returns `Option<ImageRecord>`, has
+/// no LIMIT/OFFSET, uses parameterized binds, sorts by `file_extension
+/// ASC`, and iterates Rust-side with classify-based early-exit.
 ///
-/// WHERE-clause parameterization is preserved as-is from the call sites:
-/// `get_images_filtered` and `get_images_for_path_prefix` use `format!`
-/// interpolation with manual single-quote escape. Queue item 4 (Chunk 6)
-/// will parameterize these as a separate change. This helper deliberately
-/// stays neutral on that question — it accepts already-interpolated WHERE
-/// text, so the Chunk 6 work touches call sites without disturbing the
-/// projection.
+/// **Filter composition (Session 20 Step 4a, design doc §5–§6):**
+///
+/// Two filter booleans gate the new WHERE-clause fragments:
+///
+/// - `apply_raw_jpeg_collapse` (true when Swift's `showRawJpegPairsAsOne`
+///   is on): appends `RAW_JPEG_COLLAPSE_PREDICATE` to the inner WHERE
+///   alongside the caller-supplied predicate. Both reference stored
+///   columns on `images` and compose with `AND`.
+///
+/// - `apply_duplicate_filter` (true when Swift's `showDuplicates` is off):
+///   wraps the inner projection in a subquery and applies
+///   `DUPLICATE_FILTER_PREDICATE` at the OUTER WHERE level, where the
+///   `duplicate_group_id` alias is in scope. When the filter is off, the
+///   projection is emitted at the top level without subquery wrapping
+///   (the alias is still present on the returned `ImageRecord`s for
+///   future Filter Builder use).
+///
+/// **Caller convention (Step 4a change):** `where_clause` is now predicate
+/// text WITHOUT the "WHERE" keyword (empty string for no filter). The
+/// helper assembles WHERE clauses internally. This is a convention change
+/// from Steps 2/3 where callers included the keyword.
+///
+/// WHERE-clause `format!` interpolation with manual single-quote escape is
+/// preserved at call sites; Queue item 4 (Chunk 6) will parameterize these
+/// as a separate change.
 ///
 /// Parameters:
 /// - conn: borrowed catalogue connection (caller holds the MutexGuard)
-/// - where_clause: already-interpolated WHERE clause text including the
-///   "WHERE" keyword when non-empty; empty string for no filter
+/// - where_clause: predicate text only (no "WHERE" keyword); empty string
+///   for no caller-supplied filter
 /// - order_by: ORDER BY expression text only (no "ORDER BY" keyword);
 ///   helper prepends the keyword
 /// - limit: LIMIT value, bound as ?1
 /// - offset: OFFSET value, bound as ?2
+/// - apply_duplicate_filter: when true, wrap projection in subquery and
+///   apply `DUPLICATE_FILTER_PREDICATE` at outer level
+/// - apply_raw_jpeg_collapse: when true, AND-in
+///   `RAW_JPEG_COLLAPSE_PREDICATE` at inner WHERE level
 ///
 /// Returns:
 /// - Vec of `ImageRecord` structs in the order specified by `order_by`.
-/// - Empty Vec if prepare or query_map fails; errors logged via eprintln!
-///   to match the pre-extraction call-site behavior.
+/// - Empty Vec if prepare or query_map fails; errors logged via eprintln!.
 fn execute_image_record_query(
     conn: &Connection,
     where_clause: &str,
     order_by: &str,
     limit: i64,
     offset: i64,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
 ) -> Vec<ImageRecord>
 {
-    // Assemble the SQL via two positional {} slots (decision C7): the WHERE
-    // clause and the ORDER BY expression. The SELECT projection and the
-    // window-function CASE are byte-identical to the pre-extraction text in
-    // each of the four callers.
-    let query_sql = format!(r#"
-        SELECT
-            id, epoch(indexed_timestamp) as indexed_ts_epoch,
-            file_path, file_size, file_name, file_extension,
-            created_timestamp, modified_timestamp,
-            camera_make, camera_model, lens_model,
-            focal_length, aperture, shutter_speed, iso,
-            capture_datetime,
-            pixel_width, pixel_height, color_space, bit_depth,
-            gps_latitude, gps_longitude, gps_altitude,
-            copyright, creator, description,
-            rating, flag, color_label, rotation,
-            CASE
-                WHEN capture_datetime IS NULL THEN NULL
-                WHEN COUNT(*) OVER (
-                    PARTITION BY
-                        capture_datetime,
-                        camera_model,
-                        pixel_width,
-                        pixel_height,
-                        image_kind,
-                        LOWER(file_stem)
-                ) = 1 THEN NULL
-                ELSE FIRST_VALUE(id) OVER (
-                    PARTITION BY
-                        capture_datetime,
-                        camera_model,
-                        pixel_width,
-                        pixel_height,
-                        image_kind,
-                        LOWER(file_stem)
-                    ORDER BY file_path ASC
-                    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-                )
-            END AS duplicate_group_id
-        FROM images
-        {}
-        ORDER BY {}
-        LIMIT ?1 OFFSET ?2
-    "#, where_clause, order_by);
+    // Assemble the inner WHERE from the caller-supplied predicate text
+    // and the RAW+JPEG collapse predicate (both stored-column references;
+    // both safely composable with AND at the inner level).
+    let mut inner_predicates: Vec<&str> = Vec::new();
+    if !where_clause.is_empty()
+    {
+        inner_predicates.push(where_clause);
+    }
+    if apply_raw_jpeg_collapse
+    {
+        inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
+    }
+    let inner_where = if inner_predicates.is_empty()
+    {
+        String::new()
+    }
+    else
+    {
+        format!("WHERE {}", inner_predicates.join(" AND "))
+    };
+
+    // Branch on apply_duplicate_filter (decision C1). When active, wrap
+    // the projection-with-duplicate_group_id in a subquery so the outer
+    // WHERE can reference the alias. When inactive, emit the same
+    // projection at the top level — the alias is still surfaced on the
+    // returned ImageRecord (column 30) for the existing Swift filter and
+    // future Filter Builder consumers.
+    let query_sql = if apply_duplicate_filter
+    {
+        format!(r#"
+            SELECT * FROM (
+                SELECT
+                    id, epoch(indexed_timestamp) as indexed_ts_epoch,
+                    file_path, file_size, file_name, file_extension,
+                    created_timestamp, modified_timestamp,
+                    camera_make, camera_model, lens_model,
+                    focal_length, aperture, shutter_speed, iso,
+                    capture_datetime,
+                    pixel_width, pixel_height, color_space, bit_depth,
+                    gps_latitude, gps_longitude, gps_altitude,
+                    copyright, creator, description,
+                    rating, flag, color_label, rotation,
+                    {}
+                FROM images
+                {}
+            )
+            WHERE {}
+            ORDER BY {}
+            LIMIT ?1 OFFSET ?2
+        "#,
+            DUPLICATE_GROUP_ID_CASE,
+            inner_where,
+            DUPLICATE_FILTER_PREDICATE,
+            order_by)
+    }
+    else
+    {
+        format!(r#"
+            SELECT
+                id, epoch(indexed_timestamp) as indexed_ts_epoch,
+                file_path, file_size, file_name, file_extension,
+                created_timestamp, modified_timestamp,
+                camera_make, camera_model, lens_model,
+                focal_length, aperture, shutter_speed, iso,
+                capture_datetime,
+                pixel_width, pixel_height, color_space, bit_depth,
+                gps_latitude, gps_longitude, gps_altitude,
+                copyright, creator, description,
+                rating, flag, color_label, rotation,
+                {}
+            FROM images
+            {}
+            ORDER BY {}
+            LIMIT ?1 OFFSET ?2
+        "#,
+            DUPLICATE_GROUP_ID_CASE,
+            inner_where,
+            order_by)
+    };
 
     let mut stmt = match conn.prepare(&query_sql)
     {
@@ -1090,18 +1251,34 @@ fn execute_image_record_query(
 
 /// Execute a `COUNT(*)` query against the `images` table.
 ///
-/// Single source of truth for the `SELECT COUNT(*) FROM images …` shape
-/// shared by the four count functions: `get_image_count`,
-/// `get_filtered_image_count`, `get_image_count_for_path_prefix`, and
-/// `get_image_count_for_filters`. Each caller builds its own WHERE clause
-/// text (including the "WHERE" keyword when non-empty) and delegates the
-/// prepare, query, and error logging to this helper.
+/// Single source of truth for the COUNT shape shared by the four count
+/// functions: `get_image_count`, `get_filtered_image_count`,
+/// `get_image_count_for_path_prefix`, and `get_image_count_for_filters`.
+/// Each caller passes its WHERE predicate text (without the "WHERE"
+/// keyword) plus the two filter booleans; this helper assembles the
+/// final SQL and delegates the prepare, query, and error logging.
 ///
-/// Symmetrical with `execute_image_record_query` but minimal: COUNT has
+/// Symmetrical with `execute_image_record_query` but lighter: COUNT has
 /// no projection, no ORDER BY, no LIMIT/OFFSET, and no bound parameters.
 /// WHERE-clause parameterization is preserved as-is at the call sites
 /// (`format!` interpolation with manual single-quote escape). Queue
 /// item 4 (Chunk 6) will parameterize these as a separate change.
+///
+/// Step 4a (Session 20) — Filter-Aware Pagination:
+/// - `apply_duplicate_filter` (decision C2): When false, the helper
+///   emits the simple `SELECT COUNT(*) FROM images {where}` form — no
+///   subquery, no window function. When true, it wraps a projection
+///   carrying `duplicate_group_id` (via DUPLICATE_GROUP_ID_CASE) in a
+///   subquery and applies DUPLICATE_FILTER_PREDICATE at the outer WHERE,
+///   matching the wrap-in-subquery shape of the record helper so the
+///   two functions produce a consistent total/page relationship.
+/// - `apply_raw_jpeg_collapse`: When true, RAW_JPEG_COLLAPSE_PREDICATE
+///   is composed with the caller-supplied predicate at the inner WHERE
+///   (AND-joined). Independent of the duplicate filter.
+///
+/// Predicate-only convention (decision C3): callers must NOT include
+/// the "WHERE" keyword in `where_clause`; this helper inserts the
+/// keyword when any predicate is active.
 ///
 /// Implementation-log note: Session 19 Step 3 decision C1 — STATUS.md's
 /// prior framing of "three count functions" was imprecise. The helper
@@ -1111,10 +1288,12 @@ fn execute_image_record_query(
 ///
 /// Parameters:
 /// - conn: borrowed catalogue connection (caller holds the MutexGuard)
-/// - where_clause: already-interpolated WHERE clause text including the
-///   "WHERE" keyword when non-empty; empty string for no filter. A
-///   trailing space appears in the assembled SQL when `where_clause`
-///   is empty (decision C6); DuckDB handles trailing whitespace identically.
+/// - where_clause: caller-supplied predicate text WITHOUT the "WHERE"
+///   keyword; empty string for no caller predicate.
+/// - apply_duplicate_filter: when true, restrict to one row per
+///   duplicate cluster via the wrap-in-subquery pattern.
+/// - apply_raw_jpeg_collapse: when true, suppress RAW siblings of JPEGs
+///   sharing file_stem within the same directory_path.
 ///
 /// Returns:
 /// - i64 count of matching rows.
@@ -1123,9 +1302,54 @@ fn execute_image_record_query(
 fn execute_image_count_query(
     conn: &Connection,
     where_clause: &str,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
 ) -> i64
 {
-    let query_sql = format!("SELECT COUNT(*) FROM images {}", where_clause);
+    let mut inner_predicates: Vec<&str> = Vec::new();
+    if !where_clause.is_empty()
+    {
+        inner_predicates.push(where_clause);
+    }
+    if apply_raw_jpeg_collapse
+    {
+        inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
+    }
+    let inner_where = if inner_predicates.is_empty()
+    {
+        String::new()
+    }
+    else
+    {
+        format!("WHERE {}", inner_predicates.join(" AND "))
+    };
+
+    // Branch on apply_duplicate_filter (decision C2). When inactive,
+    // emit the minimal COUNT form — no subquery, no window function.
+    // When active, wrap a projection carrying duplicate_group_id in a
+    // subquery so the outer WHERE can reference the alias; this matches
+    // the record helper's wrap-in-subquery shape so totals stay
+    // consistent with the paginated page contents.
+    let query_sql = if apply_duplicate_filter
+    {
+        format!(r#"
+            SELECT COUNT(*) FROM (
+                SELECT
+                    id,
+                    {}
+                FROM images
+                {}
+            )
+            WHERE {}
+        "#,
+            DUPLICATE_GROUP_ID_CASE,
+            inner_where,
+            DUPLICATE_FILTER_PREDICATE)
+    }
+    else
+    {
+        format!("SELECT COUNT(*) FROM images {}", inner_where)
+    };
 
     let count_result: Result<i64, _> = conn.query_row(
         &query_sql,
@@ -1167,7 +1391,12 @@ fn execute_image_count_query(
 ///
 /// Returns:
 /// - Vec of ImageRecord structs, empty vec if catalogue is empty or not initialized
-pub async fn get_all_images(limit: u32, offset: u32) -> Vec<ImageRecord> {
+pub async fn get_all_images(
+    limit: u32,
+    offset: u32,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+) -> Vec<ImageRecord> {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
     let conn = match catalogue.as_ref() {
@@ -1179,11 +1408,20 @@ pub async fn get_all_images(limit: u32, offset: u32) -> Vec<ImageRecord> {
     };
 
     // Delegate projection, prepare, bind, row decode, and error logging to
-    // execute_image_record_query. No WHERE clause; ORDER BY id (insertion
-    // order, not the date-sorted order used by the other three paginating
-    // callers — get_all_images preserves the original "browse by id"
-    // semantic for the Browse view).
-    execute_image_record_query(conn, "", "id", limit as i64, offset as i64)
+    // execute_image_record_query. No caller predicate; ORDER BY id
+    // (insertion order, not the date-sorted order used by the other three
+    // paginating callers — get_all_images preserves the original
+    // "browse by id" semantic for the Browse view). The two filter
+    // booleans are forwarded as-is (Step 4a, Session 20).
+    execute_image_record_query(
+        conn,
+        "",
+        "id",
+        limit as i64,
+        offset as i64,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+    )
 }
 
 /// Get images from the catalogue with pagination and proper global sort order
@@ -1214,7 +1452,12 @@ pub async fn get_all_images(limit: u32, offset: u32) -> Vec<ImageRecord> {
 ///
 /// Returns:
 /// - Vec of ImageRecord structs sorted by date, empty vec if catalogue is empty or not initialized
-pub async fn get_images_sorted(limit: u32, offset: u32) -> Vec<ImageRecord> {
+pub async fn get_images_sorted(
+    limit: u32,
+    offset: u32,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+) -> Vec<ImageRecord> {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
     let conn = match catalogue.as_ref() {
@@ -1225,16 +1468,20 @@ pub async fn get_images_sorted(limit: u32, offset: u32) -> Vec<ImageRecord> {
         }
     };
 
-    // Delegate to execute_image_record_query. No WHERE clause; ORDER BY
-    // capture_datetime DESC NULLS LAST then created_timestamp DESC — the
-    // "global sort" semantic used by the Photos view (images with dates
-    // first, newest to oldest, with undated images at the end).
+    // Delegate to execute_image_record_query. No caller predicate;
+    // ORDER BY capture_datetime DESC NULLS LAST then created_timestamp
+    // DESC — the "global sort" semantic used by the Photos view (images
+    // with dates first, newest to oldest, with undated images at the
+    // end). The two filter booleans are forwarded as-is (Step 4a,
+    // Session 20).
     execute_image_record_query(
         conn,
         "",
         "capture_datetime DESC NULLS LAST, created_timestamp DESC",
         limit as i64,
         offset as i64,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
     )
 }
 
@@ -1530,7 +1777,13 @@ pub async fn get_distinct_directory_paths() -> Vec<String>
 ///
 /// Returns:
 /// - Vec of ImageRecord structs sorted by date, empty vec if catalogue is empty or not initialized
-pub async fn get_images_filtered(limit: i64, offset: i64, date_prefix: String) -> Vec<ImageRecord> {
+pub async fn get_images_filtered(
+    limit: i64,
+    offset: i64,
+    date_prefix: String,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+) -> Vec<ImageRecord> {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
     let conn = match catalogue.as_ref() {
@@ -1541,22 +1794,25 @@ pub async fn get_images_filtered(limit: i64, offset: i64, date_prefix: String) -
         }
     };
 
-    // Build optional WHERE clause. Preserves the pre-extraction format!
+    // Build optional predicate (predicate-only convention per decision
+    // C3 — no "WHERE" keyword). Preserves the pre-extraction format!
     // interpolation pattern verbatim (decision C6) — Queue item 4
     // (Chunk 6) will parameterize this as a separate change. Empty
-    // date_prefix → no WHERE; non-empty → LIKE filter.
-    let where_clause = if date_prefix.is_empty() {
+    // date_prefix → empty predicate; non-empty → LIKE filter.
+    let predicate = if date_prefix.is_empty() {
         String::new()
     } else {
-        format!("WHERE capture_datetime LIKE '{}%'", date_prefix)
+        format!("capture_datetime LIKE '{}%'", date_prefix)
     };
 
     execute_image_record_query(
         conn,
-        &where_clause,
+        &predicate,
         "capture_datetime DESC NULLS LAST, created_timestamp DESC",
         limit,
         offset,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
     )
 }
 
@@ -1577,7 +1833,11 @@ pub async fn get_images_filtered(limit: i64, offset: i64, date_prefix: String) -
 /// Returns:
 /// - Total number of image records matching the filter
 /// - 0 if catalogue not initialized or query fails
-pub async fn get_filtered_image_count(date_prefix: String) -> i64 {
+pub async fn get_filtered_image_count(
+    date_prefix: String,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+) -> i64 {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
     let conn = match catalogue.as_ref() {
@@ -1588,16 +1848,22 @@ pub async fn get_filtered_image_count(date_prefix: String) -> i64 {
         }
     };
 
-    // Build optional WHERE clause. Single-quote escape preserved verbatim
-    // from the pre-extraction code (decision C6) — Queue item 4 (Chunk 6)
-    // will parameterize this as a separate change.
-    let where_clause = if date_prefix.is_empty() {
+    // Build optional predicate (predicate-only convention per decision
+    // C3 — no "WHERE" keyword). Single-quote escape preserved verbatim
+    // from the pre-extraction code (decision C6) — Queue item 4 (Chunk
+    // 6) will parameterize this as a separate change.
+    let predicate = if date_prefix.is_empty() {
         String::new()
     } else {
-        format!("WHERE capture_datetime LIKE '{}%'", date_prefix)
+        format!("capture_datetime LIKE '{}%'", date_prefix)
     };
 
-    execute_image_count_query(conn, &where_clause)
+    execute_image_count_query(
+        conn,
+        &predicate,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+    )
 }
 
 /// Get the count of images in a directory (matching path prefix)
@@ -1611,7 +1877,11 @@ pub async fn get_filtered_image_count(date_prefix: String) -> i64 {
 /// Returns:
 /// - Total number of image records in the directory tree
 /// - 0 if catalogue not initialized or query fails
-pub async fn get_image_count_for_path_prefix(path_prefix: String) -> i64
+pub async fn get_image_count_for_path_prefix(
+    path_prefix: String,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+) -> i64
 {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
@@ -1625,13 +1895,19 @@ pub async fn get_image_count_for_path_prefix(path_prefix: String) -> i64
         }
     };
 
-    // Build WHERE clause with single-quote escape preserved verbatim
-    // from the pre-extraction code (decision C6) — Queue item 4 (Chunk 6)
-    // will parameterize this as a separate change.
+    // Build predicate (predicate-only convention per decision C3 — no
+    // "WHERE" keyword). Single-quote escape preserved verbatim from the
+    // pre-extraction code (decision C6) — Queue item 4 (Chunk 6) will
+    // parameterize this as a separate change.
     let escaped_prefix = path_prefix.replace("'", "''");
-    let where_clause = format!("WHERE file_path LIKE '{}%'", escaped_prefix);
+    let predicate = format!("file_path LIKE '{}%'", escaped_prefix);
 
-    execute_image_count_query(conn, &where_clause)
+    execute_image_count_query(
+        conn,
+        &predicate,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+    )
 }
 
 /// Get images from a directory with pagination (matching path prefix)
@@ -1649,7 +1925,14 @@ pub async fn get_image_count_for_path_prefix(path_prefix: String) -> i64
 ///
 /// Returns:
 /// - Vec of ImageRecord structs sorted by date, empty vec if catalogue is empty or not initialized
-pub async fn get_images_for_path_prefix(limit: i64, offset: i64, path_prefix: String, date_prefix: String) -> Vec<ImageRecord>
+pub async fn get_images_for_path_prefix(
+    limit: i64,
+    offset: i64,
+    path_prefix: String,
+    date_prefix: String,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+) -> Vec<ImageRecord>
 {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
@@ -1663,27 +1946,30 @@ pub async fn get_images_for_path_prefix(limit: i64, offset: i64, path_prefix: St
         }
     };
 
-    // Build WHERE clause from the four (path empty?, date empty?)
-    // combinations. Single-quote escape preserved verbatim from the
+    // Build predicate from the four (path empty?, date empty?)
+    // combinations (predicate-only convention per decision C3 — no
+    // "WHERE" keyword). Single-quote escape preserved verbatim from the
     // pre-extraction code (decision C6) — Queue item 4 (Chunk 6) will
     // parameterize this as a separate change.
     let escaped_path = path_prefix.replace("'", "''");
     let escaped_date = date_prefix.replace("'", "''");
 
-    let where_clause = match (path_prefix.is_empty(), date_prefix.is_empty())
+    let predicate = match (path_prefix.is_empty(), date_prefix.is_empty())
     {
         (true, true) => String::new(),
-        (false, true) => format!("WHERE file_path LIKE '{}%'", escaped_path),
-        (true, false) => format!("WHERE capture_datetime LIKE '{}%'", escaped_date),
-        (false, false) => format!("WHERE file_path LIKE '{}%' AND capture_datetime LIKE '{}%'", escaped_path, escaped_date),
+        (false, true) => format!("file_path LIKE '{}%'", escaped_path),
+        (true, false) => format!("capture_datetime LIKE '{}%'", escaped_date),
+        (false, false) => format!("file_path LIKE '{}%' AND capture_datetime LIKE '{}%'", escaped_path, escaped_date),
     };
 
     execute_image_record_query(
         conn,
-        &where_clause,
+        &predicate,
         "capture_datetime DESC NULLS LAST, created_timestamp DESC",
         limit,
         offset,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
     )
 }
 
@@ -1700,7 +1986,12 @@ pub async fn get_images_for_path_prefix(limit: i64, offset: i64, path_prefix: St
 /// Returns:
 /// - Total number of image records matching both filters
 /// - 0 if catalogue not initialized or query fails
-pub async fn get_image_count_for_filters(path_prefix: String, date_prefix: String) -> i64
+pub async fn get_image_count_for_filters(
+    path_prefix: String,
+    date_prefix: String,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+) -> i64
 {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
@@ -1714,22 +2005,28 @@ pub async fn get_image_count_for_filters(path_prefix: String, date_prefix: Strin
         }
     };
 
-    // Build WHERE clause from the four (path empty?, date empty?)
-    // combinations. Single-quote escape preserved verbatim from the
+    // Build predicate from the four (path empty?, date empty?)
+    // combinations (predicate-only convention per decision C3 — no
+    // "WHERE" keyword). Single-quote escape preserved verbatim from the
     // pre-extraction code (decision C6) — Queue item 4 (Chunk 6) will
     // parameterize this as a separate change.
     let escaped_path = path_prefix.replace("'", "''");
     let escaped_date = date_prefix.replace("'", "''");
 
-    let where_clause = match (path_prefix.is_empty(), date_prefix.is_empty())
+    let predicate = match (path_prefix.is_empty(), date_prefix.is_empty())
     {
         (true, true) => String::new(),
-        (false, true) => format!("WHERE file_path LIKE '{}%'", escaped_path),
-        (true, false) => format!("WHERE capture_datetime LIKE '{}%'", escaped_date),
-        (false, false) => format!("WHERE file_path LIKE '{}%' AND capture_datetime LIKE '{}%'", escaped_path, escaped_date),
+        (false, true) => format!("file_path LIKE '{}%'", escaped_path),
+        (true, false) => format!("capture_datetime LIKE '{}%'", escaped_date),
+        (false, false) => format!("file_path LIKE '{}%' AND capture_datetime LIKE '{}%'", escaped_path, escaped_date),
     };
 
-    execute_image_count_query(conn, &where_clause)
+    execute_image_count_query(
+        conn,
+        &predicate,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+    )
 }
 
 /// Find the JPEG+RAW counterpart of an image in the catalogue

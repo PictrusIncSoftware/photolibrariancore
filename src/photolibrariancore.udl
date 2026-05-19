@@ -9,23 +9,28 @@ namespace photolibrariancore {
     [Async]
     u32 ingest_metadata(sequence<ImageMetadata> metadata);
 
-    // Get the total count of images in the catalogue
+    // Get the total count of images in the catalogue.
+    // Step 4a (Filter-Aware Pagination): accepts the two filter booleans
+    // (apply_duplicate_filter, apply_raw_jpeg_collapse) so the total matches
+    // what the paginated SELECTs will return for the same filter state.
     [Async]
-    u64 get_image_count();
+    u64 get_image_count(boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
 
     // Get images from the catalogue with pagination support
     // Returns a paginated list of image records ordered by ID
     // limit: maximum number of records to return (page size)
     // offset: number of records to skip (page_number * page_size)
+    // apply_duplicate_filter / apply_raw_jpeg_collapse: Step 4a filter booleans.
     [Async]
-    sequence<ImageRecord> get_all_images(u32 limit, u32 offset);
+    sequence<ImageRecord> get_all_images(u32 limit, u32 offset, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
 
     // Get images from the catalogue with pagination and proper global sort order
     // Returns a paginated list of image records ordered by capture_datetime DESC NULLS LAST, created_timestamp DESC
     // limit: maximum number of records to return (page size)
     // offset: number of records to skip (page_number * page_size)
+    // apply_duplicate_filter / apply_raw_jpeg_collapse: Step 4a filter booleans.
     [Async]
-    sequence<ImageRecord> get_images_sorted(u32 limit, u32 offset);
+    sequence<ImageRecord> get_images_sorted(u32 limit, u32 offset, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
 
     // Update the rating for an image identified by file path
     // rating: Star rating from 0-5 (0 clears the rating)
@@ -51,28 +56,33 @@ namespace photolibrariancore {
 
     // Get images with pagination and optional date filtering
     // date_prefix: Empty string for all images, or "YYYY:", "YYYY:MM:", "YYYY:MM:DD" for filtering
+    // apply_duplicate_filter / apply_raw_jpeg_collapse: Step 4a filter booleans.
     // Returns paginated list ordered by capture_datetime DESC NULLS LAST, created_timestamp DESC
     [Async]
-    sequence<ImageRecord> get_images_filtered(i64 limit, i64 offset, string date_prefix);
+    sequence<ImageRecord> get_images_filtered(i64 limit, i64 offset, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
 
     // Get count of images matching the date filter
     // date_prefix: Empty string for all images, or "YYYY:", "YYYY:MM:", "YYYY:MM:DD" for filtering
+    // apply_duplicate_filter / apply_raw_jpeg_collapse: Step 4a filter booleans.
     [Async]
-    i64 get_filtered_image_count(string date_prefix);
+    i64 get_filtered_image_count(string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
 
     // Get count of images in a directory (matching path prefix)
     // path_prefix: Directory path prefix (e.g., "/Users/richard/Photos/")
+    // apply_duplicate_filter / apply_raw_jpeg_collapse: Step 4a filter booleans.
     [Async]
-    i64 get_image_count_for_path_prefix(string path_prefix);
+    i64 get_image_count_for_path_prefix(string path_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
 
     // Get images from a directory with pagination (matching path prefix)
-    // Supports both path and date filtering simultaneously
+    // Supports both path and date filtering simultaneously.
+    // apply_duplicate_filter / apply_raw_jpeg_collapse: Step 4a filter booleans.
     [Async]
-    sequence<ImageRecord> get_images_for_path_prefix(i64 limit, i64 offset, string path_prefix, string date_prefix);
+    sequence<ImageRecord> get_images_for_path_prefix(i64 limit, i64 offset, string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
 
     // Get count of images matching both path prefix and date filter
+    // apply_duplicate_filter / apply_raw_jpeg_collapse: Step 4a filter booleans.
     [Async]
-    i64 get_image_count_for_filters(string path_prefix, string date_prefix);
+    i64 get_image_count_for_filters(string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
 
     // Find the JPEG<->RAW counterpart for an image identified by file_path.
     // Returns the opposite-kind sibling sharing the same parent directory and

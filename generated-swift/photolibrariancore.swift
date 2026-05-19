@@ -1321,11 +1321,11 @@ public func findCounterpartImage(filePath: String)async  -> ImageRecord?  {
             
         )
 }
-public func getAllImages(limit: UInt32, offset: UInt32)async  -> [ImageRecord]  {
+public func getAllImages(limit: UInt32, offset: UInt32, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> [ImageRecord]  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_photolibrariancore_fn_func_get_all_images(FfiConverterUInt32.lower(limit),FfiConverterUInt32.lower(offset)
+                uniffi_photolibrariancore_fn_func_get_all_images(FfiConverterUInt32.lower(limit),FfiConverterUInt32.lower(offset),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
@@ -1366,11 +1366,11 @@ public func getDistinctDirectoryPaths()async  -> [String]  {
             
         )
 }
-public func getFilteredImageCount(datePrefix: String)async  -> Int64  {
+public func getFilteredImageCount(datePrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> Int64  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_photolibrariancore_fn_func_get_filtered_image_count(FfiConverterString.lower(datePrefix)
+                uniffi_photolibrariancore_fn_func_get_filtered_image_count(FfiConverterString.lower(datePrefix),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_i64,
@@ -1381,11 +1381,11 @@ public func getFilteredImageCount(datePrefix: String)async  -> Int64  {
             
         )
 }
-public func getImageCount()async  -> UInt64  {
+public func getImageCount(applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_photolibrariancore_fn_func_get_image_count(
+                uniffi_photolibrariancore_fn_func_get_image_count(FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
@@ -1396,11 +1396,11 @@ public func getImageCount()async  -> UInt64  {
             
         )
 }
-public func getImageCountForFilters(pathPrefix: String, datePrefix: String)async  -> Int64  {
+public func getImageCountForFilters(pathPrefix: String, datePrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> Int64  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_photolibrariancore_fn_func_get_image_count_for_filters(FfiConverterString.lower(pathPrefix),FfiConverterString.lower(datePrefix)
+                uniffi_photolibrariancore_fn_func_get_image_count_for_filters(FfiConverterString.lower(pathPrefix),FfiConverterString.lower(datePrefix),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_i64,
@@ -1411,11 +1411,11 @@ public func getImageCountForFilters(pathPrefix: String, datePrefix: String)async
             
         )
 }
-public func getImageCountForPathPrefix(pathPrefix: String)async  -> Int64  {
+public func getImageCountForPathPrefix(pathPrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> Int64  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_photolibrariancore_fn_func_get_image_count_for_path_prefix(FfiConverterString.lower(pathPrefix)
+                uniffi_photolibrariancore_fn_func_get_image_count_for_path_prefix(FfiConverterString.lower(pathPrefix),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_i64,
@@ -1426,11 +1426,11 @@ public func getImageCountForPathPrefix(pathPrefix: String)async  -> Int64  {
             
         )
 }
-public func getImagesFiltered(limit: Int64, offset: Int64, datePrefix: String)async  -> [ImageRecord]  {
+public func getImagesFiltered(limit: Int64, offset: Int64, datePrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> [ImageRecord]  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_photolibrariancore_fn_func_get_images_filtered(FfiConverterInt64.lower(limit),FfiConverterInt64.lower(offset),FfiConverterString.lower(datePrefix)
+                uniffi_photolibrariancore_fn_func_get_images_filtered(FfiConverterInt64.lower(limit),FfiConverterInt64.lower(offset),FfiConverterString.lower(datePrefix),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
@@ -1441,11 +1441,11 @@ public func getImagesFiltered(limit: Int64, offset: Int64, datePrefix: String)as
             
         )
 }
-public func getImagesForPathPrefix(limit: Int64, offset: Int64, pathPrefix: String, datePrefix: String)async  -> [ImageRecord]  {
+public func getImagesForPathPrefix(limit: Int64, offset: Int64, pathPrefix: String, datePrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> [ImageRecord]  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_photolibrariancore_fn_func_get_images_for_path_prefix(FfiConverterInt64.lower(limit),FfiConverterInt64.lower(offset),FfiConverterString.lower(pathPrefix),FfiConverterString.lower(datePrefix)
+                uniffi_photolibrariancore_fn_func_get_images_for_path_prefix(FfiConverterInt64.lower(limit),FfiConverterInt64.lower(offset),FfiConverterString.lower(pathPrefix),FfiConverterString.lower(datePrefix),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
@@ -1456,11 +1456,11 @@ public func getImagesForPathPrefix(limit: Int64, offset: Int64, pathPrefix: Stri
             
         )
 }
-public func getImagesSorted(limit: UInt32, offset: UInt32)async  -> [ImageRecord]  {
+public func getImagesSorted(limit: UInt32, offset: UInt32, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> [ImageRecord]  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_photolibrariancore_fn_func_get_images_sorted(FfiConverterUInt32.lower(limit),FfiConverterUInt32.lower(offset)
+                uniffi_photolibrariancore_fn_func_get_images_sorted(FfiConverterUInt32.lower(limit),FfiConverterUInt32.lower(offset),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
@@ -1560,7 +1560,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_find_counterpart_image() != 51699) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_photolibrariancore_checksum_func_get_all_images() != 59615) {
+    if (uniffi_photolibrariancore_checksum_func_get_all_images() != 32796) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_distinct_date_strings() != 13981) {
@@ -1569,25 +1569,25 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_get_distinct_directory_paths() != 54232) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_photolibrariancore_checksum_func_get_filtered_image_count() != 37271) {
+    if (uniffi_photolibrariancore_checksum_func_get_filtered_image_count() != 33470) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_photolibrariancore_checksum_func_get_image_count() != 3228) {
+    if (uniffi_photolibrariancore_checksum_func_get_image_count() != 30319) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_photolibrariancore_checksum_func_get_image_count_for_filters() != 17778) {
+    if (uniffi_photolibrariancore_checksum_func_get_image_count_for_filters() != 53360) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_photolibrariancore_checksum_func_get_image_count_for_path_prefix() != 9167) {
+    if (uniffi_photolibrariancore_checksum_func_get_image_count_for_path_prefix() != 38666) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_photolibrariancore_checksum_func_get_images_filtered() != 61854) {
+    if (uniffi_photolibrariancore_checksum_func_get_images_filtered() != 37905) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_photolibrariancore_checksum_func_get_images_for_path_prefix() != 22286) {
+    if (uniffi_photolibrariancore_checksum_func_get_images_for_path_prefix() != 15560) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_photolibrariancore_checksum_func_get_images_sorted() != 18023) {
+    if (uniffi_photolibrariancore_checksum_func_get_images_sorted() != 8765) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_ingest_metadata() != 1621) {
