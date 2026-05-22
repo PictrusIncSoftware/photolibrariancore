@@ -257,6 +257,51 @@ pub fn classify_extension(ext: String) -> ImageKind
     }
 }
 
+/// Project the RAW_EXTENSIONS constant table out to the Swift side
+///
+/// Added for A11 (editor default preferences). The PreferencesView
+/// "Default RAW editor" picker needs to enumerate every RAW extension
+/// the catalogue recognizes so it can compute the intersection of
+/// LaunchServices-capable apps across all of them — an editor only
+/// appears as a candidate default if it can open EVERY format in
+/// this set. That intersection logic lives Swift-side, but the
+/// canonical extension list lives here (this file is the
+/// single source of truth — see RAW_EXTENSIONS doc comment, "Single
+/// source of truth at the Rust layer").
+///
+/// **Synchronous** — pure projection of a compile-time constant; no
+/// I/O, no DuckDB, no shared state. Matches the synchronous
+/// precedent set by `classify_extension`.
+///
+/// Returns a `Vec<String>` (UniFFI sequence<string>) rather than a
+/// borrowed slice so the bridge has a value type to hand over. Each
+/// extension is lowercase, no leading dot, as stored in the
+/// catalogue's `file_extension` column and as expected by
+/// `classify_extension`.
+///
+/// Order matches the declaration order of RAW_EXTENSIONS. Callers
+/// that need a different order should sort Swift-side; this function
+/// preserves the canonical order for predictability.
+pub fn get_raw_extensions() -> Vec<String>
+{
+    RAW_EXTENSIONS.iter().map(|s| s.to_string()).collect()
+}
+
+/// Project the JPEG_EXTENSIONS constant table out to the Swift side
+///
+/// Companion to `get_raw_extensions` (A11). The PreferencesView
+/// "Default JPEG editor" picker queries by `UTType.jpeg` and does
+/// not strictly need this list today, but exposing it here keeps
+/// symmetry with the RAW projection and forecloses any future
+/// Swift-side need to know which extensions classify as JPEG without
+/// asking `classify_extension` one extension at a time.
+///
+/// **Synchronous** — same rationale as `get_raw_extensions`.
+pub fn get_jpeg_extensions() -> Vec<String>
+{
+    JPEG_EXTENSIONS.iter().map(|s| s.to_string()).collect()
+}
+
 /// Parsed components of a filename
 ///
 /// Returned by `parse_filename` — owns the canonical filename-parsing contract

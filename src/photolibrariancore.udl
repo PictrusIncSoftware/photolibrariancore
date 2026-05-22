@@ -140,6 +140,23 @@ namespace photolibrariancore {
     // ext: file extension without leading dot, case-insensitive (e.g., "jpg", "NEF").
     ImageKind classify_extension(string ext);
 
+    // A11 (editor default preferences): project the canonical RAW
+    // extension list to Swift. PreferencesView's "Default RAW editor"
+    // picker needs to enumerate every recognized RAW extension to
+    // compute the intersection of LaunchServices-capable apps across
+    // all of them. SYNCHRONOUS — pure projection of a compile-time
+    // const; mirrors classify_extension's sync precedent. Returns
+    // lowercase, no-leading-dot extensions in declaration order.
+    sequence<string> get_raw_extensions();
+
+    // A11 companion to get_raw_extensions. The "Default JPEG editor"
+    // picker queries by UTType.jpeg directly and does not strictly
+    // need this list today, but exposing it keeps symmetry with the
+    // RAW projection and avoids per-extension classify_extension
+    // calls if a future Swift consumer needs to know which extensions
+    // classify as JPEG. SYNCHRONOUS — same rationale.
+    sequence<string> get_jpeg_extensions();
+
     // Parse a filename into stem, lowercased extension, and ImageKind.
     // SYNCHRONOUS — same rationale as classify_extension. Composes on top of
     // classify_extension; see DESIGN-Duplicate-Consolidation.md §7 for the

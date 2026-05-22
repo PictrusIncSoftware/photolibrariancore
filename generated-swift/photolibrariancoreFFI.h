@@ -315,6 +315,18 @@ uint64_t uniffi_photolibrariancore_fn_func_get_images_for_path_prefix(int64_t li
 uint64_t uniffi_photolibrariancore_fn_func_get_images_sorted(uint32_t limit, uint32_t offset, int8_t apply_duplicate_filter, int8_t apply_raw_jpeg_collapse
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_JPEG_EXTENSIONS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_JPEG_EXTENSIONS
+RustBuffer uniffi_photolibrariancore_fn_func_get_jpeg_extensions(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_RAW_EXTENSIONS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_RAW_EXTENSIONS
+RustBuffer uniffi_photolibrariancore_fn_func_get_raw_extensions(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_INGEST_METADATA
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_INGEST_METADATA
 uint64_t uniffi_photolibrariancore_fn_func_ingest_metadata(RustBuffer metadata
@@ -681,6 +693,18 @@ uint16_t uniffi_photolibrariancore_checksum_func_get_images_for_path_prefix(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_IMAGES_SORTED
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_IMAGES_SORTED
 uint16_t uniffi_photolibrariancore_checksum_func_get_images_sorted(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_JPEG_EXTENSIONS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_JPEG_EXTENSIONS
+uint16_t uniffi_photolibrariancore_checksum_func_get_jpeg_extensions(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_RAW_EXTENSIONS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_RAW_EXTENSIONS
+uint16_t uniffi_photolibrariancore_checksum_func_get_raw_extensions(void
     
 );
 #endif

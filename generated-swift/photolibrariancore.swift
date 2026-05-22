@@ -1559,6 +1559,18 @@ public func getImagesSorted(limit: UInt32, offset: UInt32, applyDuplicateFilter:
             
         )
 }
+public func getJpegExtensions() -> [String]  {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_photolibrariancore_fn_func_get_jpeg_extensions($0
+    )
+})
+}
+public func getRawExtensions() -> [String]  {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_photolibrariancore_fn_func_get_raw_extensions($0
+    )
+})
+}
 public func ingestMetadata(metadata: [ImageMetadata])async  -> UInt32  {
     return
         try!  await uniffiRustCallAsync(
@@ -1682,6 +1694,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_images_sorted() != 8765) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_get_jpeg_extensions() != 14521) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_get_raw_extensions() != 16992) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_ingest_metadata() != 1621) {
