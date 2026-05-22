@@ -1030,6 +1030,48 @@ const RAW_JPEG_COLLAPSE_PREDICATE: &str = "\
           AND j.directory_path = images.directory_path \
     ))";
 
+/// Build the path/date predicate text from the (path_prefix, date_prefix)
+/// pair.
+///
+/// Single source of truth for the four-arm composition used by
+/// `get_images_for_path_prefix`, `get_image_count_for_filters`, and (A9)
+/// `get_file_paths_for_filters`. Returns predicate text WITHOUT the
+/// "WHERE" keyword (predicate-only convention, decision C3 — the query
+/// helpers prepend the keyword).
+///
+/// Single-quote escape (replace `'` with `''`) is preserved verbatim from
+/// the pre-extraction call sites — Queue item 4 (Chunk 6) will parameterize
+/// this as a separate change. Both inputs are treated as untrusted strings
+/// that may legitimately contain single quotes (paths with apostrophes,
+/// for instance).
+///
+/// Arms:
+/// - (empty,  empty)  → empty predicate (no path/date filter)
+/// - (path,   empty)  → `file_path LIKE 'PATH%'`
+/// - (empty,  date)   → `capture_datetime LIKE 'DATE%'`
+/// - (path,   date)   → both, AND-joined
+///
+/// Composes safely with the other inner-WHERE predicates
+/// (`RAW_JPEG_COLLAPSE_PREDICATE`) and with the outer duplicate-filter
+/// wrapper — see `execute_image_record_query` /
+/// `execute_image_count_query` / `execute_file_path_projection_query`.
+fn build_path_date_predicate(path_prefix: &str, date_prefix: &str) -> String
+{
+    let escaped_path = path_prefix.replace("'", "''");
+    let escaped_date = date_prefix.replace("'", "''");
+
+    match (path_prefix.is_empty(), date_prefix.is_empty())
+    {
+        (true, true) => String::new(),
+        (false, true) => format!("file_path LIKE '{}%'", escaped_path),
+        (true, false) => format!("capture_datetime LIKE '{}%'", escaped_date),
+        (false, false) => format!(
+            "file_path LIKE '{}%' AND capture_datetime LIKE '{}%'",
+            escaped_path, escaped_date
+        ),
+    }
+}
+
 /// Execute a paginated `ImageRecord`-returning query against the catalogue.
 ///
 /// Single source of truth for the 32-column SELECT projection (including
@@ -1366,6 +1408,331 @@ fn execute_image_count_query(
             0
         }
     }
+}
+
+/// Execute a `file_path` projection query against the `images` table.
+///
+/// Third sibling to `execute_image_record_query` and
+/// `execute_image_count_query` — projection-only enumeration of the
+/// `file_path` column for callers that need the set of files matching
+/// a filter state without materializing full `ImageRecord` rows.
+///
+/// Shape parallels the count helper: same inner-WHERE assembly
+/// (caller-supplied predicate AND-joined with `RAW_JPEG_COLLAPSE_PREDICATE`
+/// when active), same branch on `apply_duplicate_filter` (subquery wrap
+/// with `DUPLICATE_GROUP_ID_CASE` + outer `DUPLICATE_FILTER_PREDICATE`),
+/// no LIMIT/OFFSET, no ORDER BY. Sharing the filter constants
+/// structurally with the other two helpers is what guarantees parity
+/// with the gallery's loaded set by construction.
+///
+/// Path contract: returns `file_path` values EXACTLY as stored in the
+/// catalogue (no normalization, no transformation). Order is unspecified
+/// — callers that need a total order must sort. Empty Vec is a valid
+/// success result (zero rows matched); use the outer
+/// `Result`/sentinel-bundle to distinguish from a true failure.
+///
+/// Predicate-only convention (decision C3): `where_clause` is predicate
+/// text WITHOUT the "WHERE" keyword; the helper inserts the keyword when
+/// any predicate is active.
+///
+/// Parameters:
+/// - conn: borrowed catalogue connection (caller holds the MutexGuard)
+/// - where_clause: caller-supplied predicate text WITHOUT the "WHERE"
+///   keyword; empty string for no caller predicate.
+/// - apply_duplicate_filter: when true, restrict to one row per
+///   duplicate cluster via the wrap-in-subquery pattern.
+/// - apply_raw_jpeg_collapse: when true, AND-in
+///   `RAW_JPEG_COLLAPSE_PREDICATE` at the inner WHERE level.
+///
+/// Returns:
+/// - `Ok(Vec<String>)` of `file_path` values (possibly empty) on success.
+/// - `Err(String)` on prepare/query failure, with the underlying error
+///   message; errors also logged via `eprintln!` for parity with the
+///   sibling helpers' diagnostic style.
+fn execute_file_path_projection_query(
+    conn: &Connection,
+    where_clause: &str,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+) -> Result<Vec<String>, String>
+{
+    let mut inner_predicates: Vec<&str> = Vec::new();
+    if !where_clause.is_empty()
+    {
+        inner_predicates.push(where_clause);
+    }
+    if apply_raw_jpeg_collapse
+    {
+        inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
+    }
+    let inner_where = if inner_predicates.is_empty()
+    {
+        String::new()
+    }
+    else
+    {
+        format!("WHERE {}", inner_predicates.join(" AND "))
+    };
+
+    // Branch on apply_duplicate_filter — mirrors the count helper's
+    // shape. When inactive, emit the minimal projection. When active,
+    // wrap an (id, file_path, duplicate_group_id) projection in a
+    // subquery so the outer WHERE can apply DUPLICATE_FILTER_PREDICATE
+    // against the alias.
+    let query_sql = if apply_duplicate_filter
+    {
+        format!(r#"
+            SELECT file_path FROM (
+                SELECT
+                    id,
+                    file_path,
+                    {}
+                FROM images
+                {}
+            )
+            WHERE {}
+        "#,
+            DUPLICATE_GROUP_ID_CASE,
+            inner_where,
+            DUPLICATE_FILTER_PREDICATE)
+    }
+    else
+    {
+        format!("SELECT file_path FROM images {}", inner_where)
+    };
+
+    let mut stmt = match conn.prepare(&query_sql)
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("Failed to prepare file_path projection query: {}", e);
+            return Err(format!("prepare failed: {}", e));
+        }
+    };
+
+    let rows = match stmt.query_map([], |row| row.get::<_, String>(0))
+    {
+        Ok(r) => r,
+        Err(e) =>
+        {
+            eprintln!("Failed to execute file_path projection query: {}", e);
+            return Err(format!("query failed: {}", e));
+        }
+    };
+
+    let mut paths: Vec<String> = Vec::new();
+    for row_result in rows
+    {
+        match row_result
+        {
+            Ok(path) => paths.push(path),
+            Err(e) => eprintln!("Failed to read file_path row: {}", e),
+        }
+    }
+
+    Ok(paths)
+}
+
+/// Execute an unbounded `ImageRecord` query against the `images` table.
+///
+/// Records analogue of `execute_file_path_projection_query` (A9) — same
+/// filter machinery, but selects the full `ImageRecord` column set
+/// instead of just `file_path`. Used by `get_image_records_for_filters`
+/// (A10) to enumerate every record matching a node's filter state in
+/// one shot.
+///
+/// Diverges from `execute_image_record_query` (the paginated helper)
+/// on three axes:
+/// 1. **No LIMIT / OFFSET.** Returns every matching record in one
+///    pass. The caller (A10's sidebar bulk-copy path) feeds the result
+///    into `CopyPlanner`, which sorts and groups in Swift — bringing
+///    the full set across the FFI in one call is cheaper than
+///    paginating from Swift, and avoids any "did the page boundary
+///    drop something" failure mode.
+/// 2. **No ORDER BY.** The planner owns sort order (the Copy To
+///    total order: `capture_datetime DESC NULLS LAST, created_timestamp
+///    DESC, file_path ASC`). Adding a SQL ORDER BY here would be wasted
+///    work — the planner re-sorts anyway.
+/// 3. **No bound parameters.** The simplified prepare/query path uses
+///    `query_map([], …)` directly.
+///
+/// Filter assembly is IDENTICAL to the other two helpers (`inner_where`
+/// composition, branch on `apply_duplicate_filter` with the same
+/// subquery-wrap + outer `DUPLICATE_FILTER_PREDICATE` shape). This is
+/// the parity-by-construction guarantee: a sidebar bulk-copy enumerates
+/// the same set of rows that the gallery would display for the same
+/// `(path_prefix, date_prefix, apply_duplicate_filter,
+/// apply_raw_jpeg_collapse)` tuple, because both routes flow through
+/// the same predicate constants and the same composition order.
+///
+/// Predicate-only convention (decision C3): `where_clause` is predicate
+/// text WITHOUT the "WHERE" keyword; the helper inserts the keyword
+/// when any predicate is active.
+///
+/// Parameters:
+/// - conn: borrowed catalogue connection (caller holds the MutexGuard)
+/// - where_clause: caller-supplied predicate text WITHOUT the "WHERE"
+///   keyword; empty string for no caller predicate.
+/// - apply_duplicate_filter: when true, restrict to one row per
+///   duplicate cluster via the wrap-in-subquery pattern.
+/// - apply_raw_jpeg_collapse: when true, AND-in
+///   `RAW_JPEG_COLLAPSE_PREDICATE` at the inner WHERE level.
+///
+/// Returns:
+/// - `Vec<ImageRecord>` of matching rows in DuckDB-natural order
+///   (unspecified — caller MUST sort). Empty vec on prepare/query
+///   failure, with errors logged via `eprintln!` to match the sibling
+///   helpers' diagnostic style and the established
+///   record-returning-function convention (no `[Throws]`, no wrapper
+///   dictionary — see `get_all_images`, `get_images_for_path_prefix`).
+fn execute_image_record_projection_query(
+    conn: &Connection,
+    where_clause: &str,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+) -> Vec<ImageRecord>
+{
+    let mut inner_predicates: Vec<&str> = Vec::new();
+    if !where_clause.is_empty()
+    {
+        inner_predicates.push(where_clause);
+    }
+    if apply_raw_jpeg_collapse
+    {
+        inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
+    }
+    let inner_where = if inner_predicates.is_empty()
+    {
+        String::new()
+    }
+    else
+    {
+        format!("WHERE {}", inner_predicates.join(" AND "))
+    };
+
+    // Branch on apply_duplicate_filter — mirrors the other two helpers
+    // structurally. When active, wrap the projection-with-
+    // duplicate_group_id in a subquery so the outer WHERE can reference
+    // the alias. When inactive, emit the projection at the top level
+    // (the alias is still surfaced on the returned ImageRecord, column
+    // 30).
+    let query_sql = if apply_duplicate_filter
+    {
+        format!(r#"
+            SELECT * FROM (
+                SELECT
+                    id, epoch(indexed_timestamp) as indexed_ts_epoch,
+                    file_path, file_size, file_name, file_extension,
+                    created_timestamp, modified_timestamp,
+                    camera_make, camera_model, lens_model,
+                    focal_length, aperture, shutter_speed, iso,
+                    capture_datetime,
+                    pixel_width, pixel_height, color_space, bit_depth,
+                    gps_latitude, gps_longitude, gps_altitude,
+                    copyright, creator, description,
+                    rating, flag, color_label, rotation,
+                    {}
+                FROM images
+                {}
+            )
+            WHERE {}
+        "#,
+            DUPLICATE_GROUP_ID_CASE,
+            inner_where,
+            DUPLICATE_FILTER_PREDICATE)
+    }
+    else
+    {
+        format!(r#"
+            SELECT
+                id, epoch(indexed_timestamp) as indexed_ts_epoch,
+                file_path, file_size, file_name, file_extension,
+                created_timestamp, modified_timestamp,
+                camera_make, camera_model, lens_model,
+                focal_length, aperture, shutter_speed, iso,
+                capture_datetime,
+                pixel_width, pixel_height, color_space, bit_depth,
+                gps_latitude, gps_longitude, gps_altitude,
+                copyright, creator, description,
+                rating, flag, color_label, rotation,
+                {}
+            FROM images
+            {}
+        "#,
+            DUPLICATE_GROUP_ID_CASE,
+            inner_where)
+    };
+
+    let mut stmt = match conn.prepare(&query_sql)
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("Failed to prepare image record projection query: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map([], |row|
+    {
+        let epoch_secs: i64 = row.get(1)?;
+        let indexed_ts = format_epoch_to_iso8601(epoch_secs);
+
+        Ok(ImageRecord {
+            id: row.get(0)?,
+            indexed_timestamp: indexed_ts,
+            file_path: row.get(2)?,
+            file_size: row.get::<_, i64>(3)? as u64,
+            file_name: row.get(4)?,
+            file_extension: row.get(5)?,
+            created_timestamp: row.get(6)?,
+            modified_timestamp: row.get(7)?,
+            camera_make: row.get(8)?,
+            camera_model: row.get(9)?,
+            lens_model: row.get(10)?,
+            focal_length: row.get(11)?,
+            aperture: row.get(12)?,
+            shutter_speed: row.get(13)?,
+            iso: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
+            capture_datetime: row.get(15)?,
+            pixel_width: row.get::<_, Option<i64>>(16)?.map(|v| v as u32),
+            pixel_height: row.get::<_, Option<i64>>(17)?.map(|v| v as u32),
+            color_space: row.get(18)?,
+            bit_depth: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
+            gps_latitude: row.get(20)?,
+            gps_longitude: row.get(21)?,
+            gps_altitude: row.get(22)?,
+            copyright: row.get(23)?,
+            creator: row.get(24)?,
+            description: row.get(25)?,
+            rating: row.get::<_, Option<i64>>(26)?.map(|v| v as u8),
+            flag: row.get(27)?,
+            color_label: row.get(28)?,
+            rotation: row.get::<_, i64>(29)? as i32,
+            duplicate_group_id: row.get::<_, Option<i64>>(30)?,
+        })
+    })
+    {
+        Ok(r) => r,
+        Err(e) =>
+        {
+            eprintln!("Failed to execute image record projection query: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mut records = Vec::new();
+    for row_result in rows
+    {
+        match row_result
+        {
+            Ok(record) => records.push(record),
+            Err(e) => eprintln!("Failed to parse image record row: {}", e),
+        }
+    }
+
+    records
 }
 
 /// Get images from the catalogue with pagination support
@@ -1946,21 +2313,9 @@ pub async fn get_images_for_path_prefix(
         }
     };
 
-    // Build predicate from the four (path empty?, date empty?)
-    // combinations (predicate-only convention per decision C3 — no
-    // "WHERE" keyword). Single-quote escape preserved verbatim from the
-    // pre-extraction code (decision C6) — Queue item 4 (Chunk 6) will
-    // parameterize this as a separate change.
-    let escaped_path = path_prefix.replace("'", "''");
-    let escaped_date = date_prefix.replace("'", "''");
-
-    let predicate = match (path_prefix.is_empty(), date_prefix.is_empty())
-    {
-        (true, true) => String::new(),
-        (false, true) => format!("file_path LIKE '{}%'", escaped_path),
-        (true, false) => format!("capture_datetime LIKE '{}%'", escaped_date),
-        (false, false) => format!("file_path LIKE '{}%' AND capture_datetime LIKE '{}%'", escaped_path, escaped_date),
-    };
+    // Build predicate via shared helper (single source of truth for the
+    // four-arm path/date composition — see `build_path_date_predicate`).
+    let predicate = build_path_date_predicate(&path_prefix, &date_prefix);
 
     execute_image_record_query(
         conn,
@@ -2005,23 +2360,214 @@ pub async fn get_image_count_for_filters(
         }
     };
 
-    // Build predicate from the four (path empty?, date empty?)
-    // combinations (predicate-only convention per decision C3 — no
-    // "WHERE" keyword). Single-quote escape preserved verbatim from the
-    // pre-extraction code (decision C6) — Queue item 4 (Chunk 6) will
-    // parameterize this as a separate change.
-    let escaped_path = path_prefix.replace("'", "''");
-    let escaped_date = date_prefix.replace("'", "''");
-
-    let predicate = match (path_prefix.is_empty(), date_prefix.is_empty())
-    {
-        (true, true) => String::new(),
-        (false, true) => format!("file_path LIKE '{}%'", escaped_path),
-        (true, false) => format!("capture_datetime LIKE '{}%'", escaped_date),
-        (false, false) => format!("file_path LIKE '{}%' AND capture_datetime LIKE '{}%'", escaped_path, escaped_date),
-    };
+    // Build predicate via shared helper (single source of truth for the
+    // four-arm path/date composition — see `build_path_date_predicate`).
+    let predicate = build_path_date_predicate(&path_prefix, &date_prefix);
 
     execute_image_count_query(
+        conn,
+        &predicate,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+    )
+}
+
+/// Result wrapper for `get_file_paths_for_filters` (A9).
+///
+/// Mirrors the UDL dictionary `FilePathsResult`. Distinguishes a genuine
+/// failure (catalogue not initialized, prepare/query error) from a
+/// legitimate empty-result success — required because this codebase
+/// signals errors via sentinel/wrapper structs rather than `[Throws]`.
+///
+/// Contract:
+/// - `ok == true`: query succeeded. `paths` holds the matching
+///   `file_path` values (possibly empty); `error_message` is `None`.
+/// - `ok == false`: query failed. `paths` is empty; `error_message`
+///   carries a human-readable diagnostic (also logged via `eprintln!`
+///   inside the helpers for parallel observability).
+#[derive(Debug, Clone)]
+pub struct FilePathsResult {
+    pub ok: bool,
+    pub paths: Vec<String>,
+    pub error_message: Option<String>,
+}
+
+/// Return the set of `file_path` values matching the catalogue filter
+/// state — projection-only enumeration of paths.
+///
+/// **STATUS (Session 24, A10 landing):** CURRENTLY UNUSED. Originally
+/// designed (Session 24, A9) as the enumeration foundation for the
+/// sidebar bulk-copy feature, but A10's actual consumer needs records,
+/// not paths: `CopyPlanner.planGroupsWithoutDuplicates` /
+/// `planGroupsWithDuplicates` consume `[ImageRecord]` because they read
+/// `fileName`, `captureDatetime`, `createdTimestamp`, `filePath`, and
+/// the `(file_size, file_name, capture_datetime)` three-field equality
+/// tuple. So A10 calls the records sibling `get_image_records_for_filters`
+/// instead, and this function ships unused.
+///
+/// **Why it stays in the build**: the natural future consumer is the
+/// **Query / Filter Builder** (the v1 late-capstone feature, briefly
+/// described in CLAUDE.md §"Three-Surface Architectural Philosophy"
+/// point 3). A query builder that wants to enumerate the file_paths of
+/// an arbitrary result set — for export, scripting, "open in Finder",
+/// or any path-only consumer — can take this function as-is. The
+/// projection-only design saves the ~94MB → ~4MB hit at catalogue scale
+/// when only paths are needed.
+///
+/// **MARK FOR POTENTIAL DELETION (Session 24)**: if the Query Builder
+/// is designed and turns out NOT to need path-only enumeration (or to
+/// need it through a different surface — e.g., result-set-id-based
+/// rather than predicate-based), this function AND `FilePathsResult`
+/// AND `execute_file_path_projection_query` become safe to remove. Do
+/// not delete blindly — confirm no other callers first.
+///
+/// ----
+///
+/// **Why** (original A9 rationale, retained for context): copying every
+/// file in the current filtered view would require dragging the full
+/// ~94MB `ImageRecord` payload across the FFI just to read one column.
+/// This function returns the same set of matching rows projected down
+/// to `file_path` only (~4MB at catalogue scale).
+///
+/// **Parity with the gallery (by construction, not parallel
+/// reimplementation)**: this function builds its predicate via the
+/// shared `build_path_date_predicate` helper and executes via
+/// `execute_file_path_projection_query`, which composes the same
+/// `RAW_JPEG_COLLAPSE_PREDICATE` and `DUPLICATE_GROUP_ID_CASE` /
+/// `DUPLICATE_FILTER_PREDICATE` constants used by
+/// `get_images_for_path_prefix` and `get_image_count_for_filters`.
+/// The set returned here equals the set the gallery would load for
+/// the same `(path_prefix, date_prefix, apply_duplicate_filter,
+/// apply_raw_jpeg_collapse)` tuple.
+///
+/// **Argument polarity**: the caller is responsible for translating
+/// UI booleans to filter booleans (e.g., pass `!show_duplicates` for
+/// `apply_duplicate_filter`). This function does NOT bake that polarity
+/// in — matching the convention of every other filter-aware FFI here.
+///
+/// **Path contract**: `file_path` values are returned EXACTLY as stored
+/// in the catalogue. No normalization, no canonicalization. Order is
+/// UNSPECIFIED — caller must sort if a total order is required.
+///
+/// **Error vs empty**: see `FilePathsResult` doc.
+///
+/// Parameters:
+/// - `path_prefix`: Directory path prefix (empty string for no filter).
+/// - `date_prefix`: Date prefix in `YYYY[:MM[:DD]]` form (empty for no
+///   filter).
+/// - `apply_duplicate_filter`: When true, restrict to one row per
+///   duplicate cluster (caller passes `!show_duplicates`).
+/// - `apply_raw_jpeg_collapse`: When true, suppress RAW siblings of
+///   JPEGs sharing `file_stem` within the same `directory_path`.
+pub async fn get_file_paths_for_filters(
+    path_prefix: String,
+    date_prefix: String,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+) -> FilePathsResult
+{
+    // Acquire lock and validate connection. Catalogue not initialized
+    // is a hard failure — caller must distinguish from "zero matches".
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return FilePathsResult {
+                ok: false,
+                paths: Vec::new(),
+                error_message: Some("catalogue not initialized".to_string()),
+            };
+        }
+    };
+
+    // Build predicate via shared helper (single source of truth for the
+    // four-arm path/date composition — see `build_path_date_predicate`).
+    let predicate = build_path_date_predicate(&path_prefix, &date_prefix);
+
+    match execute_file_path_projection_query(
+        conn,
+        &predicate,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+    )
+    {
+        Ok(paths) => FilePathsResult {
+            ok: true,
+            paths,
+            error_message: None,
+        },
+        Err(msg) => FilePathsResult {
+            ok: false,
+            paths: Vec::new(),
+            error_message: Some(msg),
+        },
+    }
+}
+
+/// A10 (sidebar bulk-copy records enumeration): return the full
+/// `ImageRecord` set matching the gallery's current filter state via
+/// the records-projection helper — no LIMIT/OFFSET, no ORDER BY.
+///
+/// Records-returning sibling of A9's `get_file_paths_for_filters`.
+/// Chosen over A9's path-projection output because the copy planner
+/// (`CopyPlanner.planGroupsWithoutDuplicates` /
+/// `planGroupsWithDuplicates`) consumes `[ImageRecord]` directly —
+/// reusing A9 would require a second round trip to inflate paths back
+/// into records. See A9 doc for the path-projection rationale and its
+/// future-consumer (Query/Filter Builder) marker.
+///
+/// **Parity-by-construction**: shares the same `build_path_date_predicate`
+/// helper and the same filter constants as
+/// `get_images_for_path_prefix` / `get_image_count_for_filters` /
+/// `get_file_paths_for_filters`. A change to any predicate constant
+/// updates every consumer in lockstep — preventing the four-arm match
+/// drift that motivated the Layer B refactor.
+///
+/// **Argument polarity**: caller translates UI booleans to filter
+/// booleans (e.g., pass `!show_duplicates` for `apply_duplicate_filter`).
+/// A10's sidebar callers pass `false, false` — RAW CATALOGUE TRUTH,
+/// independent of the gallery's view preferences.
+///
+/// **Order**: UNSPECIFIED. The planner owns sort order (selection-scoped
+/// dedup + collision naming pass), so returning unsorted rows is correct
+/// and avoids paying for an ORDER BY the consumer would override.
+///
+/// **Error vs empty**: mirrors the established record-returning
+/// convention (NOT the A9 wrapper-dict idiom). Failure returns an empty
+/// `Vec<ImageRecord>` with `eprintln!` diagnostics on the Rust side.
+/// The caller cannot distinguish failure from zero matches, but for the
+/// sidebar bulk-copy flow this is acceptable: an empty result correctly
+/// surfaces in the UI as "nothing to copy" regardless of root cause,
+/// and the diagnostic trail lives in the console log.
+pub async fn get_image_records_for_filters(
+    path_prefix: String,
+    date_prefix: String,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+) -> Vec<ImageRecord>
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let predicate = build_path_date_predicate(&path_prefix, &date_prefix);
+
+    // `execute_image_record_projection_query` returns Vec<ImageRecord>
+    // directly (NOT Result) — matching the established convention of
+    // every other record-returning helper in this file. SQL errors are
+    // logged inside the helper and surface here as an empty Vec, which
+    // the sidebar UI correctly renders as "nothing to copy".
+    execute_image_record_projection_query(
         conn,
         &predicate,
         apply_duplicate_filter,

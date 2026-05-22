@@ -84,6 +84,42 @@ namespace photolibrariancore {
     [Async]
     i64 get_image_count_for_filters(string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
 
+    // A9 (sidebar bulk-copy enumeration foundation): return the set of
+    // `file_path` values matching the gallery's current filter state via
+    // a projection-only query — avoids dragging full ImageRecord rows
+    // across the FFI when only the paths are needed.
+    //
+    // Parity-by-construction: shares the same predicate constants and
+    // assembly path as `get_images_for_path_prefix` /
+    // `get_image_count_for_filters`. Caller is responsible for argument
+    // polarity (e.g., pass `!showDuplicates` for `apply_duplicate_filter`).
+    //
+    // Error vs empty: result.ok == false signals a genuine failure
+    // (catalogue not initialized, prepare/query error) with
+    // error_message populated and paths empty. result.ok == true with an
+    // empty paths sequence is a valid success indicating zero matches.
+    //
+    // Order: unspecified. Path strings are returned exactly as stored.
+    [Async]
+    FilePathsResult get_file_paths_for_filters(string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
+
+    // A10 (sidebar bulk-copy records enumeration): records-returning
+    // sibling of `get_file_paths_for_filters`. Returns the full
+    // `ImageRecord` set matching the current filter state, unordered,
+    // no LIMIT/OFFSET. Consumed by `CopyPlanner.planGroups*` for the
+    // sidebar right-click "Copy To…" flow.
+    //
+    // Mirror of the established record-returning convention: returns
+    // an empty sequence on failure (NOT a wrapper dict). Diagnostics
+    // logged via eprintln! on the Rust side.
+    //
+    // Parity-by-construction with A9 — same predicate builder, same
+    // filter constants. Caller owns argument polarity. Sidebar callers
+    // pass `false, false` (raw catalogue truth, independent of gallery
+    // view preferences).
+    [Async]
+    sequence<ImageRecord> get_image_records_for_filters(string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
+
     // Find the JPEG<->RAW counterpart for an image identified by file_path.
     // Returns the opposite-kind sibling sharing the same parent directory and
     // file-name stem (e.g. given /Pics/IMG_1234.NEF, returns /Pics/IMG_1234.JPG
@@ -241,4 +277,23 @@ dictionary ImageRecord {
     // gallery filter shows only rows where Int64(id) == duplicate_group_id
     // when "Show duplicates" is OFF.
     i64? duplicate_group_id;
+};
+
+// A9: Result wrapper for `get_file_paths_for_filters`.
+//
+// Distinguishes a genuine failure (catalogue not initialized, SQL prepare
+// or query error) from a legitimate empty-result success — required because
+// this codebase signals errors via sentinel/wrapper dictionaries rather
+// than `[Throws]` (consistent with every other FFI surface in the .udl).
+//
+// Contract:
+// - ok == true: query succeeded. `paths` holds the matching file_path
+//   values (possibly empty); `error_message` is null.
+// - ok == false: query failed. `paths` is empty; `error_message` carries
+//   a human-readable diagnostic (also logged via eprintln! on the Rust
+//   side for parallel observability).
+dictionary FilePathsResult {
+    boolean ok;
+    sequence<string> paths;
+    string? error_message;
 };

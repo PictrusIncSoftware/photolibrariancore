@@ -578,6 +578,64 @@ fileprivate struct FfiConverterString: FfiConverter {
 }
 
 
+public struct FilePathsResult: Equatable, Hashable {
+    public var ok: Bool
+    public var paths: [String]
+    public var errorMessage: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(ok: Bool, paths: [String], errorMessage: String?) {
+        self.ok = ok
+        self.paths = paths
+        self.errorMessage = errorMessage
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FilePathsResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFilePathsResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FilePathsResult {
+        return
+            try FilePathsResult(
+                ok: FfiConverterBool.read(from: &buf), 
+                paths: FfiConverterSequenceString.read(from: &buf), 
+                errorMessage: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FilePathsResult, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.ok, into: &buf)
+        FfiConverterSequenceString.write(value.paths, into: &buf)
+        FfiConverterOptionString.write(value.errorMessage, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFilePathsResult_lift(_ buf: RustBuffer) throws -> FilePathsResult {
+    return try FfiConverterTypeFilePathsResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFilePathsResult_lower(_ value: FilePathsResult) -> RustBuffer {
+    return FfiConverterTypeFilePathsResult.lower(value)
+}
+
+
 public struct ImageMetadata: Equatable, Hashable {
     public var filePath: String
     public var fileSize: UInt64
@@ -1366,6 +1424,21 @@ public func getDistinctDirectoryPaths()async  -> [String]  {
             
         )
 }
+public func getFilePathsForFilters(pathPrefix: String, datePrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> FilePathsResult  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_get_file_paths_for_filters(FfiConverterString.lower(pathPrefix),FfiConverterString.lower(datePrefix),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeFilePathsResult_lift,
+            errorHandler: nil
+            
+        )
+}
 public func getFilteredImageCount(datePrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> Int64  {
     return
         try!  await uniffiRustCallAsync(
@@ -1422,6 +1495,21 @@ public func getImageCountForPathPrefix(pathPrefix: String, applyDuplicateFilter:
             completeFunc: ffi_photolibrariancore_rust_future_complete_i64,
             freeFunc: ffi_photolibrariancore_rust_future_free_i64,
             liftFunc: FfiConverterInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+public func getImageRecordsForFilters(pathPrefix: String, datePrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> [ImageRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_get_image_records_for_filters(FfiConverterString.lower(pathPrefix),FfiConverterString.lower(datePrefix),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeImageRecord.lift,
             errorHandler: nil
             
         )
@@ -1569,6 +1657,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_get_distinct_directory_paths() != 54232) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_get_file_paths_for_filters() != 29177) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_get_filtered_image_count() != 33470) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1579,6 +1670,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_image_count_for_path_prefix() != 38666) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_get_image_records_for_filters() != 7922) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_images_filtered() != 37905) {
