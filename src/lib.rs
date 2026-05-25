@@ -1117,6 +1117,118 @@ fn build_path_date_predicate(path_prefix: &str, date_prefix: &str) -> String
     }
 }
 
+/// Escape a string for use as a literal inside a DuckDB `SIMILAR TO`
+/// regex pattern.
+///
+/// `SIMILAR TO` uses POSIX-style regex semantics. The characters that
+/// have regex meaning and therefore need a leading `\` to be matched
+/// literally are: `\ . ^ $ * + ? ( ) [ ] { } |`. Notably, underscore
+/// (`_`) is NOT a wildcard in regex (that is a `LIKE`-ism) — so an
+/// underscore in a filename like `RSW_0001.NEF` is literal under
+/// `SIMILAR TO` without escaping. This is the precise property that
+/// motivated choosing `SIMILAR TO` over `LIKE` for the destination-
+/// family predicate (see `build_destination_family_predicate`): only
+/// the two leading digits in the `NN_version_` prefix should be
+/// wildcards; everything else — including every underscore in the
+/// canonical and in "_version_" itself — must match literally.
+///
+/// Does NOT perform SQL single-quote escaping; callers wrap the result
+/// in `'…'` and must follow with the usual `.replace("'", "''")` at
+/// the assembly site (`build_destination_family_predicate` does both).
+fn regex_escape_for_similar_to(s: &str) -> String
+{
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars()
+    {
+        match c
+        {
+            '\\' | '.' | '^' | '$' | '*' | '+' | '?'
+            | '(' | ')' | '[' | ']' | '{' | '}' | '|' =>
+            {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Build the predicate text for the destination-family catalogue query
+/// used by the cross-plan overwrite-gap fix (Session 30).
+///
+/// The fix turns the destination probe from "is the on-disk file
+/// identical?" into "what does the catalogue already record at this
+/// basePath?" so that `versionCountByBasePath` can be pre-seeded
+/// whenever the canonical destination path is occupied by a DISTINCT
+/// image — not only on the suppression-identical branch as before.
+///
+/// The "family" at a given basePath is the union of:
+/// - the canonical row at `<dir>/<canonical_file_name>`, and
+/// - any version-prefixed rows at `<dir>/NN_version_<canonical_file_name>`
+///   for two leading digits.
+///
+/// **`directory_path` match-by-construction (silent-no-op guard).**
+/// The predicate pivots on the stored `directory_path` column with an
+/// EQUALITY comparison against the SAME `SUBSTRING / LENGTH / INSTR /
+/// REVERSE` expression used at ingest (`INSERT OR IGNORE INTO images
+/// (…, directory_path, …) VALUES (…, SUBSTRING(?1, 1, LENGTH(?1) -
+/// INSTR(REVERSE(?1), '/')), …)` — see the ingest block above). The
+/// caller passes a SAMPLE destination `file_path` (e.g. the planner's
+/// computed `destinationRoot + '/' + 'YYYY/MM_monthname/DD/' +
+/// canonical_file_name`); the helper derives `directory_path` from
+/// THAT string via the same SQL expression. The two strings are
+/// produced by the same expression on inputs that are byte-equal by
+/// construction (the orchestrator catalogues exactly what it wrote),
+/// so the equality cannot silently return empty on a directory_path
+/// drift — there is no Swift-side directory string in flight to drift.
+///
+/// **`SIMILAR TO` with strict digit-only wildcards.** The version-
+/// prefix arm uses `file_name SIMILAR TO '[0-9][0-9]_version_<regex-
+/// escaped-canonical>'`. ONLY the two leading digits are wildcards;
+/// every literal `_` (in `_version_` and inside the canonical) and the
+/// canonical's `.` are matched literally — the latter via
+/// `regex_escape_for_similar_to`. `LIKE` would over-match here because
+/// every `_` in the pattern is a single-char wildcard.
+///
+/// **Returned text (predicate-only convention, decision C3):** WITHOUT
+/// the `WHERE` keyword — `execute_image_record_projection_query`
+/// inserts the keyword when any predicate is active. SQL single-quote
+/// escape (`'` → `''`) is applied to both inputs, matching the call-
+/// site quoting style of `build_path_date_predicate`.
+///
+/// Example with `canonical_file_name = "RSW_0001.NEF"` and
+/// `sample_file_path = "/Volumes/Photos/Library/2026/01_january/15/RSW_0001.NEF"`:
+/// ```sql
+/// directory_path = SUBSTRING('/Volumes/Photos/Library/2026/01_january/15/RSW_0001.NEF', 1,
+///                            LENGTH('/Volumes/Photos/Library/2026/01_january/15/RSW_0001.NEF')
+///                            - INSTR(REVERSE('/Volumes/Photos/Library/2026/01_january/15/RSW_0001.NEF'), '/'))
+///   AND (file_name = 'RSW_0001.NEF' OR file_name SIMILAR TO '[0-9][0-9]_version_RSW_0001\.NEF')
+/// ```
+fn build_destination_family_predicate(sample_file_path: &str, canonical_file_name: &str) -> String
+{
+    let escaped_sample_path = sample_file_path.replace("'", "''");
+    let escaped_canonical_sql = canonical_file_name.replace("'", "''");
+
+    // Regex-escape first (chars with regex meaning), THEN SQL-escape
+    // the result (any embedded single quotes in the canonical). The
+    // two escape layers are independent: regex escaping protects the
+    // SIMILAR TO engine; SQL escaping protects the string-literal
+    // syntax around it.
+    let regex_escaped = regex_escape_for_similar_to(canonical_file_name);
+    let regex_escaped_sql = regex_escaped.replace("'", "''");
+
+    format!(
+        "directory_path = SUBSTRING('{}', 1, LENGTH('{}') - INSTR(REVERSE('{}'), '/')) \
+         AND (file_name = '{}' OR file_name SIMILAR TO '[0-9][0-9]_version_{}')",
+        escaped_sample_path,
+        escaped_sample_path,
+        escaped_sample_path,
+        escaped_canonical_sql,
+        regex_escaped_sql
+    )
+}
+
 /// Execute a paginated `ImageRecord`-returning query against the catalogue.
 ///
 /// Single source of truth for the 32-column SELECT projection (including
@@ -2617,6 +2729,104 @@ pub async fn get_image_records_for_filters(
         &predicate,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+    )
+}
+
+/// Session 30 (cross-plan overwrite-gap fix): return every catalogued
+/// `ImageRecord` in the destination "family" at a given basePath —
+/// i.e. the canonical row at `<dir>/<canonical_file_name>` plus any
+/// version-prefixed rows at `<dir>/NN_version_<canonical_file_name>`.
+///
+/// **Why this exists.** Two sequential removable-storage card imports
+/// of cards each containing distinct-content `RSW_0001.NEF` are two
+/// SEPARATE plans; Card B's planner has no in-plan knowledge of Card
+/// A's already-written file. The shipped `suppressIdenticalAtDestination`
+/// pre-seeded `versionCountByBasePath` ONLY on the suppression
+/// (identical-match) branch — when the on-disk file was a DISTINCT
+/// image (size mismatch → not identical → no pre-seed), the next
+/// distinct tuple got the clean canonical path and the engine's
+/// residual `removeItem`-then-copy SILENTLY OVERWROTE it. See the
+/// "Copy To — Cross-Plan Overwrite Gap" section in CLAUDE.md.
+///
+/// **Design (catalogue-as-truth).** The planner queries the catalogue
+/// for the family at each basePath BEFORE collision naming. The
+/// family count → pre-seed `versionCountByBasePath` (the count is the
+/// number of slots already reserved on disk; a new distinct tuple
+/// must be forced to `(N+1)_version_`). The pre-seed fires
+/// UNCONDITIONALLY of identical-match — no disk-confirm — because the
+/// stakes are asymmetric: an extra seed only forces a `NN_version_`
+/// prefix on a tuple, harmless; a missed seed re-introduces the
+/// overwrite bug. The disk-confirm stays on the SUPPRESSION decision
+/// (planner's existing identical-at-destination check), where stale-
+/// catalogue stakes are real ("skip a copy that should occur").
+///
+/// **Parity-by-construction with ingest.** The predicate built by
+/// `build_destination_family_predicate` pivots on `directory_path`
+/// EQUALITY against `SUBSTRING(?1, 1, LENGTH(?1) - INSTR(REVERSE(?1),
+/// '/'))` applied to a sample destination `file_path` — the SAME
+/// expression used at ingest time (see the `insert_sql` block above,
+/// `directory_path` column). The caller passes a sample destination
+/// `file_path` (e.g. the planner's computed `destinationRoot + '/' +
+/// 'YYYY/MM_monthname/DD/' + canonical_file_name`); Rust derives
+/// `directory_path` from THAT string via the same SQL. There is no
+/// Swift-computed directory string in flight to drift; the equality
+/// cannot silently return empty. (Item #3 in the Session-30 read-and-
+/// confirm — match-by-construction or no fix.)
+///
+/// **Filters: catalogue truth, not gallery view.** Passes `false,
+/// false` to `execute_image_record_projection_query` — neither the
+/// duplicate filter nor the RAW+JPEG collapse predicate may suppress
+/// rows here. The family is the catalogue's complete record of what
+/// occupies the basePath; gallery view preferences are irrelevant to
+/// "what does disk hold?". Matches the A10 sidebar-copy convention.
+///
+/// **Order**: UNSPECIFIED. The planner counts (and inspects for
+/// existing `NN_version_*` to pre-seed HIGHER than 1 — handled Swift-
+/// side); sort order is not part of the contract.
+///
+/// **Error vs empty**: mirrors the established record-returning
+/// convention (NOT the A9 wrapper-dict idiom — see
+/// `get_image_records_for_filters`). Failure returns an empty
+/// `Vec<ImageRecord>` with `eprintln!` diagnostics on the Rust side.
+/// For the planner's pre-seed flow, empty-on-failure degrades
+/// gracefully to "no family found" → no pre-seed (the pre-fix
+/// behavior) — the planner does not get worse than before in the
+/// failure mode.
+///
+/// Parameters:
+/// - sample_file_path: a sample destination `file_path` whose
+///   `directory_path` (via SUBSTRING/INSTR/REVERSE on this string) is
+///   the basePath directory to query. Typically the planner's
+///   computed canonical destination path; need not refer to an
+///   actually-catalogued row.
+/// - canonical_file_name: the canonical (un-prefixed) filename for
+///   the basePath collision group, e.g. `RSW_0001.NEF`.
+pub async fn get_destination_family_records(
+    sample_file_path: String,
+    canonical_file_name: String,
+) -> Vec<ImageRecord>
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let predicate = build_destination_family_predicate(
+        &sample_file_path,
+        &canonical_file_name,
+    );
+
+    execute_image_record_projection_query(
+        conn,
+        &predicate,
+        false,
+        false,
     )
 }
 

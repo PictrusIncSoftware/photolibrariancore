@@ -120,6 +120,30 @@ namespace photolibrariancore {
     [Async]
     sequence<ImageRecord> get_image_records_for_filters(string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
 
+    // Session 30 (cross-plan overwrite-gap fix): return the destination
+    // "family" at a given basePath — canonical row + any NN_version_
+    // siblings (two leading digits) in the same directory_path. Used by
+    // CopyPlanner to pre-seed versionCountByBasePath from the catalogue,
+    // closing the silent-overwrite seam between sequential copy plans
+    // (e.g. two card imports). See get_destination_family_records doc
+    // in lib.rs and the "Copy To — Cross-Plan Overwrite Gap" section
+    // in CLAUDE.md.
+    //
+    // sample_file_path: a sample destination file_path string. Rust
+    // derives directory_path from it via the SAME SUBSTRING/INSTR/REVERSE
+    // expression used at ingest — match-by-construction, no Swift-side
+    // directory string in flight to drift.
+    //
+    // canonical_file_name: the unprefixed canonical filename for the
+    // basePath collision group, e.g. "RSW_0001.NEF".
+    //
+    // Returns: every catalogued ImageRecord in the family, in
+    // UNSPECIFIED order. Empty Vec on failure (matches the established
+    // record-returning convention). Bypasses the duplicate filter and
+    // RAW+JPEG collapse — catalogue truth, not gallery view.
+    [Async]
+    sequence<ImageRecord> get_destination_family_records(string sample_file_path, string canonical_file_name);
+
     // Find the JPEG<->RAW counterpart for an image identified by file_path.
     // Returns the opposite-kind sibling sharing the same parent directory and
     // file-name stem (e.g. given /Pics/IMG_1234.NEF, returns /Pics/IMG_1234.JPG
