@@ -1394,6 +1394,21 @@ public func getAllImages(limit: UInt32, offset: UInt32, applyDuplicateFilter: Bo
             
         )
 }
+public func getDestinationFamilyRecords(sampleFilePath: String, canonicalFileName: String)async  -> [ImageRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_get_destination_family_records(FfiConverterString.lower(sampleFilePath),FfiConverterString.lower(canonicalFileName)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeImageRecord.lift,
+            errorHandler: nil
+            
+        )
+}
 public func getDistinctDateStrings()async  -> [String]  {
     return
         try!  await uniffiRustCallAsync(
@@ -1661,6 +1676,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_all_images() != 32796) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_get_destination_family_records() != 13287) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_distinct_date_strings() != 13981) {
