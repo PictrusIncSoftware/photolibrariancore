@@ -1623,6 +1623,21 @@ public func parseFilename(fileName: String) -> ParsedFilename  {
     )
 })
 }
+public func removeImagesForFilters(pathPrefix: String, datePrefix: String)async  -> Int64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_remove_images_for_filters(FfiConverterString.lower(pathPrefix),FfiConverterString.lower(datePrefix)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_i64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_i64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_i64,
+            liftFunc: FfiConverterInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func updateImageRating(filePath: String, rating: UInt32)async  -> Bool  {
     return
         try!  await uniffiRustCallAsync(
@@ -1727,6 +1742,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_parse_filename() != 30612) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_remove_images_for_filters() != 12960) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_image_rating() != 15118) {

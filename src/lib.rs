@@ -2732,6 +2732,72 @@ pub async fn get_image_records_for_filters(
     )
 }
 
+/// Session 31: catalogue-only bulk DELETE for the Sources sidebar's
+/// "Remove from Catalogue" context-menu action. Removes every row
+/// matching the same path/date predicate the gallery reader uses —
+/// touches NO files and NO thumbnails.
+///
+/// **Predicate parity-by-construction.** Reuses
+/// `build_path_date_predicate`, the same builder consumed by
+/// `get_image_records_for_filters` and the rest of the A10 family.
+/// The set of rows deleted is, by construction, the set of rows that
+/// would have been listed at that sidebar node. A future change to
+/// the predicate updates reader and remover in lockstep.
+///
+/// **Safety guard: empty-predicate refusal.** When both prefixes are
+/// empty, `build_path_date_predicate` returns the empty string. We
+/// refuse the call and return 0 rather than emit
+/// `DELETE FROM images WHERE ` (syntax error) — and, more importantly,
+/// we never want a future caller change to silently produce
+/// `DELETE FROM images` (full catalogue wipe). The current Sources
+/// caller always passes a non-empty path_prefix, so this guard never
+/// fires in practice; it exists to bound the blast radius.
+///
+/// **Return.** Number of rows deleted, as i64. Returns 0 on every
+/// failure mode (catalogue not initialized, empty-predicate refusal,
+/// SQL error) — mirroring the failure-as-zero convention of
+/// `get_image_count_for_path_prefix`. Diagnostic detail goes to
+/// stderr. The caller cannot distinguish "zero matched" from "error";
+/// the Swift trace and the post-remove notification carry the user-
+/// facing surface, and a zero return correctly produces no UI change.
+pub async fn remove_images_for_filters(
+    path_prefix: String,
+    date_prefix: String,
+) -> i64
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    let predicate = build_path_date_predicate(&path_prefix, &date_prefix);
+    if predicate.is_empty()
+    {
+        eprintln!(
+            "remove_images_for_filters refused: empty predicate \
+             (path_prefix and date_prefix both empty)"
+        );
+        return 0;
+    }
+
+    let delete_sql = format!("DELETE FROM images WHERE {}", predicate);
+    match conn.execute(&delete_sql, [])
+    {
+        Ok(rows_changed) => rows_changed as i64,
+        Err(e) =>
+        {
+            eprintln!("remove_images_for_filters DELETE failed: {}", e);
+            0
+        }
+    }
+}
+
 /// Session 30 (cross-plan overwrite-gap fix): return every catalogued
 /// `ImageRecord` in the destination "family" at a given basePath —
 /// i.e. the canonical row at `<dir>/<canonical_file_name>` plus any

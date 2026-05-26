@@ -120,6 +120,25 @@ namespace photolibrariancore {
     [Async]
     sequence<ImageRecord> get_image_records_for_filters(string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
 
+    // Session 31: catalogue-only bulk DELETE for the Sources sidebar's
+    // "Remove from Catalogue" context-menu action. Deletes every row
+    // matching the SAME path/date predicate `get_image_records_for_filters`
+    // would have read — predicate parity-by-construction via the shared
+    // `build_path_date_predicate` builder. Touches NO files, NO thumbnails.
+    //
+    // Safety guard: if both prefixes are empty (would yield an empty
+    // WHERE clause and risk a catalogue wipe), the call is refused and
+    // 0 is returned. The Sources caller always passes a non-empty
+    // path_prefix; the guard exists to bound the blast radius for any
+    // future caller that drifts.
+    //
+    // Returns: number of rows deleted, as i64. Returns 0 on any failure
+    // (catalogue uninitialized, empty-predicate refusal, SQL error) —
+    // mirroring `get_image_count_for_path_prefix`'s failure-as-zero
+    // convention. Diagnostic detail goes to stderr.
+    [Async]
+    i64 remove_images_for_filters(string path_prefix, string date_prefix);
+
     // Session 30 (cross-plan overwrite-gap fix): return the destination
     // "family" at a given basePath — canonical row + any NN_version_
     // siblings (two leading digits) in the same directory_path. Used by
