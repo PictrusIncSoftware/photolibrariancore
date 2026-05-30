@@ -38,6 +38,19 @@ namespace photolibrariancore {
     [Async]
     boolean update_image_rating(string file_path, u32 rating);
 
+    // Update the pick/reject flag for an image identified by file path
+    // flag: "pick" or "reject"; null (or any value outside that set) clears the flag
+    // Returns true on success, false on failure (incl. an invalid non-null value)
+    [Async]
+    boolean update_image_flag(string file_path, string? flag);
+
+    // Update the color label for an image identified by file path
+    // color_label: "red"/"yellow"/"green"/"blue"/"purple"; null (or any value
+    // outside that set) clears the label
+    // Returns true on success, false on failure (incl. an invalid non-null value)
+    [Async]
+    boolean update_image_color_label(string file_path, string? color_label);
+
     // Update the rotation angle for an image identified by file path
     // degrees: Rotation angle in degrees (0, 90, 180, or 270)
     // Returns true on success, false on failure

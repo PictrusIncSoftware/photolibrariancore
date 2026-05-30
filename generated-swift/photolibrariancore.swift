@@ -1638,6 +1638,36 @@ public func removeImagesForFilters(pathPrefix: String, datePrefix: String)async 
             
         )
 }
+public func updateImageColorLabel(filePath: String, colorLabel: String?)async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_update_image_color_label(FfiConverterString.lower(filePath),FfiConverterOptionString.lower(colorLabel)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_i8,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_i8,
+            freeFunc: ffi_photolibrariancore_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
+        )
+}
+public func updateImageFlag(filePath: String, flag: String?)async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_update_image_flag(FfiConverterString.lower(filePath),FfiConverterOptionString.lower(flag)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_i8,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_i8,
+            freeFunc: ffi_photolibrariancore_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
+        )
+}
 public func updateImageRating(filePath: String, rating: UInt32)async  -> Bool  {
     return
         try!  await uniffiRustCallAsync(
@@ -1745,6 +1775,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_remove_images_for_filters() != 12960) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_update_image_color_label() != 55337) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_update_image_flag() != 990) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_image_rating() != 15118) {

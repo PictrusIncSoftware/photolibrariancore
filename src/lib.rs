@@ -2072,6 +2072,119 @@ pub async fn update_image_rating(file_path: String, rating: u32) -> bool {
     }
 }
 
+/// Update the pick/reject flag for an image
+///
+/// Sets the flag ("pick" or "reject") for an image identified by its file path.
+/// Mirrors `update_image_rating`. Passing None clears the flag (sets it to NULL).
+///
+/// A non-null value OUTSIDE the canonical set {"pick", "reject"} is REJECTED
+/// (returns false) rather than silently written, so the indexed `flag` column
+/// can never hold a garbage value. This canonical set is also the stable
+/// interchange vocabulary for a future Lightroom-catalogue import.
+///
+/// Returns:
+/// - true if update succeeded
+/// - false if catalogue not initialized, file not found, query failed, or an
+///   invalid non-null value was supplied
+pub async fn update_image_flag(file_path: String, flag: Option<String>) -> bool {
+    // Acquire lock and validate connection
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return false;
+        }
+    };
+
+    // Validate against the canonical set; None clears.
+    let flag_value: Option<String> = match flag.as_deref() {
+        None => None,
+        Some(v @ ("pick" | "reject")) => Some(v.to_string()),
+        Some(other) => {
+            eprintln!("Rejected invalid flag value '{}' for {}", other, file_path);
+            return false;
+        }
+    };
+
+    let update_sql = "UPDATE images SET flag = ? WHERE file_path = ?";
+
+    match conn.execute(update_sql, params![flag_value, file_path]) {
+        Ok(changed) => {
+            if changed == 0 {
+                // No rows updated - file path not found
+                eprintln!("No image found with file_path: {}", file_path);
+                false
+            } else {
+                // Successfully updated
+                true
+            }
+        }
+        Err(e) => {
+            // Log error but don't crash
+            eprintln!("Failed to update flag for {}: {}", file_path, e);
+            false
+        }
+    }
+}
+
+/// Update the color label for an image
+///
+/// Sets the color label for an image identified by its file path. Mirrors
+/// `update_image_rating`. Passing None clears the label (sets it to NULL).
+///
+/// A non-null value OUTSIDE the canonical set
+/// {"red", "yellow", "green", "blue", "purple"} is REJECTED (returns false)
+/// rather than silently written, so the indexed `color_label` column can never
+/// hold a garbage value. This canonical set is also the stable interchange
+/// vocabulary for a future Lightroom-catalogue import.
+///
+/// Returns:
+/// - true if update succeeded
+/// - false if catalogue not initialized, file not found, query failed, or an
+///   invalid non-null value was supplied
+pub async fn update_image_color_label(file_path: String, color_label: Option<String>) -> bool {
+    // Acquire lock and validate connection
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return false;
+        }
+    };
+
+    // Validate against the canonical set; None clears.
+    let label_value: Option<String> = match color_label.as_deref() {
+        None => None,
+        Some(v @ ("red" | "yellow" | "green" | "blue" | "purple")) => Some(v.to_string()),
+        Some(other) => {
+            eprintln!("Rejected invalid color label '{}' for {}", other, file_path);
+            return false;
+        }
+    };
+
+    let update_sql = "UPDATE images SET color_label = ? WHERE file_path = ?";
+
+    match conn.execute(update_sql, params![label_value, file_path]) {
+        Ok(changed) => {
+            if changed == 0 {
+                // No rows updated - file path not found
+                eprintln!("No image found with file_path: {}", file_path);
+                false
+            } else {
+                // Successfully updated
+                true
+            }
+        }
+        Err(e) => {
+            // Log error but don't crash
+            eprintln!("Failed to update color label for {}: {}", file_path, e);
+            false
+        }
+    }
+}
+
 /// Update the rotation angle for an image
 ///
 /// Sets the rotation angle (0, 90, 180, or 270 degrees) for an image identified by its file path.
