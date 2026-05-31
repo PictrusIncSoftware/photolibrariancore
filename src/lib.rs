@@ -2410,6 +2410,38 @@ fn build_filter_predicate(predicates: &[QueryPredicate], connectors: &[Connector
     format!("({})", acc)
 }
 
+/// The Browse default row order: capture date newest-first. Used for the empty
+/// filter and for any first-subject that doesn't define its own order.
+const DEFAULT_FILTER_ORDER_BY: &str = "capture_datetime DESC NULLS LAST, created_timestamp DESC";
+
+/// First-subject-rating order: stars high-to-low, then newest-first as the
+/// tie-break (and a stable final key).
+const RATING_FILTER_ORDER_BY: &str =
+    "rating DESC NULLS LAST, capture_datetime DESC NULLS LAST, created_timestamp DESC";
+
+/// Choose the `ORDER BY` for a filtered query from the FIRST predicate's
+/// subject — the Session-44 "first filter subject drives the sort" rule:
+///   - rating-first  → stars best-to-worst (`rating DESC`)
+///   - date-first    → newest-first (the default — `capture_datetime DESC`)
+///   - flag/color-first, or no filter → the default (newest-first)
+///
+/// This only affects WHICH rows land on each page and the default display
+/// order; the Swift side still allows page-local column re-sorting on top.
+/// `count_query_images` needs no order, so it is unaffected (count/page parity
+/// is about the WHERE, not the ORDER BY).
+fn order_by_for_filter(predicates: &[QueryPredicate]) -> &'static str
+{
+    match predicates.first()
+    {
+        Some(p) => match p.kind.as_str()
+        {
+            "rating" | "rating_unrated" => RATING_FILTER_ORDER_BY,
+            _ => DEFAULT_FILTER_ORDER_BY,
+        },
+        None => DEFAULT_FILTER_ORDER_BY,
+    }
+}
+
 /// Filter / Query Builder — paginated records matching a structured filter.
 ///
 /// Builds ONE predicate string (left-to-right connectors) and delegates to the
@@ -2438,11 +2470,12 @@ pub async fn query_images(
     };
 
     let where_clause = build_filter_predicate(&predicates, &connectors);
+    let order_by = order_by_for_filter(&predicates);
 
     execute_image_record_query(
         conn,
         &where_clause,
-        "capture_datetime DESC NULLS LAST, created_timestamp DESC",
+        order_by,
         limit as i64,
         offset as i64,
         apply_duplicate_filter,
@@ -2589,6 +2622,26 @@ mod query_builder_tests
     fn empty_predicates_no_where()
     {
         assert_eq!(build_filter_predicate(&[], &[]), "");
+    }
+
+    #[test]
+    fn order_by_follows_first_subject()
+    {
+        // Rating-first → stars best-to-worst.
+        assert_eq!(order_by_for_filter(&[rating("gte", 4)]), RATING_FILTER_ORDER_BY);
+        assert_eq!(order_by_for_filter(&[qp("rating_unrated")]), RATING_FILTER_ORDER_BY);
+        // The FIRST subject wins even when rating appears later.
+        assert_eq!(
+            order_by_for_filter(&[flag("pick"), rating("gte", 4)]),
+            DEFAULT_FILTER_ORDER_BY
+        );
+        // Date-, flag-, color-first, and empty → the default newest-first.
+        let mut d = qp("date_after");
+        d.day = Some("2026:05:15".to_string());
+        assert_eq!(order_by_for_filter(&[d]), DEFAULT_FILTER_ORDER_BY);
+        assert_eq!(order_by_for_filter(&[flag("pick")]), DEFAULT_FILTER_ORDER_BY);
+        assert_eq!(order_by_for_filter(&[color("red")]), DEFAULT_FILTER_ORDER_BY);
+        assert_eq!(order_by_for_filter(&[]), DEFAULT_FILTER_ORDER_BY);
     }
 
     #[test]
