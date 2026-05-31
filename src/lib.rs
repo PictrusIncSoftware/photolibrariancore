@@ -2328,10 +2328,22 @@ fn predicate_to_sql(p: &QueryPredicate) -> String
                 format!("(SUBSTRING(capture_datetime, 1, 10) >= '{}')", d.replace('\'', "''")),
             _ => bad(),
         },
-        "date_before" => match p.day.as_deref() // on or before
+        "date_before" => match p.day.as_deref() // on or before (<=)
         {
             Some(d) if is_valid_day(d) =>
                 format!("(SUBSTRING(capture_datetime, 1, 10) <= '{}')", d.replace('\'', "''")),
+            _ => bad(),
+        },
+        "date_gt" => match p.day.as_deref() // strictly after (>)
+        {
+            Some(d) if is_valid_day(d) =>
+                format!("(SUBSTRING(capture_datetime, 1, 10) > '{}')", d.replace('\'', "''")),
+            _ => bad(),
+        },
+        "date_lt" => match p.day.as_deref() // strictly before (<)
+        {
+            Some(d) if is_valid_day(d) =>
+                format!("(SUBSTRING(capture_datetime, 1, 10) < '{}')", d.replace('\'', "''")),
             _ => bad(),
         },
         "rating" => match (p.op.as_deref(), p.stars)
@@ -2531,6 +2543,35 @@ mod query_builder_tests
         let mut fou = qp("flag_or_unflagged");
         fou.value = Some("pick".to_string());
         assert_eq!(predicate_to_sql(&fou), "(flag = 'pick' OR flag IS NULL)");
+    }
+
+    #[test]
+    fn date_atoms()
+    {
+        let mut eq = qp("date_equals");
+        eq.day = Some("2026:05:15".to_string());
+        assert_eq!(predicate_to_sql(&eq), "(SUBSTRING(capture_datetime, 1, 10) = '2026:05:15')");
+
+        let mut ge = qp("date_after");
+        ge.day = Some("2026:05:15".to_string());
+        assert_eq!(predicate_to_sql(&ge), "(SUBSTRING(capture_datetime, 1, 10) >= '2026:05:15')");
+
+        let mut le = qp("date_before");
+        le.day = Some("2026:05:15".to_string());
+        assert_eq!(predicate_to_sql(&le), "(SUBSTRING(capture_datetime, 1, 10) <= '2026:05:15')");
+
+        let mut gt = qp("date_gt");
+        gt.day = Some("2026:05:15".to_string());
+        assert_eq!(predicate_to_sql(&gt), "(SUBSTRING(capture_datetime, 1, 10) > '2026:05:15')");
+
+        let mut lt = qp("date_lt");
+        lt.day = Some("2026:05:15".to_string());
+        assert_eq!(predicate_to_sql(&lt), "(SUBSTRING(capture_datetime, 1, 10) < '2026:05:15')");
+
+        let mut bt = qp("date_between");
+        bt.day = Some("2026:01:01".to_string());
+        bt.day_end = Some("2026:03:31".to_string());
+        assert_eq!(predicate_to_sql(&bt), "(SUBSTRING(capture_datetime, 1, 10) BETWEEN '2026:01:01' AND '2026:03:31')");
     }
 
     #[test]
