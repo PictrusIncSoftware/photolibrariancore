@@ -51,6 +51,30 @@ namespace photolibrariancore {
     [Async]
     boolean update_image_color_label(string file_path, string? color_label);
 
+    // ---- Filter / Query Builder (structured query) ----
+    // Build a dynamic WHERE from a list of filter segments joined LEFT-TO-
+    // RIGHT by connectors (predicates.len() == connectors.len() + 1).
+    // Delegates to the SAME record/count helpers as every other query, so
+    // count/page parity holds by construction. Default sort
+    // (capture_datetime DESC). See DESIGN-Filter-Query-Builder.md.
+    [Async]
+    sequence<ImageRecord> query_images(
+        sequence<QueryPredicate> predicates,
+        sequence<Connector> connectors,
+        u32 limit,
+        u32 offset,
+        boolean apply_duplicate_filter,
+        boolean apply_raw_jpeg_collapse
+    );
+
+    [Async]
+    u64 count_query_images(
+        sequence<QueryPredicate> predicates,
+        sequence<Connector> connectors,
+        boolean apply_duplicate_filter,
+        boolean apply_raw_jpeg_collapse
+    );
+
     // Update the rotation angle for an image identified by file path
     // degrees: Rotation angle in degrees (0, 90, 180, or 270)
     // Returns true on success, false on failure
@@ -234,6 +258,40 @@ enum ImageKind {
     "Raw",
     "Other",
     "Heif",
+};
+
+// Boolean connector between two filter segments (Query Builder), applied
+// LEFT-TO-RIGHT (no operator precedence). Variant ORDER must match the Rust
+// `enum Connector` (UniFFI maps by position).
+enum Connector {
+    "And",
+    "Or",
+    "Xor",
+};
+
+// One filter segment (one clause of the filter sentence), flattened for the
+// FFI. `kind` selects which fields are meaningful; the Swift side holds the
+// strong FilterSegment type and serializes to this. Modelled as a dictionary
+// (not an associated-data enum) to use only UDL features the project already
+// relies on. See DESIGN-Filter-Query-Builder.md §10 for the kind→fields map:
+//   "date_equals"       → day
+//   "date_between"      → day (start), day_end (end)
+//   "date_after"        → day            (on or after)
+//   "date_before"       → day            (on or before)
+//   "rating"            → op (eq/gt/lt/gte/lte), stars (1..5)
+//   "rating_unrated"    → (none)
+//   "flag"              → value ("pick"/"reject")
+//   "flag_or_unflagged" → value ("pick"/"reject")  → value OR NULL
+//   "unflagged"         → (none)
+//   "color"             → value ("red".."purple")
+//   "no_color"          → (none)
+dictionary QueryPredicate {
+    string kind;
+    string? day;
+    string? day_end;
+    string? op;
+    u8? stars;
+    string? value;
 };
 
 // Parsed components of a filename, returned by parse_filename.

@@ -248,6 +248,11 @@ typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t, UniffiForeignFutureRes
 RustBuffer uniffi_photolibrariancore_fn_func_classify_extension(RustBuffer ext, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_COUNT_QUERY_IMAGES
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_COUNT_QUERY_IMAGES
+uint64_t uniffi_photolibrariancore_fn_func_count_query_images(RustBuffer predicates, RustBuffer connectors, int8_t apply_duplicate_filter, int8_t apply_raw_jpeg_collapse
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_FIND_COUNTERPART_IMAGE
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_FIND_COUNTERPART_IMAGE
 uint64_t uniffi_photolibrariancore_fn_func_find_counterpart_image(RustBuffer file_path
@@ -345,6 +350,11 @@ uint64_t uniffi_photolibrariancore_fn_func_initialize_catalogue(RustBuffer catal
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_PARSE_FILENAME
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_PARSE_FILENAME
 RustBuffer uniffi_photolibrariancore_fn_func_parse_filename(RustBuffer file_name, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_QUERY_IMAGES
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_QUERY_IMAGES
+uint64_t uniffi_photolibrariancore_fn_func_query_images(RustBuffer predicates, RustBuffer connectors, uint32_t limit, uint32_t offset, int8_t apply_duplicate_filter, int8_t apply_raw_jpeg_collapse
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_REMOVE_IMAGES_FOR_FILTERS
@@ -638,6 +648,12 @@ uint16_t uniffi_photolibrariancore_checksum_func_classify_extension(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_COUNT_QUERY_IMAGES
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_COUNT_QUERY_IMAGES
+uint16_t uniffi_photolibrariancore_checksum_func_count_query_images(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_FIND_COUNTERPART_IMAGE
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_FIND_COUNTERPART_IMAGE
 uint16_t uniffi_photolibrariancore_checksum_func_find_counterpart_image(void
@@ -749,6 +765,12 @@ uint16_t uniffi_photolibrariancore_checksum_func_initialize_catalogue(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_PARSE_FILENAME
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_PARSE_FILENAME
 uint16_t uniffi_photolibrariancore_checksum_func_parse_filename(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_QUERY_IMAGES
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_QUERY_IMAGES
+uint16_t uniffi_photolibrariancore_checksum_func_query_images(void
     
 );
 #endif

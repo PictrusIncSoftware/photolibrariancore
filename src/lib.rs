@@ -2208,6 +2208,378 @@ pub async fn update_image_color_label(file_path: String, color_label: Option<Str
     }
 }
 
+// ============================================================================
+// Filter / Query Builder — structured query (see DESIGN-Filter-Query-Builder.md)
+// ============================================================================
+
+/// A boolean connector between two filter segments, applied LEFT-TO-RIGHT.
+/// Variant ORDER must match the UDL `enum Connector` (UniFFI maps by position).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Connector
+{
+    And,
+    Or,
+    Xor,
+}
+
+/// One filter segment, flattened for the FFI. `kind` selects which fields are
+/// meaningful; the Swift side holds the strong `FilterSegment` type and
+/// serializes to this. See the UDL `dictionary QueryPredicate` for the
+/// kind→fields map.
+#[derive(Debug, Clone)]
+pub struct QueryPredicate
+{
+    pub kind: String,
+    pub day: Option<String>,
+    pub day_end: Option<String>,
+    pub op: Option<String>,
+    pub stars: Option<u8>,
+    pub value: Option<String>,
+}
+
+/// Validate a day string as exactly `YYYY:MM:DD` (10 chars; colons at index 4
+/// and 7; digits elsewhere) — the form produced by `SUBSTRING(capture_datetime,
+/// 1, 10)`. Because only digits + colons can pass, a validated day cannot carry
+/// a SQL-injection payload (defense-in-depth on top of Swift-side validation).
+fn is_valid_day(s: &str) -> bool
+{
+    let b = s.as_bytes();
+    if b.len() != 10
+    {
+        return false;
+    }
+    for (i, &c) in b.iter().enumerate()
+    {
+        let ok = if i == 4 || i == 7 { c == b':' } else { c.is_ascii_digit() };
+        if !ok
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_valid_flag(s: &str) -> bool
+{
+    matches!(s, "pick" | "reject")
+}
+
+fn is_valid_color(s: &str) -> bool
+{
+    matches!(s, "red" | "yellow" | "green" | "blue" | "purple")
+}
+
+/// Map a rating comparison op token to its SQL symbol. Unknown → None.
+fn sql_compare_op(op: &str) -> Option<&'static str>
+{
+    match op
+    {
+        "eq" => Some("="),
+        "gt" => Some(">"),
+        "lt" => Some("<"),
+        "gte" => Some(">="),
+        "lte" => Some("<="),
+        _ => None,
+    }
+}
+
+/// SQL for a connector. XOR is boolean inequality (`<>`) — exactly-one-true.
+fn connector_sql(c: &Connector) -> &'static str
+{
+    match c
+    {
+        Connector::And => "AND",
+        Connector::Or => "OR",
+        Connector::Xor => "<>",
+    }
+}
+
+/// Translate ONE filter segment into a parenthesized boolean SQL atom.
+///
+/// Every value is validated against its canonical set / format and single-
+/// quote-escaped before interpolation; an invalid or malformed segment becomes
+/// `(FALSE)` (matches nothing) rather than risking malformed or unsafe SQL.
+/// Swift validates before sending, so `(FALSE)` is a defensive backstop.
+fn predicate_to_sql(p: &QueryPredicate) -> String
+{
+    // A segment that should match nothing (invalid input backstop).
+    let bad = || "(FALSE)".to_string();
+
+    match p.kind.as_str()
+    {
+        "date_equals" => match p.day.as_deref()
+        {
+            Some(d) if is_valid_day(d) =>
+                format!("(SUBSTRING(capture_datetime, 1, 10) = '{}')", d.replace('\'', "''")),
+            _ => bad(),
+        },
+        "date_between" => match (p.day.as_deref(), p.day_end.as_deref())
+        {
+            (Some(a), Some(b)) if is_valid_day(a) && is_valid_day(b) => format!(
+                "(SUBSTRING(capture_datetime, 1, 10) BETWEEN '{}' AND '{}')",
+                a.replace('\'', "''"),
+                b.replace('\'', "''")
+            ),
+            _ => bad(),
+        },
+        "date_after" => match p.day.as_deref() // on or after
+        {
+            Some(d) if is_valid_day(d) =>
+                format!("(SUBSTRING(capture_datetime, 1, 10) >= '{}')", d.replace('\'', "''")),
+            _ => bad(),
+        },
+        "date_before" => match p.day.as_deref() // on or before
+        {
+            Some(d) if is_valid_day(d) =>
+                format!("(SUBSTRING(capture_datetime, 1, 10) <= '{}')", d.replace('\'', "''")),
+            _ => bad(),
+        },
+        "rating" => match (p.op.as_deref(), p.stars)
+        {
+            (Some(op), Some(stars)) if (1..=5).contains(&stars) => match sql_compare_op(op)
+            {
+                Some(sym) => format!("(rating {} {})", sym, stars),
+                None => bad(),
+            },
+            _ => bad(),
+        },
+        "rating_unrated" => "(rating IS NULL)".to_string(),
+        "flag" => match p.value.as_deref()
+        {
+            Some(v) if is_valid_flag(v) => format!("(flag = '{}')", v.replace('\'', "''")),
+            _ => bad(),
+        },
+        "flag_or_unflagged" => match p.value.as_deref()
+        {
+            Some(v) if is_valid_flag(v) =>
+                format!("(flag = '{}' OR flag IS NULL)", v.replace('\'', "''")),
+            _ => bad(),
+        },
+        "unflagged" => "(flag IS NULL)".to_string(),
+        "color" => match p.value.as_deref()
+        {
+            Some(v) if is_valid_color(v) => format!("(color_label = '{}')", v.replace('\'', "''")),
+            _ => bad(),
+        },
+        "no_color" => "(color_label IS NULL)".to_string(),
+        other =>
+        {
+            eprintln!("Unknown query predicate kind '{}'", other);
+            bad()
+        }
+    }
+}
+
+/// Assemble the filter segments into ONE predicate string, folding LEFT-TO-
+/// RIGHT: `((A op B) op C) …` — no operator precedence, exactly as the filter
+/// sentence reads. Empty when there are no predicates (→ all rows).
+///
+/// The whole accumulation is wrapped in an outer paren so the record/count
+/// helpers can AND it with the RAW+JPEG-collapse predicate without precedence
+/// surprises (AND binds tighter than OR; an unwrapped trailing OR would wrongly
+/// bind the collapse predicate to only the last branch).
+fn build_filter_predicate(predicates: &[QueryPredicate], connectors: &[Connector]) -> String
+{
+    if predicates.is_empty()
+    {
+        return String::new();
+    }
+
+    let mut acc = predicate_to_sql(&predicates[0]);
+    for i in 1..predicates.len()
+    {
+        // connectors[i-1] joins the running result with segment i. Swift
+        // sends predicates.len()-1 connectors; default to AND if short.
+        let op = connectors.get(i - 1).map(connector_sql).unwrap_or("AND");
+        let next = predicate_to_sql(&predicates[i]);
+        acc = format!("({}) {} ({})", acc, op, next);
+    }
+
+    format!("({})", acc)
+}
+
+/// Filter / Query Builder — paginated records matching a structured filter.
+///
+/// Builds ONE predicate string (left-to-right connectors) and delegates to the
+/// shared `execute_image_record_query` helper — the SAME helper every other
+/// record query uses — so count/page parity with `count_query_images` holds by
+/// construction. Default sort. The two filter booleans compose orthogonally,
+/// unchanged. Empty predicate list → all rows.
+pub async fn query_images(
+    predicates: Vec<QueryPredicate>,
+    connectors: Vec<Connector>,
+    limit: u32,
+    offset: u32,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+) -> Vec<ImageRecord>
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let where_clause = build_filter_predicate(&predicates, &connectors);
+
+    execute_image_record_query(
+        conn,
+        &where_clause,
+        "capture_datetime DESC NULLS LAST, created_timestamp DESC",
+        limit as i64,
+        offset as i64,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+    )
+}
+
+/// Filter / Query Builder — total matching count for the SAME filter, via the
+/// shared `execute_image_count_query` helper (parity by construction).
+pub async fn count_query_images(
+    predicates: Vec<QueryPredicate>,
+    connectors: Vec<Connector>,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+) -> u64
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    let where_clause = build_filter_predicate(&predicates, &connectors);
+
+    let count = execute_image_count_query(
+        conn,
+        &where_clause,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+    );
+
+    if count < 0 { 0 } else { count as u64 }
+}
+
+#[cfg(test)]
+mod query_builder_tests
+{
+    use super::*;
+
+    fn qp(kind: &str) -> QueryPredicate
+    {
+        QueryPredicate
+        {
+            kind: kind.to_string(),
+            day: None,
+            day_end: None,
+            op: None,
+            stars: None,
+            value: None,
+        }
+    }
+
+    fn rating(op: &str, stars: u8) -> QueryPredicate
+    {
+        let mut p = qp("rating");
+        p.op = Some(op.to_string());
+        p.stars = Some(stars);
+        p
+    }
+
+    fn flag(value: &str) -> QueryPredicate
+    {
+        let mut p = qp("flag");
+        p.value = Some(value.to_string());
+        p
+    }
+
+    fn color(value: &str) -> QueryPredicate
+    {
+        let mut p = qp("color");
+        p.value = Some(value.to_string());
+        p
+    }
+
+    #[test]
+    fn day_validation()
+    {
+        assert!(is_valid_day("2026:05:15"));
+        assert!(!is_valid_day("2026-05-15")); // dashes, not colons
+        assert!(!is_valid_day("2026:5:15")); // wrong length
+        assert!(!is_valid_day("abcd:ef:gh")); // non-digits
+        assert!(!is_valid_day(""));
+    }
+
+    #[test]
+    fn atom_sql()
+    {
+        assert_eq!(predicate_to_sql(&rating("gte", 4)), "(rating >= 4)");
+        assert_eq!(predicate_to_sql(&flag("pick")), "(flag = 'pick')");
+        assert_eq!(predicate_to_sql(&color("red")), "(color_label = 'red')");
+        assert_eq!(predicate_to_sql(&qp("rating_unrated")), "(rating IS NULL)");
+        assert_eq!(predicate_to_sql(&qp("unflagged")), "(flag IS NULL)");
+        let mut fou = qp("flag_or_unflagged");
+        fou.value = Some("pick".to_string());
+        assert_eq!(predicate_to_sql(&fou), "(flag = 'pick' OR flag IS NULL)");
+    }
+
+    #[test]
+    fn invalid_atoms_become_false()
+    {
+        assert_eq!(predicate_to_sql(&flag("bogus")), "(FALSE)");
+        assert_eq!(predicate_to_sql(&rating("gte", 6)), "(FALSE)"); // stars out of range
+        assert_eq!(predicate_to_sql(&color("teal")), "(FALSE)");
+        let mut bad_date = qp("date_equals");
+        bad_date.day = Some("2026-05-15".to_string()); // dashes → rejected
+        assert_eq!(predicate_to_sql(&bad_date), "(FALSE)");
+    }
+
+    #[test]
+    fn empty_predicates_no_where()
+    {
+        assert_eq!(build_filter_predicate(&[], &[]), "");
+    }
+
+    #[test]
+    fn single_predicate_wrapped()
+    {
+        assert_eq!(build_filter_predicate(&[rating("gte", 4)], &[]), "((rating >= 4))");
+    }
+
+    #[test]
+    fn left_to_right_accumulation()
+    {
+        // "A and B or C" → ((A AND B) OR C), left-to-right, NO precedence.
+        let preds = vec![rating("gte", 4), flag("pick"), color("red")];
+        let conns = vec![Connector::And, Connector::Or];
+        assert_eq!(
+            build_filter_predicate(&preds, &conns),
+            "((((rating >= 4)) AND ((flag = 'pick'))) OR ((color_label = 'red')))"
+        );
+    }
+
+    #[test]
+    fn xor_is_boolean_inequality()
+    {
+        let preds = vec![flag("pick"), color("red")];
+        let conns = vec![Connector::Xor];
+        assert_eq!(
+            build_filter_predicate(&preds, &conns),
+            "(((flag = 'pick')) <> ((color_label = 'red')))"
+        );
+    }
+}
+
 /// Update the rotation angle for an image
 ///
 /// Sets the rotation angle (0, 90, 180, or 270 degrees) for an image identified by its file path.

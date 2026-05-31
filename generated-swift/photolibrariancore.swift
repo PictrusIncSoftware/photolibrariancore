@@ -1017,6 +1017,150 @@ public func FfiConverterTypeParsedFilename_lower(_ value: ParsedFilename) -> Rus
     return FfiConverterTypeParsedFilename.lower(value)
 }
 
+
+public struct QueryPredicate: Equatable, Hashable {
+    public var kind: String
+    public var day: String?
+    public var dayEnd: String?
+    public var op: String?
+    public var stars: UInt8?
+    public var value: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(kind: String, day: String?, dayEnd: String?, op: String?, stars: UInt8?, value: String?) {
+        self.kind = kind
+        self.day = day
+        self.dayEnd = dayEnd
+        self.op = op
+        self.stars = stars
+        self.value = value
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension QueryPredicate: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeQueryPredicate: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> QueryPredicate {
+        return
+            try QueryPredicate(
+                kind: FfiConverterString.read(from: &buf), 
+                day: FfiConverterOptionString.read(from: &buf), 
+                dayEnd: FfiConverterOptionString.read(from: &buf), 
+                op: FfiConverterOptionString.read(from: &buf), 
+                stars: FfiConverterOptionUInt8.read(from: &buf), 
+                value: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: QueryPredicate, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.kind, into: &buf)
+        FfiConverterOptionString.write(value.day, into: &buf)
+        FfiConverterOptionString.write(value.dayEnd, into: &buf)
+        FfiConverterOptionString.write(value.op, into: &buf)
+        FfiConverterOptionUInt8.write(value.stars, into: &buf)
+        FfiConverterOptionString.write(value.value, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQueryPredicate_lift(_ buf: RustBuffer) throws -> QueryPredicate {
+    return try FfiConverterTypeQueryPredicate.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQueryPredicate_lower(_ value: QueryPredicate) -> RustBuffer {
+    return FfiConverterTypeQueryPredicate.lower(value)
+}
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum Connector: Equatable, Hashable {
+    
+    case and
+    case or
+    case xor
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension Connector: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeConnector: FfiConverterRustBuffer {
+    typealias SwiftType = Connector
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Connector {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .and
+        
+        case 2: return .or
+        
+        case 3: return .xor
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: Connector, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .and:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .or:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .xor:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConnector_lift(_ buf: RustBuffer) throws -> Connector {
+    return try FfiConverterTypeConnector.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeConnector_lower(_ value: Connector) -> RustBuffer {
+    return FfiConverterTypeConnector.lower(value)
+}
+
+
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
@@ -1316,6 +1460,56 @@ fileprivate struct FfiConverterSequenceTypeImageRecord: FfiConverterRustBuffer {
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeQueryPredicate: FfiConverterRustBuffer {
+    typealias SwiftType = [QueryPredicate]
+
+    public static func write(_ value: [QueryPredicate], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeQueryPredicate.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [QueryPredicate] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [QueryPredicate]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeQueryPredicate.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeConnector: FfiConverterRustBuffer {
+    typealias SwiftType = [Connector]
+
+    public static func write(_ value: [Connector], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeConnector.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Connector] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Connector]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeConnector.read(from: &buf))
+        }
+        return seq
+    }
+}
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
 private let UNIFFI_RUST_FUTURE_POLL_WAKE: Int8 = 1
 
@@ -1370,6 +1564,21 @@ public func classifyExtension(ext: String) -> ImageKind  {
         FfiConverterString.lower(ext),$0
     )
 })
+}
+public func countQueryImages(predicates: [QueryPredicate], connectors: [Connector], applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_count_query_images(FfiConverterSequenceTypeQueryPredicate.lower(predicates),FfiConverterSequenceTypeConnector.lower(connectors),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
 }
 public func findCounterpartImage(filePath: String)async  -> ImageRecord?  {
     return
@@ -1630,6 +1839,21 @@ public func parseFilename(fileName: String) -> ParsedFilename  {
     )
 })
 }
+public func queryImages(predicates: [QueryPredicate], connectors: [Connector], limit: UInt32, offset: UInt32, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> [ImageRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_query_images(FfiConverterSequenceTypeQueryPredicate.lower(predicates),FfiConverterSequenceTypeConnector.lower(connectors),FfiConverterUInt32.lower(limit),FfiConverterUInt32.lower(offset),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeImageRecord.lift,
+            errorHandler: nil
+            
+        )
+}
 public func removeImagesForFilters(pathPrefix: String, datePrefix: String)async  -> Int64  {
     return
         try!  await uniffiRustCallAsync(
@@ -1724,6 +1948,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_classify_extension() != 38346) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_count_query_images() != 3172) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_find_counterpart_image() != 51699) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1779,6 +2006,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_parse_filename() != 30612) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_query_images() != 560) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_remove_images_for_filters() != 12960) {
