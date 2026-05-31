@@ -2673,6 +2673,79 @@ pub async fn get_images_by_ids(ids: Vec<i64>) -> Vec<ImageRecord>
     execute_image_record_projection_query(conn, &where_clause, false, false)
 }
 
+/// Expand a set of visible record IDs to their RAW+JPEG/HEIF collapse-group:
+/// the input IDs PLUS any hidden RAW siblings sharing `(file_stem,
+/// directory_path)`. Used when the collapse toggle is ON so an action on a
+/// collapsed row (curation, copy) reaches the hidden RAW too.
+///
+/// Adds ONLY RAW rows — exactly what `RAW_JPEG_COLLAPSE_PREDICATE` hides — so
+/// two same-stem JPEGs with no RAW are never falsely merged. Deduped by UNION;
+/// order unspecified. On any error it falls back to the input IDs (degraded:
+/// the action still hits the visible rows, just not the RAW). Empty → empty.
+pub async fn expand_collapse_group_ids(ids: Vec<i64>) -> Vec<i64>
+{
+    if ids.is_empty()
+    {
+        return Vec::new();
+    }
+    let csv = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return ids;
+        }
+    };
+
+    let query_sql = format!(
+        "SELECT id FROM images WHERE id IN ({csv}) \
+         UNION \
+         SELECT r.id FROM images r \
+         WHERE r.image_kind = 'raw' AND EXISTS ( \
+             SELECT 1 FROM images s \
+             WHERE s.id IN ({csv}) \
+               AND s.file_stem = r.file_stem \
+               AND s.directory_path = r.directory_path \
+         )",
+        csv = csv
+    );
+
+    let mut stmt = match conn.prepare(&query_sql)
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("Failed to prepare collapse-group expansion: {}", e);
+            return ids;
+        }
+    };
+
+    let rows = match stmt.query_map([], |row| row.get::<_, i64>(0))
+    {
+        Ok(r) => r,
+        Err(e) =>
+        {
+            eprintln!("Failed to execute collapse-group expansion: {}", e);
+            return ids;
+        }
+    };
+
+    let mut result: Vec<i64> = Vec::new();
+    for row_result in rows
+    {
+        if let Ok(id) = row_result
+        {
+            result.push(id);
+        }
+    }
+
+    if result.is_empty() { ids } else { result }
+}
+
 /// Bulk-set the pick/reject flag on many records in ONE statement (Browse
 /// "Set Flag" on a selection / the whole query). Mirrors `update_image_flag`'s
 /// allow-list guard: `None` clears; any value outside {pick, reject} rejects

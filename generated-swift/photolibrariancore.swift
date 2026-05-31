@@ -1605,6 +1605,21 @@ public func countQueryImages(predicates: [QueryPredicate], connectors: [Connecto
             
         )
 }
+public func expandCollapseGroupIds(ids: [Int64])async  -> [Int64]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_expand_collapse_group_ids(FfiConverterSequenceInt64.lower(ids)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func findCounterpartImage(filePath: String)async  -> ImageRecord?  {
     return
         try!  await uniffiRustCallAsync(
@@ -2049,6 +2064,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_count_query_images() != 3172) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_expand_collapse_group_ids() != 192) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_find_counterpart_image() != 51699) {

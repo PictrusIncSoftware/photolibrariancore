@@ -91,6 +91,11 @@ namespace photolibrariancore {
     [Async]
     sequence<ImageRecord> get_images_by_ids(sequence<i64> ids);
 
+    // Expand visible IDs to include hidden RAW collapse-siblings (so an action
+    // on a collapsed row reaches the RAW too, when the collapse toggle is on).
+    [Async]
+    sequence<i64> expand_collapse_group_ids(sequence<i64> ids);
+
     [Async]
     u64 update_flag_for_ids(sequence<i64> ids, string? flag);
 
