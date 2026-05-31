@@ -2515,6 +2515,289 @@ pub async fn count_query_images(
     if count < 0 { 0 } else { count as u64 }
 }
 
+// ============================================================================
+// Browse multi-select — selection + bulk actions (Session 44)
+//   - query_image_ids:        the IDs of every row matching a filter (⌘A)
+//   - get_images_by_ids:      resolve a selection (any IDs, even cross-page or
+//                             whole-query) to full records for Copy / Reveal
+//   - update_*_for_ids:       bulk curation in ONE statement (so "select the
+//                             whole query → Set Flag" isn't N round-trips)
+// ============================================================================
+
+/// Build a safe `id IN (...)` predicate from i64 IDs (predicate text only — no
+/// "WHERE", per the projection-helper convention). The IDs are integers, so
+/// direct interpolation carries no injection risk. `None` for an empty slice —
+/// the caller MUST short-circuit, since `IN ()` is a syntax error.
+fn id_in_list(ids: &[i64]) -> Option<String>
+{
+    if ids.is_empty()
+    {
+        return None;
+    }
+    let joined = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+    Some(format!("id IN ({})", joined))
+}
+
+/// ID projection — the `id` analogue of `execute_file_path_projection_query`.
+/// Same filter machinery (inner WHERE + the duplicate-filter subquery wrap), but
+/// SELECTs `id`, so ⌘A can enumerate every matching row's ID cheaply without
+/// materializing full records.
+fn execute_id_projection_query(
+    conn: &Connection,
+    where_clause: &str,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+) -> Vec<i64>
+{
+    let mut inner_predicates: Vec<&str> = Vec::new();
+    if !where_clause.is_empty()
+    {
+        inner_predicates.push(where_clause);
+    }
+    if apply_raw_jpeg_collapse
+    {
+        inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
+    }
+    let inner_where = if inner_predicates.is_empty()
+    {
+        String::new()
+    }
+    else
+    {
+        format!("WHERE {}", inner_predicates.join(" AND "))
+    };
+
+    let query_sql = if apply_duplicate_filter
+    {
+        format!(r#"
+            SELECT id FROM (
+                SELECT
+                    id,
+                    {}
+                FROM images
+                {}
+            )
+            WHERE {}
+        "#,
+            DUPLICATE_GROUP_ID_CASE,
+            inner_where,
+            DUPLICATE_FILTER_PREDICATE)
+    }
+    else
+    {
+        format!("SELECT id FROM images {}", inner_where)
+    };
+
+    let mut stmt = match conn.prepare(&query_sql)
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("Failed to prepare id projection query: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map([], |row| row.get::<_, i64>(0))
+    {
+        Ok(r) => r,
+        Err(e) =>
+        {
+            eprintln!("Failed to execute id projection query: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mut ids: Vec<i64> = Vec::new();
+    for row_result in rows
+    {
+        match row_result
+        {
+            Ok(id) => ids.push(id),
+            Err(e) => eprintln!("Failed to read id row: {}", e),
+        }
+    }
+
+    ids
+}
+
+/// All matching record IDs for a structured filter — powers ⌘A "select the
+/// whole query" on Browse. Same predicate + two-boolean machinery as
+/// `query_images`, so the selected set is EXACTLY the rows the filtered table
+/// shows. Empty predicate list → every row (subject to the toggles).
+pub async fn query_image_ids(
+    predicates: Vec<QueryPredicate>,
+    connectors: Vec<Connector>,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+) -> Vec<i64>
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let where_clause = build_filter_predicate(&predicates, &connectors);
+    execute_id_projection_query(conn, &where_clause, apply_duplicate_filter, apply_raw_jpeg_collapse)
+}
+
+/// Resolve record IDs to full `ImageRecord`s — turns a Browse selection (which
+/// may span pages, or be the whole query) into records for Copy / Reveal.
+/// The IDs ARE the exact selection, so NO duplicate / raw-collapse filtering is
+/// applied. Order is unspecified (the copy planner re-sorts). Empty → empty.
+pub async fn get_images_by_ids(ids: Vec<i64>) -> Vec<ImageRecord>
+{
+    let where_clause = match id_in_list(&ids)
+    {
+        Some(w) => w,
+        None => return Vec::new(),
+    };
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    execute_image_record_projection_query(conn, &where_clause, false, false)
+}
+
+/// Bulk-set the pick/reject flag on many records in ONE statement (Browse
+/// "Set Flag" on a selection / the whole query). Mirrors `update_image_flag`'s
+/// allow-list guard: `None` clears; any value outside {pick, reject} rejects
+/// the WHOLE update (→ 0). Returns the number of rows changed.
+pub async fn update_flag_for_ids(ids: Vec<i64>, flag: Option<String>) -> u64
+{
+    let flag_value: Option<String> = match flag.as_deref()
+    {
+        None => None,
+        Some(v @ ("pick" | "reject")) => Some(v.to_string()),
+        Some(other) =>
+        {
+            eprintln!("Rejected invalid flag value '{}' for bulk update", other);
+            return 0;
+        }
+    };
+
+    let where_clause = match id_in_list(&ids)
+    {
+        Some(w) => w,
+        None => return 0,
+    };
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    let update_sql = format!("UPDATE images SET flag = ? WHERE {}", where_clause);
+    match conn.execute(&update_sql, params![flag_value])
+    {
+        Ok(changed) => changed as u64,
+        Err(e) =>
+        {
+            eprintln!("Failed to bulk-update flag: {}", e);
+            0
+        }
+    }
+}
+
+/// Bulk-set the color label on many records in ONE statement. Mirrors
+/// `update_image_color_label`'s allow-list guard. Returns rows changed.
+pub async fn update_color_label_for_ids(ids: Vec<i64>, color_label: Option<String>) -> u64
+{
+    let label_value: Option<String> = match color_label.as_deref()
+    {
+        None => None,
+        Some(v @ ("red" | "yellow" | "green" | "blue" | "purple")) => Some(v.to_string()),
+        Some(other) =>
+        {
+            eprintln!("Rejected invalid color label '{}' for bulk update", other);
+            return 0;
+        }
+    };
+
+    let where_clause = match id_in_list(&ids)
+    {
+        Some(w) => w,
+        None => return 0,
+    };
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    let update_sql = format!("UPDATE images SET color_label = ? WHERE {}", where_clause);
+    match conn.execute(&update_sql, params![label_value])
+    {
+        Ok(changed) => changed as u64,
+        Err(e) =>
+        {
+            eprintln!("Failed to bulk-update color label: {}", e);
+            0
+        }
+    }
+}
+
+/// Bulk-set the star rating on many records in ONE statement. Rating 0 clears
+/// (NULL), mirroring `update_image_rating`. Returns rows changed.
+pub async fn update_rating_for_ids(ids: Vec<i64>, rating: u32) -> u64
+{
+    let rating_value: Option<i64> = if rating == 0 { None } else { Some(rating as i64) };
+
+    let where_clause = match id_in_list(&ids)
+    {
+        Some(w) => w,
+        None => return 0,
+    };
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    let update_sql = format!("UPDATE images SET rating = ? WHERE {}", where_clause);
+    match conn.execute(&update_sql, params![rating_value])
+    {
+        Ok(changed) => changed as u64,
+        Err(e) =>
+        {
+            eprintln!("Failed to bulk-update rating: {}", e);
+            0
+        }
+    }
+}
+
 #[cfg(test)]
 mod query_builder_tests
 {
@@ -2622,6 +2905,14 @@ mod query_builder_tests
     fn empty_predicates_no_where()
     {
         assert_eq!(build_filter_predicate(&[], &[]), "");
+    }
+
+    #[test]
+    fn id_in_list_assembly()
+    {
+        assert_eq!(id_in_list(&[]), None);
+        assert_eq!(id_in_list(&[5]), Some("id IN (5)".to_string()));
+        assert_eq!(id_in_list(&[1, 2, 3]), Some("id IN (1, 2, 3)".to_string()));
     }
 
     #[test]

@@ -75,6 +75,31 @@ namespace photolibrariancore {
         boolean apply_raw_jpeg_collapse
     );
 
+    // Browse multi-select (Session 44). query_image_ids returns the IDs of
+    // every row matching the filter (⌘A "select the whole query");
+    // get_images_by_ids resolves a selection (any IDs, cross-page or whole-
+    // query) to full records for Copy/Reveal; the three update_*_for_ids do
+    // bulk curation in ONE statement.
+    [Async]
+    sequence<i64> query_image_ids(
+        sequence<QueryPredicate> predicates,
+        sequence<Connector> connectors,
+        boolean apply_duplicate_filter,
+        boolean apply_raw_jpeg_collapse
+    );
+
+    [Async]
+    sequence<ImageRecord> get_images_by_ids(sequence<i64> ids);
+
+    [Async]
+    u64 update_flag_for_ids(sequence<i64> ids, string? flag);
+
+    [Async]
+    u64 update_color_label_for_ids(sequence<i64> ids, string? color_label);
+
+    [Async]
+    u64 update_rating_for_ids(sequence<i64> ids, u32 rating);
+
     // Update the rotation angle for an image identified by file path
     // degrees: Rotation angle in degrees (0, 90, 180, or 270)
     // Returns true on success, false on failure

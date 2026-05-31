@@ -1389,6 +1389,31 @@ fileprivate struct FfiConverterOptionTypeImageRecord: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceInt64: FfiConverterRustBuffer {
+    typealias SwiftType = [Int64]
+
+    public static func write(_ value: [Int64], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterInt64.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Int64] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Int64]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterInt64.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]
 
@@ -1745,6 +1770,21 @@ public func getImageRecordsForFilters(pathPrefix: String, datePrefix: String, ap
             
         )
 }
+public func getImagesByIds(ids: [Int64])async  -> [ImageRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_get_images_by_ids(FfiConverterSequenceInt64.lower(ids)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeImageRecord.lift,
+            errorHandler: nil
+            
+        )
+}
 public func getImagesFiltered(limit: Int64, offset: Int64, datePrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> [ImageRecord]  {
     return
         try!  await uniffiRustCallAsync(
@@ -1839,6 +1879,21 @@ public func parseFilename(fileName: String) -> ParsedFilename  {
     )
 })
 }
+public func queryImageIds(predicates: [QueryPredicate], connectors: [Connector], applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> [Int64]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_query_image_ids(FfiConverterSequenceTypeQueryPredicate.lower(predicates),FfiConverterSequenceTypeConnector.lower(connectors),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func queryImages(predicates: [QueryPredicate], connectors: [Connector], limit: UInt32, offset: UInt32, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> [ImageRecord]  {
     return
         try!  await uniffiRustCallAsync(
@@ -1865,6 +1920,36 @@ public func removeImagesForFilters(pathPrefix: String, datePrefix: String)async 
             completeFunc: ffi_photolibrariancore_rust_future_complete_i64,
             freeFunc: ffi_photolibrariancore_rust_future_free_i64,
             liftFunc: FfiConverterInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+public func updateColorLabelForIds(ids: [Int64], colorLabel: String?)async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_update_color_label_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterOptionString.lower(colorLabel)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+public func updateFlagForIds(ids: [Int64], flag: String?)async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_update_flag_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterOptionString.lower(flag)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
             
         )
@@ -1929,6 +2014,21 @@ public func updateImageRotation(filePath: String, degrees: Int32)async  -> Bool 
             
         )
 }
+public func updateRatingForIds(ids: [Int64], rating: UInt32)async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_update_rating_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterUInt32.lower(rating)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 
 private enum InitializationResult {
     case ok
@@ -1984,6 +2084,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_get_image_records_for_filters() != 7922) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_get_images_by_ids() != 29207) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_get_images_filtered() != 37905) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2008,10 +2111,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_parse_filename() != 30612) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_query_image_ids() != 49132) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_query_images() != 560) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_remove_images_for_filters() != 12960) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_update_color_label_for_ids() != 9065) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_update_flag_for_ids() != 57492) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_image_color_label() != 55337) {
@@ -2024,6 +2136,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_image_rotation() != 63730) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_update_rating_for_ids() != 35398) {
         return InitializationResult.apiChecksumMismatch
     }
 
