@@ -189,6 +189,15 @@ const RAW_EXTENSIONS: &[&str] = &[
 /// has settled on these two spellings in the workflows this app targets.
 const JPEG_EXTENSIONS: &[&str] = &["jpg", "jpeg"];
 
+/// Recognized HEIF image file extensions (Session 41)
+///
+/// "heic"/"heif" are Apple/phone/generic; "hif" is the extension Nikon,
+/// Canon, AND Sony all write HEIF as (e.g. the Nikon Z8's RAW+HEIF mode
+/// produces NEF + HIF). HEIF participates in RAW pair-collapse exactly the
+/// way JPEG does — it is a lightweight, viewable sibling of the RAW — so it
+/// is its own `ImageKind` rather than living in the `Other` bucket.
+const HEIF_EXTENSIONS: &[&str] = &["heic", "heif", "hif"];
+
 /// Image classification categories for JPEG+RAW pair handling
 ///
 /// Used by classify_extension to answer "what kind of image is this?" and by
@@ -214,6 +223,10 @@ pub enum ImageKind
     Jpeg,
     Raw,
     Other,
+    // Session 41: HEIF (heic/heif/hif). Appended LAST to keep the existing
+    // UniFFI discriminants stable — must stay in the same position as the
+    // UDL `enum ImageKind`.
+    Heif,
 }
 
 /// Classify a file extension into JPEG, RAW, or Other
@@ -246,6 +259,10 @@ pub fn classify_extension(ext: String) -> ImageKind
     if JPEG_EXTENSIONS.contains(&lower.as_str())
     {
         ImageKind::Jpeg
+    }
+    else if HEIF_EXTENSIONS.contains(&lower.as_str())
+    {
+        ImageKind::Heif
     }
     else if RAW_EXTENSIONS.contains(&lower.as_str())
     {
@@ -679,6 +696,7 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             ImageKind::Jpeg => "jpeg",
             ImageKind::Raw  => "raw",
             ImageKind::Other => "other",
+            ImageKind::Heif => "heif",
         };
         match conn.execute(
             "UPDATE images SET file_stem = ?1, image_kind = ?2 WHERE id = ?3",
@@ -832,6 +850,7 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
             ImageKind::Jpeg => "jpeg",
             ImageKind::Raw  => "raw",
             ImageKind::Other => "other",
+            ImageKind::Heif => "heif",
         };
 
         // Execute the prepared statement with positional parameters
@@ -1056,21 +1075,25 @@ const DUPLICATE_FILTER_PREDICATE: &str =
 /// (`image_kind`, `file_stem`, `directory_path`); no projection-alias
 /// dependency.
 ///
-/// Semantics: drop a record if it is a RAW and a JPEG counterpart exists
-/// in the same directory with the same stem. The JPEG record is kept;
-/// the RAW counterpart is hidden.
+/// Semantics: drop a record if it is a RAW and a JPEG **or HEIF** counterpart
+/// exists in the same directory with the same stem. The lightweight sibling
+/// (JPEG or HEIF) is kept; the RAW counterpart is hidden. (Session 41
+/// generalized this from JPEG-only — Nikon/Canon/Sony RAW+HEIF shooting
+/// modes produce e.g. NEF + HIF, which should collapse the same as RAW+JPEG.
+/// If a RAW happens to have BOTH a JPEG and a HEIF sibling — rare — both
+/// siblings remain visible; only the RAW is hidden.)
 ///
 /// Note: `image_kind` literal comparisons use lowercase per the project-
 /// wide lowercase canonical-case convention (Session 18). Verified in
 /// `ingest_metadata` — image_kind is always stored as "jpeg" / "raw" /
-/// "other".
+/// "heif" / "other".
 ///
 /// Single source of truth — both helpers reference this constant. See
 /// DESIGN-Filter-Aware-Pagination.md §6.
 const RAW_JPEG_COLLAPSE_PREDICATE: &str = "\
     NOT (image_kind = 'raw' AND EXISTS ( \
         SELECT 1 FROM images j \
-        WHERE j.image_kind = 'jpeg' \
+        WHERE j.image_kind IN ('jpeg', 'heif') \
           AND j.file_stem = images.file_stem \
           AND j.directory_path = images.directory_path \
     ))";
@@ -3106,6 +3129,12 @@ pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord>
         ImageKind::Jpeg => ImageKind::Raw,
         ImageKind::Raw => ImageKind::Jpeg,
         ImageKind::Other => return None,
+        // Session 41: HEIF has no RAW↔HEIF counterpart lookup yet (the
+        // "Open RAW / Open JPEG" submenu enhancement is deliberately
+        // deferred). HEIF still participates in grid pair-COLLAPSE via
+        // RAW_JPEG_COLLAPSE_PREDICATE; only this menu-counterpart path
+        // returns None for now.
+        ImageKind::Heif => return None,
     };
 
     // 4. Acquire lock and validate connection.

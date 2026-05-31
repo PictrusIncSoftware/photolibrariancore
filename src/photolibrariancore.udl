@@ -223,13 +223,17 @@ namespace photolibrariancore {
 };
 
 // Image classification categories for JPEG+RAW pair handling.
-// Three variants — Jpeg, Raw, Other — chosen deliberately over a boolean.
-// Other is a real category (PNG, TIFF, HEIC, etc.), not a "not RAW" bucket.
+// Four variants — Jpeg, Raw, Other, Heif. Other is a real category (PNG,
+// TIFF, etc.), not a "not RAW" bucket. Heif (heic/heif/hif) was promoted out
+// of Other in Session 41 so it can participate in RAW pair-collapse like JPEG.
 // First enum exposed across the UniFFI boundary in this project.
+// NOTE: variant ORDER must match the Rust `enum ImageKind` (UniFFI maps by
+// position) — Heif is appended LAST in both to keep existing discriminants.
 enum ImageKind {
     "Jpeg",
     "Raw",
     "Other",
+    "Heif",
 };
 
 // Parsed components of a filename, returned by parse_filename.

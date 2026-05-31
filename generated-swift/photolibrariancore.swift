@@ -1025,6 +1025,7 @@ public enum ImageKind: Equatable, Hashable {
     case jpeg
     case raw
     case other
+    case heif
 
 
 
@@ -1052,6 +1053,8 @@ public struct FfiConverterTypeImageKind: FfiConverterRustBuffer {
         
         case 3: return .other
         
+        case 4: return .heif
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -1070,6 +1073,10 @@ public struct FfiConverterTypeImageKind: FfiConverterRustBuffer {
         
         case .other:
             writeInt(&buf, Int32(3))
+        
+        
+        case .heif:
+            writeInt(&buf, Int32(4))
         
         }
     }
