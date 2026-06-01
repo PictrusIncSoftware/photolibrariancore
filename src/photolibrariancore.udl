@@ -105,6 +105,38 @@ namespace photolibrariancore {
     [Async]
     u64 update_rating_for_ids(sequence<i64> ids, u32 rating);
 
+    // ---- Keyword system (Session 45; Docs/DESIGN-Keyword-System.md) ----
+    // Hierarchical keywords in a single `keyword` table. assign materializes a
+    // path's ancestor chain (one row per level) for each image; remove/restore
+    // soft-hide / un-hide a node + its descendants; reparent/rename re-
+    // materialize a subtree GLOBALLY. Reads: keywords_for_image (per-photo
+    // reconstruction), keyword_vocabulary (autocomplete), and
+    // hidden_keywords_for_image (the recovery surface). All catalogue-only
+    // (cloud-safe). Mutators return an affected-count; reads return rows.
+    [Async]
+    u64 assign_keyword_for_ids(sequence<i64> ids, sequence<string> segments);
+
+    [Async]
+    u64 remove_keyword_for_ids(sequence<i64> ids, string path);
+
+    [Async]
+    u64 restore_keyword_for_ids(sequence<i64> ids, string path);
+
+    [Async]
+    u64 reparent_keyword(sequence<string> source_path, sequence<string> new_parent);
+
+    [Async]
+    u64 rename_keyword(sequence<string> target_path, string new_label);
+
+    [Async]
+    sequence<KeywordRow> keywords_for_image(i64 image_id);
+
+    [Async]
+    sequence<KeywordNode> keyword_vocabulary();
+
+    [Async]
+    sequence<KeywordRow> hidden_keywords_for_image(i64 image_id);
+
     // Update the rotation angle for an image identified by file path
     // degrees: Rotation angle in degrees (0, 90, 180, or 270)
     // Returns true on success, false on failure
@@ -315,6 +347,8 @@ enum Connector {
 //   "unflagged"         → (none)
 //   "color"             → value ("red".."purple")
 //   "no_color"          → (none)
+//   "keyword_has"       → value (the keyword label)  → EXISTS (subtree-inclusive)
+//   "keyword_not"       → value (the keyword label)  → NOT EXISTS
 dictionary QueryPredicate {
     string kind;
     string? day;
@@ -322,6 +356,25 @@ dictionary QueryPredicate {
     string? op;
     u8? stars;
     string? value;
+};
+
+// One materialized keyword row (Session 45), returned to Swift. status: 1 =
+// active/retained, 0 = hidden. created_at / hidden_at are VARCHAR-cast
+// timestamps (hidden_at null while active). label = last path segment; path =
+// root->node, U+001F-separated (the UI renders a visible glyph in its place).
+dictionary KeywordRow {
+    string label;
+    string path;
+    i32 status;
+    string created_at;
+    string? hidden_at;
+};
+
+// A distinct (label, path) node — the keyword vocabulary, for autocomplete and
+// the (future) tree browser.
+dictionary KeywordNode {
+    string label;
+    string path;
 };
 
 // Parsed components of a filename, returned by parse_filename.

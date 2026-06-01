@@ -606,6 +606,36 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         CREATE INDEX IF NOT EXISTS idx_rating ON images(rating);
         CREATE INDEX IF NOT EXISTS idx_flag ON images(flag);
         CREATE INDEX IF NOT EXISTS idx_color_label ON images(color_label);
+
+        -- === Keyword system (Session 45; Docs/DESIGN-Keyword-System.md) ===
+        -- Hierarchical keywords in ONE table. Each applied keyword PATH is
+        -- materialized as one row per ancestor level; each row carries `label`
+        -- (that node, = last path segment) and `path` (root->that node,
+        -- U+001F-joined). Soft-hide via `status` (1 = active/retained, 0 =
+        -- hidden); `created_at`/`hidden_at` move together. `label` is the hot
+        -- query key; `path` is the structural truth. No stored `level` (it is
+        -- derivable from `path`).
+        CREATE SEQUENCE IF NOT EXISTS keyword_id_seq START 1;
+
+        CREATE TABLE IF NOT EXISTS keyword (
+            id INTEGER PRIMARY KEY DEFAULT nextval('keyword_id_seq'),
+            image_id INTEGER NOT NULL,          -- -> images.id (the "image pointer")
+            label TEXT NOT NULL,                -- this node's text (= last path segment)
+            path TEXT NOT NULL,                 -- root->this node, U+001F-separated
+            status INTEGER NOT NULL DEFAULT 1,  -- 1 = active, 0 = hidden (soft-delete)
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            hidden_at TIMESTAMP                 -- set when status->0; NULL while active
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_keyword_image_id ON keyword(image_id);
+        CREATE INDEX IF NOT EXISTS idx_keyword_label ON keyword(label);
+        CREATE INDEX IF NOT EXISTS idx_keyword_path ON keyword(path);
+        CREATE INDEX IF NOT EXISTS idx_keyword_status ON keyword(status);
+
+        -- Active-only view: ALL normal keyword reads/queries hit this so the
+        -- status filter can never be forgotten. Recovery reads the raw table.
+        CREATE OR REPLACE VIEW keyword_visible AS
+            SELECT * FROM keyword WHERE status = 1;
     "#;
 
     // Execute schema creation as a batch
@@ -2374,6 +2404,27 @@ fn predicate_to_sql(p: &QueryPredicate) -> String
             _ => bad(),
         },
         "no_color" => "(color_label IS NULL)".to_string(),
+        // Keyword subject (Session 45). Label-equality is automatically
+        // subtree-inclusive: every ancestor is its own materialized row carrying
+        // its label, so `label = 'Animals'` matches everything beneath Animals.
+        // Correlated on images.id against the active-only view. Isolation-first:
+        // this pair of arms is the ONLY touch to the existing query engine.
+        "keyword_has" => match p.value.as_deref()
+        {
+            Some(v) if !v.is_empty() => format!(
+                "(EXISTS (SELECT 1 FROM keyword_visible k WHERE k.image_id = images.id AND k.label = '{}'))",
+                v.replace('\'', "''")
+            ),
+            _ => bad(),
+        },
+        "keyword_not" => match p.value.as_deref()
+        {
+            Some(v) if !v.is_empty() => format!(
+                "(NOT EXISTS (SELECT 1 FROM keyword_visible k WHERE k.image_id = images.id AND k.label = '{}'))",
+                v.replace('\'', "''")
+            ),
+            _ => bad(),
+        },
         other =>
         {
             eprintln!("Unknown query predicate kind '{}'", other);
@@ -2744,6 +2795,642 @@ pub async fn expand_collapse_group_ids(ids: Vec<i64>) -> Vec<i64>
     }
 
     if result.is_empty() { ids } else { result }
+}
+
+// === Keyword system (Session 45) ===
+//
+// A hierarchical keyword subsystem in a SINGLE `keyword` table (see
+// Docs/DESIGN-Keyword-System.md). Each applied keyword path is materialized as
+// one row per ancestor level; each row's `label` is that node and `path` is the
+// chain root->that node, joined by U+001F. Soft-hide via `status` (1 active, 0
+// hidden). Reads go through the `keyword_visible` view; the raw table is the
+// recovery surface. Isolation-first: these are all brand-new functions; the
+// only touch to existing code is the additive `keyword_has`/`keyword_not` arm
+// in `predicate_to_sql`.
+
+/// The path-segment separator: U+001F (ASCII Unit Separator). Non-printing, so
+/// it can never collide with human-typed keyword text — no escaping needed. The
+/// UI renders a visible glyph (e.g. "›") in its place.
+const KEYWORD_PATH_SEPARATOR: &str = "\u{001F}";
+
+/// A single materialized keyword row, as returned to Swift.
+#[derive(Debug, Clone)]
+pub struct KeywordRow
+{
+    pub label: String,
+    pub path: String,
+    pub status: i32,
+    pub created_at: String,
+    pub hidden_at: Option<String>,
+}
+
+/// A distinct (label, path) node — the vocabulary, for autocomplete + browsing.
+#[derive(Debug, Clone)]
+pub struct KeywordNode
+{
+    pub label: String,
+    pub path: String,
+}
+
+/// Materialize an ordered segment list into one (label, path) pair per ancestor
+/// depth. `["Animals","Dog","Lab"]` -> `[("Animals","Animals"),
+/// ("Dog","Animals␟Dog"), ("Lab","Animals␟Dog␟Lab")]`. Returns empty if any
+/// segment is blank or itself contains the separator (-> caller no-ops).
+fn keyword_materialized_rows(segments: &[String]) -> Vec<(String, String)>
+{
+    let mut rows: Vec<(String, String)> = Vec::new();
+    let mut prefix: Vec<String> = Vec::new();
+    for seg in segments
+    {
+        let trimmed = seg.trim();
+        if trimmed.is_empty() || trimmed.contains(KEYWORD_PATH_SEPARATOR)
+        {
+            return Vec::new();
+        }
+        prefix.push(trimmed.to_string());
+        rows.push((trimmed.to_string(), prefix.join(KEYWORD_PATH_SEPARATOR)));
+    }
+    rows
+}
+
+/// `image_id IN (...)` for the keyword table — sibling of `id_in_list`, which is
+/// hard-coded to the `images.id` column. `None` on empty.
+fn keyword_image_id_in_list(ids: &[i64]) -> Option<String>
+{
+    if ids.is_empty()
+    {
+        return None;
+    }
+    let joined = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+    Some(format!("image_id IN ({})", joined))
+}
+
+/// Assign a keyword PATH to many images. Rust materializes the ancestor chain
+/// and inserts one row per depth for each image. Blind-insert, except it skips a
+/// row byte-identical to an already-ACTIVE row for that image (so a double-apply
+/// doesn't spam duplicates). A previously-removed (hidden) identical row is NOT
+/// resurrected — a fresh active row is inserted, preserving history. One
+/// transaction. Returns the number of rows inserted.
+pub async fn assign_keyword_for_ids(ids: Vec<i64>, segments: Vec<String>) -> u64
+{
+    if ids.is_empty()
+    {
+        return 0;
+    }
+    let rows = keyword_materialized_rows(&segments);
+    if rows.is_empty()
+    {
+        eprintln!("assign_keyword_for_ids: empty or invalid segments");
+        return 0;
+    }
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("assign_keyword_for_ids: begin failed: {}", e);
+        return 0;
+    }
+
+    let mut inserted: u64 = 0;
+    for id in &ids
+    {
+        for (label, path) in &rows
+        {
+            let existing: Result<i64, _> = conn.query_row(
+                "SELECT 1 FROM keyword WHERE image_id = ? AND path = ? AND status = 1 LIMIT 1",
+                params![id, path],
+                |r| r.get(0),
+            );
+            if existing.is_ok()
+            {
+                continue;
+            }
+            match conn.execute(
+                "INSERT INTO keyword (image_id, label, path, status, created_at) \
+                 VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)",
+                params![id, label, path],
+            )
+            {
+                Ok(_) => inserted += 1,
+                Err(e) =>
+                {
+                    eprintln!("assign_keyword_for_ids: insert failed: {}", e);
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    return 0;
+                }
+            }
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("assign_keyword_for_ids: commit failed: {}", e);
+        return 0;
+    }
+    inserted
+}
+
+/// Remove a keyword from many images — soft-hide the node AND its descendants
+/// (`path = ? OR starts_with(path, ?␟)`) for those images. Ancestors are LEFT
+/// intact (a lone parent is a valid flat keyword). Returns rows hidden.
+pub async fn remove_keyword_for_ids(ids: Vec<i64>, path: String) -> u64
+{
+    if ids.is_empty() || path.is_empty()
+    {
+        return 0;
+    }
+    let where_ids = match keyword_image_id_in_list(&ids)
+    {
+        Some(w) => w,
+        None => return 0,
+    };
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    let prefix = format!("{}{}", path, KEYWORD_PATH_SEPARATOR);
+    let sql = format!(
+        "UPDATE keyword SET status = 0, hidden_at = CURRENT_TIMESTAMP \
+         WHERE status = 1 AND {} AND (path = ? OR starts_with(path, ?))",
+        where_ids
+    );
+    match conn.execute(&sql, params![path, prefix])
+    {
+        Ok(changed) => changed as u64,
+        Err(e) =>
+        {
+            eprintln!("remove_keyword_for_ids: {}", e);
+            0
+        }
+    }
+}
+
+/// Restore (un-hide) a previously removed keyword node + descendants for many
+/// images — undo of `remove_keyword_for_ids` and the recovery-screen action.
+pub async fn restore_keyword_for_ids(ids: Vec<i64>, path: String) -> u64
+{
+    if ids.is_empty() || path.is_empty()
+    {
+        return 0;
+    }
+    let where_ids = match keyword_image_id_in_list(&ids)
+    {
+        Some(w) => w,
+        None => return 0,
+    };
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    let prefix = format!("{}{}", path, KEYWORD_PATH_SEPARATOR);
+    let sql = format!(
+        "UPDATE keyword SET status = 1, hidden_at = NULL \
+         WHERE status = 0 AND {} AND (path = ? OR starts_with(path, ?))",
+        where_ids
+    );
+    match conn.execute(&sql, params![path, prefix])
+    {
+        Ok(changed) => changed as u64,
+        Err(e) =>
+        {
+            eprintln!("restore_keyword_for_ids: {}", e);
+            0
+        }
+    }
+}
+
+/// All ACTIVE keyword rows for one image, ordered by path (root->leaf within a
+/// branch). For the detail-panel reconstruction.
+pub async fn keywords_for_image(image_id: i64) -> Vec<KeywordRow>
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let mut stmt = match conn.prepare(
+        "SELECT label, path, status, CAST(created_at AS VARCHAR), CAST(hidden_at AS VARCHAR) \
+         FROM keyword_visible WHERE image_id = ? ORDER BY path",
+    )
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("keywords_for_image: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mapped = stmt.query_map(params![image_id], |row|
+    {
+        Ok(KeywordRow {
+            label: row.get(0)?,
+            path: row.get(1)?,
+            status: row.get(2)?,
+            created_at: row.get(3)?,
+            hidden_at: row.get(4)?,
+        })
+    });
+
+    match mapped
+    {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(e) =>
+        {
+            eprintln!("keywords_for_image: query {}", e);
+            Vec::new()
+        }
+    }
+}
+
+/// The DISTINCT (label, path) keyword vocabulary over the active view — for the
+/// assignment-panel autocomplete and (future) tree browser. Ordered by path.
+pub async fn keyword_vocabulary() -> Vec<KeywordNode>
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let mut stmt = match conn.prepare("SELECT DISTINCT label, path FROM keyword_visible ORDER BY path")
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("keyword_vocabulary: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mapped = stmt.query_map([], |row|
+    {
+        Ok(KeywordNode { label: row.get(0)?, path: row.get(1)? })
+    });
+
+    match mapped
+    {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(e) =>
+        {
+            eprintln!("keyword_vocabulary: query {}", e);
+            Vec::new()
+        }
+    }
+}
+
+/// Hidden (removed) keyword rows for one image — the recovery surface. Reads the
+/// RAW table (not the view), newest-hidden first.
+pub async fn hidden_keywords_for_image(image_id: i64) -> Vec<KeywordRow>
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let mut stmt = match conn.prepare(
+        "SELECT label, path, status, CAST(created_at AS VARCHAR), CAST(hidden_at AS VARCHAR) \
+         FROM keyword WHERE image_id = ? AND status = 0 ORDER BY hidden_at DESC",
+    )
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("hidden_keywords_for_image: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mapped = stmt.query_map(params![image_id], |row|
+    {
+        Ok(KeywordRow {
+            label: row.get(0)?,
+            path: row.get(1)?,
+            status: row.get(2)?,
+            created_at: row.get(3)?,
+            hidden_at: row.get(4)?,
+        })
+    });
+
+    match mapped
+    {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(e) =>
+        {
+            eprintln!("hidden_keywords_for_image: query {}", e);
+            Vec::new()
+        }
+    }
+}
+
+/// Re-parent a keyword node (and its whole subtree) GLOBALLY — for every image
+/// that carries it. (1) Materializes the new-parent ancestor chain for affected
+/// images; (2) re-roots the moved subtree under `<new_parent> ␟ <last source
+/// segment>` (labels unchanged, paths re-rooted); (3) hides the old subtree.
+/// Empty `new_parent` moves the node to the top level. One transaction. Returns
+/// the number of old rows hidden.
+pub async fn reparent_keyword(source_path: Vec<String>, new_parent: Vec<String>) -> u64
+{
+    if source_path.is_empty()
+    {
+        return 0;
+    }
+    for s in source_path.iter().chain(new_parent.iter())
+    {
+        if s.trim().is_empty() || s.contains(KEYWORD_PATH_SEPARATOR)
+        {
+            eprintln!("reparent_keyword: invalid segment");
+            return 0;
+        }
+    }
+
+    let source_joined = source_path.join(KEYWORD_PATH_SEPARATOR);
+    let source_prefix = format!("{}{}", source_joined, KEYWORD_PATH_SEPARATOR);
+    let last_seg = source_path.last().unwrap().trim().to_string();
+    let new_root = if new_parent.is_empty()
+    {
+        last_seg
+    }
+    else
+    {
+        format!("{}{}{}", new_parent.join(KEYWORD_PATH_SEPARATOR), KEYWORD_PATH_SEPARATOR, last_seg)
+    };
+    // char count + 1 = 1-indexed position of the first char AFTER source_joined
+    // ("" for the subtree root, "␟Yellow" for a descendant).
+    let suffix_start = (source_joined.chars().count() + 1) as i64;
+    let new_parent_rows = keyword_materialized_rows(&new_parent);
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("reparent_keyword: begin failed: {}", e);
+        return 0;
+    }
+
+    // (1) Ensure the new-parent ancestor chain exists for every affected image.
+    for (label, path) in &new_parent_rows
+    {
+        let sql = "INSERT INTO keyword (image_id, label, path, status, created_at) \
+                   SELECT DISTINCT image_id, ?, ?, 1, CURRENT_TIMESTAMP FROM keyword \
+                   WHERE status = 1 AND (path = ? OR starts_with(path, ?)) \
+                   AND image_id NOT IN (SELECT image_id FROM keyword WHERE status = 1 AND path = ?)";
+        if let Err(e) = conn.execute(sql, params![label, path, source_joined, source_prefix, path])
+        {
+            eprintln!("reparent_keyword: ancestor insert failed: {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return 0;
+        }
+    }
+
+    // (2) Re-root the moved subtree (label unchanged; path = new_root || suffix).
+    let move_sql = "INSERT INTO keyword (image_id, label, path, status, created_at) \
+                    SELECT image_id, label, ? || substr(path, ?), 1, CURRENT_TIMESTAMP FROM keyword \
+                    WHERE status = 1 AND (path = ? OR starts_with(path, ?))";
+    if let Err(e) = conn.execute(move_sql, params![new_root, suffix_start, source_joined, source_prefix])
+    {
+        eprintln!("reparent_keyword: move insert failed: {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return 0;
+    }
+
+    // (3) Hide the old subtree.
+    let hide_sql = "UPDATE keyword SET status = 0, hidden_at = CURRENT_TIMESTAMP \
+                    WHERE status = 1 AND (path = ? OR starts_with(path, ?))";
+    let changed = match conn.execute(hide_sql, params![source_joined, source_prefix])
+    {
+        Ok(c) => c as u64,
+        Err(e) =>
+        {
+            eprintln!("reparent_keyword: hide failed: {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return 0;
+        }
+    };
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("reparent_keyword: commit failed: {}", e);
+        return 0;
+    }
+    changed
+}
+
+/// Rename a keyword node GLOBALLY (its label + the corresponding path segment),
+/// cascading to descendants. Same machinery as reparent, but the subtree is
+/// re-rooted under the SAME parent with the new label (so no ancestor insert is
+/// needed — the parent already exists). One transaction. Returns rows hidden.
+pub async fn rename_keyword(target_path: Vec<String>, new_label: String) -> u64
+{
+    if target_path.is_empty()
+    {
+        return 0;
+    }
+    let new_label = new_label.trim().to_string();
+    if new_label.is_empty() || new_label.contains(KEYWORD_PATH_SEPARATOR)
+    {
+        eprintln!("rename_keyword: invalid new label");
+        return 0;
+    }
+    for s in target_path.iter()
+    {
+        if s.trim().is_empty() || s.contains(KEYWORD_PATH_SEPARATOR)
+        {
+            eprintln!("rename_keyword: invalid segment");
+            return 0;
+        }
+    }
+
+    let target_joined = target_path.join(KEYWORD_PATH_SEPARATOR);
+    let target_prefix = format!("{}{}", target_joined, KEYWORD_PATH_SEPARATOR);
+    let suffix_start = (target_joined.chars().count() + 1) as i64;
+    let parent = &target_path[..target_path.len() - 1];
+    let new_root = if parent.is_empty()
+    {
+        new_label.clone()
+    }
+    else
+    {
+        format!("{}{}{}", parent.join(KEYWORD_PATH_SEPARATOR), KEYWORD_PATH_SEPARATOR, new_label)
+    };
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("rename_keyword: begin failed: {}", e);
+        return 0;
+    }
+
+    // Re-root the subtree; the root row's label becomes new_label (descendants
+    // keep theirs), path re-rooted for the whole subtree.
+    let move_sql = "INSERT INTO keyword (image_id, label, path, status, created_at) \
+                    SELECT image_id, \
+                           CASE WHEN path = ? THEN ? ELSE label END, \
+                           ? || substr(path, ?), 1, CURRENT_TIMESTAMP FROM keyword \
+                    WHERE status = 1 AND (path = ? OR starts_with(path, ?))";
+    if let Err(e) = conn.execute(
+        move_sql,
+        params![target_joined, new_label, new_root, suffix_start, target_joined, target_prefix],
+    )
+    {
+        eprintln!("rename_keyword: move insert failed: {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return 0;
+    }
+
+    let hide_sql = "UPDATE keyword SET status = 0, hidden_at = CURRENT_TIMESTAMP \
+                    WHERE status = 1 AND (path = ? OR starts_with(path, ?))";
+    let changed = match conn.execute(hide_sql, params![target_joined, target_prefix])
+    {
+        Ok(c) => c as u64,
+        Err(e) =>
+        {
+            eprintln!("rename_keyword: hide failed: {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return 0;
+        }
+    };
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("rename_keyword: commit failed: {}", e);
+        return 0;
+    }
+    changed
+}
+
+#[cfg(test)]
+mod keyword_tests
+{
+    use super::*;
+
+    #[test]
+    fn materialized_rows_builds_ancestor_chain()
+    {
+        let rows = keyword_materialized_rows(&vec![
+            "Animals".to_string(),
+            "Dog".to_string(),
+            "Lab".to_string(),
+        ]);
+        let sep = KEYWORD_PATH_SEPARATOR;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], ("Animals".to_string(), "Animals".to_string()));
+        assert_eq!(rows[1], ("Dog".to_string(), format!("Animals{sep}Dog")));
+        assert_eq!(rows[2], ("Lab".to_string(), format!("Animals{sep}Dog{sep}Lab")));
+    }
+
+    #[test]
+    fn materialized_rows_trims_and_rejects_bad_segments()
+    {
+        // Blank segment -> whole path rejected (empty).
+        assert!(keyword_materialized_rows(&vec!["Animals".to_string(), "  ".to_string()]).is_empty());
+        // Segment containing the separator -> rejected.
+        assert!(keyword_materialized_rows(&vec![format!("a{KEYWORD_PATH_SEPARATOR}b")]).is_empty());
+        // Trimming.
+        let rows = keyword_materialized_rows(&vec![" Animals ".to_string()]);
+        assert_eq!(rows[0], ("Animals".to_string(), "Animals".to_string()));
+    }
+
+    #[test]
+    fn keyword_image_id_in_list_assembly()
+    {
+        assert_eq!(keyword_image_id_in_list(&[]), None);
+        assert_eq!(keyword_image_id_in_list(&[5, 9, 12]), Some("image_id IN (5, 9, 12)".to_string()));
+    }
+
+    #[test]
+    fn keyword_predicate_sql()
+    {
+        let has = QueryPredicate {
+            kind: "keyword_has".to_string(),
+            day: None, day_end: None, op: None, stars: None,
+            value: Some("Wagner".to_string()),
+        };
+        assert_eq!(
+            predicate_to_sql(&has),
+            "(EXISTS (SELECT 1 FROM keyword_visible k WHERE k.image_id = images.id AND k.label = 'Wagner'))"
+        );
+
+        let not = QueryPredicate {
+            kind: "keyword_not".to_string(),
+            day: None, day_end: None, op: None, stars: None,
+            value: Some("snapshot".to_string()),
+        };
+        assert_eq!(
+            predicate_to_sql(&not),
+            "(NOT EXISTS (SELECT 1 FROM keyword_visible k WHERE k.image_id = images.id AND k.label = 'snapshot'))"
+        );
+
+        // Empty value -> backstop.
+        let empty = QueryPredicate {
+            kind: "keyword_has".to_string(),
+            day: None, day_end: None, op: None, stars: None,
+            value: Some(String::new()),
+        };
+        assert_eq!(predicate_to_sql(&empty), "(FALSE)");
+    }
 }
 
 /// Bulk-set the pick/reject flag on many records in ONE statement (Browse

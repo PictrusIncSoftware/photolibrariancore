@@ -960,6 +960,126 @@ public func FfiConverterTypeImageRecord_lower(_ value: ImageRecord) -> RustBuffe
 }
 
 
+public struct KeywordNode: Equatable, Hashable {
+    public var label: String
+    public var path: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(label: String, path: String) {
+        self.label = label
+        self.path = path
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension KeywordNode: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeKeywordNode: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> KeywordNode {
+        return
+            try KeywordNode(
+                label: FfiConverterString.read(from: &buf), 
+                path: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: KeywordNode, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.label, into: &buf)
+        FfiConverterString.write(value.path, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeKeywordNode_lift(_ buf: RustBuffer) throws -> KeywordNode {
+    return try FfiConverterTypeKeywordNode.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeKeywordNode_lower(_ value: KeywordNode) -> RustBuffer {
+    return FfiConverterTypeKeywordNode.lower(value)
+}
+
+
+public struct KeywordRow: Equatable, Hashable {
+    public var label: String
+    public var path: String
+    public var status: Int32
+    public var createdAt: String
+    public var hiddenAt: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(label: String, path: String, status: Int32, createdAt: String, hiddenAt: String?) {
+        self.label = label
+        self.path = path
+        self.status = status
+        self.createdAt = createdAt
+        self.hiddenAt = hiddenAt
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension KeywordRow: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeKeywordRow: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> KeywordRow {
+        return
+            try KeywordRow(
+                label: FfiConverterString.read(from: &buf), 
+                path: FfiConverterString.read(from: &buf), 
+                status: FfiConverterInt32.read(from: &buf), 
+                createdAt: FfiConverterString.read(from: &buf), 
+                hiddenAt: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: KeywordRow, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.label, into: &buf)
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterInt32.write(value.status, into: &buf)
+        FfiConverterString.write(value.createdAt, into: &buf)
+        FfiConverterOptionString.write(value.hiddenAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeKeywordRow_lift(_ buf: RustBuffer) throws -> KeywordRow {
+    return try FfiConverterTypeKeywordRow.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeKeywordRow_lower(_ value: KeywordRow) -> RustBuffer {
+    return FfiConverterTypeKeywordRow.lower(value)
+}
+
+
 public struct ParsedFilename: Equatable, Hashable {
     public var stem: String
     public var extensionLower: String
@@ -1489,6 +1609,56 @@ fileprivate struct FfiConverterSequenceTypeImageRecord: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeKeywordNode: FfiConverterRustBuffer {
+    typealias SwiftType = [KeywordNode]
+
+    public static func write(_ value: [KeywordNode], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeKeywordNode.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [KeywordNode] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [KeywordNode]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeKeywordNode.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeKeywordRow: FfiConverterRustBuffer {
+    typealias SwiftType = [KeywordRow]
+
+    public static func write(_ value: [KeywordRow], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeKeywordRow.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [KeywordRow] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [KeywordRow]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeKeywordRow.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeQueryPredicate: FfiConverterRustBuffer {
     typealias SwiftType = [QueryPredicate]
 
@@ -1582,6 +1752,21 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
     } else {
         print("uniffiFutureContinuationCallback invalid handle")
     }
+}
+public func assignKeywordForIds(ids: [Int64], segments: [String])async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_assign_keyword_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterSequenceString.lower(segments)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
 }
 public func classifyExtension(ext: String) -> ImageKind  {
     return try!  FfiConverterTypeImageKind_lift(try! rustCall() {
@@ -1857,6 +2042,21 @@ public func getRawExtensions() -> [String]  {
     )
 })
 }
+public func hiddenKeywordsForImage(imageId: Int64)async  -> [KeywordRow]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_hidden_keywords_for_image(FfiConverterInt64.lower(imageId)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeKeywordRow.lift,
+            errorHandler: nil
+            
+        )
+}
 public func ingestMetadata(metadata: [ImageMetadata])async  -> UInt32  {
     return
         try!  await uniffiRustCallAsync(
@@ -1883,6 +2083,36 @@ public func initializeCatalogue(cataloguePath: String)async  -> Bool  {
             completeFunc: ffi_photolibrariancore_rust_future_complete_i8,
             freeFunc: ffi_photolibrariancore_rust_future_free_i8,
             liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
+        )
+}
+public func keywordVocabulary()async  -> [KeywordNode]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_keyword_vocabulary(
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeKeywordNode.lift,
+            errorHandler: nil
+            
+        )
+}
+public func keywordsForImage(imageId: Int64)async  -> [KeywordRow]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_keywords_for_image(FfiConverterInt64.lower(imageId)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeKeywordRow.lift,
             errorHandler: nil
             
         )
@@ -1935,6 +2165,66 @@ public func removeImagesForFilters(pathPrefix: String, datePrefix: String)async 
             completeFunc: ffi_photolibrariancore_rust_future_complete_i64,
             freeFunc: ffi_photolibrariancore_rust_future_free_i64,
             liftFunc: FfiConverterInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+public func removeKeywordForIds(ids: [Int64], path: String)async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_remove_keyword_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterString.lower(path)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+public func renameKeyword(targetPath: [String], newLabel: String)async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_rename_keyword(FfiConverterSequenceString.lower(targetPath),FfiConverterString.lower(newLabel)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+public func reparentKeyword(sourcePath: [String], newParent: [String])async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_reparent_keyword(FfiConverterSequenceString.lower(sourcePath),FfiConverterSequenceString.lower(newParent)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+public func restoreKeywordForIds(ids: [Int64], path: String)async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_restore_keyword_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterString.lower(path)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
             
         )
@@ -2060,6 +2350,9 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_assign_keyword_for_ids() != 32359) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_classify_extension() != 38346) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2120,10 +2413,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_get_raw_extensions() != 16992) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_hidden_keywords_for_image() != 10588) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_ingest_metadata() != 1621) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_initialize_catalogue() != 29822) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_keyword_vocabulary() != 50955) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_keywords_for_image() != 32244) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_parse_filename() != 30612) {
@@ -2136,6 +2438,18 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_remove_images_for_filters() != 12960) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_remove_keyword_for_ids() != 55303) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_rename_keyword() != 48109) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_reparent_keyword() != 9760) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_restore_keyword_for_ids() != 5225) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_color_label_for_ids() != 9065) {
