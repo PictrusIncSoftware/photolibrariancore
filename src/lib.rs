@@ -177,7 +177,10 @@ const RAW_EXTENSIONS: &[&str] = &[
     "cr2",  // Canon (older)
     "cr3",  // Canon (newer)
     "arw",  // Sony
-    "dng",  // Adobe / Pentax / Leica / etc.
+    // NOTE: "dng" intentionally NOT here — DNG is its own ImageKind::Dng
+    // (Lightroom import, Docs/DESIGN-Lightroom-Catalog-Import.md §7), so it does
+    // NOT pair-collapse as a RAW. Re-adding it here would regress that. See
+    // DNG_EXTENSIONS below.
     "raf",  // Fujifilm
     "rw2",  // Panasonic
     "orf",  // Olympus / OM System
@@ -197,6 +200,26 @@ const JPEG_EXTENSIONS: &[&str] = &["jpg", "jpeg"];
 /// way JPEG does — it is a lightweight, viewable sibling of the RAW — so it
 /// is its own `ImageKind` rather than living in the `Other` bucket.
 const HEIF_EXTENSIONS: &[&str] = &["heic", "heif", "hif"];
+
+/// Recognized DNG file extension (Lightroom-import work)
+///
+/// DNG is its OWN `ImageKind::Dng`, deliberately NOT folded into
+/// `RAW_EXTENSIONS`: a single shot can carry RAW + JPEG + DNG, and DNGs are
+/// typically edit/conversion artifacts rather than the camera original.
+/// Consequence: `.dng` no longer pair-collapses behind a JPEG — it shows as its
+/// own kind. See Docs/DESIGN-Lightroom-Catalog-Import.md §7. Trade-off: cameras
+/// that shoot NATIVE DNG (Leica/Pentax/some drones) lose RAW-style collapse for
+/// those files — accepted.
+const DNG_EXTENSIONS: &[&str] = &["dng"];
+
+/// Recognized Photoshop, TIFF, and PNG extensions (Lightroom-import work)
+///
+/// Promoted out of the `Other` bucket to their own `ImageKind`s so they
+/// catalogue, thumbnail, and filter as first-class formats. None participate in
+/// RAW+JPEG/HEIF pair-collapse. See Docs/DESIGN-Lightroom-Catalog-Import.md §7.
+const PSD_EXTENSIONS: &[&str] = &["psd"];
+const TIFF_EXTENSIONS: &[&str] = &["tif", "tiff"];
+const PNG_EXTENSIONS: &[&str] = &["png"];
 
 /// Image classification categories for JPEG+RAW pair handling
 ///
@@ -227,9 +250,18 @@ pub enum ImageKind
     // UniFFI discriminants stable — must stay in the same position as the
     // UDL `enum ImageKind`.
     Heif,
+    // Lightroom import (Docs/DESIGN-Lightroom-Catalog-Import.md §7): DNG
+    // promoted out of Raw; PSD/TIFF/PNG out of Other. Each is its own kind so a
+    // shot's RAW + JPEG + DNG/PSD/etc. stay distinct, and none participate in
+    // RAW+JPEG/HEIF pair-collapse. Appended LAST (after Heif) to keep existing
+    // UniFFI discriminants stable — order MUST match the UDL `enum ImageKind`.
+    Dng,
+    Psd,
+    Tiff,
+    Png,
 }
 
-/// Classify a file extension into JPEG, RAW, or Other
+/// Classify a file extension into its ImageKind (JPEG/RAW/HEIF/DNG/PSD/TIFF/PNG/Other)
 ///
 /// Pure string-to-enum lookup. Case-insensitive: lowercases the input before
 /// checking the constant tables.
@@ -264,9 +296,26 @@ pub fn classify_extension(ext: String) -> ImageKind
     {
         ImageKind::Heif
     }
+    else if DNG_EXTENSIONS.contains(&lower.as_str())
+    {
+        // Checked before RAW: DNG is its own kind, not a RAW (see DNG_EXTENSIONS).
+        ImageKind::Dng
+    }
     else if RAW_EXTENSIONS.contains(&lower.as_str())
     {
         ImageKind::Raw
+    }
+    else if PSD_EXTENSIONS.contains(&lower.as_str())
+    {
+        ImageKind::Psd
+    }
+    else if TIFF_EXTENSIONS.contains(&lower.as_str())
+    {
+        ImageKind::Tiff
+    }
+    else if PNG_EXTENSIONS.contains(&lower.as_str())
+    {
+        ImageKind::Png
     }
     else
     {
@@ -636,6 +685,54 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         -- status filter can never be forgotten. Recovery reads the raw table.
         CREATE OR REPLACE VIEW keyword_visible AS
             SELECT * FROM keyword WHERE status = 1;
+
+        -- === Videos (Lightroom import; Docs/DESIGN-Lightroom-Catalog-Import.md §8) ===
+        -- Video assets live in their OWN table, NOT in `images` (video is not an
+        -- ImageKind). Catalog-only for v1: metadata + curation. Poster-frame
+        -- thumbnails + playback are Stage 6 (AVFoundation). The column shape
+        -- mirrors `images` where they overlap (file props, timestamps, curation)
+        -- so the two stay consistent and no migration is needed when videos
+        -- become first-class. Video-specific columns: duration_seconds /
+        -- frame_rate (decoded Swift-side from AgVideoInfo's hex QuickTime
+        -- rationals), has_audio, video_kind (mov/mp4/mpeg by extension).
+        -- Populated by merge_lightroom_videos (same ON CONFLICT(file_path) upsert
+        -- pattern as the images merge). Sequence PK because DuckDB 1.2.2 drops
+        -- GENERATED ... IDENTITY (same reason as images_id_seq).
+        CREATE SEQUENCE IF NOT EXISTS videos_id_seq START 1;
+
+        CREATE TABLE IF NOT EXISTS videos (
+            id INTEGER PRIMARY KEY DEFAULT nextval('videos_id_seq'),
+
+            -- File-system properties (mirror images)
+            file_path TEXT NOT NULL UNIQUE,
+            file_size BIGINT NOT NULL,
+            file_name TEXT NOT NULL,
+            file_extension TEXT,
+            directory_path VARCHAR,
+            created_timestamp INTEGER NOT NULL,   -- Unix epoch seconds
+            modified_timestamp INTEGER NOT NULL,  -- Unix epoch seconds
+
+            -- Capture / media metadata
+            capture_datetime TEXT,                -- ISO 8601
+            pixel_width INTEGER,
+            pixel_height INTEGER,
+            duration_seconds DOUBLE,              -- AgVideoInfo.duration (decoded)
+            frame_rate DOUBLE,                    -- AgVideoInfo.frame_rate (decoded)
+            has_audio BOOLEAN,
+            video_kind TEXT,                      -- 'mov' / 'mp4' / 'mpeg' (by extension)
+
+            -- Curation (LR rates/flags/labels videos too)
+            rating INTEGER,
+            flag TEXT,
+            color_label TEXT,
+
+            -- Audit
+            indexed_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_videos_capture_datetime ON videos(capture_datetime);
+        CREATE INDEX IF NOT EXISTS idx_videos_rating ON videos(rating);
+        CREATE INDEX IF NOT EXISTS idx_videos_directory_path ON videos(directory_path);
     "#;
 
     // Execute schema creation as a batch
@@ -727,6 +824,10 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             ImageKind::Raw  => "raw",
             ImageKind::Other => "other",
             ImageKind::Heif => "heif",
+            ImageKind::Dng  => "dng",
+            ImageKind::Psd  => "psd",
+            ImageKind::Tiff => "tiff",
+            ImageKind::Png  => "png",
         };
         match conn.execute(
             "UPDATE images SET file_stem = ?1, image_kind = ?2 WHERE id = ?3",
@@ -769,6 +870,46 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
     {
         Ok(changed) => eprintln!("[migration] backfilled directory_path for {} rows", changed),
         Err(e) => eprintln!("[migration] Failed to backfill directory_path: {}", e),
+    }
+
+    // Step 4: reclassify formats promoted to their own ImageKind
+    // (Docs/DESIGN-Lightroom-Catalog-Import.md §7a). DNG left the Raw class;
+    // PSD/TIFF/PNG left Other. Rows ingested under the old kind are moved here.
+    // file_extension is already lowercased by Step 2, so plain equality hits
+    // idx_file_extension. Idempotent: the `image_kind <> …` guard no-ops re-runs.
+    // (Rows with a NULL file_extension are skipped — they keep their parse-time
+    // kind; this matches the §7a documented edge.)
+    match conn.execute(
+        "UPDATE images SET image_kind = 'dng' WHERE file_extension = 'dng' AND image_kind <> 'dng'",
+        [],
+    )
+    {
+        Ok(changed) => eprintln!("[migration] reclassified {} dng rows", changed),
+        Err(e) => eprintln!("[migration] Failed to reclassify dng: {}", e),
+    }
+    match conn.execute(
+        "UPDATE images SET image_kind = 'psd' WHERE file_extension = 'psd' AND image_kind <> 'psd'",
+        [],
+    )
+    {
+        Ok(changed) => eprintln!("[migration] reclassified {} psd rows", changed),
+        Err(e) => eprintln!("[migration] Failed to reclassify psd: {}", e),
+    }
+    match conn.execute(
+        "UPDATE images SET image_kind = 'tiff' WHERE file_extension IN ('tif','tiff') AND image_kind <> 'tiff'",
+        [],
+    )
+    {
+        Ok(changed) => eprintln!("[migration] reclassified {} tiff rows", changed),
+        Err(e) => eprintln!("[migration] Failed to reclassify tiff: {}", e),
+    }
+    match conn.execute(
+        "UPDATE images SET image_kind = 'png' WHERE file_extension = 'png' AND image_kind <> 'png'",
+        [],
+    )
+    {
+        Ok(changed) => eprintln!("[migration] reclassified {} png rows", changed),
+        Err(e) => eprintln!("[migration] Failed to reclassify png: {}", e),
     }
 
     if let Err(e) = conn.execute_batch("COMMIT;")
@@ -881,6 +1022,10 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
             ImageKind::Raw  => "raw",
             ImageKind::Other => "other",
             ImageKind::Heif => "heif",
+            ImageKind::Dng  => "dng",
+            ImageKind::Psd  => "psd",
+            ImageKind::Tiff => "tiff",
+            ImageKind::Png  => "png",
         };
 
         // Execute the prepared statement with positional parameters
@@ -3361,6 +3506,367 @@ pub async fn rename_keyword(target_path: Vec<String>, new_label: String) -> u64
     changed
 }
 
+// === Lightroom catalog import (Docs/DESIGN-Lightroom-Catalog-Import.md) ===
+
+/// Per-chunk merge result. `image_ids` is aligned to the INPUT order so the
+/// Swift keyword pass can attach keywords by id. On any row error the chunk is
+/// rolled back and a zeroed result is returned (inserted + updated == 0 on a
+/// non-empty input signals a failed chunk to the orchestrator).
+#[derive(Debug, Clone)]
+pub struct MergeChunkResult
+{
+    pub inserted: u64,
+    pub updated: u64,
+    pub image_ids: Vec<i64>,
+}
+
+/// The image-merge logic, on a borrowed connection (so it is testable against an
+/// in-memory catalogue). Wrapped by `merge_lightroom_records`, which locks the
+/// global CATALOGUE. Per-row **check-then-UPDATE-or-INSERT** — see §4 for WHY
+/// this is NOT `ON CONFLICT`: `images.id` is a sequence-default PK, and DuckDB's
+/// `ON CONFLICT DO UPDATE` fires `nextval()` for the proposed tuple on the
+/// conflict path (advancing the sequence and confusing `RETURNING id`). The
+/// explicit path is id-stable by construction (an UPDATE never touches `id` —
+/// `keyword.image_id` FKs depend on it) and yields the inserted/updated tally
+/// for free.
+fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChunkResult
+{
+    let mut out = MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::with_capacity(records.len()) };
+    if records.is_empty()
+    {
+        return out;
+    }
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("merge_records_into: begin failed: {}", e);
+        return out;
+    }
+
+    for record in records
+    {
+        // Pre-check: an existing row keeps its id (UPDATE); else a fresh INSERT.
+        let existing: Result<i64, _> = conn.query_row(
+            "SELECT id FROM images WHERE file_path = ?1",
+            params![record.file_path],
+            |r| r.get(0),
+        );
+
+        // Each arm yields Result<(was_insert, id), Error>.
+        let row_result: Result<(bool, i64), _> = if let Ok(id) = existing
+        {
+            // UPDATE — facts fill-if-missing, curation Lightroom-wins (§4/§5).
+            conn.execute(
+                "UPDATE images SET \
+                    capture_datetime = COALESCE(capture_datetime, ?2), \
+                    pixel_width      = COALESCE(pixel_width, ?3), \
+                    pixel_height     = COALESCE(pixel_height, ?4), \
+                    camera_make      = COALESCE(camera_make, ?5), \
+                    camera_model     = COALESCE(camera_model, ?6), \
+                    lens_model       = COALESCE(lens_model, ?7), \
+                    focal_length     = COALESCE(focal_length, ?8), \
+                    aperture         = COALESCE(aperture, ?9), \
+                    shutter_speed    = COALESCE(shutter_speed, ?10), \
+                    iso              = COALESCE(iso, ?11), \
+                    bit_depth        = COALESCE(bit_depth, ?12), \
+                    gps_latitude     = COALESCE(gps_latitude, ?13), \
+                    gps_longitude    = COALESCE(gps_longitude, ?14), \
+                    rating      = COALESCE(?15, rating), \
+                    flag        = COALESCE(?16, flag), \
+                    color_label = COALESCE(?17, color_label) \
+                 WHERE id = ?1",
+                params![
+                    id,
+                    record.capture_datetime,
+                    record.pixel_width.map(|v| v as i64),
+                    record.pixel_height.map(|v| v as i64),
+                    record.camera_make,
+                    record.camera_model,
+                    record.lens_model,
+                    record.focal_length,
+                    record.aperture,
+                    record.shutter_speed,
+                    record.iso.map(|v| v as i64),
+                    record.bit_depth.map(|v| v as i64),
+                    record.gps_latitude,
+                    record.gps_longitude,
+                    record.rating.map(|v| v as i64),
+                    record.flag,
+                    record.color_label,
+                ],
+            ).map(|_| (false, id))
+        }
+        else
+        {
+            // INSERT — mirror ingest_metadata's column set + the canonical
+            // directory_path expression; RETURNING id (a plain insert is reliable).
+            let parsed = parse_filename(record.file_name.clone());
+            let image_kind_str = match parsed.kind
+            {
+                ImageKind::Jpeg => "jpeg",
+                ImageKind::Raw  => "raw",
+                ImageKind::Other => "other",
+                ImageKind::Heif => "heif",
+                ImageKind::Dng  => "dng",
+                ImageKind::Psd  => "psd",
+                ImageKind::Tiff => "tiff",
+                ImageKind::Png  => "png",
+            };
+            conn.query_row(
+                "INSERT INTO images ( \
+                    file_path, file_size, file_name, file_extension, \
+                    file_stem, image_kind, directory_path, \
+                    created_timestamp, modified_timestamp, \
+                    camera_make, camera_model, lens_model, \
+                    focal_length, aperture, shutter_speed, iso, \
+                    capture_datetime, pixel_width, pixel_height, color_space, bit_depth, \
+                    gps_latitude, gps_longitude, gps_altitude, \
+                    copyright, creator, description, \
+                    rating, flag, color_label \
+                 ) VALUES ( \
+                    ?1, ?2, ?3, ?4, ?5, ?6, \
+                    SUBSTRING(?1, 1, LENGTH(?1) - INSTR(REVERSE(?1), '/')), \
+                    ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
+                    ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29 \
+                 ) RETURNING id",
+                params![
+                    record.file_path,
+                    record.file_size as i64,
+                    record.file_name,
+                    record.file_extension,
+                    parsed.stem,
+                    image_kind_str,
+                    record.created_timestamp,
+                    record.modified_timestamp,
+                    record.camera_make,
+                    record.camera_model,
+                    record.lens_model,
+                    record.focal_length,
+                    record.aperture,
+                    record.shutter_speed,
+                    record.iso.map(|v| v as i64),
+                    record.capture_datetime,
+                    record.pixel_width.map(|v| v as i64),
+                    record.pixel_height.map(|v| v as i64),
+                    record.color_space,
+                    record.bit_depth.map(|v| v as i64),
+                    record.gps_latitude,
+                    record.gps_longitude,
+                    record.gps_altitude,
+                    record.copyright,
+                    record.creator,
+                    record.description,
+                    record.rating.map(|v| v as i64),
+                    record.flag,
+                    record.color_label,
+                ],
+                |r| r.get::<_, i64>(0),
+            ).map(|new_id| (true, new_id))
+        };
+
+        match row_result
+        {
+            Ok((true, id))  => { out.inserted += 1; out.image_ids.push(id); }
+            Ok((false, id)) => { out.updated  += 1; out.image_ids.push(id); }
+            Err(e) =>
+            {
+                eprintln!("merge_records_into: row failed for {}: {}", record.file_path, e);
+                let _ = conn.execute_batch("ROLLBACK;");
+                return MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::new() };
+            }
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("merge_records_into: commit failed: {}", e);
+        return MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::new() };
+    }
+    out
+}
+
+/// FFI entry: merge a chunk of Lightroom-sourced image records into the
+/// catalogue (matched on file_path). Reuses `ImageMetadata` as the input — it is
+/// an exact superset of what LR provides (§10). Returns per-chunk stats + the
+/// resulting catalogue ids (aligned to input order) for the keyword pass.
+pub async fn merge_lightroom_records(records: Vec<ImageMetadata>) -> MergeChunkResult
+{
+    if records.is_empty()
+    {
+        return MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::new() };
+    }
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("merge_lightroom_records: catalogue not initialized");
+            return MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::new() };
+        }
+    };
+    merge_records_into(conn, &records)
+}
+
+/// One Lightroom-sourced VIDEO record (input to merge_lightroom_videos). No
+/// `ImageMetadata` analogue — videos carry duration/frame_rate/has_audio/
+/// video_kind and no EXIF. `directory_path` is derived Rust-side (like images).
+#[derive(Debug, Clone)]
+pub struct LightroomVideoRecord
+{
+    pub file_path: String,
+    pub file_size: u64,
+    pub file_name: String,
+    pub file_extension: Option<String>,
+    pub created_timestamp: i64,
+    pub modified_timestamp: i64,
+    pub capture_datetime: Option<String>,
+    pub pixel_width: Option<u32>,
+    pub pixel_height: Option<u32>,
+    pub duration_seconds: Option<f64>,
+    pub frame_rate: Option<f64>,
+    pub has_audio: Option<bool>,
+    pub video_kind: Option<String>,
+    pub rating: Option<u8>,
+    pub flag: Option<String>,
+    pub color_label: Option<String>,
+}
+
+/// Video-merge logic on a borrowed connection (testable). Same
+/// check-then-UPDATE-or-INSERT pattern as `merge_records_into` (§4), into the
+/// `videos` table. The result's `image_ids` holds the VIDEO-row ids (aligned to
+/// input) — the field name is shared for one `MergeChunkResult` shape.
+fn merge_videos_into(conn: &Connection, records: &[LightroomVideoRecord]) -> MergeChunkResult
+{
+    let mut out = MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::with_capacity(records.len()) };
+    if records.is_empty()
+    {
+        return out;
+    }
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("merge_videos_into: begin failed: {}", e);
+        return out;
+    }
+
+    for record in records
+    {
+        let existing: Result<i64, _> = conn.query_row(
+            "SELECT id FROM videos WHERE file_path = ?1",
+            params![record.file_path],
+            |r| r.get(0),
+        );
+
+        let row_result: Result<(bool, i64), _> = if let Ok(id) = existing
+        {
+            // UPDATE — facts fill-if-missing, curation Lightroom-wins.
+            conn.execute(
+                "UPDATE videos SET \
+                    capture_datetime = COALESCE(capture_datetime, ?2), \
+                    pixel_width      = COALESCE(pixel_width, ?3), \
+                    pixel_height     = COALESCE(pixel_height, ?4), \
+                    duration_seconds = COALESCE(duration_seconds, ?5), \
+                    frame_rate       = COALESCE(frame_rate, ?6), \
+                    has_audio        = COALESCE(has_audio, ?7), \
+                    video_kind       = COALESCE(video_kind, ?8), \
+                    rating      = COALESCE(?9, rating), \
+                    flag        = COALESCE(?10, flag), \
+                    color_label = COALESCE(?11, color_label) \
+                 WHERE id = ?1",
+                params![
+                    id,
+                    record.capture_datetime,
+                    record.pixel_width.map(|v| v as i64),
+                    record.pixel_height.map(|v| v as i64),
+                    record.duration_seconds,
+                    record.frame_rate,
+                    record.has_audio,
+                    record.video_kind,
+                    record.rating.map(|v| v as i64),
+                    record.flag,
+                    record.color_label,
+                ],
+            ).map(|_| (false, id))
+        }
+        else
+        {
+            conn.query_row(
+                "INSERT INTO videos ( \
+                    file_path, file_size, file_name, file_extension, directory_path, \
+                    created_timestamp, modified_timestamp, \
+                    capture_datetime, pixel_width, pixel_height, \
+                    duration_seconds, frame_rate, has_audio, video_kind, \
+                    rating, flag, color_label \
+                 ) VALUES ( \
+                    ?1, ?2, ?3, ?4, \
+                    SUBSTRING(?1, 1, LENGTH(?1) - INSTR(REVERSE(?1), '/')), \
+                    ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16 \
+                 ) RETURNING id",
+                params![
+                    record.file_path,
+                    record.file_size as i64,
+                    record.file_name,
+                    record.file_extension,
+                    record.created_timestamp,
+                    record.modified_timestamp,
+                    record.capture_datetime,
+                    record.pixel_width.map(|v| v as i64),
+                    record.pixel_height.map(|v| v as i64),
+                    record.duration_seconds,
+                    record.frame_rate,
+                    record.has_audio,
+                    record.video_kind,
+                    record.rating.map(|v| v as i64),
+                    record.flag,
+                    record.color_label,
+                ],
+                |r| r.get::<_, i64>(0),
+            ).map(|new_id| (true, new_id))
+        };
+
+        match row_result
+        {
+            Ok((true, id))  => { out.inserted += 1; out.image_ids.push(id); }
+            Ok((false, id)) => { out.updated  += 1; out.image_ids.push(id); }
+            Err(e) =>
+            {
+                eprintln!("merge_videos_into: row failed for {}: {}", record.file_path, e);
+                let _ = conn.execute_batch("ROLLBACK;");
+                return MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::new() };
+            }
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("merge_videos_into: commit failed: {}", e);
+        return MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::new() };
+    }
+    out
+}
+
+/// FFI entry: merge a chunk of Lightroom-sourced VIDEO records into the `videos`
+/// table (matched on file_path). Returns per-chunk stats + the video-row ids.
+pub async fn merge_lightroom_videos(records: Vec<LightroomVideoRecord>) -> MergeChunkResult
+{
+    if records.is_empty()
+    {
+        return MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::new() };
+    }
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("merge_lightroom_videos: catalogue not initialized");
+            return MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::new() };
+        }
+    };
+    merge_videos_into(conn, &records)
+}
+
 #[cfg(test)]
 mod keyword_tests
 {
@@ -3430,6 +3936,368 @@ mod keyword_tests
             value: Some(String::new()),
         };
         assert_eq!(predicate_to_sql(&empty), "(FALSE)");
+    }
+}
+
+#[cfg(test)]
+mod lightroom_import_tests
+{
+    use super::*;
+    use duckdb::{Connection, params};
+
+    // ---- classify_extension: the new ImageKind promotions (§7) ----
+
+    #[test]
+    fn classify_promotes_new_kinds()
+    {
+        // DNG out of Raw (its own kind, checked BEFORE the RAW table).
+        assert_eq!(classify_extension("dng".to_string()), ImageKind::Dng);
+        // PSD / TIFF / PNG out of the Other bucket.
+        assert_eq!(classify_extension("psd".to_string()), ImageKind::Psd);
+        assert_eq!(classify_extension("tif".to_string()), ImageKind::Tiff);
+        assert_eq!(classify_extension("tiff".to_string()), ImageKind::Tiff);
+        assert_eq!(classify_extension("png".to_string()), ImageKind::Png);
+    }
+
+    #[test]
+    fn classify_preserves_existing_kinds()
+    {
+        // The promotions must not disturb the existing classifications.
+        assert_eq!(classify_extension("nef".to_string()), ImageKind::Raw);
+        assert_eq!(classify_extension("cr3".to_string()), ImageKind::Raw);
+        assert_eq!(classify_extension("jpg".to_string()), ImageKind::Jpeg);
+        assert_eq!(classify_extension("jpeg".to_string()), ImageKind::Jpeg);
+        assert_eq!(classify_extension("heic".to_string()), ImageKind::Heif);
+        assert_eq!(classify_extension("xyz".to_string()), ImageKind::Other);
+        assert_eq!(classify_extension(String::new()), ImageKind::Other);
+    }
+
+    #[test]
+    fn classify_is_case_insensitive_for_new_kinds()
+    {
+        assert_eq!(classify_extension("DNG".to_string()), ImageKind::Dng);
+        assert_eq!(classify_extension("Psd".to_string()), ImageKind::Psd);
+        assert_eq!(classify_extension("TIFF".to_string()), ImageKind::Tiff);
+        assert_eq!(classify_extension("PNG".to_string()), ImageKind::Png);
+    }
+
+    // ---- DuckDB ON CONFLICT upsert probe (de-risks §4 before the merge) ----
+    //
+    // Proves the BUNDLED DuckDB engine supports the exact upsert the Lightroom
+    // merge relies on: INSERT ... ON CONFLICT(unique) DO UPDATE SET, referencing
+    // both `excluded.<col>` (the would-be-inserted row) and the target table's
+    // own columns, in BOTH COALESCE directions:
+    //   - CURATION (Lightroom-wins):  COALESCE(excluded.x, t.x)
+    //   - FACTS    (fill-if-missing): COALESCE(t.x, excluded.x)
+    // and that an LR-NULL value never erases an existing curation value.
+    #[test]
+    fn duckdb_on_conflict_upsert_behaves()
+    {
+        let conn = Connection::open_in_memory().expect("open in-memory duckdb");
+        conn.execute_batch("CREATE TABLE t (fp TEXT UNIQUE, rating INTEGER, cam TEXT);")
+            .expect("create table");
+
+        // One upsert mirroring the merge: rating = LR-wins, cam = fill-if-missing.
+        let upsert = "INSERT INTO t (fp, rating, cam) VALUES (?1, ?2, ?3) \
+                      ON CONFLICT (fp) DO UPDATE SET \
+                        rating = COALESCE(excluded.rating, t.rating), \
+                        cam    = COALESCE(t.cam, excluded.cam)";
+
+        // 1. First insert (no conflict): the row is created.
+        conn.execute(upsert, params!["a", 3i32, "CanonX"]).expect("insert 1");
+
+        // 2. Conflict with a NEW rating + a different cam:
+        //    rating -> 5 (Lightroom-wins), cam stays CanonX (fact, fill-if-missing).
+        conn.execute(upsert, params!["a", 5i32, "CanonY"]).expect("insert 2");
+        let (rating, cam): (i64, String) = conn.query_row(
+            "SELECT rating, cam FROM t WHERE fp = 'a'", [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).expect("select 2");
+        assert_eq!(rating, 5, "Lightroom-wins should overwrite rating");
+        assert_eq!(cam, "CanonX", "fact should be fill-if-missing (keep existing)");
+
+        // 3. Conflict with a NULL rating must NOT erase the existing 5.
+        conn.execute(upsert, params!["a", Option::<i32>::None, "CanonZ"]).expect("insert 3");
+        let rating_after: Option<i64> = conn.query_row(
+            "SELECT rating FROM t WHERE fp = 'a'", [], |r| r.get(0),
+        ).expect("select 3");
+        assert_eq!(rating_after, Some(5), "LR-null must not erase existing curation");
+
+        // Upserts, not duplicate inserts: exactly one row.
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).expect("count");
+        assert_eq!(count, 1);
+    }
+
+    // ---- videos table DDL probe (de-risks §8 before merge_lightroom_videos) ----
+    //
+    // Validates the new `videos` schema against the BUNDLED engine: the
+    // sequence-default PK (DuckDB drops IDENTITY), and the DOUBLE / BOOLEAN /
+    // BIGINT column types not otherwise exercised by the images schema.
+    #[test]
+    fn videos_table_ddl_and_insert()
+    {
+        let conn = Connection::open_in_memory().expect("open in-memory duckdb");
+        conn.execute_batch(
+            "CREATE SEQUENCE videos_id_seq START 1;
+             CREATE TABLE videos (
+                id INTEGER PRIMARY KEY DEFAULT nextval('videos_id_seq'),
+                file_path TEXT NOT NULL UNIQUE,
+                file_size BIGINT NOT NULL,
+                file_name TEXT NOT NULL,
+                file_extension TEXT,
+                directory_path VARCHAR,
+                created_timestamp INTEGER NOT NULL,
+                modified_timestamp INTEGER NOT NULL,
+                capture_datetime TEXT,
+                pixel_width INTEGER,
+                pixel_height INTEGER,
+                duration_seconds DOUBLE,
+                frame_rate DOUBLE,
+                has_audio BOOLEAN,
+                video_kind TEXT,
+                rating INTEGER,
+                flag TEXT,
+                color_label TEXT,
+                indexed_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+             );"
+        ).expect("create videos table");
+
+        // Insert omitting id (sequence default) + exercising DOUBLE/BOOLEAN/BIGINT.
+        conn.execute(
+            "INSERT INTO videos
+                (file_path, file_size, file_name, file_extension, directory_path,
+                 created_timestamp, modified_timestamp, capture_datetime,
+                 pixel_width, pixel_height, duration_seconds, frame_rate, has_audio,
+                 video_kind, rating, flag, color_label)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            params![
+                "/v/clip.mov", 4_087_595_000i64, "clip.mov", "mov", "/v",
+                1_700_000_000i64, 1_700_000_000i64, "2025-01-02T03:04:05",
+                1920i32, 1080i32, 204.4f64, 59.94f64, true,
+                "mov", 4i32, "pick", "blue"
+            ],
+        ).expect("insert video");
+
+        let (id, dur, fps, audio, kind): (i64, f64, f64, bool, String) = conn.query_row(
+            "SELECT id, duration_seconds, frame_rate, has_audio, video_kind \
+             FROM videos WHERE file_path = '/v/clip.mov'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        ).expect("read video");
+
+        assert_eq!(id, 1, "sequence default should auto-assign id = 1");
+        assert!((dur - 204.4).abs() < 1e-6, "DOUBLE round-trips");
+        assert!((fps - 59.94).abs() < 1e-6, "DOUBLE round-trips");
+        assert!(audio, "BOOLEAN round-trips");
+        assert_eq!(kind, "mov");
+    }
+
+    // ---- ON CONFLICT + sequence-PK id behavior (CRITICAL — drives the merge) ----
+    //
+    // The merge matches on file_path and must keep each row's `id` STABLE across
+    // re-import — `keyword.image_id` FKs depend on it. DuckDB evaluates the
+    // sequence DEFAULT for the proposed insert tuple even on the conflict path,
+    // so `RETURNING id` after DO UPDATE returns the PROPOSED (advanced) id, not
+    // the existing one. What actually matters is whether the STORED id changes.
+    // This test pins that down. (The merge retrieves ids via SELECT, never
+    // RETURNING; if the STORED id were unstable we'd abandon ON CONFLICT for an
+    // explicit check-then-UPDATE-or-INSERT, which never touches id.)
+    #[test]
+    fn duckdb_upsert_keeps_stored_id_stable()
+    {
+        let conn = Connection::open_in_memory().expect("open in-memory duckdb");
+        conn.execute_batch(
+            "CREATE SEQUENCE s START 1;
+             CREATE TABLE m (id INTEGER PRIMARY KEY DEFAULT nextval('s'), fp TEXT UNIQUE, rating INTEGER);"
+        ).expect("create");
+
+        conn.execute("INSERT INTO m (fp, rating) VALUES ('a', 3)", []).expect("insert a");
+        let id_before: i64 = conn.query_row("SELECT id FROM m WHERE fp = 'a'", [], |r| r.get(0)).expect("id before");
+
+        // Conflicting upsert (curation COALESCE direction).
+        conn.execute(
+            "INSERT INTO m (fp, rating) VALUES ('a', 5) \
+             ON CONFLICT (fp) DO UPDATE SET rating = COALESCE(excluded.rating, m.rating)",
+            [],
+        ).expect("upsert a");
+
+        let id_after: i64 = conn.query_row("SELECT id FROM m WHERE fp = 'a'", [], |r| r.get(0)).expect("id after");
+        let rating_after: i64 = conn.query_row("SELECT rating FROM m WHERE fp = 'a'", [], |r| r.get(0)).expect("rating after");
+
+        assert_eq!(id_before, id_after, "STORED id must be stable across ON CONFLICT update (keyword FKs depend on it)");
+        assert_eq!(rating_after, 5, "curation still updates (Lightroom-wins)");
+    }
+
+    // ---- merge_records_into: insert / update / policies / id-stability ----
+
+    // A minimal `images` table covering exactly the columns the merge touches.
+    fn create_images(conn: &Connection)
+    {
+        conn.execute_batch(
+            "CREATE SEQUENCE images_id_seq START 1;
+             CREATE TABLE images (
+                id INTEGER PRIMARY KEY DEFAULT nextval('images_id_seq'),
+                file_path TEXT NOT NULL UNIQUE,
+                file_size BIGINT NOT NULL,
+                file_name TEXT NOT NULL,
+                file_extension TEXT,
+                file_stem VARCHAR,
+                image_kind VARCHAR,
+                directory_path VARCHAR,
+                created_timestamp INTEGER NOT NULL,
+                modified_timestamp INTEGER NOT NULL,
+                camera_make TEXT, camera_model TEXT, lens_model TEXT,
+                focal_length REAL, aperture REAL, shutter_speed REAL, iso INTEGER,
+                capture_datetime TEXT, pixel_width INTEGER, pixel_height INTEGER,
+                color_space TEXT, bit_depth INTEGER,
+                gps_latitude REAL, gps_longitude REAL, gps_altitude REAL,
+                copyright TEXT, creator TEXT, description TEXT,
+                rating INTEGER, flag TEXT, color_label TEXT
+             );"
+        ).expect("create images");
+    }
+
+    // A default ImageMetadata; override fields per test.
+    fn img(file_path: &str, file_name: &str) -> ImageMetadata
+    {
+        ImageMetadata {
+            file_path: file_path.to_string(),
+            file_size: 1000,
+            file_name: file_name.to_string(),
+            file_extension: Some("nef".to_string()),
+            created_timestamp: 1_700_000_000,
+            modified_timestamp: 1_700_000_000,
+            camera_make: None, camera_model: None, lens_model: None,
+            focal_length: None, aperture: None, shutter_speed: None, iso: None,
+            capture_datetime: None,
+            pixel_width: None, pixel_height: None, color_space: None, bit_depth: None,
+            gps_latitude: None, gps_longitude: None, gps_altitude: None,
+            copyright: None, creator: None, description: None,
+            rating: None, flag: None, color_label: None,
+        }
+    }
+
+    #[test]
+    fn merge_inserts_then_updates_with_policies()
+    {
+        let conn = Connection::open_in_memory().expect("open in-memory duckdb");
+        create_images(&conn);
+
+        // 1. First merge: two NEW rows.
+        let mut a = img("/p/a.nef", "a.nef");
+        a.rating = Some(3);
+        a.camera_model = Some("Nikon Z8".to_string());
+        let b = img("/p/b.nef", "b.nef");
+        let r1 = merge_records_into(&conn, &[a, b]);
+        assert_eq!(r1.inserted, 2);
+        assert_eq!(r1.updated, 0);
+        assert_eq!(r1.image_ids.len(), 2);
+        let id_a = r1.image_ids[0];
+
+        // Derived columns: nef -> 'raw'; directory_path from file_path.
+        let (kind, dir): (String, String) = conn.query_row(
+            "SELECT image_kind, directory_path FROM images WHERE file_path = '/p/a.nef'", [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).expect("derived cols");
+        assert_eq!(kind, "raw");
+        assert_eq!(dir, "/p");
+
+        // 2. Re-merge 'a': new rating (LR-wins), a fact that was missing (fills),
+        //    and a fact already set (must NOT overwrite).
+        let mut a2 = img("/p/a.nef", "a.nef");
+        a2.rating = Some(5);                                            // LR-wins -> 5
+        a2.capture_datetime = Some("2025-01-01T00:00:00".to_string()); // fact was NULL -> fills
+        a2.camera_model = Some("WRONG".to_string());                   // fact set -> keep "Nikon Z8"
+        let r2 = merge_records_into(&conn, &[a2]);
+        assert_eq!(r2.inserted, 0);
+        assert_eq!(r2.updated, 1);
+        assert_eq!(r2.image_ids[0], id_a, "id stable across re-merge (FK safety)");
+
+        let (rating, cap, cam): (i64, String, String) = conn.query_row(
+            "SELECT rating, capture_datetime, camera_model FROM images WHERE file_path = '/p/a.nef'", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).expect("post-update");
+        assert_eq!(rating, 5, "curation: Lightroom wins");
+        assert_eq!(cap, "2025-01-01T00:00:00", "fact: filled when missing");
+        assert_eq!(cam, "Nikon Z8", "fact: existing value kept, not overwritten");
+
+        // 3. LR-null rating must NOT erase the existing 5.
+        let a3 = img("/p/a.nef", "a.nef"); // rating None
+        let r3 = merge_records_into(&conn, &[a3]);
+        assert_eq!(r3.updated, 1);
+        let rating2: i64 = conn.query_row(
+            "SELECT rating FROM images WHERE file_path = '/p/a.nef'", [], |r| r.get(0),
+        ).expect("rating after null");
+        assert_eq!(rating2, 5, "LR-null must not erase existing curation");
+    }
+
+    // ---- merge_videos_into: insert / update / policies (the videos table) ----
+
+    fn create_videos(conn: &Connection)
+    {
+        conn.execute_batch(
+            "CREATE SEQUENCE videos_id_seq START 1;
+             CREATE TABLE videos (
+                id INTEGER PRIMARY KEY DEFAULT nextval('videos_id_seq'),
+                file_path TEXT NOT NULL UNIQUE, file_size BIGINT NOT NULL,
+                file_name TEXT NOT NULL, file_extension TEXT, directory_path VARCHAR,
+                created_timestamp INTEGER NOT NULL, modified_timestamp INTEGER NOT NULL,
+                capture_datetime TEXT, pixel_width INTEGER, pixel_height INTEGER,
+                duration_seconds DOUBLE, frame_rate DOUBLE, has_audio BOOLEAN, video_kind TEXT,
+                rating INTEGER, flag TEXT, color_label TEXT,
+                indexed_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+             );"
+        ).expect("create videos");
+    }
+
+    fn vid(file_path: &str, file_name: &str) -> LightroomVideoRecord
+    {
+        LightroomVideoRecord {
+            file_path: file_path.to_string(),
+            file_size: 5000,
+            file_name: file_name.to_string(),
+            file_extension: Some("mov".to_string()),
+            created_timestamp: 1_700_000_000,
+            modified_timestamp: 1_700_000_000,
+            capture_datetime: None, pixel_width: None, pixel_height: None,
+            duration_seconds: None, frame_rate: None, has_audio: None,
+            video_kind: Some("mov".to_string()),
+            rating: None, flag: None, color_label: None,
+        }
+    }
+
+    #[test]
+    fn merge_videos_inserts_then_updates()
+    {
+        let conn = Connection::open_in_memory().expect("open in-memory duckdb");
+        create_videos(&conn);
+
+        // 1. Insert a new video with a fact (duration) + curation (rating).
+        let mut a = vid("/v/a.mov", "a.mov");
+        a.duration_seconds = Some(204.4);
+        a.rating = Some(2);
+        let r1 = merge_videos_into(&conn, &[a]);
+        assert_eq!(r1.inserted, 1);
+        let id = r1.image_ids[0];
+        let dir: String = conn.query_row(
+            "SELECT directory_path FROM videos WHERE file_path = '/v/a.mov'", [], |r| r.get(0),
+        ).expect("dir");
+        assert_eq!(dir, "/v");
+
+        // 2. Re-merge: rating LR-wins; duration (fact, already set) must NOT change.
+        let mut a2 = vid("/v/a.mov", "a.mov");
+        a2.rating = Some(4);
+        a2.duration_seconds = Some(999.0);
+        let r2 = merge_videos_into(&conn, &[a2]);
+        assert_eq!(r2.updated, 1);
+        assert_eq!(r2.image_ids[0], id, "video id stable across re-merge");
+
+        let (rating, dur): (i64, f64) = conn.query_row(
+            "SELECT rating, duration_seconds FROM videos WHERE file_path = '/v/a.mov'", [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).expect("post-update");
+        assert_eq!(rating, 4, "curation: Lightroom wins");
+        assert!((dur - 204.4).abs() < 1e-6, "fact: existing duration kept, not overwritten");
     }
 }
 
@@ -4652,6 +5520,9 @@ pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord>
         // RAW_JPEG_COLLAPSE_PREDICATE; only this menu-counterpart path
         // returns None for now.
         ImageKind::Heif => return None,
+        // Lightroom import: DNG/PSD/TIFF/PNG are standalone kinds with no
+        // JPEG↔RAW menu-counterpart lookup (Docs/DESIGN-Lightroom-Catalog-Import.md §7).
+        ImageKind::Dng | ImageKind::Psd | ImageKind::Tiff | ImageKind::Png => return None,
     };
 
     // 4. Acquire lock and validate connection.

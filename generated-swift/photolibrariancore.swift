@@ -1080,6 +1080,174 @@ public func FfiConverterTypeKeywordRow_lower(_ value: KeywordRow) -> RustBuffer 
 }
 
 
+public struct LightroomVideoRecord: Equatable, Hashable {
+    public var filePath: String
+    public var fileSize: UInt64
+    public var fileName: String
+    public var fileExtension: String?
+    public var createdTimestamp: Int64
+    public var modifiedTimestamp: Int64
+    public var captureDatetime: String?
+    public var pixelWidth: UInt32?
+    public var pixelHeight: UInt32?
+    public var durationSeconds: Double?
+    public var frameRate: Double?
+    public var hasAudio: Bool?
+    public var videoKind: String?
+    public var rating: UInt8?
+    public var flag: String?
+    public var colorLabel: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(filePath: String, fileSize: UInt64, fileName: String, fileExtension: String?, createdTimestamp: Int64, modifiedTimestamp: Int64, captureDatetime: String?, pixelWidth: UInt32?, pixelHeight: UInt32?, durationSeconds: Double?, frameRate: Double?, hasAudio: Bool?, videoKind: String?, rating: UInt8?, flag: String?, colorLabel: String?) {
+        self.filePath = filePath
+        self.fileSize = fileSize
+        self.fileName = fileName
+        self.fileExtension = fileExtension
+        self.createdTimestamp = createdTimestamp
+        self.modifiedTimestamp = modifiedTimestamp
+        self.captureDatetime = captureDatetime
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+        self.durationSeconds = durationSeconds
+        self.frameRate = frameRate
+        self.hasAudio = hasAudio
+        self.videoKind = videoKind
+        self.rating = rating
+        self.flag = flag
+        self.colorLabel = colorLabel
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension LightroomVideoRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLightroomVideoRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LightroomVideoRecord {
+        return
+            try LightroomVideoRecord(
+                filePath: FfiConverterString.read(from: &buf), 
+                fileSize: FfiConverterUInt64.read(from: &buf), 
+                fileName: FfiConverterString.read(from: &buf), 
+                fileExtension: FfiConverterOptionString.read(from: &buf), 
+                createdTimestamp: FfiConverterInt64.read(from: &buf), 
+                modifiedTimestamp: FfiConverterInt64.read(from: &buf), 
+                captureDatetime: FfiConverterOptionString.read(from: &buf), 
+                pixelWidth: FfiConverterOptionUInt32.read(from: &buf), 
+                pixelHeight: FfiConverterOptionUInt32.read(from: &buf), 
+                durationSeconds: FfiConverterOptionDouble.read(from: &buf), 
+                frameRate: FfiConverterOptionDouble.read(from: &buf), 
+                hasAudio: FfiConverterOptionBool.read(from: &buf), 
+                videoKind: FfiConverterOptionString.read(from: &buf), 
+                rating: FfiConverterOptionUInt8.read(from: &buf), 
+                flag: FfiConverterOptionString.read(from: &buf), 
+                colorLabel: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LightroomVideoRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.filePath, into: &buf)
+        FfiConverterUInt64.write(value.fileSize, into: &buf)
+        FfiConverterString.write(value.fileName, into: &buf)
+        FfiConverterOptionString.write(value.fileExtension, into: &buf)
+        FfiConverterInt64.write(value.createdTimestamp, into: &buf)
+        FfiConverterInt64.write(value.modifiedTimestamp, into: &buf)
+        FfiConverterOptionString.write(value.captureDatetime, into: &buf)
+        FfiConverterOptionUInt32.write(value.pixelWidth, into: &buf)
+        FfiConverterOptionUInt32.write(value.pixelHeight, into: &buf)
+        FfiConverterOptionDouble.write(value.durationSeconds, into: &buf)
+        FfiConverterOptionDouble.write(value.frameRate, into: &buf)
+        FfiConverterOptionBool.write(value.hasAudio, into: &buf)
+        FfiConverterOptionString.write(value.videoKind, into: &buf)
+        FfiConverterOptionUInt8.write(value.rating, into: &buf)
+        FfiConverterOptionString.write(value.flag, into: &buf)
+        FfiConverterOptionString.write(value.colorLabel, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLightroomVideoRecord_lift(_ buf: RustBuffer) throws -> LightroomVideoRecord {
+    return try FfiConverterTypeLightroomVideoRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLightroomVideoRecord_lower(_ value: LightroomVideoRecord) -> RustBuffer {
+    return FfiConverterTypeLightroomVideoRecord.lower(value)
+}
+
+
+public struct MergeChunkResult: Equatable, Hashable {
+    public var inserted: UInt64
+    public var updated: UInt64
+    public var imageIds: [Int64]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(inserted: UInt64, updated: UInt64, imageIds: [Int64]) {
+        self.inserted = inserted
+        self.updated = updated
+        self.imageIds = imageIds
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MergeChunkResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMergeChunkResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MergeChunkResult {
+        return
+            try MergeChunkResult(
+                inserted: FfiConverterUInt64.read(from: &buf), 
+                updated: FfiConverterUInt64.read(from: &buf), 
+                imageIds: FfiConverterSequenceInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MergeChunkResult, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.inserted, into: &buf)
+        FfiConverterUInt64.write(value.updated, into: &buf)
+        FfiConverterSequenceInt64.write(value.imageIds, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMergeChunkResult_lift(_ buf: RustBuffer) throws -> MergeChunkResult {
+    return try FfiConverterTypeMergeChunkResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMergeChunkResult_lower(_ value: MergeChunkResult) -> RustBuffer {
+    return FfiConverterTypeMergeChunkResult.lower(value)
+}
+
+
 public struct ParsedFilename: Equatable, Hashable {
     public var stem: String
     public var extensionLower: String
@@ -1290,6 +1458,10 @@ public enum ImageKind: Equatable, Hashable {
     case raw
     case other
     case heif
+    case dng
+    case psd
+    case tiff
+    case png
 
 
 
@@ -1319,6 +1491,14 @@ public struct FfiConverterTypeImageKind: FfiConverterRustBuffer {
         
         case 4: return .heif
         
+        case 5: return .dng
+        
+        case 6: return .psd
+        
+        case 7: return .tiff
+        
+        case 8: return .png
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -1341,6 +1521,22 @@ public struct FfiConverterTypeImageKind: FfiConverterRustBuffer {
         
         case .heif:
             writeInt(&buf, Int32(4))
+        
+        
+        case .dng:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .psd:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .tiff:
+            writeInt(&buf, Int32(7))
+        
+        
+        case .png:
+            writeInt(&buf, Int32(8))
         
         }
     }
@@ -1453,6 +1649,30 @@ fileprivate struct FfiConverterOptionDouble: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterDouble.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionBool: FfiConverterRustBuffer {
+    typealias SwiftType = Bool?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterBool.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterBool.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -1651,6 +1871,31 @@ fileprivate struct FfiConverterSequenceTypeKeywordRow: FfiConverterRustBuffer {
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeKeywordRow.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeLightroomVideoRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [LightroomVideoRecord]
+
+    public static func write(_ value: [LightroomVideoRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeLightroomVideoRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [LightroomVideoRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [LightroomVideoRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeLightroomVideoRecord.read(from: &buf))
         }
         return seq
     }
@@ -2117,6 +2362,36 @@ public func keywordsForImage(imageId: Int64)async  -> [KeywordRow]  {
             
         )
 }
+public func mergeLightroomRecords(records: [ImageMetadata])async  -> MergeChunkResult  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_merge_lightroom_records(FfiConverterSequenceTypeImageMetadata.lower(records)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeMergeChunkResult_lift,
+            errorHandler: nil
+            
+        )
+}
+public func mergeLightroomVideos(records: [LightroomVideoRecord])async  -> MergeChunkResult  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_merge_lightroom_videos(FfiConverterSequenceTypeLightroomVideoRecord.lower(records)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeMergeChunkResult_lift,
+            errorHandler: nil
+            
+        )
+}
 public func parseFilename(fileName: String) -> ParsedFilename  {
     return try!  FfiConverterTypeParsedFilename_lift(try! rustCall() {
     uniffi_photolibrariancore_fn_func_parse_filename(
@@ -2426,6 +2701,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_keywords_for_image() != 32244) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_merge_lightroom_records() != 40572) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_merge_lightroom_videos() != 20188) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_parse_filename() != 30612) {

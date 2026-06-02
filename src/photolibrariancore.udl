@@ -9,6 +9,17 @@ namespace photolibrariancore {
     [Async]
     u32 ingest_metadata(sequence<ImageMetadata> metadata);
 
+    // Lightroom catalog import (Docs/DESIGN-Lightroom-Catalog-Import.md).
+    // Merge a chunk of LR-sourced records into the catalogue (matched on
+    // file_path; per-row check-then-UPDATE-or-INSERT). Reuses ImageMetadata as
+    // the image input (an exact superset of what LR provides). Returns per-chunk
+    // {inserted, updated} + the resulting catalogue ids aligned to input order
+    // (for the keyword pass). Videos go to the separate `videos` table.
+    [Async]
+    MergeChunkResult merge_lightroom_records(sequence<ImageMetadata> records);
+    [Async]
+    MergeChunkResult merge_lightroom_videos(sequence<LightroomVideoRecord> records);
+
     // Get the total count of images in the catalogue.
     // Step 4a (Filter-Aware Pagination): accepts the two filter booleans
     // (apply_duplicate_filter, apply_raw_jpeg_collapse) so the total matches
@@ -309,17 +320,25 @@ namespace photolibrariancore {
 };
 
 // Image classification categories for JPEG+RAW pair handling.
-// Four variants — Jpeg, Raw, Other, Heif. Other is a real category (PNG,
-// TIFF, etc.), not a "not RAW" bucket. Heif (heic/heif/hif) was promoted out
-// of Other in Session 41 so it can participate in RAW pair-collapse like JPEG.
+// Eight variants — Jpeg, Raw, Other, Heif, Dng, Psd, Tiff, Png. Other is a real
+// category, not a "not RAW" bucket. Heif (heic/heif/hif) was promoted out of
+// Other in Session 41 so it can participate in RAW pair-collapse like JPEG.
+// The Lightroom-import work (Docs/DESIGN-Lightroom-Catalog-Import.md §7)
+// promoted DNG out of Raw and PSD/TIFF/PNG out of Other to their own kinds —
+// none of the four participate in pair-collapse.
 // First enum exposed across the UniFFI boundary in this project.
 // NOTE: variant ORDER must match the Rust `enum ImageKind` (UniFFI maps by
-// position) — Heif is appended LAST in both to keep existing discriminants.
+// position) — new variants are appended LAST in both to keep existing
+// discriminants stable.
 enum ImageKind {
     "Jpeg",
     "Raw",
     "Other",
     "Heif",
+    "Dng",
+    "Psd",
+    "Tiff",
+    "Png",
 };
 
 // Boolean connector between two filter segments (Query Builder), applied
@@ -375,6 +394,38 @@ dictionary KeywordRow {
 dictionary KeywordNode {
     string label;
     string path;
+};
+
+// Lightroom import — per-chunk merge result. image_ids is aligned to the input
+// order (image-row ids for merge_lightroom_records; video-row ids for
+// merge_lightroom_videos) so the Swift keyword pass can attach by id.
+dictionary MergeChunkResult {
+    u64 inserted;
+    u64 updated;
+    sequence<i64> image_ids;
+};
+
+// Lightroom import — one VIDEO record. No ImageMetadata analogue (videos carry
+// duration/frame_rate/has_audio/video_kind, no EXIF). directory_path is derived
+// Rust-side. Times are Unix epoch (Swift converts LR's Cocoa modTime + decodes
+// AgVideoInfo's hex QuickTime rationals).
+dictionary LightroomVideoRecord {
+    string file_path;
+    u64 file_size;
+    string file_name;
+    string? file_extension;
+    i64 created_timestamp;
+    i64 modified_timestamp;
+    string? capture_datetime;
+    u32? pixel_width;
+    u32? pixel_height;
+    f64? duration_seconds;
+    f64? frame_rate;
+    boolean? has_audio;
+    string? video_kind;
+    u8? rating;
+    string? flag;
+    string? color_label;
 };
 
 // Parsed components of a filename, returned by parse_filename.
