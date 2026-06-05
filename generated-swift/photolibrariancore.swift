@@ -1375,6 +1375,64 @@ public func FfiConverterTypeQueryPredicate_lower(_ value: QueryPredicate) -> Rus
     return FfiConverterTypeQueryPredicate.lower(value)
 }
 
+
+public struct RelocateResult: Equatable, Hashable {
+    public var ok: Bool
+    public var updated: UInt64
+    public var message: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(ok: Bool, updated: UInt64, message: String) {
+        self.ok = ok
+        self.updated = updated
+        self.message = message
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension RelocateResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRelocateResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RelocateResult {
+        return
+            try RelocateResult(
+                ok: FfiConverterBool.read(from: &buf), 
+                updated: FfiConverterUInt64.read(from: &buf), 
+                message: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RelocateResult, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.ok, into: &buf)
+        FfiConverterUInt64.write(value.updated, into: &buf)
+        FfiConverterString.write(value.message, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelocateResult_lift(_ buf: RustBuffer) throws -> RelocateResult {
+    return try FfiConverterTypeRelocateResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelocateResult_lower(_ value: RelocateResult) -> RustBuffer {
+    return FfiConverterTypeRelocateResult.lower(value)
+}
+
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
@@ -2429,6 +2487,21 @@ public func queryImages(predicates: [QueryPredicate], connectors: [Connector], l
             
         )
 }
+public func relocateFilePathPrefix(oldPrefix: String, newPrefix: String)async  -> RelocateResult  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_relocate_file_path_prefix(FfiConverterString.lower(oldPrefix),FfiConverterString.lower(newPrefix)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeRelocateResult_lift,
+            errorHandler: nil
+            
+        )
+}
 public func removeImagesForFilters(pathPrefix: String, datePrefix: String)async  -> Int64  {
     return
         try!  await uniffiRustCallAsync(
@@ -2716,6 +2789,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_query_images() != 560) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_relocate_file_path_prefix() != 30525) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_remove_images_for_filters() != 12960) {

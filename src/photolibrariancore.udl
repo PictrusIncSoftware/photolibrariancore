@@ -62,6 +62,12 @@ namespace photolibrariancore {
     [Async]
     boolean update_image_color_label(string file_path, string? color_label);
 
+    // Source-panel relocate (S51): bulk re-point every catalogued row under
+    // old_prefix to new_prefix (rewrites file_path + the stored directory_path
+    // in one transaction; rolls back on a UNIQUE collision). No re-scan.
+    [Async]
+    RelocateResult relocate_file_path_prefix(string old_prefix, string new_prefix);
+
     // ---- Filter / Query Builder (structured query) ----
     // Build a dynamic WHERE from a list of filter segments joined LEFT-TO-
     // RIGHT by connectors (predicates.len() == connectors.len() + 1).
@@ -565,4 +571,13 @@ dictionary FilePathsResult {
     boolean ok;
     sequence<string> paths;
     string? error_message;
+};
+
+// Source-panel relocate result (S51). ok = committed (or nothing to move);
+// updated = rows whose file_path + directory_path were rewritten; message =
+// short diagnostic on failure (e.g. a UNIQUE path collision), empty on success.
+dictionary RelocateResult {
+    boolean ok;
+    u64 updated;
+    string message;
 };

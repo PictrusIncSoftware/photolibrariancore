@@ -2326,6 +2326,92 @@ pub async fn update_image_flag(file_path: String, flag: Option<String>) -> bool 
     }
 }
 
+/// Result of `relocate_file_path_prefix`. `ok` = the rewrite committed (or
+/// there was nothing to move); `updated` = rows whose `file_path` and stored
+/// `directory_path` were rewritten; `message` carries a short diagnostic on
+/// failure (e.g. a UNIQUE collision when the new location overlaps another
+/// cataloged root), empty on success.
+pub struct RelocateResult
+{
+    pub ok: bool,
+    pub updated: u64,
+    pub message: String,
+}
+
+/// Re-point every catalogued row under `old_prefix` to `new_prefix` — a bulk
+/// path-prefix rewrite for the Source-panel relocate feature (no re-scan).
+/// Rewrites BOTH `file_path` AND the stored `directory_path` (the canonical
+/// SUBSTRING/INSTR/REVERSE idiom) inside a transaction; any error — notably a
+/// UNIQUE collision when `new_prefix` overlaps an existing cataloged root —
+/// rolls the whole thing back and reports `ok = false`.
+///
+/// `old_prefix` / `new_prefix` are absolute root paths WITHOUT a trailing
+/// slash; only rows strictly under them (`LIKE old_prefix || '/%'`) move, so a
+/// sibling like `.../InPutTest2` is never caught by `.../InPutTest`. The SQL
+/// was validated against a real 1,587-row catalogue copy before shipping
+/// (S51 Gate 2).
+pub async fn relocate_file_path_prefix(old_prefix: String, new_prefix: String) -> RelocateResult
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("relocate_file_path_prefix: catalogue not initialized");
+            return RelocateResult { ok: false, updated: 0, message: "Catalogue not initialized".to_string() };
+        }
+    };
+
+    if old_prefix.is_empty() || new_prefix.is_empty()
+    {
+        return RelocateResult { ok: false, updated: 0, message: "Empty source or destination prefix".to_string() };
+    }
+    if old_prefix == new_prefix
+    {
+        return RelocateResult { ok: true, updated: 0, message: String::new() };
+    }
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("relocate_file_path_prefix: begin failed: {}", e);
+        return RelocateResult { ok: false, updated: 0, message: format!("begin failed: {}", e) };
+    }
+
+    // Rewrite file_path AND directory_path from the OLD file_path. The new-path
+    // subexpression is repeated because a SET clause cannot reference a column
+    // value being assigned in the same statement. ?1 = new_prefix, ?2 =
+    // old_prefix (LENGTH(?2) drives the tail split; ?2 is reused in the WHERE).
+    let update_sql = "UPDATE images \
+        SET file_path = ?1 || SUBSTR(file_path, LENGTH(?2) + 1), \
+            directory_path = SUBSTRING( \
+                ?1 || SUBSTR(file_path, LENGTH(?2) + 1), 1, \
+                LENGTH(?1 || SUBSTR(file_path, LENGTH(?2) + 1)) \
+                    - INSTR(REVERSE(?1 || SUBSTR(file_path, LENGTH(?2) + 1)), '/')) \
+        WHERE file_path LIKE ?2 || '/%'";
+
+    let changed = match conn.execute(update_sql, params![new_prefix, old_prefix])
+    {
+        Ok(n) => n as u64,
+        Err(e) =>
+        {
+            eprintln!("relocate_file_path_prefix: update failed: {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return RelocateResult { ok: false, updated: 0, message: format!("rewrite failed (possible path collision): {}", e) };
+        }
+    };
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("relocate_file_path_prefix: commit failed: {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return RelocateResult { ok: false, updated: 0, message: format!("commit failed: {}", e) };
+    }
+
+    eprintln!("relocate_file_path_prefix: moved {} rows '{}' -> '{}'", changed, old_prefix, new_prefix);
+    RelocateResult { ok: true, updated: changed, message: String::new() }
+}
+
 /// Update the color label for an image
 ///
 /// Sets the color label for an image identified by its file path. Mirrors
