@@ -374,6 +374,10 @@ enum Connector {
 //   "no_color"          → (none)
 //   "keyword_has"       → value (the keyword label)  → EXISTS (subtree-inclusive)
 //   "keyword_not"       → value (the keyword label)  → NOT EXISTS
+//   "filename_contains" → value (text)  → file_name ILIKE %text% (case-insensitive)
+//   "filename_starts"   → value (text)  → file_name ILIKE text%
+//   "filename_ends"     → value (text)  → file_name ILIKE %text
+//   "filename_exact"    → value (text)  → file_name ILIKE text (case-insensitive equality)
 dictionary QueryPredicate {
     string kind;
     string? day;

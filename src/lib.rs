@@ -2530,6 +2530,25 @@ fn is_valid_color(s: &str) -> bool
     matches!(s, "red" | "yellow" | "green" | "blue" | "purple")
 }
 
+/// Escape a user-supplied string for safe use INSIDE a DuckDB `ILIKE` pattern
+/// whose `ESCAPE` character is backslash: neutralize the `%` and `_` wildcards
+/// (and the escape backslash itself) so typed text matches LITERALLY rather than
+/// acting as a wildcard. The single-quote doubling for the surrounding SQL
+/// string literal is applied separately by `filename_ilike_atom`.
+fn escape_for_ilike(s: &str) -> String
+{
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+/// Build a parenthesized, case-insensitive file-name match atom from an already
+/// wildcard-escaped `ILIKE` pattern. Doubles single quotes for the SQL literal
+/// and pins the `ESCAPE` character to backslash. `ILIKE` gives the case-
+/// insensitivity the four File Name modes all require.
+fn filename_ilike_atom(pattern: &str) -> String
+{
+    format!("(file_name ILIKE '{}' ESCAPE '\\')", pattern.replace('\'', "''"))
+}
+
 /// Map a rating comparison op token to its SQL symbol. Unknown → None.
 fn sql_compare_op(op: &str) -> Option<&'static str>
 {
@@ -2654,6 +2673,30 @@ fn predicate_to_sql(p: &QueryPredicate) -> String
                 "(NOT EXISTS (SELECT 1 FROM keyword_visible k WHERE k.image_id = images.id AND k.label = '{}'))",
                 v.replace('\'', "''")
             ),
+            _ => bad(),
+        },
+        // File Name subject (Session 58). Four match modes against `file_name`
+        // (the basename WITH extension), all case-insensitive via `ILIKE`; the
+        // typed text rides in `value`. The text is wildcard-escaped so a literal
+        // `%`/`_` matches itself, then quote-escaped for the SQL literal.
+        "filename_contains" => match p.value.as_deref()
+        {
+            Some(v) if !v.is_empty() => filename_ilike_atom(&format!("%{}%", escape_for_ilike(v))),
+            _ => bad(),
+        },
+        "filename_starts" => match p.value.as_deref()
+        {
+            Some(v) if !v.is_empty() => filename_ilike_atom(&format!("{}%", escape_for_ilike(v))),
+            _ => bad(),
+        },
+        "filename_ends" => match p.value.as_deref()
+        {
+            Some(v) if !v.is_empty() => filename_ilike_atom(&format!("%{}", escape_for_ilike(v))),
+            _ => bad(),
+        },
+        "filename_exact" => match p.value.as_deref()
+        {
+            Some(v) if !v.is_empty() => filename_ilike_atom(&escape_for_ilike(v)),
             _ => bad(),
         },
         other =>
@@ -4022,6 +4065,45 @@ mod keyword_tests
             value: Some(String::new()),
         };
         assert_eq!(predicate_to_sql(&empty), "(FALSE)");
+    }
+
+    #[test]
+    fn filename_predicate_sql()
+    {
+        let fname = |kind: &str, v: &str| QueryPredicate {
+            kind: kind.to_string(),
+            day: None, day_end: None, op: None, stars: None,
+            value: Some(v.to_string()),
+        };
+
+        // The four modes, all case-insensitive (ILIKE) with backslash ESCAPE.
+        assert_eq!(
+            predicate_to_sql(&fname("filename_contains", "somers")),
+            "(file_name ILIKE '%somers%' ESCAPE '\\')"
+        );
+        assert_eq!(
+            predicate_to_sql(&fname("filename_starts", "RSW")),
+            "(file_name ILIKE 'RSW%' ESCAPE '\\')"
+        );
+        assert_eq!(
+            predicate_to_sql(&fname("filename_ends", ".nef")),
+            "(file_name ILIKE '%.nef' ESCAPE '\\')"
+        );
+        assert_eq!(
+            predicate_to_sql(&fname("filename_exact", "RSW_0001.NEF")),
+            // The underscore is a LIKE wildcard → escaped so it matches a literal '_'.
+            "(file_name ILIKE 'RSW\\_0001.NEF' ESCAPE '\\')"
+        );
+
+        // Wildcard + quote injection are neutralized: '%' and '_' are escaped,
+        // the apostrophe is doubled for the SQL literal.
+        assert_eq!(
+            predicate_to_sql(&fname("filename_contains", "50% O'Neil_")),
+            "(file_name ILIKE '%50\\% O''Neil\\_%' ESCAPE '\\')"
+        );
+
+        // Empty value -> backstop (matches nothing).
+        assert_eq!(predicate_to_sql(&fname("filename_contains", "")), "(FALSE)");
     }
 }
 
