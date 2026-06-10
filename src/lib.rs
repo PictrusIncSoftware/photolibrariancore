@@ -2687,6 +2687,23 @@ fn predicate_to_sql(p: &QueryPredicate) -> String
             ),
             _ => bad(),
         },
+        // Collection subject (Session 63 — the gallery "Select Collection"
+        // scope). Membership = a row in the RAW `keyword` table carrying this
+        // label with the `collection` switch ON. Deliberately NOT the
+        // keyword_visible view: collection and visibility are independent
+        // switches on the row (the two-switch doctrine), so a search-hidden
+        // keyword still counts as a collection member. Label equality is
+        // exact-case ('Dogs' ≠ 'dogs' — identity is case-sensitive); the Swift
+        // picker supplies exact stored labels. Multiple selected collections
+        // arrive as one collection_is predicate each, joined with OR (union).
+        "collection_is" => match p.value.as_deref()
+        {
+            Some(v) if !v.is_empty() => format!(
+                "(EXISTS (SELECT 1 FROM keyword k WHERE k.image_id = images.id AND k.label = '{}' AND k.collection = TRUE))",
+                v.replace('\'', "''")
+            ),
+            _ => bad(),
+        },
         // File Name subject (Session 58). Four match modes against `file_name`
         // (the basename WITH extension), all case-insensitive via `ILIKE`; the
         // typed text rides in `value`. The text is wildcard-escaped so a literal
@@ -3442,6 +3459,53 @@ pub async fn keyword_labels() -> Vec<String>
         Err(e) =>
         {
             eprintln!("keyword_labels: query {}", e);
+            Vec::new()
+        }
+    }
+}
+
+/// Distinct collection names — labels carrying `collection = TRUE` on any row,
+/// read from the RAW `keyword` table (membership is independent of search
+/// visibility). The gallery "Select Collection" picker's autofill/dropdown —
+/// collections ONLY, the deliberate opposite of `keyword_labels` (the Add
+/// dialog's flag-agnostic list). A collection whose members were all removed
+/// (every `collection` switch flipped back FALSE) simply doesn't appear here;
+/// its label still re-suggests in the Add dialog and re-creates by name.
+pub async fn collection_labels() -> Vec<String>
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let mut stmt = match conn.prepare("SELECT DISTINCT label FROM keyword WHERE collection = TRUE ORDER BY label")
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("collection_labels: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mapped = stmt.query_map([], |row|
+    {
+        let label: String = row.get(0)?;
+        Ok(label)
+    });
+
+    match mapped
+    {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(e) =>
+        {
+            eprintln!("collection_labels: query {}", e);
             Vec::new()
         }
     }
@@ -4281,6 +4345,32 @@ mod keyword_tests
 
         // Empty value -> backstop (matches nothing).
         assert_eq!(predicate_to_sql(&fname("filename_contains", "")), "(FALSE)");
+    }
+
+    #[test]
+    fn collection_predicate_sql()
+    {
+        let coll = |v: &str| QueryPredicate {
+            kind: "collection_is".to_string(),
+            day: None, day_end: None, op: None, stars: None,
+            value: Some(v.to_string()),
+        };
+
+        // Membership probes the RAW keyword table (not keyword_visible) with
+        // the collection switch ON — collection and visibility are independent.
+        assert_eq!(
+            predicate_to_sql(&coll("Dogs")),
+            "(EXISTS (SELECT 1 FROM keyword k WHERE k.image_id = images.id AND k.label = 'Dogs' AND k.collection = TRUE))"
+        );
+
+        // The apostrophe doubles for the SQL literal.
+        assert_eq!(
+            predicate_to_sql(&coll("Richard's Picks")),
+            "(EXISTS (SELECT 1 FROM keyword k WHERE k.image_id = images.id AND k.label = 'Richard''s Picks' AND k.collection = TRUE))"
+        );
+
+        // Empty value -> backstop (matches nothing).
+        assert_eq!(predicate_to_sql(&coll("")), "(FALSE)");
     }
 }
 

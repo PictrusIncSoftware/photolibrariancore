@@ -258,6 +258,12 @@ uint64_t uniffi_photolibrariancore_fn_func_assign_keyword_for_ids(RustBuffer ids
 RustBuffer uniffi_photolibrariancore_fn_func_classify_extension(RustBuffer ext, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_COLLECTION_LABELS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_COLLECTION_LABELS
+uint64_t uniffi_photolibrariancore_fn_func_collection_labels(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_COUNT_QUERY_IMAGES
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_COUNT_QUERY_IMAGES
 uint64_t uniffi_photolibrariancore_fn_func_count_query_images(RustBuffer predicates, RustBuffer connectors, int8_t apply_duplicate_filter, int8_t apply_raw_jpeg_collapse
@@ -754,6 +760,12 @@ uint16_t uniffi_photolibrariancore_checksum_func_assign_keyword_for_ids(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_CLASSIFY_EXTENSION
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_CLASSIFY_EXTENSION
 uint16_t uniffi_photolibrariancore_checksum_func_classify_extension(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_COLLECTION_LABELS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_COLLECTION_LABELS
+uint16_t uniffi_photolibrariancore_checksum_func_collection_labels(void
     
 );
 #endif

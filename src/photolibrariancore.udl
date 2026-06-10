@@ -165,6 +165,12 @@ namespace photolibrariancore {
     [Async]
     u64 add_images_to_collections(sequence<i64> ids, sequence<string> labels);
 
+    // collection_labels: collections ONLY (labels with collection = TRUE on any
+    //   row, raw table — membership is independent of visibility) — the gallery
+    //   "Select Collection" picker (the opposite of keyword_labels' list).
+    [Async]
+    sequence<string> collection_labels();
+
     // Update the rotation angle for an image identified by file path
     // degrees: Rotation angle in degrees (0, 90, 180, or 270)
     // Returns true on success, false on failure
