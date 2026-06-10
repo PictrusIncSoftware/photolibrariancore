@@ -1433,6 +1433,114 @@ public func FfiConverterTypeRelocateResult_lower(_ value: RelocateResult) -> Rus
     return FfiConverterTypeRelocateResult.lower(value)
 }
 
+
+public struct SavedQueryInfo: Equatable, Hashable {
+    public var id: Int64
+    public var name: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: Int64, name: String) {
+        self.id = id
+        self.name = name
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SavedQueryInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSavedQueryInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SavedQueryInfo {
+        return
+            try SavedQueryInfo(
+                id: FfiConverterInt64.read(from: &buf), 
+                name: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SavedQueryInfo, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.id, into: &buf)
+        FfiConverterString.write(value.name, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSavedQueryInfo_lift(_ buf: RustBuffer) throws -> SavedQueryInfo {
+    return try FfiConverterTypeSavedQueryInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSavedQueryInfo_lower(_ value: SavedQueryInfo) -> RustBuffer {
+    return FfiConverterTypeSavedQueryInfo.lower(value)
+}
+
+
+public struct SavedQueryPayload: Equatable, Hashable {
+    public var predicates: [QueryPredicate]
+    public var connectors: [Connector]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(predicates: [QueryPredicate], connectors: [Connector]) {
+        self.predicates = predicates
+        self.connectors = connectors
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SavedQueryPayload: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSavedQueryPayload: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SavedQueryPayload {
+        return
+            try SavedQueryPayload(
+                predicates: FfiConverterSequenceTypeQueryPredicate.read(from: &buf), 
+                connectors: FfiConverterSequenceTypeConnector.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SavedQueryPayload, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeQueryPredicate.write(value.predicates, into: &buf)
+        FfiConverterSequenceTypeConnector.write(value.connectors, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSavedQueryPayload_lift(_ buf: RustBuffer) throws -> SavedQueryPayload {
+    return try FfiConverterTypeSavedQueryPayload.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSavedQueryPayload_lower(_ value: SavedQueryPayload) -> RustBuffer {
+    return FfiConverterTypeSavedQueryPayload.lower(value)
+}
+
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
@@ -1787,6 +1895,54 @@ fileprivate struct FfiConverterOptionTypeImageRecord: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeSavedQueryInfo: FfiConverterRustBuffer {
+    typealias SwiftType = SavedQueryInfo?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSavedQueryInfo.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSavedQueryInfo.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSavedQueryPayload: FfiConverterRustBuffer {
+    typealias SwiftType = SavedQueryPayload?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSavedQueryPayload.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSavedQueryPayload.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceInt64: FfiConverterRustBuffer {
     typealias SwiftType = [Int64]
 
@@ -1987,6 +2143,31 @@ fileprivate struct FfiConverterSequenceTypeQueryPredicate: FfiConverterRustBuffe
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeSavedQueryInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [SavedQueryInfo]
+
+    public static func write(_ value: [SavedQueryInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSavedQueryInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SavedQueryInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SavedQueryInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSavedQueryInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeConnector: FfiConverterRustBuffer {
     typealias SwiftType = [Connector]
 
@@ -2119,6 +2300,21 @@ public func countQueryImages(predicates: [QueryPredicate], connectors: [Connecto
             completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+public func deleteSavedQuery(id: Int64)async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_delete_saved_query(FfiConverterInt64.lower(id)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_i8,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_i8,
+            freeFunc: ffi_photolibrariancore_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
             errorHandler: nil
             
         )
@@ -2465,6 +2661,36 @@ public func keywordsForImage(imageId: Int64)async  -> [KeywordRow]  {
             
         )
 }
+public func listSavedQueries()async  -> [SavedQueryInfo]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_list_saved_queries(
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeSavedQueryInfo.lift,
+            errorHandler: nil
+            
+        )
+}
+public func loadSavedQuery(id: Int64)async  -> SavedQueryPayload?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_load_saved_query(FfiConverterInt64.lower(id)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeSavedQueryPayload.lift,
+            errorHandler: nil
+            
+        )
+}
 public func mergeLightroomRecords(records: [ImageMetadata])async  -> MergeChunkResult  {
     return
         try!  await uniffiRustCallAsync(
@@ -2622,6 +2848,21 @@ public func restoreKeywordForIds(ids: [Int64], path: String)async  -> UInt64  {
             
         )
 }
+public func saveQuery(name: String, predicates: [QueryPredicate], connectors: [Connector])async  -> SavedQueryInfo?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_save_query(FfiConverterString.lower(name),FfiConverterSequenceTypeQueryPredicate.lower(predicates),FfiConverterSequenceTypeConnector.lower(connectors)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeSavedQueryInfo.lift,
+            errorHandler: nil
+            
+        )
+}
 public func updateColorLabelForIds(ids: [Int64], colorLabel: String?)async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
@@ -2758,6 +2999,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_count_query_images() != 3172) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_delete_saved_query() != 60302) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_expand_collapse_group_ids() != 192) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2830,6 +3074,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_keywords_for_image() != 32244) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_list_saved_queries() != 23588) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_load_saved_query() != 5281) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_merge_lightroom_records() != 40572) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2861,6 +3111,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_restore_keyword_for_ids() != 5225) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_save_query() != 43330) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_color_label_for_ids() != 9065) {

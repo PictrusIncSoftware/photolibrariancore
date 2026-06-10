@@ -745,6 +745,36 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         CREATE INDEX IF NOT EXISTS idx_videos_capture_datetime ON videos(capture_datetime);
         CREATE INDEX IF NOT EXISTS idx_videos_rating ON videos(rating);
         CREATE INDEX IF NOT EXISTS idx_videos_directory_path ON videos(directory_path);
+
+        -- === Saved Queries (Session 63; Docs/DESIGN-Saved-Queries.md) ===
+        -- A saved Find in Gallery query: the RECIPE (criterion rows), never the
+        -- results. `saved_query_criterion` mirrors the QueryPredicate wire
+        -- struct exactly, plus placement: `position` (1-based slot in the
+        -- sentence) and `connector` (how the row joins everything to its LEFT
+        -- in the builder's left-to-right fold; NULL at position 1). One row per
+        -- criterion — repeated subjects are simply more rows. Both tables are
+        -- fresh CREATEs: no ALTER migration, ever (the S62 WAL lesson).
+        CREATE SEQUENCE IF NOT EXISTS saved_query_id_seq START 1;
+
+        CREATE TABLE IF NOT EXISTS saved_query (
+            id INTEGER PRIMARY KEY DEFAULT nextval('saved_query_id_seq'),
+            name TEXT NOT NULL,                 -- unique by construction (save_query suffixes collisions)
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS saved_query_criterion (
+            query_id INTEGER NOT NULL,          -- -> saved_query.id
+            position INTEGER NOT NULL,          -- 1-based slot in the sentence
+            connector TEXT,                     -- 'and' / 'or' / 'xor'; NULL at position 1
+            kind TEXT NOT NULL,                 -- QueryPredicate.kind (the subject discriminator)
+            op TEXT,                            -- QueryPredicate.op
+            value TEXT,                         -- QueryPredicate.value
+            day TEXT,                           -- QueryPredicate.day ("YYYY:MM:DD")
+            day_end TEXT,                       -- QueryPredicate.day_end
+            stars INTEGER                       -- QueryPredicate.stars
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_saved_query_criterion_query ON saved_query_criterion(query_id);
     "#;
 
     // Execute schema creation as a batch
@@ -2498,8 +2528,9 @@ pub enum Connector
 /// One filter segment, flattened for the FFI. `kind` selects which fields are
 /// meaningful; the Swift side holds the strong `FilterSegment` type and
 /// serializes to this. See the UDL `dictionary QueryPredicate` for the
-/// kind→fields map.
-#[derive(Debug, Clone)]
+/// kind→fields map. (`PartialEq` is for the saved-query round-trip tests;
+/// it is not part of the FFI surface.)
+#[derive(Debug, Clone, PartialEq)]
 pub struct QueryPredicate
 {
     pub kind: String,
@@ -3464,6 +3495,359 @@ pub async fn keyword_labels() -> Vec<String>
     }
 }
 
+// === Saved Queries (Session 63; Docs/DESIGN-Saved-Queries.md) =============
+// The recipe, never the results: a header row (saved_query) + one
+// saved_query_criterion row per segment, mirroring the QueryPredicate wire
+// struct plus placement (position + the connector joining the row leftward).
+// Impl fns take &Connection so the unit tests can drive them on an in-memory
+// database; the pub async FFI wrappers below just lock CATALOGUE.
+
+/// One saved query's identity (header row), returned to Swift.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedQueryInfo
+{
+    pub id: i64,
+    pub name: String,
+}
+
+/// A loaded saved query: the same two arrays `query_images` consumes — load,
+/// hand to the sheet, run. Parity by construction with the live builder.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedQueryPayload
+{
+    pub predicates: Vec<QueryPredicate>,
+    pub connectors: Vec<Connector>,
+}
+
+/// Storage text for a connector (saved_query_criterion.connector).
+fn connector_to_text(c: &Connector) -> &'static str
+{
+    match c
+    {
+        Connector::And => "and",
+        Connector::Or => "or",
+        Connector::Xor => "xor",
+    }
+}
+
+/// Inverse of `connector_to_text`. Unknown/garbled → AND (the builder's
+/// default — same forgiveness as `build_filter_predicate`'s short-array rule).
+fn connector_from_text(s: &str) -> Connector
+{
+    match s
+    {
+        "or" => Connector::Or,
+        "xor" => Connector::Xor,
+        _ => Connector::And,
+    }
+}
+
+/// Save a Find in Gallery sentence under `name`. Collision policy (Richard's
+/// rule, S63): an existing name gains a numeric suffix — "Dogs" → "Dogs-01" →
+/// "Dogs-02" … — never a replace, never a prompt. The suffixing lives HERE so
+/// there is exactly one source of truth for it (and it runs under the
+/// CATALOGUE lock, so two saves can't race to the same name). Returns the
+/// header carrying the FINAL (possibly suffixed) name, or None on invalid
+/// input / DB failure. One transaction.
+fn save_query_impl(conn: &Connection, name: &str,
+                   predicates: &[QueryPredicate], connectors: &[Connector]) -> Option<SavedQueryInfo>
+{
+    let base = name.trim();
+    if base.is_empty() || predicates.is_empty()
+    {
+        return None;
+    }
+
+    let exists = |n: &str| -> bool
+    {
+        conn.query_row("SELECT COUNT(*) FROM saved_query WHERE name = ?", [n],
+                       |row| row.get::<_, i64>(0))
+            .unwrap_or(0) > 0
+    };
+
+    let mut final_name = base.to_string();
+    if exists(&final_name)
+    {
+        let mut n = 1;
+        loop
+        {
+            if n > 999
+            {
+                eprintln!("save_query: suffix space exhausted for '{}'", base);
+                return None;
+            }
+            let candidate = format!("{}-{:02}", base, n);
+            if !exists(&candidate)
+            {
+                final_name = candidate;
+                break;
+            }
+            n += 1;
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("save_query: begin failed: {}", e);
+        return None;
+    }
+
+    if let Err(e) = conn.execute("INSERT INTO saved_query (name) VALUES (?)", [&final_name])
+    {
+        eprintln!("save_query: insert header failed: {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return None;
+    }
+
+    // The name is unique by construction (checked above, under the lock), so
+    // it safely keys the id read-back.
+    let id: i64 = match conn.query_row("SELECT id FROM saved_query WHERE name = ?",
+                                       [&final_name], |row| row.get(0))
+    {
+        Ok(v) => v,
+        Err(e) =>
+        {
+            eprintln!("save_query: id read-back failed: {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return None;
+        }
+    };
+
+    for (i, p) in predicates.iter().enumerate()
+    {
+        // Row 1 has nothing to its left; row i (1-based) joins via connectors[i-2]
+        // (Swift sends predicates.len()-1 connectors; default AND if short —
+        // the same rule build_filter_predicate applies at query time).
+        let connector_text: Option<&str> = if i == 0
+        {
+            None
+        }
+        else
+        {
+            Some(connector_to_text(connectors.get(i - 1).unwrap_or(&Connector::And)))
+        };
+
+        if let Err(e) = conn.execute(
+            "INSERT INTO saved_query_criterion \
+             (query_id, position, connector, kind, op, value, day, day_end, stars) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![id, (i + 1) as i64, connector_text, p.kind, p.op, p.value,
+                    p.day, p.day_end, p.stars.map(|s| s as i32)],
+        )
+        {
+            eprintln!("save_query: insert criterion failed: {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return None;
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("save_query: commit failed: {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return None;
+    }
+
+    Some(SavedQueryInfo { id, name: final_name })
+}
+
+/// All saved queries, ordered by name (case-folded) for the picker list.
+fn list_saved_queries_impl(conn: &Connection) -> Vec<SavedQueryInfo>
+{
+    let mut stmt = match conn.prepare("SELECT id, name FROM saved_query ORDER BY LOWER(name), id")
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("list_saved_queries: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mapped = stmt.query_map([], |row|
+    {
+        Ok(SavedQueryInfo { id: row.get(0)?, name: row.get(1)? })
+    });
+
+    match mapped
+    {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(e) =>
+        {
+            eprintln!("list_saved_queries: query {}", e);
+            Vec::new()
+        }
+    }
+}
+
+/// Load a saved query's criterion rows back into the two arrays the builder
+/// (and `query_images`) consume. None for an unknown id or an empty recipe.
+fn load_saved_query_impl(conn: &Connection, id: i64) -> Option<SavedQueryPayload>
+{
+    let mut stmt = match conn.prepare(
+        "SELECT position, connector, kind, op, value, day, day_end, stars \
+         FROM saved_query_criterion WHERE query_id = ? ORDER BY position")
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("load_saved_query: prepare {}", e);
+            return None;
+        }
+    };
+
+    let mapped = stmt.query_map([id], |row|
+    {
+        Ok((
+            row.get::<_, i64>(0)?,            // position
+            row.get::<_, Option<String>>(1)?, // connector
+            row.get::<_, String>(2)?,         // kind
+            row.get::<_, Option<String>>(3)?, // op
+            row.get::<_, Option<String>>(4)?, // value
+            row.get::<_, Option<String>>(5)?, // day
+            row.get::<_, Option<String>>(6)?, // day_end
+            row.get::<_, Option<i32>>(7)?,    // stars
+        ))
+    });
+
+    let rows = match mapped
+    {
+        Ok(iter) => iter.filter_map(|r| r.ok()),
+        Err(e) =>
+        {
+            eprintln!("load_saved_query: query {}", e);
+            return None;
+        }
+    };
+
+    let mut predicates: Vec<QueryPredicate> = Vec::new();
+    let mut connectors: Vec<Connector> = Vec::new();
+    for (position, connector, kind, op, value, day, day_end, stars) in rows
+    {
+        if position > 1
+        {
+            connectors.push(connector_from_text(connector.as_deref().unwrap_or("and")));
+        }
+        predicates.push(QueryPredicate {
+            kind,
+            day,
+            day_end,
+            op,
+            stars: stars.map(|s| s as u8),
+            value,
+        });
+    }
+
+    if predicates.is_empty()
+    {
+        return None;
+    }
+    Some(SavedQueryPayload { predicates, connectors })
+}
+
+/// Delete a saved query (header + criterion rows, one transaction). Returns
+/// whether a header row was actually removed.
+fn delete_saved_query_impl(conn: &Connection, id: i64) -> bool
+{
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("delete_saved_query: begin failed: {}", e);
+        return false;
+    }
+
+    if let Err(e) = conn.execute("DELETE FROM saved_query_criterion WHERE query_id = ?", [id])
+    {
+        eprintln!("delete_saved_query: criteria delete failed: {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return false;
+    }
+
+    let removed = match conn.execute("DELETE FROM saved_query WHERE id = ?", [id])
+    {
+        Ok(n) => n,
+        Err(e) =>
+        {
+            eprintln!("delete_saved_query: header delete failed: {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return false;
+        }
+    };
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("delete_saved_query: commit failed: {}", e);
+        return false;
+    }
+
+    removed > 0
+}
+
+/// FFI: save the current Find in Gallery sentence under `name` (suffixing a
+/// colliding name per the S63 policy). Returns the header with the FINAL name.
+pub async fn save_query(name: String, predicates: Vec<QueryPredicate>,
+                        connectors: Vec<Connector>) -> Option<SavedQueryInfo>
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return None;
+        }
+    };
+    save_query_impl(conn, &name, &predicates, &connectors)
+}
+
+/// FFI: all saved queries (id + name), name-ordered, for the picker.
+pub async fn list_saved_queries() -> Vec<SavedQueryInfo>
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+    list_saved_queries_impl(conn)
+}
+
+/// FFI: load a saved query back into builder arrays. None if id unknown.
+pub async fn load_saved_query(id: i64) -> Option<SavedQueryPayload>
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return None;
+        }
+    };
+    load_saved_query_impl(conn, id)
+}
+
+/// FFI: delete a saved query. True if it existed.
+pub async fn delete_saved_query(id: i64) -> bool
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return false;
+        }
+    };
+    delete_saved_query_impl(conn, id)
+}
+
 /// Distinct collection names — labels carrying `collection = TRUE` on any row,
 /// read from the RAW `keyword` table (membership is independent of search
 /// visibility). The gallery "Select Collection" picker's autofill/dropdown —
@@ -4371,6 +4755,129 @@ mod keyword_tests
 
         // Empty value -> backstop (matches nothing).
         assert_eq!(predicate_to_sql(&coll("")), "(FALSE)");
+    }
+}
+
+#[cfg(test)]
+mod saved_query_tests
+{
+    use super::*;
+    use duckdb::Connection;
+
+    /// The saved-query DDL, as in the main schema (fresh CREATEs, no ALTERs).
+    fn setup() -> Connection
+    {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE SEQUENCE saved_query_id_seq START 1;
+             CREATE TABLE saved_query (
+                 id INTEGER PRIMARY KEY DEFAULT nextval('saved_query_id_seq'),
+                 name TEXT NOT NULL,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+             );
+             CREATE TABLE saved_query_criterion (
+                 query_id INTEGER NOT NULL,
+                 position INTEGER NOT NULL,
+                 connector TEXT,
+                 kind TEXT NOT NULL,
+                 op TEXT,
+                 value TEXT,
+                 day TEXT,
+                 day_end TEXT,
+                 stars INTEGER
+             );",
+        )
+        .expect("saved-query DDL");
+        conn
+    }
+
+    fn pred(kind: &str, day: Option<&str>, day_end: Option<&str>,
+            op: Option<&str>, stars: Option<u8>, value: Option<&str>) -> QueryPredicate
+    {
+        QueryPredicate {
+            kind: kind.to_string(),
+            day: day.map(str::to_string),
+            day_end: day_end.map(str::to_string),
+            op: op.map(str::to_string),
+            stars,
+            value: value.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn round_trip_preserves_sentence()
+    {
+        let conn = setup();
+
+        // The design doc's "Spring picks": two date ranges EITHER, color AND,
+        // color EITHER, rating AND — repeated subjects + every connector slot.
+        let predicates = vec![
+            pred("date_between", Some("2024:01:01"), Some("2024:02:15"), None, None, None),
+            pred("date_between", Some("2025:06:01"), Some("2025:07:04"), None, None, None),
+            pred("color", None, None, None, None, Some("blue")),
+            pred("color", None, None, None, None, Some("green")),
+            pred("rating", None, None, Some("gte"), Some(3), None),
+        ];
+        let connectors = vec![Connector::Or, Connector::And, Connector::Or, Connector::And];
+
+        let info = save_query_impl(&conn, "Spring picks", &predicates, &connectors)
+            .expect("save succeeds");
+        assert_eq!(info.name, "Spring picks");
+
+        let payload = load_saved_query_impl(&conn, info.id).expect("load succeeds");
+        assert_eq!(payload.predicates, predicates);
+        assert_eq!(payload.connectors, connectors);
+    }
+
+    #[test]
+    fn name_collisions_gain_numeric_suffixes()
+    {
+        let conn = setup();
+        let predicates = vec![pred("rating", None, None, Some("gte"), Some(1), None)];
+
+        let a = save_query_impl(&conn, "Dogs", &predicates, &[]).expect("first save");
+        let b = save_query_impl(&conn, "Dogs", &predicates, &[]).expect("second save");
+        let c = save_query_impl(&conn, "Dogs", &predicates, &[]).expect("third save");
+        assert_eq!(a.name, "Dogs");
+        assert_eq!(b.name, "Dogs-01");
+        assert_eq!(c.name, "Dogs-02");
+
+        // The list shows all three, name-ordered.
+        let names: Vec<String> = list_saved_queries_impl(&conn).into_iter().map(|q| q.name).collect();
+        assert_eq!(names, vec!["Dogs", "Dogs-01", "Dogs-02"]);
+    }
+
+    #[test]
+    fn empty_name_or_empty_sentence_rejected()
+    {
+        let conn = setup();
+        let predicates = vec![pred("rating", None, None, Some("gte"), Some(1), None)];
+        assert!(save_query_impl(&conn, "   ", &predicates, &[]).is_none());
+        assert!(save_query_impl(&conn, "Fine", &[], &[]).is_none());
+    }
+
+    #[test]
+    fn delete_removes_header_and_criteria()
+    {
+        let conn = setup();
+        let predicates = vec![
+            pred("flag", None, None, None, None, Some("pick")),
+            pred("color", None, None, None, None, Some("red")),
+        ];
+        let info = save_query_impl(&conn, "Culls", &predicates, &[Connector::And]).expect("save");
+
+        assert!(delete_saved_query_impl(&conn, info.id));
+        assert!(load_saved_query_impl(&conn, info.id).is_none());
+        assert!(list_saved_queries_impl(&conn).is_empty());
+
+        // Deleting again reports false (nothing there).
+        assert!(!delete_saved_query_impl(&conn, info.id));
+
+        // No orphaned criterion rows.
+        let leftover: i64 = conn
+            .query_row("SELECT COUNT(*) FROM saved_query_criterion", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(leftover, 0);
     }
 }
 

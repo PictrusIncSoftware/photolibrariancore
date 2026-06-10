@@ -171,6 +171,24 @@ namespace photolibrariancore {
     [Async]
     sequence<string> collection_labels();
 
+    // ---- Saved Queries (Session 63; Docs/DESIGN-Saved-Queries.md) ----
+    // save_query: write the sentence down under `name`; a colliding name gains
+    //   a -01/-02 suffix (never replace, never prompt — Richard's rule). The
+    //   returned header carries the FINAL name. Null = invalid input/failure.
+    // load_saved_query: rows -> the same (predicates, connectors) arrays
+    //   query_images consumes. Null = unknown id.
+    [Async]
+    SavedQueryInfo? save_query(string name, sequence<QueryPredicate> predicates, sequence<Connector> connectors);
+
+    [Async]
+    sequence<SavedQueryInfo> list_saved_queries();
+
+    [Async]
+    SavedQueryPayload? load_saved_query(i64 id);
+
+    [Async]
+    boolean delete_saved_query(i64 id);
+
     // Update the rotation angle for an image identified by file path
     // degrees: Rotation angle in degrees (0, 90, 180, or 270)
     // Returns true on success, false on failure
@@ -402,6 +420,19 @@ dictionary QueryPredicate {
     string? op;
     u8? stars;
     string? value;
+};
+
+// One saved query's identity (Session 63, saved queries — the header row).
+dictionary SavedQueryInfo {
+    i64 id;
+    string name;
+};
+
+// A loaded saved query: the same two arrays query_images consumes — load,
+// hand to the Find in Gallery sheet, run. See Docs/DESIGN-Saved-Queries.md.
+dictionary SavedQueryPayload {
+    sequence<QueryPredicate> predicates;
+    sequence<Connector> connectors;
 };
 
 // One materialized keyword row (Session 45), returned to Swift. status: 1 =
