@@ -243,6 +243,11 @@ typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t, UniffiForeignFutureRes
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_ADD_IMAGES_TO_COLLECTIONS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_ADD_IMAGES_TO_COLLECTIONS
+uint64_t uniffi_photolibrariancore_fn_func_add_images_to_collections(RustBuffer ids, RustBuffer labels
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_ASSIGN_KEYWORD_FOR_IDS
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_ASSIGN_KEYWORD_FOR_IDS
 uint64_t uniffi_photolibrariancore_fn_func_assign_keyword_for_ids(RustBuffer ids, RustBuffer segments
@@ -365,6 +370,12 @@ uint64_t uniffi_photolibrariancore_fn_func_ingest_metadata(RustBuffer metadata
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_INITIALIZE_CATALOGUE
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_INITIALIZE_CATALOGUE
 uint64_t uniffi_photolibrariancore_fn_func_initialize_catalogue(RustBuffer catalogue_path
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_KEYWORD_LABELS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_KEYWORD_LABELS
+uint64_t uniffi_photolibrariancore_fn_func_keyword_labels(void
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_KEYWORD_VOCABULARY
@@ -728,6 +739,12 @@ void ffi_photolibrariancore_rust_future_free_void(uint64_t handle
 void ffi_photolibrariancore_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_ADD_IMAGES_TO_COLLECTIONS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_ADD_IMAGES_TO_COLLECTIONS
+uint16_t uniffi_photolibrariancore_checksum_func_add_images_to_collections(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_ASSIGN_KEYWORD_FOR_IDS
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_ASSIGN_KEYWORD_FOR_IDS
 uint16_t uniffi_photolibrariancore_checksum_func_assign_keyword_for_ids(void
@@ -869,6 +886,12 @@ uint16_t uniffi_photolibrariancore_checksum_func_ingest_metadata(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_INITIALIZE_CATALOGUE
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_INITIALIZE_CATALOGUE
 uint16_t uniffi_photolibrariancore_checksum_func_initialize_catalogue(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_KEYWORD_LABELS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_KEYWORD_LABELS
+uint16_t uniffi_photolibrariancore_checksum_func_keyword_labels(void
     
 );
 #endif

@@ -2056,6 +2056,21 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
         print("uniffiFutureContinuationCallback invalid handle")
     }
 }
+public func addImagesToCollections(ids: [Int64], labels: [String])async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_add_images_to_collections(FfiConverterSequenceInt64.lower(ids),FfiConverterSequenceString.lower(labels)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func assignKeywordForIds(ids: [Int64], segments: [String])async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
@@ -2390,6 +2405,21 @@ public func initializeCatalogue(cataloguePath: String)async  -> Bool  {
             
         )
 }
+public func keywordLabels()async  -> [String]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_keyword_labels(
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceString.lift,
+            errorHandler: nil
+            
+        )
+}
 public func keywordVocabulary()async  -> [KeywordNode]  {
     return
         try!  await uniffiRustCallAsync(
@@ -2698,6 +2728,9 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_add_images_to_collections() != 9062) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_assign_keyword_for_ids() != 32359) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2768,6 +2801,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_initialize_catalogue() != 29822) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_keyword_labels() != 36384) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_keyword_vocabulary() != 50955) {

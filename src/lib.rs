@@ -673,13 +673,25 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             path TEXT NOT NULL,                 -- root->this node, U+001F-separated
             status INTEGER NOT NULL DEFAULT 1,  -- 1 = active, 0 = hidden (soft-delete)
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            hidden_at TIMESTAMP                 -- set when status->0; NULL while active
+            hidden_at TIMESTAMP,                -- set when status->0; NULL while active
+            collection BOOLEAN NOT NULL DEFAULT FALSE  -- Collections-panel membership; orthogonal to status (keyword search stays oblivious)
         );
 
         CREATE INDEX IF NOT EXISTS idx_keyword_image_id ON keyword(image_id);
         CREATE INDEX IF NOT EXISTS idx_keyword_label ON keyword(label);
         CREATE INDEX IF NOT EXISTS idx_keyword_path ON keyword(path);
         CREATE INDEX IF NOT EXISTS idx_keyword_status ON keyword(status);
+
+        -- Migration for pre-existing catalogues (no-op on a fresh DB, where the
+        -- CREATE TABLE above already carries the column). Mirrors the images ALTERs:
+        -- add the column WITHOUT a DEFAULT, then backfill the literal. An
+        -- `ALTER TABLE ... ADD COLUMN ... DEFAULT <expr>` does NOT survive WAL
+        -- replay — on reopen DuckDB re-binds the default with no database context
+        -- set and throws an internal error (GetDefaultDatabase), wedging the whole
+        -- catalogue. `collection = TRUE` excludes the NULLs anyway; the backfill
+        -- just makes it tidy.
+        ALTER TABLE keyword ADD COLUMN IF NOT EXISTS collection BOOLEAN;
+        UPDATE keyword SET collection = FALSE WHERE collection IS NULL;
 
         -- Active-only view: ALL normal keyword reads/queries hit this so the
         -- status filter can never be forgotten. Recovery reads the raw table.
@@ -3388,6 +3400,171 @@ pub async fn keyword_vocabulary() -> Vec<KeywordNode>
             Vec::new()
         }
     }
+}
+
+/// Distinct VISIBLE keyword labels (case-sensitive, alphabetical) — the source for
+/// the Collection "Add" dialog's autofill + dropdown. Deliberately ALL labels,
+/// regardless of the `collection` flag, so any keyword can seed a collection and a
+/// dead collection's name still suggests itself. (The Collection TAB picker filters
+/// to `collection = TRUE` instead — a separate read, added with the tab.)
+pub async fn keyword_labels() -> Vec<String>
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let mut stmt = match conn.prepare("SELECT DISTINCT label FROM keyword_visible ORDER BY label")
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("keyword_labels: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mapped = stmt.query_map([], |row|
+    {
+        let label: String = row.get(0)?;
+        Ok(label)
+    });
+
+    match mapped
+    {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(e) =>
+        {
+            eprintln!("keyword_labels: query {}", e);
+            Vec::new()
+        }
+    }
+}
+
+/// Add images to one or more collections — the right-click → Collection "Apply".
+/// A collection IS a `keyword` label carrying `collection = TRUE`, so for each
+/// image x label: flip the `collection` switch ON for any existing VISIBLE row with
+/// that label (a flat keyword OR the leaf of a hierarchical one — the same record
+/// serves both keyword and collection); if the image has no visible row with that
+/// label, insert a FLAT row (path = label) with `collection = TRUE`. Idempotent
+/// (already a member -> no-op). `status`/visibility is never touched — `collection`
+/// and visible are independent switches on the row. One transaction. Returns the
+/// number of rows changed (flipped + inserted).
+pub async fn add_images_to_collections(ids: Vec<i64>, labels: Vec<String>) -> u64
+{
+    if ids.is_empty()
+    {
+        return 0;
+    }
+
+    // A collection name is a single flat segment — trim, drop empties and any that
+    // carry the path separator (mirrors keyword_materialized_rows), then de-dupe.
+    let mut clean: Vec<String> = Vec::new();
+    for label in &labels
+    {
+        let trimmed = label.trim();
+        if trimmed.is_empty() || trimmed.contains(KEYWORD_PATH_SEPARATOR)
+        {
+            continue;
+        }
+        let s = trimmed.to_string();
+        if !clean.contains(&s)
+        {
+            clean.push(s);
+        }
+    }
+    if clean.is_empty()
+    {
+        return 0;
+    }
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("add_images_to_collections: begin failed: {}", e);
+        return 0;
+    }
+
+    let mut changed: u64 = 0;
+    for id in &ids
+    {
+        for label in &clean
+        {
+            // Flip ON any existing visible row(s) with this label that aren't
+            // already a collection (FALSE or, on migrated catalogues, NULL).
+            let flipped = match conn.execute(
+                "UPDATE keyword SET collection = TRUE \
+                 WHERE image_id = ? AND label = ? AND status = 1 \
+                   AND (collection = FALSE OR collection IS NULL)",
+                params![id, label],
+            )
+            {
+                Ok(n) => n as u64,
+                Err(e) =>
+                {
+                    eprintln!("add_images_to_collections: update failed: {}", e);
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    return 0;
+                }
+            };
+            if flipped > 0
+            {
+                changed += flipped;
+                continue;
+            }
+
+            // Already a member (a visible row with collection already TRUE)? no-op.
+            let already: Result<i64, _> = conn.query_row(
+                "SELECT 1 FROM keyword \
+                 WHERE image_id = ? AND label = ? AND status = 1 AND collection = TRUE LIMIT 1",
+                params![id, label],
+                |r| r.get(0),
+            );
+            if already.is_ok()
+            {
+                continue;
+            }
+
+            // No visible row with this label → insert a flat collection row.
+            match conn.execute(
+                "INSERT INTO keyword (image_id, label, path, status, created_at, collection) \
+                 VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, TRUE)",
+                params![id, label, label],
+            )
+            {
+                Ok(_) => changed += 1,
+                Err(e) =>
+                {
+                    eprintln!("add_images_to_collections: insert failed: {}", e);
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    return 0;
+                }
+            }
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("add_images_to_collections: commit failed: {}", e);
+        return 0;
+    }
+    changed
 }
 
 /// Hidden (removed) keyword rows for one image — the recovery surface. Reads the

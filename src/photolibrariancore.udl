@@ -154,6 +154,17 @@ namespace photolibrariancore {
     [Async]
     sequence<KeywordRow> hidden_keywords_for_image(i64 image_id);
 
+    // ---- Collections (the `collection` switch on the keyword row) ----
+    // keyword_labels: ALL distinct visible keyword labels — the Add dialog's
+    //   autofill/dropdown (any label can seed a collection; flag-agnostic).
+    // add_images_to_collections: the "Apply" — per image x label, flip the
+    //   `collection` switch ON (or insert a flat collection row). Idempotent.
+    [Async]
+    sequence<string> keyword_labels();
+
+    [Async]
+    u64 add_images_to_collections(sequence<i64> ids, sequence<string> labels);
+
     // Update the rotation angle for an image identified by file path
     // degrees: Rotation angle in degrees (0, 90, 180, or 270)
     // Returns true on success, false on failure
