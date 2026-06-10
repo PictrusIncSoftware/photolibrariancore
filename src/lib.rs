@@ -752,8 +752,9 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         -- struct exactly, plus placement: `position` (1-based slot in the
         -- sentence) and `connector` (how the row joins everything to its LEFT
         -- in the builder's left-to-right fold; NULL at position 1). One row per
-        -- criterion — repeated subjects are simply more rows. Both tables are
-        -- fresh CREATEs: no ALTER migration, ever (the S62 WAL lesson).
+        -- criterion — repeated subjects are simply more rows. Migrations stay
+        -- WAL-safe: bare ALTER ADD COLUMN only, never with a DEFAULT (the S62
+        -- lesson) — see the S65 num/num_end ALTERs below.
         CREATE SEQUENCE IF NOT EXISTS saved_query_id_seq START 1;
 
         CREATE TABLE IF NOT EXISTS saved_query (
@@ -771,8 +772,17 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             value TEXT,                         -- QueryPredicate.value
             day TEXT,                           -- QueryPredicate.day ("YYYY:MM:DD")
             day_end TEXT,                       -- QueryPredicate.day_end
-            stars INTEGER                       -- QueryPredicate.stars
+            stars INTEGER,                      -- QueryPredicate.stars
+            num DOUBLE,                         -- QueryPredicate.num (S65 numeric subjects)
+            num_end DOUBLE                      -- QueryPredicate.num_end ("between" upper bound)
         );
+
+        -- S65: catalogues whose saved_query_criterion predates the numeric
+        -- subjects gain the two columns here — bare ALTER, NO DEFAULT (the S62
+        -- WAL-replay lesson), and no backfill: NULL is the correct resting
+        -- value for every pre-numeric row.
+        ALTER TABLE saved_query_criterion ADD COLUMN IF NOT EXISTS num DOUBLE;
+        ALTER TABLE saved_query_criterion ADD COLUMN IF NOT EXISTS num_end DOUBLE;
 
         CREATE INDEX IF NOT EXISTS idx_saved_query_criterion_query ON saved_query_criterion(query_id);
     "#;
@@ -2539,6 +2549,13 @@ pub struct QueryPredicate
     pub op: Option<String>,
     pub stars: Option<u8>,
     pub value: Option<String>,
+    // Numeric subjects (S65 — ISO / aperture / shutter / focal length): the
+    // bound(s). `num` carries the value (or the lower bound), `num_end` the
+    // upper bound for op "between". APPENDED LAST — UniFFI maps dictionary
+    // fields by position (the ImageKind lesson); both carry UDL `= null`
+    // defaults so existing Swift construction sites compile unchanged.
+    pub num: Option<f64>,
+    pub num_end: Option<f64>,
 }
 
 /// Validate a day string as exactly `YYYY:MM:DD` (10 chars; colons at index 4
@@ -2612,6 +2629,44 @@ fn sql_compare_op(op: &str) -> Option<&'static str>
         "gte" => Some(">="),
         "lte" => Some("<="),
         _ => None,
+    }
+}
+
+/// One numeric-subject atom (S65 — ISO / aperture / shutter_speed /
+/// focal_length). `column` is fixed by the calling arm (never caller text);
+/// the numbers are formatted with Rust's shortest-round-trip f64 Display, so
+/// the SQL literal parses back to the exact stored double — equality on a
+/// dropdown-picked value is exact, not approximate. Non-finite numbers and
+/// unknown ops fall to the `(FALSE)` backstop via None. `between` requires
+/// both bounds; the other ops reuse the rating token vocabulary.
+fn numeric_atom(column: &str, op: &str, num: f64, num_end: Option<f64>) -> Option<String>
+{
+    if !num.is_finite()
+    {
+        return None;
+    }
+    if op == "between"
+    {
+        let end = num_end?;
+        if !end.is_finite()
+        {
+            return None;
+        }
+        return Some(format!("({} BETWEEN {} AND {})", column, num, end));
+    }
+    let sym = sql_compare_op(op)?;
+    Some(format!("({} {} {})", column, sym, num))
+}
+
+/// The shared arm body for the four numeric kinds: op + num are required
+/// (num_end only for "between"); anything malformed matches nothing.
+fn numeric_predicate_sql(p: &QueryPredicate, column: &str) -> String
+{
+    match (p.op.as_deref(), p.num)
+    {
+        (Some(op), Some(num)) => numeric_atom(column, op, num, p.num_end)
+            .unwrap_or_else(|| "(FALSE)".to_string()),
+        _ => "(FALSE)".to_string(),
     }
 }
 
@@ -2812,6 +2867,16 @@ fn predicate_to_sql(p: &QueryPredicate) -> String
             Some(v) if !v.is_empty() => lens_ilike_atom(&format!("%{}%", escape_for_ilike(v))),
             _ => bad(),
         },
+        // Numeric subjects (S65 — Gate 1 of the smart-collections plan): the
+        // four exposure columns, op ∈ eq/gte/lte/between (UI sends those; the
+        // remaining rating tokens gt/lt also work — the LR import may use
+        // them). The bound(s) ride `num`/`num_end`; a NULL column (no EXIF)
+        // correctly never matches. ISO is INTEGER, the rest REAL — DuckDB
+        // compares either against the f64 literal directly.
+        "iso_num" => numeric_predicate_sql(p, "iso"),
+        "aperture_num" => numeric_predicate_sql(p, "aperture"),
+        "shutter_num" => numeric_predicate_sql(p, "shutter_speed"),
+        "focal_num" => numeric_predicate_sql(p, "focal_length"),
         other =>
         {
             eprintln!("Unknown query predicate kind '{}'", other);
@@ -3682,10 +3747,10 @@ fn save_query_impl(conn: &Connection, name: &str,
 
         if let Err(e) = conn.execute(
             "INSERT INTO saved_query_criterion \
-             (query_id, position, connector, kind, op, value, day, day_end, stars) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (query_id, position, connector, kind, op, value, day, day_end, stars, num, num_end) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![id, (i + 1) as i64, connector_text, p.kind, p.op, p.value,
-                    p.day, p.day_end, p.stars.map(|s| s as i32)],
+                    p.day, p.day_end, p.stars.map(|s| s as i32), p.num, p.num_end],
         )
         {
             eprintln!("save_query: insert criterion failed: {}", e);
@@ -3738,7 +3803,7 @@ fn list_saved_queries_impl(conn: &Connection) -> Vec<SavedQueryInfo>
 fn load_saved_query_impl(conn: &Connection, id: i64) -> Option<SavedQueryPayload>
 {
     let mut stmt = match conn.prepare(
-        "SELECT position, connector, kind, op, value, day, day_end, stars \
+        "SELECT position, connector, kind, op, value, day, day_end, stars, num, num_end \
          FROM saved_query_criterion WHERE query_id = ? ORDER BY position")
     {
         Ok(s) => s,
@@ -3760,6 +3825,8 @@ fn load_saved_query_impl(conn: &Connection, id: i64) -> Option<SavedQueryPayload
             row.get::<_, Option<String>>(5)?, // day
             row.get::<_, Option<String>>(6)?, // day_end
             row.get::<_, Option<i32>>(7)?,    // stars
+            row.get::<_, Option<f64>>(8)?,    // num (S65)
+            row.get::<_, Option<f64>>(9)?,    // num_end (S65)
         ))
     });
 
@@ -3775,7 +3842,7 @@ fn load_saved_query_impl(conn: &Connection, id: i64) -> Option<SavedQueryPayload
 
     let mut predicates: Vec<QueryPredicate> = Vec::new();
     let mut connectors: Vec<Connector> = Vec::new();
-    for (position, connector, kind, op, value, day, day_end, stars) in rows
+    for (position, connector, kind, op, value, day, day_end, stars, num, num_end) in rows
     {
         if position > 1
         {
@@ -3788,6 +3855,8 @@ fn load_saved_query_impl(conn: &Connection, id: i64) -> Option<SavedQueryPayload
             op,
             stars: stars.map(|s| s as u8),
             value,
+            num,
+            num_end,
         });
     }
 
@@ -3956,6 +4025,65 @@ pub async fn distinct_image_values(field: String) -> Vec<String>
         Err(e) =>
         {
             eprintln!("distinct_image_values: query {}", e);
+            Vec::new()
+        }
+    }
+}
+
+/// `distinct_image_values`' numeric twin (S65) — the four exposure subjects'
+/// type-ahead source, returned as the exact stored doubles (Swift formats the
+/// photographer notation — f/2.8, 1/2000, 70 mm — and hands the picked double
+/// straight back into the predicate, so "is exactly" equality never rides a
+/// string round-trip). ISO is an INTEGER column → CAST keeps one return type.
+/// Ascending numeric order. Unknown token → empty.
+pub async fn distinct_numeric_values(field: String) -> Vec<f64>
+{
+    let column = match field.as_str()
+    {
+        "iso" => "iso",
+        "aperture" => "aperture",
+        "shutter_speed" => "shutter_speed",
+        "focal_length" => "focal_length",
+        other =>
+        {
+            eprintln!("distinct_numeric_values: unknown field '{}'", other);
+            return Vec::new();
+        }
+    };
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let sql = format!(
+        "SELECT DISTINCT CAST({col} AS DOUBLE) AS v FROM images WHERE {col} IS NOT NULL ORDER BY v",
+        col = column
+    );
+    let mut stmt = match conn.prepare(&sql)
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("distinct_numeric_values: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mapped = stmt.query_map([], |row| row.get::<_, f64>(0));
+
+    match mapped
+    {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(e) =>
+        {
+            eprintln!("distinct_numeric_values: query {}", e);
             Vec::new()
         }
     }
@@ -4867,7 +4995,7 @@ mod keyword_tests
     {
         let has = QueryPredicate {
             kind: "keyword_has".to_string(),
-            day: None, day_end: None, op: None, stars: None,
+            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
             value: Some("Wagner".to_string()),
         };
         assert_eq!(
@@ -4877,7 +5005,7 @@ mod keyword_tests
 
         let not = QueryPredicate {
             kind: "keyword_not".to_string(),
-            day: None, day_end: None, op: None, stars: None,
+            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
             value: Some("snapshot".to_string()),
         };
         assert_eq!(
@@ -4888,7 +5016,7 @@ mod keyword_tests
         // Empty value -> backstop.
         let empty = QueryPredicate {
             kind: "keyword_has".to_string(),
-            day: None, day_end: None, op: None, stars: None,
+            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
             value: Some(String::new()),
         };
         assert_eq!(predicate_to_sql(&empty), "(FALSE)");
@@ -4899,7 +5027,7 @@ mod keyword_tests
     {
         let fname = |kind: &str, v: &str| QueryPredicate {
             kind: kind.to_string(),
-            day: None, day_end: None, op: None, stars: None,
+            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
             value: Some(v.to_string()),
         };
 
@@ -4938,7 +5066,7 @@ mod keyword_tests
     {
         let coll = |v: &str| QueryPredicate {
             kind: "collection_is".to_string(),
-            day: None, day_end: None, op: None, stars: None,
+            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
             value: Some(v.to_string()),
         };
 
@@ -4964,7 +5092,7 @@ mod keyword_tests
     {
         let meta = |kind: &str, v: &str| QueryPredicate {
             kind: kind.to_string(),
-            day: None, day_end: None, op: None, stars: None,
+            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
             value: Some(v.to_string()),
         };
 
@@ -4992,6 +5120,42 @@ mod keyword_tests
         // Empty value -> backstop (matches nothing).
         assert_eq!(predicate_to_sql(&meta("extension_is", "")), "(FALSE)");
         assert_eq!(predicate_to_sql(&meta("lens_contains", "")), "(FALSE)");
+    }
+
+    #[test]
+    fn numeric_predicate_sql_arms()
+    {
+        let num = |kind: &str, op: &str, n: f64, end: Option<f64>| QueryPredicate {
+            kind: kind.to_string(),
+            day: None, day_end: None, stars: None, value: None,
+            op: Some(op.to_string()),
+            num: Some(n),
+            num_end: end,
+        };
+
+        // The four columns, one mode each — shortest-round-trip literals
+        // (1600 prints bare, 2.8 prints "2.8", 0.0005 prints "0.0005").
+        assert_eq!(predicate_to_sql(&num("iso_num", "eq", 1600.0, None)),
+                   "(iso = 1600)");
+        assert_eq!(predicate_to_sql(&num("aperture_num", "lte", 2.8, None)),
+                   "(aperture <= 2.8)");
+        assert_eq!(predicate_to_sql(&num("shutter_num", "gte", 0.0005, None)),
+                   "(shutter_speed >= 0.0005)");
+        assert_eq!(predicate_to_sql(&num("focal_num", "between", 70.0, Some(200.0))),
+                   "(focal_length BETWEEN 70 AND 200)");
+
+        // Malformed -> backstop: between without an upper bound, unknown op,
+        // non-finite bounds, missing num / missing op.
+        assert_eq!(predicate_to_sql(&num("focal_num", "between", 70.0, None)), "(FALSE)");
+        assert_eq!(predicate_to_sql(&num("iso_num", "approximately", 100.0, None)), "(FALSE)");
+        assert_eq!(predicate_to_sql(&num("iso_num", "eq", f64::NAN, None)), "(FALSE)");
+        assert_eq!(predicate_to_sql(&num("focal_num", "between", 70.0, Some(f64::INFINITY))), "(FALSE)");
+        let mut missing_num = num("iso_num", "eq", 0.0, None);
+        missing_num.num = None;
+        assert_eq!(predicate_to_sql(&missing_num), "(FALSE)");
+        let mut missing_op = num("iso_num", "eq", 100.0, None);
+        missing_op.op = None;
+        assert_eq!(predicate_to_sql(&missing_op), "(FALSE)");
     }
 }
 
@@ -5021,7 +5185,9 @@ mod saved_query_tests
                  value TEXT,
                  day TEXT,
                  day_end TEXT,
-                 stars INTEGER
+                 stars INTEGER,
+                 num DOUBLE,
+                 num_end DOUBLE
              );",
         )
         .expect("saved-query DDL");
@@ -5038,6 +5204,23 @@ mod saved_query_tests
             op: op.map(str::to_string),
             stars,
             value: value.map(str::to_string),
+            num: None,
+            num_end: None,
+        }
+    }
+
+    /// A numeric-subject predicate (S65) — kind + op + the bound(s).
+    fn npred(kind: &str, op: &str, num: f64, num_end: Option<f64>) -> QueryPredicate
+    {
+        QueryPredicate {
+            kind: kind.to_string(),
+            day: None,
+            day_end: None,
+            op: Some(op.to_string()),
+            stars: None,
+            value: None,
+            num: Some(num),
+            num_end,
         }
     }
 
@@ -5047,15 +5230,19 @@ mod saved_query_tests
         let conn = setup();
 
         // The design doc's "Spring picks": two date ranges EITHER, color AND,
-        // color EITHER, rating AND — repeated subjects + every connector slot.
+        // color EITHER, rating AND — repeated subjects + every connector slot —
+        // plus two numeric criteria (S65: num + num_end must survive the trip).
         let predicates = vec![
             pred("date_between", Some("2024:01:01"), Some("2024:02:15"), None, None, None),
             pred("date_between", Some("2025:06:01"), Some("2025:07:04"), None, None, None),
             pred("color", None, None, None, None, Some("blue")),
             pred("color", None, None, None, None, Some("green")),
             pred("rating", None, None, Some("gte"), Some(3), None),
+            npred("iso_num", "gte", 3200.0, None),
+            npred("focal_num", "between", 70.0, Some(200.0)),
         ];
-        let connectors = vec![Connector::Or, Connector::And, Connector::Or, Connector::And];
+        let connectors = vec![Connector::Or, Connector::And, Connector::Or,
+                              Connector::And, Connector::And, Connector::And];
 
         let info = save_query_impl(&conn, "Spring picks", &predicates, &connectors)
             .expect("save succeeds");
@@ -5620,6 +5807,8 @@ mod query_builder_tests
             op: None,
             stars: None,
             value: None,
+            num: None,
+            num_end: None,
         }
     }
 

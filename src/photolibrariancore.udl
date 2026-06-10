@@ -203,6 +203,13 @@ namespace photolibrariancore {
     [Async]
     sequence<string> distinct_image_values(string field);
 
+    // distinct_numeric_values: the numeric twin (S65) — distinct stored values
+    //   of one ALLOW-LISTED exposure column ("iso" / "aperture" /
+    //   "shutter_speed" / "focal_length") as exact doubles, ascending. The
+    //   numeric subjects' "is exactly" dropdown source.
+    [Async]
+    sequence<f64> distinct_numeric_values(string field);
+
     // Update the rotation angle for an image identified by file path
     // degrees: Rotation angle in degrees (0, 90, 180, or 270)
     // Returns true on success, false on failure
@@ -447,6 +454,12 @@ dictionary QueryPredicate {
     string? op;
     u8? stars;
     string? value;
+    // Numeric subjects (S65): "iso_num" / "aperture_num" / "shutter_num" /
+    // "focal_num" → op (eq/gte/lte/between) + num (the value or lower bound)
+    // + num_end (the "between" upper bound). Appended LAST (UniFFI maps by
+    // position); `= null` defaults keep existing Swift constructions valid.
+    f64? num = null;
+    f64? num_end = null;
 };
 
 // One saved query's identity (Session 63, saved queries — the header row).

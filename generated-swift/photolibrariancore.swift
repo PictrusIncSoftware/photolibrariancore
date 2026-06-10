@@ -1421,16 +1421,20 @@ public struct QueryPredicate: Equatable, Hashable {
     public var op: String?
     public var stars: UInt8?
     public var value: String?
+    public var num: Double?
+    public var numEnd: Double?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(kind: String, day: String?, dayEnd: String?, op: String?, stars: UInt8?, value: String?) {
+    public init(kind: String, day: String?, dayEnd: String?, op: String?, stars: UInt8?, value: String?, num: Double? = nil, numEnd: Double? = nil) {
         self.kind = kind
         self.day = day
         self.dayEnd = dayEnd
         self.op = op
         self.stars = stars
         self.value = value
+        self.num = num
+        self.numEnd = numEnd
     }
 
     
@@ -1454,7 +1458,9 @@ public struct FfiConverterTypeQueryPredicate: FfiConverterRustBuffer {
                 dayEnd: FfiConverterOptionString.read(from: &buf), 
                 op: FfiConverterOptionString.read(from: &buf), 
                 stars: FfiConverterOptionUInt8.read(from: &buf), 
-                value: FfiConverterOptionString.read(from: &buf)
+                value: FfiConverterOptionString.read(from: &buf), 
+                num: FfiConverterOptionDouble.read(from: &buf), 
+                numEnd: FfiConverterOptionDouble.read(from: &buf)
         )
     }
 
@@ -1465,6 +1471,8 @@ public struct FfiConverterTypeQueryPredicate: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.op, into: &buf)
         FfiConverterOptionUInt8.write(value.stars, into: &buf)
         FfiConverterOptionString.write(value.value, into: &buf)
+        FfiConverterOptionDouble.write(value.num, into: &buf)
+        FfiConverterOptionDouble.write(value.numEnd, into: &buf)
     }
 }
 
@@ -2076,6 +2084,31 @@ fileprivate struct FfiConverterSequenceInt64: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceDouble: FfiConverterRustBuffer {
+    typealias SwiftType = [Double]
+
+    public static func write(_ value: [Double], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterDouble.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Double] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Double]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterDouble.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
     typealias SwiftType = [String]
 
@@ -2518,6 +2551,21 @@ public func distinctImageValues(field: String)async  -> [String]  {
             completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceString.lift,
+            errorHandler: nil
+            
+        )
+}
+public func distinctNumericValues(field: String)async  -> [Double]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_distinct_numeric_values(FfiConverterString.lower(field)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceDouble.lift,
             errorHandler: nil
             
         )
@@ -3227,6 +3275,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_distinct_image_values() != 52444) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_distinct_numeric_values() != 29680) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_expand_collapse_group_ids() != 192) {
