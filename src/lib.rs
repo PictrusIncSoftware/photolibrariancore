@@ -4128,6 +4128,95 @@ pub async fn add_images_to_collections(ids: Vec<i64>, labels: Vec<String>) -> u6
     changed
 }
 
+/// Remove images from one or more collections — the scope-gated right-click
+/// "Remove from <collection>" (S65). Per image x label, flip the `collection`
+/// switch OFF on any row carrying it. The deliberate asymmetry with
+/// `add_images_to_collections`: the add flips ON only VISIBLE rows (status = 1),
+/// but removal ignores `status` entirely — membership counts even on a hidden
+/// keyword row (`collection_is` reads the raw table), so a status filter here
+/// would strand a hidden-keyword member in the collection with no way out.
+/// Rows are NEVER deleted (`status`/visibility untouched — a row that also
+/// serves keyword search keeps doing so); a collection whose every switch flips
+/// back FALSE simply stops appearing in `collection_labels`. Idempotent (not a
+/// member -> no-op). One transaction. Returns the number of rows flipped.
+pub async fn remove_images_from_collections(ids: Vec<i64>, labels: Vec<String>) -> u64
+{
+    if ids.is_empty()
+    {
+        return 0;
+    }
+
+    // Same label hygiene as the add — trim, drop empties and any carrying the
+    // path separator, de-dupe. (Scope labels arrive exact from the picker, but
+    // the FFI stays defensive.)
+    let mut clean: Vec<String> = Vec::new();
+    for label in &labels
+    {
+        let trimmed = label.trim();
+        if trimmed.is_empty() || trimmed.contains(KEYWORD_PATH_SEPARATOR)
+        {
+            continue;
+        }
+        let s = trimmed.to_string();
+        if !clean.contains(&s)
+        {
+            clean.push(s);
+        }
+    }
+    if clean.is_empty()
+    {
+        return 0;
+    }
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("remove_images_from_collections: begin failed: {}", e);
+        return 0;
+    }
+
+    let mut changed: u64 = 0;
+    for id in &ids
+    {
+        for label in &clean
+        {
+            // Flip OFF any row carrying membership — deliberately NO status
+            // filter (see the doc comment).
+            match conn.execute(
+                "UPDATE keyword SET collection = FALSE \
+                 WHERE image_id = ? AND label = ? AND collection = TRUE",
+                params![id, label],
+            )
+            {
+                Ok(n) => changed += n as u64,
+                Err(e) =>
+                {
+                    eprintln!("remove_images_from_collections: update failed: {}", e);
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    return 0;
+                }
+            }
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("remove_images_from_collections: commit failed: {}", e);
+        return 0;
+    }
+    changed
+}
+
 /// Hidden (removed) keyword rows for one image — the recovery surface. Reads the
 /// RAW table (not the view), newest-hidden first.
 pub async fn hidden_keywords_for_image(image_id: i64) -> Vec<KeywordRow>

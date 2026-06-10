@@ -165,6 +165,13 @@ namespace photolibrariancore {
     [Async]
     u64 add_images_to_collections(sequence<i64> ids, sequence<string> labels);
 
+    // remove_images_from_collections: the scope-gated "Remove from <collection>"
+    //   — per image x label, flip the `collection` switch OFF (deliberately NO
+    //   status filter: hidden-keyword members must stay reachable). Rows are
+    //   never deleted. Idempotent.
+    [Async]
+    u64 remove_images_from_collections(sequence<i64> ids, sequence<string> labels);
+
     // collection_labels: collections ONLY (labels with collection = TRUE on any
     //   row, raw table — membership is independent of visibility) — the gallery
     //   "Select Collection" picker (the opposite of keyword_labels' list).

@@ -2803,6 +2803,21 @@ public func removeImagesForFilters(pathPrefix: String, datePrefix: String)async 
             
         )
 }
+public func removeImagesFromCollections(ids: [Int64], labels: [String])async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_remove_images_from_collections(FfiConverterSequenceInt64.lower(ids),FfiConverterSequenceString.lower(labels)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func removeKeywordForIds(ids: [Int64], path: String)async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
@@ -3117,6 +3132,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_remove_images_for_filters() != 12960) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_remove_images_from_collections() != 19267) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_remove_keyword_for_ids() != 55303) {
