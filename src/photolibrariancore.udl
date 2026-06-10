@@ -189,6 +189,13 @@ namespace photolibrariancore {
     [Async]
     boolean delete_saved_query(i64 id);
 
+    // distinct_image_values: distinct stored values of one ALLOW-LISTED images
+    //   column ("file_extension" / "image_kind" / "camera_make" /
+    //   "camera_model" / "lens_model" / "creator") — the metadata subjects'
+    //   type-ahead source (S63). Unknown field token -> empty.
+    [Async]
+    sequence<string> distinct_image_values(string field);
+
     // Update the rotation angle for an image identified by file path
     // degrees: Rotation angle in degrees (0, 90, 180, or 270)
     // Returns true on success, false on failure

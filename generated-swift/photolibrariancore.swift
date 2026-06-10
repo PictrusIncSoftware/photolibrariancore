@@ -2319,6 +2319,21 @@ public func deleteSavedQuery(id: Int64)async  -> Bool  {
             
         )
 }
+public func distinctImageValues(field: String)async  -> [String]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_distinct_image_values(FfiConverterString.lower(field)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceString.lift,
+            errorHandler: nil
+            
+        )
+}
 public func expandCollapseGroupIds(ids: [Int64])async  -> [Int64]  {
     return
         try!  await uniffiRustCallAsync(
@@ -3000,6 +3015,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_delete_saved_query() != 60302) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_distinct_image_values() != 52444) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_expand_collapse_group_ids() != 192) {

@@ -2592,6 +2592,15 @@ fn filename_ilike_atom(pattern: &str) -> String
     format!("(file_name ILIKE '{}' ESCAPE '\\')", pattern.replace('\'', "''"))
 }
 
+/// `filename_ilike_atom`'s twin, pointed at `lens_model` — the Lens subject's
+/// "contains" mode (Session 63). The lens string is composite (maker + focal +
+/// aperture + line), so a case-insensitive fragment like "Viltrox" or "85mm"
+/// matches the whole family.
+fn lens_ilike_atom(pattern: &str) -> String
+{
+    format!("(lens_model ILIKE '{}' ESCAPE '\\')", pattern.replace('\'', "''"))
+}
+
 /// Map a rating comparison op token to its SQL symbol. Unknown → None.
 fn sql_compare_op(op: &str) -> Option<&'static str>
 {
@@ -2757,6 +2766,50 @@ fn predicate_to_sql(p: &QueryPredicate) -> String
         "filename_exact" => match p.value.as_deref()
         {
             Some(v) if !v.is_empty() => filename_ilike_atom(&escape_for_ilike(v)),
+            _ => bad(),
+        },
+        // Metadata subjects (Session 63 — the dropdown doctrine; Docs/
+        // DESIGN-Saved-Queries.md §3): exact equality against the PICKED
+        // catalogue value. The Swift type-ahead supplies values that exist
+        // verbatim (and file_extension is lowercase-canonical by migration
+        // invariant), so no case folding; a NULL column (no EXIF) correctly
+        // never matches.
+        "extension_is" => match p.value.as_deref()
+        {
+            Some(v) if !v.is_empty() => format!("(file_extension = '{}')", v.replace('\'', "''")),
+            _ => bad(),
+        },
+        "kind_is" => match p.value.as_deref()
+        {
+            Some(v) if !v.is_empty() => format!("(image_kind = '{}')", v.replace('\'', "''")),
+            _ => bad(),
+        },
+        "camera_make_is" => match p.value.as_deref()
+        {
+            Some(v) if !v.is_empty() => format!("(camera_make = '{}')", v.replace('\'', "''")),
+            _ => bad(),
+        },
+        "camera_model_is" => match p.value.as_deref()
+        {
+            Some(v) if !v.is_empty() => format!("(camera_model = '{}')", v.replace('\'', "''")),
+            _ => bad(),
+        },
+        "lens_is" => match p.value.as_deref()
+        {
+            Some(v) if !v.is_empty() => format!("(lens_model = '{}')", v.replace('\'', "''")),
+            _ => bad(),
+        },
+        "creator_is" => match p.value.as_deref()
+        {
+            Some(v) if !v.is_empty() => format!("(creator = '{}')", v.replace('\'', "''")),
+            _ => bad(),
+        },
+        // Lens "contains" — free text, case-INDEPENDENT (ILIKE), wildcard-
+        // escaped so a literal %/_ matches itself. No autofill by design:
+        // the user types a fragment, not an existing value (Richard, S63).
+        "lens_contains" => match p.value.as_deref()
+        {
+            Some(v) if !v.is_empty() => lens_ilike_atom(&format!("%{}%", escape_for_ilike(v))),
             _ => bad(),
         },
         other =>
@@ -3848,6 +3901,66 @@ pub async fn delete_saved_query(id: i64) -> bool
     delete_saved_query_impl(conn, id)
 }
 
+/// Distinct stored values of ONE allow-listed `images` column — the metadata
+/// subjects' type-ahead source (Session 63; the dropdown doctrine: a query can
+/// only ask for values that exist). The field token is matched against the
+/// fixed allow-list and mapped to its column identifier HERE — caller strings
+/// are never interpolated into SQL. Unknown token → empty.
+pub async fn distinct_image_values(field: String) -> Vec<String>
+{
+    let column = match field.as_str()
+    {
+        "file_extension" => "file_extension",
+        "image_kind" => "image_kind",
+        "camera_make" => "camera_make",
+        "camera_model" => "camera_model",
+        "lens_model" => "lens_model",
+        "creator" => "creator",
+        other =>
+        {
+            eprintln!("distinct_image_values: unknown field '{}'", other);
+            return Vec::new();
+        }
+    };
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let sql = format!(
+        "SELECT DISTINCT {col} FROM images WHERE {col} IS NOT NULL AND {col} <> '' ORDER BY LOWER({col})",
+        col = column
+    );
+    let mut stmt = match conn.prepare(&sql)
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("distinct_image_values: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mapped = stmt.query_map([], |row| row.get::<_, String>(0));
+
+    match mapped
+    {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(e) =>
+        {
+            eprintln!("distinct_image_values: query {}", e);
+            Vec::new()
+        }
+    }
+}
+
 /// Distinct collection names — labels carrying `collection = TRUE` on any row,
 /// read from the RAW `keyword` table (membership is independent of search
 /// visibility). The gallery "Select Collection" picker's autofill/dropdown —
@@ -4755,6 +4868,41 @@ mod keyword_tests
 
         // Empty value -> backstop (matches nothing).
         assert_eq!(predicate_to_sql(&coll("")), "(FALSE)");
+    }
+
+    #[test]
+    fn metadata_predicate_sql()
+    {
+        let meta = |kind: &str, v: &str| QueryPredicate {
+            kind: kind.to_string(),
+            day: None, day_end: None, op: None, stars: None,
+            value: Some(v.to_string()),
+        };
+
+        // The six "is" subjects: exact equality on the picked catalogue value.
+        assert_eq!(predicate_to_sql(&meta("extension_is", "nef")),
+                   "(file_extension = 'nef')");
+        assert_eq!(predicate_to_sql(&meta("kind_is", "raw")),
+                   "(image_kind = 'raw')");
+        assert_eq!(predicate_to_sql(&meta("camera_make_is", "NIKON CORPORATION")),
+                   "(camera_make = 'NIKON CORPORATION')");
+        assert_eq!(predicate_to_sql(&meta("camera_model_is", "NIKON Z 8")),
+                   "(camera_model = 'NIKON Z 8')");
+        assert_eq!(predicate_to_sql(&meta("lens_is", "NIKKOR Z 85mm f/1.8 S")),
+                   "(lens_model = 'NIKKOR Z 85mm f/1.8 S')");
+        // The apostrophe doubles for the SQL literal.
+        assert_eq!(predicate_to_sql(&meta("creator_is", "Richard O'Wagner")),
+                   "(creator = 'Richard O''Wagner')");
+
+        // Lens "contains": case-insensitive ILIKE, wildcard-escaped fragment.
+        assert_eq!(predicate_to_sql(&meta("lens_contains", "85mm")),
+                   "(lens_model ILIKE '%85mm%' ESCAPE '\\')");
+        assert_eq!(predicate_to_sql(&meta("lens_contains", "100%_O'N")),
+                   "(lens_model ILIKE '%100\\%\\_O''N%' ESCAPE '\\')");
+
+        // Empty value -> backstop (matches nothing).
+        assert_eq!(predicate_to_sql(&meta("extension_is", "")), "(FALSE)");
+        assert_eq!(predicate_to_sql(&meta("lens_contains", "")), "(FALSE)");
     }
 }
 
