@@ -5980,6 +5980,177 @@ pub async fn get_distinct_directory_paths() -> Vec<String>
     paths
 }
 
+/// One directory's own image tally for the Sources sidebar (S65) — a row of
+/// the aggregated GROUP BY. `directory_path` is the image's immediate parent
+/// directory in the SAME canonical derived form `get_distinct_directory_paths`
+/// returns (the protected S5 expression over `file_path` — deliberately NOT
+/// the stored `directory_path` column), so the key set is byte-identical to
+/// the tree's and one call can feed both structure and counts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirectoryImageCount
+{
+    pub directory_path: String,
+    pub image_count: i64,
+}
+
+/// One capture day's image tally for the Dates sidebar (S65). `day` is the
+/// "YYYY:MM:DD" prefix — the same 10-character SUBSTRING
+/// `get_distinct_date_strings` returns, so the key set is byte-identical.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaptureDayImageCount
+{
+    pub day: String,
+    pub image_count: i64,
+}
+
+/// Per-directory image counts in ONE pass — the cure (flagged S64) for the
+/// Sources sidebar's per-node COUNT flood (one query per tree node: thousands
+/// of sequential scans at 65k records). Same derived directory expression,
+/// WHERE, and ORDER BY as `get_distinct_directory_paths`, so the keys double
+/// as the distinct-paths list and this call replaces it for the sidebar.
+/// Counts are RAW catalogue (no duplicate filter / no RAW+JPEG collapse — the
+/// sidebar-count convention, design doc §11). Each image tallies under its
+/// immediate parent ONLY; Swift sums ancestors while walking the trie (an
+/// ancestor's old prefix-count equals the sum over its descendant leaves,
+/// since every image has exactly one parent directory).
+pub async fn directory_image_counts() -> Vec<DirectoryImageCount>
+{
+    // Acquire lock and validate connection
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    // The S5 directory expression (do NOT rewrite) — see
+    // get_distinct_directory_paths for the derivation notes.
+    let query_sql = r#"
+        SELECT
+            SUBSTRING(file_path, 1, LENGTH(file_path) - INSTR(REVERSE(file_path), '/')) as dir_path,
+            COUNT(*) as image_count
+        FROM images
+        WHERE file_path IS NOT NULL AND file_path LIKE '%/%'
+        GROUP BY dir_path
+        ORDER BY dir_path ASC
+    "#;
+
+    let mut stmt = match conn.prepare(query_sql)
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("directory_image_counts: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map([], |row|
+    {
+        Ok(DirectoryImageCount
+        {
+            directory_path: row.get::<_, String>(0)?,
+            image_count: row.get::<_, i64>(1)?,
+        })
+    })
+    {
+        Ok(r) => r,
+        Err(e) =>
+        {
+            eprintln!("directory_image_counts: query {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mut counts = Vec::new();
+    for row_result in rows
+    {
+        match row_result
+        {
+            Ok(c) => counts.push(c),
+            Err(e) => eprintln!("directory_image_counts: row {}", e),
+        }
+    }
+
+    counts
+}
+
+/// Per-capture-day image counts in ONE pass — the Dates-sidebar twin of
+/// `directory_image_counts` (S65; one COUNT per year + month + distinct DAY
+/// before this). Same day expression, WHERE, and ORDER BY as
+/// `get_distinct_date_strings`, so the keys double as the distinct-days list
+/// and this call replaces it for the sidebar. Counts are RAW catalogue (the
+/// §11 sidebar convention); Swift sums months and years from the days. NULL /
+/// empty capture datetimes (Undated files) are excluded here exactly as they
+/// are from the tree — the "All Photos" total is a separate whole-catalogue
+/// count and still includes them.
+pub async fn capture_day_image_counts() -> Vec<CaptureDayImageCount>
+{
+    // Acquire lock and validate connection
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let query_sql = r#"
+        SELECT SUBSTRING(capture_datetime, 1, 10) as date_str,
+               COUNT(*) as image_count
+        FROM images
+        WHERE capture_datetime IS NOT NULL AND capture_datetime != ''
+        GROUP BY date_str
+        ORDER BY date_str ASC
+    "#;
+
+    let mut stmt = match conn.prepare(query_sql)
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("capture_day_image_counts: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map([], |row|
+    {
+        Ok(CaptureDayImageCount
+        {
+            day: row.get::<_, String>(0)?,
+            image_count: row.get::<_, i64>(1)?,
+        })
+    })
+    {
+        Ok(r) => r,
+        Err(e) =>
+        {
+            eprintln!("capture_day_image_counts: query {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mut counts = Vec::new();
+    for row_result in rows
+    {
+        match row_result
+        {
+            Ok(c) => counts.push(c),
+            Err(e) => eprintln!("capture_day_image_counts: row {}", e),
+        }
+    }
+
+    counts
+}
+
 /// Get images from the catalogue with pagination and optional date filtering
 ///
 /// Returns a paginated list of image records, optionally filtered by date prefix.

@@ -578,6 +578,114 @@ fileprivate struct FfiConverterString: FfiConverter {
 }
 
 
+public struct CaptureDayImageCount: Equatable, Hashable {
+    public var day: String
+    public var imageCount: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(day: String, imageCount: Int64) {
+        self.day = day
+        self.imageCount = imageCount
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CaptureDayImageCount: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCaptureDayImageCount: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CaptureDayImageCount {
+        return
+            try CaptureDayImageCount(
+                day: FfiConverterString.read(from: &buf), 
+                imageCount: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CaptureDayImageCount, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.day, into: &buf)
+        FfiConverterInt64.write(value.imageCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCaptureDayImageCount_lift(_ buf: RustBuffer) throws -> CaptureDayImageCount {
+    return try FfiConverterTypeCaptureDayImageCount.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCaptureDayImageCount_lower(_ value: CaptureDayImageCount) -> RustBuffer {
+    return FfiConverterTypeCaptureDayImageCount.lower(value)
+}
+
+
+public struct DirectoryImageCount: Equatable, Hashable {
+    public var directoryPath: String
+    public var imageCount: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(directoryPath: String, imageCount: Int64) {
+        self.directoryPath = directoryPath
+        self.imageCount = imageCount
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension DirectoryImageCount: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDirectoryImageCount: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DirectoryImageCount {
+        return
+            try DirectoryImageCount(
+                directoryPath: FfiConverterString.read(from: &buf), 
+                imageCount: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DirectoryImageCount, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.directoryPath, into: &buf)
+        FfiConverterInt64.write(value.imageCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDirectoryImageCount_lift(_ buf: RustBuffer) throws -> DirectoryImageCount {
+    return try FfiConverterTypeDirectoryImageCount.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDirectoryImageCount_lower(_ value: DirectoryImageCount) -> RustBuffer {
+    return FfiConverterTypeDirectoryImageCount.lower(value)
+}
+
+
 public struct FilePathsResult: Equatable, Hashable {
     public var ok: Bool
     public var paths: [String]
@@ -1993,6 +2101,56 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeCaptureDayImageCount: FfiConverterRustBuffer {
+    typealias SwiftType = [CaptureDayImageCount]
+
+    public static func write(_ value: [CaptureDayImageCount], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCaptureDayImageCount.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CaptureDayImageCount] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CaptureDayImageCount]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCaptureDayImageCount.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeDirectoryImageCount: FfiConverterRustBuffer {
+    typealias SwiftType = [DirectoryImageCount]
+
+    public static func write(_ value: [DirectoryImageCount], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeDirectoryImageCount.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [DirectoryImageCount] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [DirectoryImageCount]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeDirectoryImageCount.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeImageMetadata: FfiConverterRustBuffer {
     typealias SwiftType = [ImageMetadata]
 
@@ -2267,6 +2425,21 @@ public func assignKeywordForIds(ids: [Int64], segments: [String])async  -> UInt6
             
         )
 }
+public func captureDayImageCounts()async  -> [CaptureDayImageCount]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_capture_day_image_counts(
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeCaptureDayImageCount.lift,
+            errorHandler: nil
+            
+        )
+}
 public func classifyExtension(ext: String) -> ImageKind  {
     return try!  FfiConverterTypeImageKind_lift(try! rustCall() {
     uniffi_photolibrariancore_fn_func_classify_extension(
@@ -2315,6 +2488,21 @@ public func deleteSavedQuery(id: Int64)async  -> Bool  {
             completeFunc: ffi_photolibrariancore_rust_future_complete_i8,
             freeFunc: ffi_photolibrariancore_rust_future_free_i8,
             liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
+        )
+}
+public func directoryImageCounts()async  -> [DirectoryImageCount]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_directory_image_counts(
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeDirectoryImageCount.lift,
             errorHandler: nil
             
         )
@@ -3020,6 +3208,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_assign_keyword_for_ids() != 32359) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_capture_day_image_counts() != 39878) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_classify_extension() != 38346) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3030,6 +3221,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_delete_saved_query() != 60302) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_directory_image_counts() != 16364) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_distinct_image_values() != 52444) {

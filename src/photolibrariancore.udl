@@ -219,6 +219,19 @@ namespace photolibrariancore {
     [Async]
     sequence<string> get_distinct_directory_paths();
 
+    // ---- Aggregated sidebar counts (S65 — the cure for the per-node COUNT
+    // flood flagged in S64). ONE GROUP BY per sidebar replaces thousands of
+    // sequential per-node queries; the row keys double as the distinct-paths /
+    // distinct-days lists, so each call also supersedes the structure query
+    // above for its sidebar. Counts are RAW catalogue (no duplicate filter,
+    // no RAW+JPEG collapse — the §11 sidebar convention); Swift sums
+    // ancestors (directories) and months/years (days) in memory.
+    [Async]
+    sequence<DirectoryImageCount> directory_image_counts();
+
+    [Async]
+    sequence<CaptureDayImageCount> capture_day_image_counts();
+
     // Get images with pagination and optional date filtering
     // date_prefix: Empty string for all images, or "YYYY:", "YYYY:MM:", "YYYY:MM:DD" for filtering
     // apply_duplicate_filter / apply_raw_jpeg_collapse: Step 4a filter booleans.
@@ -447,6 +460,21 @@ dictionary SavedQueryInfo {
 dictionary SavedQueryPayload {
     sequence<QueryPredicate> predicates;
     sequence<Connector> connectors;
+};
+
+// One directory's OWN image tally (S65, Sources sidebar) — directory_path is
+// the canonical derived parent-directory form (same as
+// get_distinct_directory_paths), so the keys match the tree exactly.
+dictionary DirectoryImageCount {
+    string directory_path;
+    i64 image_count;
+};
+
+// One capture day's image tally (S65, Dates sidebar) — day is the
+// "YYYY:MM:DD" prefix (same as get_distinct_date_strings).
+dictionary CaptureDayImageCount {
+    string day;
+    i64 image_count;
 };
 
 // One materialized keyword row (Session 45), returned to Swift. status: 1 =

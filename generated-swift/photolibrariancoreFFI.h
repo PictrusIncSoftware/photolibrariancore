@@ -253,6 +253,12 @@ uint64_t uniffi_photolibrariancore_fn_func_add_images_to_collections(RustBuffer 
 uint64_t uniffi_photolibrariancore_fn_func_assign_keyword_for_ids(RustBuffer ids, RustBuffer segments
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_CAPTURE_DAY_IMAGE_COUNTS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_CAPTURE_DAY_IMAGE_COUNTS
+uint64_t uniffi_photolibrariancore_fn_func_capture_day_image_counts(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_CLASSIFY_EXTENSION
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_CLASSIFY_EXTENSION
 RustBuffer uniffi_photolibrariancore_fn_func_classify_extension(RustBuffer ext, RustCallStatus *_Nonnull out_status
@@ -272,6 +278,12 @@ uint64_t uniffi_photolibrariancore_fn_func_count_query_images(RustBuffer predica
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_DELETE_SAVED_QUERY
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_DELETE_SAVED_QUERY
 uint64_t uniffi_photolibrariancore_fn_func_delete_saved_query(int64_t id
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_DIRECTORY_IMAGE_COUNTS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_DIRECTORY_IMAGE_COUNTS
+uint64_t uniffi_photolibrariancore_fn_func_directory_image_counts(void
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_DISTINCT_IMAGE_VALUES
@@ -788,6 +800,12 @@ uint16_t uniffi_photolibrariancore_checksum_func_assign_keyword_for_ids(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_CAPTURE_DAY_IMAGE_COUNTS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_CAPTURE_DAY_IMAGE_COUNTS
+uint16_t uniffi_photolibrariancore_checksum_func_capture_day_image_counts(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_CLASSIFY_EXTENSION
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_CLASSIFY_EXTENSION
 uint16_t uniffi_photolibrariancore_checksum_func_classify_extension(void
@@ -809,6 +827,12 @@ uint16_t uniffi_photolibrariancore_checksum_func_count_query_images(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_DELETE_SAVED_QUERY
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_DELETE_SAVED_QUERY
 uint16_t uniffi_photolibrariancore_checksum_func_delete_saved_query(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_DIRECTORY_IMAGE_COUNTS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_DIRECTORY_IMAGE_COUNTS
+uint16_t uniffi_photolibrariancore_checksum_func_directory_image_counts(void
     
 );
 #endif
