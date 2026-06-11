@@ -178,6 +178,15 @@ namespace photolibrariancore {
     [Async]
     sequence<string> collection_labels();
 
+    // ---- Color labels (the `color` switch on the keyword row — S66) ----
+    // assign_color_keyword_for_ids: the Lightroom import's color pass — mark a
+    //   CUSTOM color-label text on a batch of images: flip `color = TRUE` on an
+    //   existing visible row with that label, else insert a flat color row.
+    //   Idempotent. (The five standard color names never come here — they live
+    //   in images.color_label.)
+    [Async]
+    u64 assign_color_keyword_for_ids(sequence<i64> ids, string label);
+
     // ---- Saved Queries (Session 63; Docs/DESIGN-Saved-Queries.md) ----
     // save_query: write the sentence down under `name`; a colliding name gains
     //   a -01/-02 suffix (never replace, never prompt — Richard's rule). The

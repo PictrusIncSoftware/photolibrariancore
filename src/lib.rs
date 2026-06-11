@@ -674,7 +674,8 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             status INTEGER NOT NULL DEFAULT 1,  -- 1 = active, 0 = hidden (soft-delete)
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             hidden_at TIMESTAMP,                -- set when status->0; NULL while active
-            collection BOOLEAN NOT NULL DEFAULT FALSE  -- Collections-panel membership; orthogonal to status (keyword search stays oblivious)
+            collection BOOLEAN NOT NULL DEFAULT FALSE,  -- Collections-panel membership; orthogonal to status (keyword search stays oblivious)
+            color BOOLEAN NOT NULL DEFAULT FALSE        -- S66: this label is a COLOR (custom Lightroom color-label text); third independent switch
         );
 
         CREATE INDEX IF NOT EXISTS idx_keyword_image_id ON keyword(image_id);
@@ -692,6 +693,13 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         -- just makes it tidy.
         ALTER TABLE keyword ADD COLUMN IF NOT EXISTS collection BOOLEAN;
         UPDATE keyword SET collection = FALSE WHERE collection IS NULL;
+
+        -- Same migration shape for the color switch (S66). A pre-existing
+        -- catalogue's color-derived rows can't be retro-identified (that's the
+        -- gap this column closes) — they backfill FALSE and a re-import marks
+        -- them.
+        ALTER TABLE keyword ADD COLUMN IF NOT EXISTS color BOOLEAN;
+        UPDATE keyword SET color = FALSE WHERE color IS NULL;
 
         -- Active-only view: ALL normal keyword reads/queries hit this so the
         -- status filter can never be forgotten. Recovery reads the raw table.
@@ -2632,6 +2640,22 @@ fn sql_compare_op(op: &str) -> Option<&'static str>
     }
 }
 
+/// Map a `date_in_last` unit token to its DuckDB INTERVAL keyword (S66 —
+/// Gate 3). An allow-list, so unit text can never reach the SQL verbatim;
+/// the tokens are the wire vocabulary the Swift `DateUnit` enum emits (and
+/// Lightroom's own smart-collection unit words). Unknown → None.
+fn interval_unit_sql(unit: &str) -> Option<&'static str>
+{
+    match unit
+    {
+        "days" => Some("DAY"),
+        "weeks" => Some("WEEK"),
+        "months" => Some("MONTH"),
+        "years" => Some("YEAR"),
+        _ => None,
+    }
+}
+
 /// One numeric-subject atom (S65 — ISO / aperture / shutter_speed /
 /// focal_length). `column` is fixed by the calling arm (never caller text);
 /// the numbers are formatted with Rust's shortest-round-trip f64 Display, so
@@ -2733,6 +2757,29 @@ fn predicate_to_sql(p: &QueryPredicate) -> String
                 format!("(SUBSTRING(capture_datetime, 1, 10) < '{}')", d.replace('\'', "''")),
             _ => bad(),
         },
+        // Dynamic date (Session 66 — Gate 3 of the smart-collections plan):
+        // "in the last N days/weeks/months/years". THE DATABASE resolves the
+        // cutoff at EXECUTION time — `CURRENT_DATE - INTERVAL` arithmetic at
+        // this one chokepoint — so every consumer (paging, counts, ⌘A, saved
+        // queries, future surfaces) stays honest by construction, and a saved
+        // "Past Month" never freezes into the month it was saved (the S65
+        // decision: never snapshot a relative date). The count rides `value`,
+        // the unit token rides `op` (zero schema change). This is the arm
+        // Lightroom's `captureTime inLast N <unit>` smart-collection rule
+        // maps to. Day-granular like every other date arm: strftime renders
+        // the cutoff in the stored colon form and the comparison is `>=`.
+        "date_in_last" => match (p.value.as_deref(), p.op.as_deref())
+        {
+            (Some(v), Some(unit)) => match (v.parse::<u32>(), interval_unit_sql(unit))
+            {
+                (Ok(n), Some(u)) if (1..=9999).contains(&n) => format!(
+                    "(SUBSTRING(capture_datetime, 1, 10) >= strftime(CURRENT_DATE - INTERVAL {} {}, '%Y:%m:%d'))",
+                    n, u
+                ),
+                _ => bad(),
+            },
+            _ => bad(),
+        },
         "rating" => match (p.op.as_deref(), p.stars)
         {
             (Some(op), Some(stars)) if (1..=5).contains(&stars) => match sql_compare_op(op)
@@ -2760,7 +2807,17 @@ fn predicate_to_sql(p: &QueryPredicate) -> String
             Some(v) if is_valid_color(v) => format!("(color_label = '{}')", v.replace('\'', "''")),
             _ => bad(),
         },
-        "no_color" => "(color_label IS NULL)".to_string(),
+        // The color subject knows BOTH storage halves (S66): the five standard
+        // names live in `images.color_label`; custom Lightroom color-label text
+        // lives as a keyword row with the `color` switch ON. Color-ness reads
+        // the RAW keyword table (like collection_is — hiding a keyword doesn't
+        // un-color the photo), so any_color/no_color stay exact complements.
+        "no_color" => "(color_label IS NULL AND NOT EXISTS \
+                       (SELECT 1 FROM keyword k WHERE k.image_id = images.id AND k.color = TRUE))"
+            .to_string(),
+        "any_color" => "(color_label IS NOT NULL OR EXISTS \
+                        (SELECT 1 FROM keyword k WHERE k.image_id = images.id AND k.color = TRUE))"
+            .to_string(),
         // Keyword subject (Session 45). Label-equality is automatically
         // subtree-inclusive: every ancestor is its own materialized row carrying
         // its label, so `label = 'Animals'` matches everything beneath Animals.
@@ -2782,6 +2839,18 @@ fn predicate_to_sql(p: &QueryPredicate) -> String
             ),
             _ => bad(),
         },
+        // "Has no keywords" (Session 66 — Gate 2 of the smart-collections
+        // plan): true when the image carries NO visible NON-COLOR keyword row.
+        // The label-free sibling of keyword_not — `value` is ignored. Rows
+        // whose `color` switch is ON are custom Lightroom color-label text,
+        // not subject keywords, so they don't count — which keeps this arm in
+        // exact parity with Lightroom's "Without Keywords" rule (Lightroom
+        // never counts color labels as keywords). NULL-tolerant for the
+        // instant between a migration ALTER and its backfill.
+        "keyword_none" =>
+            "(NOT EXISTS (SELECT 1 FROM keyword_visible k WHERE k.image_id = images.id \
+              AND (k.color = FALSE OR k.color IS NULL)))"
+                .to_string(),
         // Collection subject (Session 63 — the gallery "Select Collection"
         // scope). Membership = a row in the RAW `keyword` table carrying this
         // label with the `collection` switch ON. Deliberately NOT the
@@ -4256,6 +4325,109 @@ pub async fn add_images_to_collections(ids: Vec<i64>, labels: Vec<String>) -> u6
     changed
 }
 
+/// The body of `assign_color_keyword_for_ids`, against an explicit connection
+/// so the unit tests can drive it on an in-memory database (the saved-query
+/// impl/wrapper pattern). Mirrors `add_images_to_collections` for the COLOR
+/// switch: per image, flip `color = TRUE` on any existing visible row carrying
+/// this label, else insert a flat row (path = label) with `color = TRUE`.
+/// Idempotent; one transaction; returns rows changed (flipped + inserted).
+fn assign_color_keyword_for_ids_impl(conn: &Connection, ids: &[i64], label: &str) -> u64
+{
+    let trimmed = label.trim();
+    if ids.is_empty() || trimmed.is_empty() || trimmed.contains(KEYWORD_PATH_SEPARATOR)
+    {
+        return 0;
+    }
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("assign_color_keyword_for_ids: begin failed: {}", e);
+        return 0;
+    }
+
+    let mut changed: u64 = 0;
+    for id in ids
+    {
+        // Flip ON any existing visible row(s) with this label that aren't
+        // already marked (FALSE or, on migrated catalogues, NULL).
+        let flipped = match conn.execute(
+            "UPDATE keyword SET color = TRUE \
+             WHERE image_id = ? AND label = ? AND status = 1 \
+               AND (color = FALSE OR color IS NULL)",
+            params![id, trimmed],
+        )
+        {
+            Ok(n) => n as u64,
+            Err(e) =>
+            {
+                eprintln!("assign_color_keyword_for_ids: update failed: {}", e);
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
+            }
+        };
+        if flipped > 0
+        {
+            changed += flipped;
+            continue;
+        }
+
+        // Already marked (a visible row with color already TRUE)? no-op.
+        let already: Result<i64, _> = conn.query_row(
+            "SELECT 1 FROM keyword \
+             WHERE image_id = ? AND label = ? AND status = 1 AND color = TRUE LIMIT 1",
+            params![id, trimmed],
+            |r| r.get(0),
+        );
+        if already.is_ok()
+        {
+            continue;
+        }
+
+        // No visible row with this label → insert a flat color row.
+        match conn.execute(
+            "INSERT INTO keyword (image_id, label, path, status, created_at, collection, color) \
+             VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, FALSE, TRUE)",
+            params![id, trimmed, trimmed],
+        )
+        {
+            Ok(_) => changed += 1,
+            Err(e) =>
+            {
+                eprintln!("assign_color_keyword_for_ids: insert failed: {}", e);
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
+            }
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("assign_color_keyword_for_ids: commit failed: {}", e);
+        return 0;
+    }
+    changed
+}
+
+/// FFI: mark a custom color-label keyword on a batch of images (S66 — the
+/// Lightroom import's color pass). A custom color label IS a `keyword` row
+/// carrying `color = TRUE` — the third independent switch on the row, exactly
+/// parallel to `collection`. The five STANDARD color names never come here
+/// (they live in `images.color_label`); the reader's SQL filters them out.
+pub async fn assign_color_keyword_for_ids(ids: Vec<i64>, label: String) -> u64
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+    assign_color_keyword_for_ids_impl(conn, &ids, &label)
+}
+
 /// Remove images from one or more collections — the scope-gated right-click
 /// "Remove from <collection>" (S65). Per image x label, flip the `collection`
 /// switch OFF on any row carrying it. The deliberate asymmetry with
@@ -5020,6 +5192,118 @@ mod keyword_tests
             value: Some(String::new()),
         };
         assert_eq!(predicate_to_sql(&empty), "(FALSE)");
+
+        // keyword_none takes no value (S66 Gate 2): no visible NON-COLOR
+        // keyword row (color-marked rows are color labels, not keywords).
+        let none = QueryPredicate {
+            kind: "keyword_none".to_string(),
+            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            value: None,
+        };
+        assert_eq!(
+            predicate_to_sql(&none),
+            "(NOT EXISTS (SELECT 1 FROM keyword_visible k WHERE k.image_id = images.id AND (k.color = FALSE OR k.color IS NULL)))"
+        );
+    }
+
+    #[test]
+    fn color_predicate_sql_knows_both_halves()
+    {
+        // S66: standard colors live in images.color_label; custom color-label
+        // text is a keyword row with the color switch ON. any_color/no_color
+        // are exact complements across BOTH halves (raw table — hiding a
+        // keyword doesn't un-color the photo).
+        let any = QueryPredicate {
+            kind: "any_color".to_string(),
+            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            value: None,
+        };
+        assert_eq!(
+            predicate_to_sql(&any),
+            "(color_label IS NOT NULL OR EXISTS (SELECT 1 FROM keyword k WHERE k.image_id = images.id AND k.color = TRUE))"
+        );
+
+        let none = QueryPredicate {
+            kind: "no_color".to_string(),
+            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            value: None,
+        };
+        assert_eq!(
+            predicate_to_sql(&none),
+            "(color_label IS NULL AND NOT EXISTS (SELECT 1 FROM keyword k WHERE k.image_id = images.id AND k.color = TRUE))"
+        );
+    }
+
+    /// The color switch end-to-end on a real in-memory engine (S66):
+    /// flip-or-insert marking, idempotence, and the three predicates that
+    /// read it (any_color / no_color / keyword_none).
+    #[test]
+    fn color_keyword_switch_end_to_end()
+    {
+        use duckdb::Connection;
+
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE images (id INTEGER, color_label TEXT);
+             CREATE SEQUENCE keyword_id_seq START 1;
+             CREATE TABLE keyword (
+                 id INTEGER PRIMARY KEY DEFAULT nextval('keyword_id_seq'),
+                 image_id INTEGER NOT NULL,
+                 label TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 status INTEGER NOT NULL DEFAULT 1,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 hidden_at TIMESTAMP,
+                 collection BOOLEAN NOT NULL DEFAULT FALSE,
+                 color BOOLEAN NOT NULL DEFAULT FALSE
+             );
+             CREATE OR REPLACE VIEW keyword_visible AS
+                 SELECT * FROM keyword WHERE status = 1;
+             -- Photo 1: standard red via color_label, no keywords.
+             -- Photo 2: will get a CUSTOM color label 'Approved' (keyword row).
+             -- Photo 3: a real keyword 'Approved' ALREADY applied -> the mark
+             --          must flip THAT row, not insert a second.
+             -- Photo 4: nothing at all.
+             INSERT INTO images VALUES (1, 'red'), (2, NULL), (3, NULL), (4, NULL);
+             INSERT INTO keyword (image_id, label, path) VALUES (3, 'Approved', 'Approved');",
+        )
+        .expect("schema + seed");
+
+        // Mark 'Approved' as a color on photos 2 and 3.
+        let changed = assign_color_keyword_for_ids_impl(&conn, &[2, 3], "Approved");
+        assert_eq!(changed, 2, "one insert (photo 2) + one flip (photo 3)");
+
+        // Photo 3 must still have exactly ONE 'Approved' row (flipped, not duplicated).
+        let rows3: i64 = conn
+            .query_row("SELECT COUNT(*) FROM keyword WHERE image_id = 3 AND label = 'Approved'",
+                       [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows3, 1);
+
+        // Idempotent: a second pass changes nothing.
+        assert_eq!(assign_color_keyword_for_ids_impl(&conn, &[2, 3], "Approved"), 0);
+
+        let count = |pred: &QueryPredicate| -> i64 {
+            let sql = format!("SELECT COUNT(*) FROM images WHERE {}", predicate_to_sql(pred));
+            conn.query_row(&sql, [], |r| r.get(0)).expect("predicate executes")
+        };
+        let bare = |kind: &str| QueryPredicate {
+            kind: kind.to_string(),
+            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            value: None,
+        };
+
+        // any_color: photo 1 (standard red) + photos 2 and 3 (custom mark).
+        assert_eq!(count(&bare("any_color")), 3);
+        // no_color: only photo 4 — the exact complement.
+        assert_eq!(count(&bare("no_color")), 1);
+        // keyword_none: color-marked rows don't count as keywords → photos 1,
+        // 2, 4 are keywordless. Photo 3 is the KNOWN, ACCEPTED residue (the
+        // same class as the S65 collection-add residue): its real keyword and
+        // its color label share one row, so the flip merges the roles and the
+        // photo reads keywordless too. Rare (needs identical text in both
+        // Lightroom systems on one photo); revisit only if real catalogs care.
+        assert_eq!(count(&bare("keyword_none")), 4);
     }
 
     #[test]
@@ -5156,6 +5440,90 @@ mod keyword_tests
         let mut missing_op = num("iso_num", "eq", 100.0, None);
         missing_op.op = None;
         assert_eq!(predicate_to_sql(&missing_op), "(FALSE)");
+    }
+
+    #[test]
+    fn date_in_last_predicate_sql()
+    {
+        let dil = |count: &str, unit: &str| QueryPredicate {
+            kind: "date_in_last".to_string(),
+            day: None, day_end: None, stars: None, num: None, num_end: None,
+            op: Some(unit.to_string()),
+            value: Some(count.to_string()),
+        };
+
+        // The four units map to DuckDB INTERVAL keywords; the cutoff is
+        // computed by the DATABASE at execution time, in the stored colon form.
+        assert_eq!(
+            predicate_to_sql(&dil("30", "days")),
+            "(SUBSTRING(capture_datetime, 1, 10) >= strftime(CURRENT_DATE - INTERVAL 30 DAY, '%Y:%m:%d'))"
+        );
+        assert_eq!(
+            predicate_to_sql(&dil("2", "weeks")),
+            "(SUBSTRING(capture_datetime, 1, 10) >= strftime(CURRENT_DATE - INTERVAL 2 WEEK, '%Y:%m:%d'))"
+        );
+        assert_eq!(
+            predicate_to_sql(&dil("1", "months")),
+            "(SUBSTRING(capture_datetime, 1, 10) >= strftime(CURRENT_DATE - INTERVAL 1 MONTH, '%Y:%m:%d'))"
+        );
+        assert_eq!(
+            predicate_to_sql(&dil("3", "years")),
+            "(SUBSTRING(capture_datetime, 1, 10) >= strftime(CURRENT_DATE - INTERVAL 3 YEAR, '%Y:%m:%d'))"
+        );
+
+        // Malformed -> backstop: zero / negative / non-numeric / oversized
+        // counts, an unknown unit, missing either field.
+        assert_eq!(predicate_to_sql(&dil("0", "days")), "(FALSE)");
+        assert_eq!(predicate_to_sql(&dil("-3", "days")), "(FALSE)");
+        assert_eq!(predicate_to_sql(&dil("soon", "days")), "(FALSE)");
+        assert_eq!(predicate_to_sql(&dil("10000", "days")), "(FALSE)");
+        assert_eq!(predicate_to_sql(&dil("30", "fortnights")), "(FALSE)");
+        let mut no_unit = dil("30", "days");
+        no_unit.op = None;
+        assert_eq!(predicate_to_sql(&no_unit), "(FALSE)");
+        let mut no_count = dil("30", "days");
+        no_count.value = None;
+        assert_eq!(predicate_to_sql(&no_count), "(FALSE)");
+    }
+
+    /// date_in_last must EXECUTE on the real engine — the strftime/INTERVAL
+    /// syntax is the risk the string test can't cover (S66 Gate 3). Rows are
+    /// seeded by DuckDB's OWN CURRENT_DATE arithmetic, so the test never reads
+    /// the host clock and cannot go stale. (All assertions stay correct even
+    /// across a midnight boundary between seed and query.)
+    #[test]
+    fn date_in_last_executes_on_duckdb()
+    {
+        use duckdb::Connection;
+
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE images (capture_datetime TEXT);
+             INSERT INTO images VALUES
+                 (strftime(CURRENT_DATE - INTERVAL 5 DAY, '%Y:%m:%d') || ' 12:00:00'),
+                 (strftime(CURRENT_DATE - INTERVAL 400 DAY, '%Y:%m:%d') || ' 12:00:00'),
+                 ('1999:01:01 00:00:00'),
+                 (NULL);",
+        )
+        .expect("seed table");
+
+        let dil = |count: &str, unit: &str| QueryPredicate {
+            kind: "date_in_last".to_string(),
+            day: None, day_end: None, stars: None, num: None, num_end: None,
+            op: Some(unit.to_string()),
+            value: Some(count.to_string()),
+        };
+        let count_for = |p: &QueryPredicate| -> i64 {
+            let sql = format!("SELECT COUNT(*) FROM images WHERE {}", predicate_to_sql(p));
+            conn.query_row(&sql, [], |row| row.get(0)).expect("predicate executes")
+        };
+
+        // 5-day-old row only; the 400-day row, 1999 row, and NULL never match.
+        assert_eq!(count_for(&dil("30", "days")), 1);
+        assert_eq!(count_for(&dil("2", "weeks")), 1);
+        assert_eq!(count_for(&dil("2", "months")), 1);
+        // 2 years reaches the 400-day row as well.
+        assert_eq!(count_for(&dil("2", "years")), 2);
     }
 }
 

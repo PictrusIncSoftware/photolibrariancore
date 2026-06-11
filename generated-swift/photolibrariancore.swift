@@ -2443,6 +2443,21 @@ public func addImagesToCollections(ids: [Int64], labels: [String])async  -> UInt
             
         )
 }
+public func assignColorKeywordForIds(ids: [Int64], label: String)async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_assign_color_keyword_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterString.lower(label)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func assignKeywordForIds(ids: [Int64], segments: [String])async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
@@ -3251,6 +3266,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.contractVersionMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_add_images_to_collections() != 9062) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_assign_color_keyword_for_ids() != 11425) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_assign_keyword_for_ids() != 32359) {
