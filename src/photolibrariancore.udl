@@ -145,6 +145,12 @@ namespace photolibrariancore {
     [Async]
     u64 mirror_keyword_rows_across_pairs();
 
+    // S67: copy keyword rows from source images to their catalogued copies —
+    // the Copy-and-Import inheritance step. Explicit (source, destination)
+    // pairs aligned by index; idempotent; whole rows ride along.
+    [Async]
+    u64 copy_keyword_rows_for_image_pairs(sequence<i64> source_ids, sequence<i64> destination_ids);
+
     [Async]
     u64 reparent_keyword(sequence<string> source_path, sequence<string> new_parent);
 
@@ -617,6 +623,12 @@ dictionary ImageMetadata {
     u8? rating;
     string? flag;
     string? color_label;
+
+    // S67 (Copy and Import): the source record's in-app rotation, inherited
+    // by a catalogued copy. APPENDED LAST with a default (the S65 wire-struct
+    // growth rule) so every existing Swift construction site compiles
+    // untouched. None at INSERT -> schema default 0; None at UPDATE preserves.
+    i32? rotation = null;
 };
 
 // Represents a complete image record from the database

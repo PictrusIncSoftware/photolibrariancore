@@ -87,6 +87,15 @@ pub struct ImageMetadata {
     pub rating: Option<u8>,                // 0-5 stars
     pub flag: Option<String>,              // "pick", "reject", or None
     pub color_label: Option<String>,       // "red", "green", "blue", etc.
+
+    // S67 (Copy and Import): the source record's in-app rotation, inherited by
+    // a catalogued copy so it displays like its original (the aliased
+    // thumbnail is baked-rotated — a 0 here would contradict it). APPENDED
+    // LAST with a UDL `= null` default (the S65 wire-struct growth rule) so
+    // every existing Swift construction site compiles untouched; None at
+    // INSERT takes the schema default 0, None at UPDATE preserves the row's
+    // value (a Lightroom re-import can never clobber an in-app rotation).
+    pub rotation: Option<i32>,
 }
 
 /// Represents a complete image record from the database
@@ -3618,6 +3627,87 @@ pub async fn mirror_keyword_rows_across_pairs() -> u64
     mirror_keyword_rows_across_pairs_impl(conn)
 }
 
+/// The body of `copy_keyword_rows_for_image_pairs`, against an explicit
+/// connection (the impl/wrapper pattern for live-testability).
+///
+/// Copies every keyword row from each source image to its paired destination
+/// image — the Copy-and-Import inheritance step (S67): a catalogued copy
+/// arrives wearing its original's keywords, collection memberships, and
+/// color marks (all three switches ride the same rows). Unlike the
+/// pair-sibling MIRROR above, the pairing here is EXPLICIT (parallel id
+/// arrays from the copy plan) — the copy lives at a different path, so no
+/// stem/directory identity exists to infer. Idempotent: NOT EXISTS on
+/// (image_id, path) makes a re-copy a no-op. One transaction.
+fn copy_keyword_rows_for_image_pairs_impl(conn: &Connection,
+                                          source_ids: &[i64],
+                                          destination_ids: &[i64]) -> u64
+{
+    if source_ids.is_empty() || source_ids.len() != destination_ids.len()
+    {
+        if source_ids.len() != destination_ids.len()
+        {
+            eprintln!("copy_keyword_rows_for_image_pairs: id arrays differ in length ({} vs {})",
+                      source_ids.len(), destination_ids.len());
+        }
+        return 0;
+    }
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("copy_keyword_rows_for_image_pairs: begin failed: {}", e);
+        return 0;
+    }
+
+    let mut copied: u64 = 0;
+    for (src, dst) in source_ids.iter().zip(destination_ids.iter())
+    {
+        if src == dst { continue; }
+        match conn.execute(
+            "INSERT INTO keyword (image_id, label, path, status, created_at, hidden_at, collection, color) \
+             SELECT ?2, k.label, k.path, k.status, CURRENT_TIMESTAMP, k.hidden_at, k.collection, k.color \
+             FROM keyword k \
+             WHERE k.image_id = ?1 \
+               AND NOT EXISTS (SELECT 1 FROM keyword k2 \
+                               WHERE k2.image_id = ?2 AND k2.path = k.path)",
+            params![src, dst],
+        )
+        {
+            Ok(changed) => copied += changed as u64,
+            Err(e) =>
+            {
+                eprintln!("copy_keyword_rows_for_image_pairs ({} -> {}): {}", src, dst, e);
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
+            }
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("copy_keyword_rows_for_image_pairs: commit failed: {}", e);
+        return 0;
+    }
+    copied
+}
+
+/// Copy keyword rows from source images to their catalogued copies — see the
+/// impl above. Called by the Copy-and-Import pass (S67) with the copy plan's
+/// (source id, destination id) pairs, aligned by index.
+pub async fn copy_keyword_rows_for_image_pairs(source_ids: Vec<i64>, destination_ids: Vec<i64>) -> u64
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+    copy_keyword_rows_for_image_pairs_impl(conn, &source_ids, &destination_ids)
+}
+
 /// All ACTIVE keyword rows for one image, ordered by path (root->leaf within a
 /// branch). For the detail-panel reconstruction.
 pub async fn keywords_for_image(image_id: i64) -> Vec<KeywordRow>
@@ -4901,7 +4991,8 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
                     gps_longitude    = COALESCE(gps_longitude, ?14), \
                     rating      = COALESCE(?15, rating), \
                     flag        = COALESCE(?16, flag), \
-                    color_label = COALESCE(?17, color_label) \
+                    color_label = COALESCE(?17, color_label), \
+                    rotation    = COALESCE(?18, rotation) \
                  WHERE id = ?1",
                 params![
                     id,
@@ -4921,6 +5012,7 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
                     record.rating.map(|v| v as i64),
                     record.flag,
                     record.color_label,
+                    record.rotation.map(|v| v as i64),
                 ],
             ).map(|_| (false, id))
         }
@@ -4950,12 +5042,12 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
                     capture_datetime, pixel_width, pixel_height, color_space, bit_depth, \
                     gps_latitude, gps_longitude, gps_altitude, \
                     copyright, creator, description, \
-                    rating, flag, color_label \
+                    rating, flag, color_label, rotation \
                  ) VALUES ( \
                     ?1, ?2, ?3, ?4, ?5, ?6, \
                     SUBSTRING(?1, 1, LENGTH(?1) - INSTR(REVERSE(?1), '/')), \
                     ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
-                    ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29 \
+                    ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30 \
                  ) RETURNING id",
                 params![
                     record.file_path,
@@ -4987,6 +5079,7 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
                     record.rating.map(|v| v as i64),
                     record.flag,
                     record.color_label,
+                    record.rotation.unwrap_or(0),
                 ],
                 |r| r.get::<_, i64>(0),
             ).map(|new_id| (true, new_id))
@@ -5378,6 +5471,58 @@ mod keyword_tests
 
         // Idempotent: a second pass copies nothing.
         assert_eq!(mirror_keyword_rows_across_pairs_impl(&conn), 0);
+    }
+
+    /// Copy-and-Import keyword inheritance on a real in-memory engine (S67):
+    /// explicit (source, destination) pairs copy whole rows — status,
+    /// collection, color — idempotently; length-mismatched arrays no-op.
+    #[test]
+    fn copy_keyword_rows_for_image_pairs_end_to_end()
+    {
+        use duckdb::Connection;
+
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE SEQUENCE keyword_id_seq START 1;
+             CREATE TABLE keyword (
+                 id INTEGER PRIMARY KEY DEFAULT nextval('keyword_id_seq'),
+                 image_id INTEGER NOT NULL,
+                 label TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 status INTEGER NOT NULL DEFAULT 1,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 hidden_at TIMESTAMP,
+                 collection BOOLEAN NOT NULL DEFAULT FALSE,
+                 color BOOLEAN NOT NULL DEFAULT FALSE
+             );
+             -- Source 1 (-> copy 11): a plain keyword + a collection-marked row.
+             -- Source 2 (-> copy 12): nothing (the copy must gain nothing).
+             -- Copy 11 already carries one of source 1's paths (partial overlap).
+             INSERT INTO keyword (image_id, label, path, status, collection, color) VALUES
+                 (1, 'Dogs',   'Dogs',   1, FALSE, FALSE),
+                 (1, 'Family', 'Family', 1, TRUE,  FALSE),
+                 (11, 'Dogs',  'Dogs',   1, FALSE, FALSE);",
+        )
+        .expect("schema + seed");
+
+        let copied = copy_keyword_rows_for_image_pairs_impl(&conn, &[1, 2], &[11, 12]);
+        assert_eq!(copied, 1, "only the missing 'Family' row copies onto 11");
+
+        let (status, collection): (i64, bool) = conn
+            .query_row("SELECT status, collection FROM keyword WHERE image_id = 11 AND path = 'Family'",
+                       [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((status, collection), (1, true), "collection switch rode the copy");
+
+        let copy12: i64 = conn
+            .query_row("SELECT COUNT(*) FROM keyword WHERE image_id = 12", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(copy12, 0, "a keywordless source copies nothing");
+
+        // Idempotent + guard rails.
+        assert_eq!(copy_keyword_rows_for_image_pairs_impl(&conn, &[1, 2], &[11, 12]), 0);
+        assert_eq!(copy_keyword_rows_for_image_pairs_impl(&conn, &[1], &[11, 12]), 0,
+                   "length mismatch no-ops");
     }
 
     /// The color switch end-to-end on a real in-memory engine (S66):
@@ -6032,7 +6177,8 @@ mod lightroom_import_tests
                 color_space TEXT, bit_depth INTEGER,
                 gps_latitude REAL, gps_longitude REAL, gps_altitude REAL,
                 copyright TEXT, creator TEXT, description TEXT,
-                rating INTEGER, flag TEXT, color_label TEXT
+                rating INTEGER, flag TEXT, color_label TEXT,
+                rotation INTEGER DEFAULT 0
              );"
         ).expect("create images");
     }
@@ -6054,6 +6200,7 @@ mod lightroom_import_tests
             gps_latitude: None, gps_longitude: None, gps_altitude: None,
             copyright: None, creator: None, description: None,
             rating: None, flag: None, color_label: None,
+            rotation: None,
         }
     }
 
@@ -6109,6 +6256,31 @@ mod lightroom_import_tests
             "SELECT rating FROM images WHERE file_path = '/p/a.nef'", [], |r| r.get(0),
         ).expect("rating after null");
         assert_eq!(rating2, 5, "LR-null must not erase existing curation");
+
+        // 4. rotation (S67): None at INSERT takes the schema default 0; Some
+        //    at INSERT lands; None at UPDATE preserves (an LR re-import can
+        //    never clobber an in-app rotation).
+        let rot_default: i64 = conn.query_row(
+            "SELECT rotation FROM images WHERE file_path = '/p/b.nef'", [], |r| r.get(0),
+        ).expect("rotation default");
+        assert_eq!(rot_default, 0, "rotation: None at insert -> schema default 0");
+
+        let mut c = img("/p/c.jpg", "c.jpg");
+        c.rotation = Some(90);
+        let rc = merge_records_into(&conn, &[c]);
+        assert_eq!(rc.inserted, 1);
+        let rot_c: i64 = conn.query_row(
+            "SELECT rotation FROM images WHERE file_path = '/p/c.jpg'", [], |r| r.get(0),
+        ).expect("rotation inserted");
+        assert_eq!(rot_c, 90, "rotation: Some at insert lands");
+
+        let c2 = img("/p/c.jpg", "c.jpg"); // rotation None
+        let rc2 = merge_records_into(&conn, &[c2]);
+        assert_eq!(rc2.updated, 1);
+        let rot_c2: i64 = conn.query_row(
+            "SELECT rotation FROM images WHERE file_path = '/p/c.jpg'", [], |r| r.get(0),
+        ).expect("rotation after null update");
+        assert_eq!(rot_c2, 90, "rotation: None at update preserves the row's value");
     }
 
     // ---- merge_videos_into: insert / update / policies (the videos table) ----

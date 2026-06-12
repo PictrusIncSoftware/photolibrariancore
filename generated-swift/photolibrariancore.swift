@@ -772,10 +772,11 @@ public struct ImageMetadata: Equatable, Hashable {
     public var rating: UInt8?
     public var flag: String?
     public var colorLabel: String?
+    public var rotation: Int32?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(filePath: String, fileSize: UInt64, fileName: String, fileExtension: String?, createdTimestamp: Int64, modifiedTimestamp: Int64, cameraMake: String?, cameraModel: String?, lensModel: String?, focalLength: Double?, aperture: Double?, shutterSpeed: Double?, iso: UInt32?, captureDatetime: String?, pixelWidth: UInt32?, pixelHeight: UInt32?, colorSpace: String?, bitDepth: UInt32?, gpsLatitude: Double?, gpsLongitude: Double?, gpsAltitude: Double?, copyright: String?, creator: String?, description: String?, rating: UInt8?, flag: String?, colorLabel: String?) {
+    public init(filePath: String, fileSize: UInt64, fileName: String, fileExtension: String?, createdTimestamp: Int64, modifiedTimestamp: Int64, cameraMake: String?, cameraModel: String?, lensModel: String?, focalLength: Double?, aperture: Double?, shutterSpeed: Double?, iso: UInt32?, captureDatetime: String?, pixelWidth: UInt32?, pixelHeight: UInt32?, colorSpace: String?, bitDepth: UInt32?, gpsLatitude: Double?, gpsLongitude: Double?, gpsAltitude: Double?, copyright: String?, creator: String?, description: String?, rating: UInt8?, flag: String?, colorLabel: String?, rotation: Int32? = nil) {
         self.filePath = filePath
         self.fileSize = fileSize
         self.fileName = fileName
@@ -803,6 +804,7 @@ public struct ImageMetadata: Equatable, Hashable {
         self.rating = rating
         self.flag = flag
         self.colorLabel = colorLabel
+        self.rotation = rotation
     }
 
     
@@ -847,7 +849,8 @@ public struct FfiConverterTypeImageMetadata: FfiConverterRustBuffer {
                 description: FfiConverterOptionString.read(from: &buf), 
                 rating: FfiConverterOptionUInt8.read(from: &buf), 
                 flag: FfiConverterOptionString.read(from: &buf), 
-                colorLabel: FfiConverterOptionString.read(from: &buf)
+                colorLabel: FfiConverterOptionString.read(from: &buf), 
+                rotation: FfiConverterOptionInt32.read(from: &buf)
         )
     }
 
@@ -879,6 +882,7 @@ public struct FfiConverterTypeImageMetadata: FfiConverterRustBuffer {
         FfiConverterOptionUInt8.write(value.rating, into: &buf)
         FfiConverterOptionString.write(value.flag, into: &buf)
         FfiConverterOptionString.write(value.colorLabel, into: &buf)
+        FfiConverterOptionInt32.write(value.rotation, into: &buf)
     }
 }
 
@@ -1891,6 +1895,30 @@ fileprivate struct FfiConverterOptionUInt32: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionInt32: FfiConverterRustBuffer {
+    typealias SwiftType = Int32?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterInt32.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterInt32.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
     typealias SwiftType = Int64?
 
@@ -2506,6 +2534,21 @@ public func collectionLabels()async  -> [String]  {
             completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceString.lift,
+            errorHandler: nil
+            
+        )
+}
+public func copyKeywordRowsForImagePairs(sourceIds: [Int64], destinationIds: [Int64])async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_copy_keyword_rows_for_image_pairs(FfiConverterSequenceInt64.lower(sourceIds),FfiConverterSequenceInt64.lower(destinationIds)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
             
         )
@@ -3296,6 +3339,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_collection_labels() != 45357) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_copy_keyword_rows_for_image_pairs() != 7187) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_count_query_images() != 3172) {
