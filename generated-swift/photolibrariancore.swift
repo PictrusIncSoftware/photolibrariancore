@@ -686,6 +686,60 @@ public func FfiConverterTypeDirectoryImageCount_lower(_ value: DirectoryImageCou
 }
 
 
+public struct DirectorySyncState: Equatable, Hashable {
+    public var directoryPath: String
+    public var lastSyncMtime: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(directoryPath: String, lastSyncMtime: Int64) {
+        self.directoryPath = directoryPath
+        self.lastSyncMtime = lastSyncMtime
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension DirectorySyncState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDirectorySyncState: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DirectorySyncState {
+        return
+            try DirectorySyncState(
+                directoryPath: FfiConverterString.read(from: &buf), 
+                lastSyncMtime: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DirectorySyncState, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.directoryPath, into: &buf)
+        FfiConverterInt64.write(value.lastSyncMtime, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDirectorySyncState_lift(_ buf: RustBuffer) throws -> DirectorySyncState {
+    return try FfiConverterTypeDirectorySyncState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDirectorySyncState_lower(_ value: DirectorySyncState) -> RustBuffer {
+    return FfiConverterTypeDirectorySyncState.lower(value)
+}
+
+
 public struct FilePathsResult: Equatable, Hashable {
     public var ok: Bool
     public var paths: [String]
@@ -2212,6 +2266,31 @@ fileprivate struct FfiConverterSequenceTypeDirectoryImageCount: FfiConverterRust
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeDirectorySyncState: FfiConverterRustBuffer {
+    typealias SwiftType = [DirectorySyncState]
+
+    public static func write(_ value: [DirectorySyncState], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeDirectorySyncState.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [DirectorySyncState] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [DirectorySyncState]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeDirectorySyncState.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeImageMetadata: FfiConverterRustBuffer {
     typealias SwiftType = [ImageMetadata]
 
@@ -2594,6 +2673,21 @@ public func directoryImageCounts()async  -> [DirectoryImageCount]  {
             completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeDirectoryImageCount.lift,
+            errorHandler: nil
+            
+        )
+}
+public func directorySyncStates()async  -> [DirectorySyncState]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_directory_sync_states(
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeDirectorySyncState.lift,
             errorHandler: nil
             
         )
@@ -3097,6 +3191,21 @@ public func relocateFilePathPrefix(oldPrefix: String, newPrefix: String)async  -
             
         )
 }
+public func removeImagesByIds(ids: [Int64])async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_remove_images_by_ids(FfiConverterSequenceInt64.lower(ids)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func removeImagesForFilters(pathPrefix: String, datePrefix: String)async  -> Int64  {
     return
         try!  await uniffiRustCallAsync(
@@ -3207,6 +3316,21 @@ public func updateColorLabelForIds(ids: [Int64], colorLabel: String?)async  -> U
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_photolibrariancore_fn_func_update_color_label_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterOptionString.lower(colorLabel)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+public func updateDirectorySyncStates(states: [DirectorySyncState])async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_update_directory_sync_states(FfiConverterSequenceTypeDirectorySyncState.lower(states)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
@@ -3353,6 +3477,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_directory_image_counts() != 16364) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_directory_sync_states() != 10530) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_distinct_image_values() != 52444) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3458,6 +3585,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_relocate_file_path_prefix() != 30525) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_remove_images_by_ids() != 22525) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_remove_images_for_filters() != 12960) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3480,6 +3610,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_color_label_for_ids() != 9065) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_update_directory_sync_states() != 43084) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_flag_for_ids() != 57492) {

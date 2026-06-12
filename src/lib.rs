@@ -802,6 +802,19 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         ALTER TABLE saved_query_criterion ADD COLUMN IF NOT EXISTS num_end DOUBLE;
 
         CREATE INDEX IF NOT EXISTS idx_saved_query_criterion_query ON saved_query_criterion(query_id);
+
+        -- === Folder Sync (Session 68; Docs/DESIGN-Folder-Sync.md) ===
+        -- One row per catalogued directory: that directory's on-disk mtime
+        -- (epoch seconds, as stat reports it) recorded when the directory was
+        -- last scanned or synced. The SourceLocationMonitor sweep compares a
+        -- fresh stat against last_sync_mtime — INEQUALITY, not greater-than
+        -- (a folder restored from backup moves BACKWARD and is still changed).
+        -- A brand-new table needs no ALTER migration, so the S62 WAL-replay
+        -- hazard cannot apply here; CREATE-time shape is final.
+        CREATE TABLE IF NOT EXISTS directory_sync_state (
+            directory_path  TEXT PRIMARY KEY,
+            last_sync_mtime BIGINT NOT NULL
+        );
     "#;
 
     // Execute schema creation as a batch
@@ -6706,6 +6719,160 @@ mod query_builder_tests
     }
 }
 
+#[cfg(test)]
+mod folder_sync_tests
+{
+    use super::*;
+    use duckdb::Connection;
+
+    fn setup() -> Connection
+    {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE directory_sync_state (
+                 directory_path  TEXT PRIMARY KEY,
+                 last_sync_mtime BIGINT NOT NULL
+             );
+             CREATE TABLE images (id INTEGER, file_path TEXT, directory_path VARCHAR);
+             CREATE SEQUENCE keyword_id_seq START 1;
+             CREATE TABLE keyword (
+                 id INTEGER PRIMARY KEY DEFAULT nextval('keyword_id_seq'),
+                 image_id INTEGER NOT NULL,
+                 label TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 status INTEGER NOT NULL DEFAULT 1,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 hidden_at TIMESTAMP,
+                 collection BOOLEAN NOT NULL DEFAULT FALSE,
+                 color BOOLEAN NOT NULL DEFAULT FALSE
+             );",
+        )
+        .expect("schema");
+        conn
+    }
+
+    #[test]
+    fn sync_state_upsert_read_and_prune()
+    {
+        let conn = setup();
+        // Both directories exist in the catalogue (prune must keep them).
+        conn.execute_batch(
+            "INSERT INTO images VALUES
+                 (1, '/A/x.jpg', '/A'),
+                 (2, '/B/y.jpg', '/B');",
+        )
+        .expect("seed images");
+
+        // Empty input is a refused no-op.
+        assert_eq!(update_directory_sync_states_impl(&conn, &[]), 0);
+
+        // First write: two inserts.
+        let first = vec![
+            DirectorySyncState { directory_path: "/A".into(), last_sync_mtime: 1_000 },
+            DirectorySyncState { directory_path: "/B".into(), last_sync_mtime: 2_000 },
+        ];
+        assert_eq!(update_directory_sync_states_impl(&conn, &first), 2);
+
+        // Read back, indexed by path.
+        let rows = directory_sync_states_impl(&conn);
+        assert_eq!(rows.len(), 2);
+        let mtime_of = |p: &str| rows.iter().find(|r| r.directory_path == p).map(|r| r.last_sync_mtime);
+        assert_eq!(mtime_of("/A"), Some(1_000));
+        assert_eq!(mtime_of("/B"), Some(2_000));
+
+        // Second write: /A moves (an UPDATE, not a duplicate row) — including
+        // BACKWARD (the restore-from-backup case the != compare exists for).
+        let second = vec![
+            DirectorySyncState { directory_path: "/A".into(), last_sync_mtime: 500 },
+        ];
+        assert_eq!(update_directory_sync_states_impl(&conn, &second), 1);
+        let rows = directory_sync_states_impl(&conn);
+        assert_eq!(rows.len(), 2, "update in place — no duplicate /A row");
+        let mtime_of = |p: &str| rows.iter().find(|r| r.directory_path == p).map(|r| r.last_sync_mtime);
+        assert_eq!(mtime_of("/A"), Some(500));
+
+        // Prune: /B's last record leaves the catalogue → the next upsert call
+        // drops /B's bookkeeping row (and the upsert itself still counts 1).
+        conn.execute_batch("DELETE FROM images WHERE id = 2;").expect("remove /B record");
+        let third = vec![
+            DirectorySyncState { directory_path: "/A".into(), last_sync_mtime: 600 },
+        ];
+        assert_eq!(update_directory_sync_states_impl(&conn, &third), 1);
+        let rows = directory_sync_states_impl(&conn);
+        assert_eq!(rows.len(), 1, "departed directory pruned");
+        assert_eq!(rows[0].directory_path, "/A");
+        assert_eq!(rows[0].last_sync_mtime, 600);
+    }
+
+    #[test]
+    fn remove_images_by_ids_explicit_rows_keyword_rows_survive()
+    {
+        let conn = setup();
+        conn.execute_batch(
+            "INSERT INTO images VALUES
+                 (1, '/A/x.jpg', '/A'),
+                 (2, '/A/y.jpg', '/A'),
+                 (3, '/A/z.jpg', '/A');
+             INSERT INTO keyword (image_id, label, path) VALUES
+                 (1, 'Dogs', 'Dogs'),
+                 (2, 'Dogs', 'Dogs'),
+                 (3, 'Cats', 'Cats');",
+        )
+        .expect("seed");
+
+        // Empty refusal: no ids must never mean \"all ids\".
+        assert_eq!(remove_images_by_ids_impl(&conn, &[]), 0);
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 3, "refusal deleted nothing");
+
+        // Remove two explicit rows.
+        assert_eq!(remove_images_by_ids_impl(&conn, &[1, 3]), 2);
+        let survivor: String = conn
+            .query_row("SELECT file_path FROM images", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(survivor, "/A/y.jpg");
+
+        // Keyword rows are NEVER deleted (the S31/S65 doctrine): all three
+        // remain, the two orphans now invisible to every consumer (each joins
+        // through images.id).
+        let keyword_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM keyword", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(keyword_rows, 3);
+
+        // Idempotent re-call on already-gone ids: zero rows, no error.
+        assert_eq!(remove_images_by_ids_impl(&conn, &[1, 3]), 0);
+    }
+
+    #[test]
+    fn remove_images_by_ids_chunks_past_500()
+    {
+        let conn = setup();
+        if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+        {
+            panic!("begin failed: {}", e);
+        }
+        for id in 1..=1_205i64
+        {
+            conn.execute(
+                "INSERT INTO images VALUES (?, ?, '/A')",
+                params![id, format!("/A/f{}.jpg", id)],
+            )
+            .expect("seed row");
+        }
+        conn.execute_batch("COMMIT;").expect("commit seed");
+
+        let ids: Vec<i64> = (1..=1_205).collect();
+        assert_eq!(remove_images_by_ids_impl(&conn, &ids), 1_205);
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 0, "all three chunks executed");
+    }
+}
+
 /// Update the rotation angle for an image
 ///
 /// Sets the rotation angle (0, 90, 180, or 270 degrees) for an image identified by its file path.
@@ -7601,6 +7768,263 @@ pub async fn remove_images_for_filters(
             0
         }
     }
+}
+
+// ============================================================================
+// Folder Sync (Session 68; Docs/DESIGN-Folder-Sync.md)
+//   - directory_sync_states:        the bookkeeping table, whole (the sweep's
+//                                   baseline: one row per catalogued directory)
+//   - update_directory_sync_states: bulk upsert after a scan/sync walk (+ prune
+//                                   of rows whose directory left the catalogue)
+//   - remove_images_by_ids:         the full-sync removal half — explicit rows,
+//                                   confirmed missing by the walk, named in the
+//                                   Swift confirm before this is ever called
+// ============================================================================
+
+/// One directory's folder-sync bookkeeping row (S68): the directory's on-disk
+/// mtime (epoch seconds, as stat reports it) recorded when the directory was
+/// last scanned or synced. The monitor sweep flags a directory when a fresh
+/// stat DIFFERS (`!=`, never `>` — a restore-from-backup moves mtime backward
+/// and the directory is still changed). Mirrors the UDL `DirectorySyncState`.
+pub struct DirectorySyncState
+{
+    pub directory_path: String,
+    pub last_sync_mtime: i64,
+}
+
+/// Body of `directory_sync_states` against an explicit connection (the
+/// impl/wrapper pattern, for in-memory unit tests). Returns the whole table,
+/// unordered; the Swift sweep indexes it by path. Empty on any error
+/// (failure-as-empty, the record-returning convention).
+fn directory_sync_states_impl(conn: &Connection) -> Vec<DirectorySyncState>
+{
+    let mut stmt = match conn.prepare(
+        "SELECT directory_path, last_sync_mtime FROM directory_sync_state",
+    )
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("directory_sync_states: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mapped = stmt.query_map([], |row|
+    {
+        Ok(DirectorySyncState
+        {
+            directory_path: row.get(0)?,
+            last_sync_mtime: row.get(1)?,
+        })
+    });
+
+    match mapped
+    {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(e) =>
+        {
+            eprintln!("directory_sync_states: query {}", e);
+            Vec::new()
+        }
+    }
+}
+
+/// The folder-sync sweep baseline: every `directory_sync_state` row. Called by
+/// `SourceLocationMonitor` once per sweep cycle; the worklist of directories
+/// to stat comes from the catalogue's distinct-directory derivation, and this
+/// table supplies the mtime each is compared against. A directory with no row
+/// here (never scanned since the feature landed) compares as changed, which is
+/// correct — its first sync records the baseline.
+pub async fn directory_sync_states() -> Vec<DirectorySyncState>
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+    directory_sync_states_impl(conn)
+}
+
+/// Body of `update_directory_sync_states` against an explicit connection (the
+/// impl/wrapper pattern). Per row: check-then-UPDATE-or-INSERT keyed on
+/// `directory_path` (the S46 house pattern — never ON CONFLICT), all in one
+/// transaction. After the upserts, one bounded housekeeping DELETE prunes rows
+/// whose directory no longer exists in the catalogue (post-relocate prefixes,
+/// fully-removed roots) — harmless if skipped, tidy if kept; the table stays
+/// a few thousand rows. Returns rows changed (updated + inserted; the prune
+/// does not count). 0 on any failure (failure-as-zero, transaction rolled
+/// back).
+fn update_directory_sync_states_impl(conn: &Connection, states: &[DirectorySyncState]) -> u64
+{
+    if states.is_empty()
+    {
+        return 0;
+    }
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("update_directory_sync_states: begin failed: {}", e);
+        return 0;
+    }
+
+    let mut changed: u64 = 0;
+    for state in states
+    {
+        // UPDATE first; an existing row is the common case after the first sync.
+        let updated = match conn.execute(
+            "UPDATE directory_sync_state SET last_sync_mtime = ? \
+             WHERE directory_path = ?",
+            params![state.last_sync_mtime, state.directory_path],
+        )
+        {
+            Ok(n) => n as u64,
+            Err(e) =>
+            {
+                eprintln!("update_directory_sync_states: update failed: {}", e);
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
+            }
+        };
+        if updated > 0
+        {
+            changed += updated;
+            continue;
+        }
+
+        match conn.execute(
+            "INSERT INTO directory_sync_state (directory_path, last_sync_mtime) \
+             VALUES (?, ?)",
+            params![state.directory_path, state.last_sync_mtime],
+        )
+        {
+            Ok(_) => changed += 1,
+            Err(e) =>
+            {
+                eprintln!("update_directory_sync_states: insert failed: {}", e);
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
+            }
+        }
+    }
+
+    // Housekeeping: drop bookkeeping rows for directories that have left the
+    // catalogue entirely (relocated prefixes, removed roots). The sweep never
+    // consults them (its worklist is the catalogue's distinct directories) —
+    // this just keeps the table from accreting dead paths across relocates.
+    if let Err(e) = conn.execute(
+        "DELETE FROM directory_sync_state \
+         WHERE directory_path NOT IN (\
+             SELECT DISTINCT directory_path FROM images \
+             WHERE directory_path IS NOT NULL)",
+        [],
+    )
+    {
+        // Non-fatal: the upserts above are the contract; stale rows are inert.
+        eprintln!("update_directory_sync_states: prune failed (non-fatal): {}", e);
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("update_directory_sync_states: commit failed: {}", e);
+        return 0;
+    }
+    changed
+}
+
+/// Record the post-walk truth for a batch of directories: their on-disk
+/// mtimes as of the scan/sync that just looked inside them. Called at the end
+/// of every directory scan and every sync (and, on first run, seeded for
+/// already-catalogued directories so the first sweep has a baseline).
+pub async fn update_directory_sync_states(states: Vec<DirectorySyncState>) -> u64
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+    update_directory_sync_states_impl(conn, &states)
+}
+
+/// Body of `remove_images_by_ids` against an explicit connection (the
+/// impl/wrapper pattern). Chunked `DELETE ... WHERE id IN (...)` inside one
+/// transaction; integer interpolation via `id_in_list` (no injection surface).
+/// Keyword rows are NEVER touched — the S31/S65 doctrine: rows are the
+/// recovery surface, and orphans are invisible because every keyword consumer
+/// joins through `images.id`. Returns rows deleted; 0 on failure (rolled
+/// back) or empty input (refusal — no ids must never mean "all ids").
+fn remove_images_by_ids_impl(conn: &Connection, ids: &[i64]) -> u64
+{
+    if ids.is_empty()
+    {
+        return 0;
+    }
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("remove_images_by_ids: begin failed: {}", e);
+        return 0;
+    }
+
+    let mut deleted: u64 = 0;
+    for chunk in ids.chunks(500)
+    {
+        let predicate = match id_in_list(chunk)
+        {
+            Some(p) => p,
+            None => continue,
+        };
+        let delete_sql = format!("DELETE FROM images WHERE {}", predicate);
+        match conn.execute(&delete_sql, [])
+        {
+            Ok(n) => deleted += n as u64,
+            Err(e) =>
+            {
+                eprintln!("remove_images_by_ids: DELETE failed: {}", e);
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
+            }
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("remove_images_by_ids: commit failed: {}", e);
+        return 0;
+    }
+    deleted
+}
+
+/// Session 68: catalogue-only DELETE of EXPLICIT image rows — the full-sync
+/// removal half. The Swift sync walk has already (1) confirmed each file
+/// missing by stat on a MOUNTED, ACCESSIBLE volume (the healthy-roots
+/// eligibility gate — an unplugged drive never reaches this call), and
+/// (2) shown the user a confirm naming the vanished files. Touches NO files
+/// and NO thumbnails (Swift owns cache hygiene for the removed paths).
+/// Refuses an empty list. Returns rows deleted, 0 on any failure.
+pub async fn remove_images_by_ids(ids: Vec<i64>) -> u64
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+    remove_images_by_ids_impl(conn, &ids)
 }
 
 /// Session 30 (cross-plan overwrite-gap fix): return every catalogued

@@ -345,6 +345,30 @@ namespace photolibrariancore {
     [Async]
     i64 remove_images_for_filters(string path_prefix, string date_prefix);
 
+    // ---- Folder Sync (Session 68; Docs/DESIGN-Folder-Sync.md) ----
+    // directory_sync_states: the sweep baseline — one row per catalogued
+    //   directory carrying its on-disk mtime as of its last scan/sync. The
+    //   monitor stats each catalogued directory and flags on INEQUALITY
+    //   (a restore-from-backup moves mtime backward; still changed). A
+    //   directory with no row compares as changed — first sync seeds it.
+    [Async]
+    sequence<DirectorySyncState> directory_sync_states();
+
+    // update_directory_sync_states: bulk check-then-UPDATE-or-INSERT of the
+    //   post-walk truth (one transaction), called at the end of every scan
+    //   and every sync; also prunes rows whose directory left the catalogue.
+    //   Returns rows changed (prune uncounted); 0 = failure or empty input.
+    [Async]
+    u64 update_directory_sync_states(sequence<DirectorySyncState> states);
+
+    // remove_images_by_ids: catalogue-only DELETE of EXPLICIT image rows — the
+    //   full-sync removal half. Swift has already stat-confirmed each file
+    //   missing on a healthy (mounted, accessible) root AND shown the named
+    //   confirm. Keyword rows are never touched (S31/S65 doctrine). Touches
+    //   no files, no thumbnails. Refuses an empty list.
+    [Async]
+    u64 remove_images_by_ids(sequence<i64> ids);
+
     // Session 30 (cross-plan overwrite-gap fix): return the destination
     // "family" at a given basePath — canonical row + any NN_version_
     // siblings (two leading digits) in the same directory_path. Used by
@@ -509,6 +533,16 @@ dictionary DirectoryImageCount {
 dictionary CaptureDayImageCount {
     string day;
     i64 image_count;
+};
+
+// One directory's folder-sync bookkeeping row (S68; Docs/DESIGN-Folder-Sync.md):
+// the directory's on-disk mtime (epoch seconds, exactly as stat reports it)
+// recorded when the directory was last scanned or synced. directory_path is the
+// canonical derived parent-directory form (same key set as
+// get_distinct_directory_paths / DirectoryImageCount).
+dictionary DirectorySyncState {
+    string directory_path;
+    i64 last_sync_mtime;
 };
 
 // One materialized keyword row (Session 45), returned to Swift. status: 1 =
