@@ -3546,6 +3546,78 @@ pub async fn restore_keyword_for_ids(ids: Vec<i64>, path: String) -> u64
     }
 }
 
+/// The body of `mirror_keyword_rows_across_pairs`, against an explicit
+/// connection (the S66 impl/wrapper pattern for live-testability).
+///
+/// Copies keyword rows across RAW <-> JPEG/HEIF pair siblings (same
+/// `file_stem` + same `directory_path` — the pair-collapse identity) so both
+/// halves carry identical keyword state. The collapse predicate hides a RAW
+/// whenever a JPEG/HEIF twin exists TABLE-WIDE, so a keyword query matching
+/// only the RAW would otherwise collapse the photo out of its own results
+/// (the kept twin doesn't match). UI keywording never needs this — it
+/// expands pairs before assigning (S44) — but import-SYNTHESIZED siblings
+/// (S67, the Lightroom sidecar pass) are born after the import's keyword
+/// pass and start bare; this heals them in one set-based statement per
+/// direction. Whole rows ride: status, collection, color, hidden_at — the
+/// three-switch model copies intact. Idempotent: NOT EXISTS on
+/// (image_id, path) skips anything already there (including a row the user
+/// hid on one half — their history wins); DISTINCT collapses double-sources
+/// (a .nef and a .dng sharing one stem are BOTH raw twins of one JPEG).
+fn mirror_keyword_rows_across_pairs_impl(conn: &Connection) -> u64
+{
+    // (dst kinds, src kinds) — both directions of the pair.
+    const DIRECTIONS: [(&str, &str); 2] = [
+        ("dst.image_kind IN ('jpeg', 'heif') AND src.image_kind = 'raw'",
+         "raw -> jpeg/heif"),
+        ("dst.image_kind = 'raw' AND src.image_kind IN ('jpeg', 'heif')",
+         "jpeg/heif -> raw"),
+    ];
+
+    let mut copied: u64 = 0;
+    for (kind_filter, direction_label) in DIRECTIONS
+    {
+        let sql = format!(
+            "INSERT INTO keyword (image_id, label, path, status, created_at, hidden_at, collection, color) \
+             SELECT DISTINCT dst.id, k.label, k.path, k.status, CURRENT_TIMESTAMP, k.hidden_at, k.collection, k.color \
+             FROM images dst \
+             JOIN images src ON src.file_stem = dst.file_stem \
+                            AND src.directory_path = dst.directory_path \
+             JOIN keyword k ON k.image_id = src.id \
+             WHERE {} \
+               AND NOT EXISTS (SELECT 1 FROM keyword k2 \
+                               WHERE k2.image_id = dst.id AND k2.path = k.path)",
+            kind_filter
+        );
+        match conn.execute(&sql, [])
+        {
+            Ok(changed) => copied += changed as u64,
+            Err(e) =>
+            {
+                eprintln!("mirror_keyword_rows_across_pairs ({}): {}", direction_label, e);
+            }
+        }
+    }
+    copied
+}
+
+/// Mirror keyword rows across RAW+JPEG/HEIF pair siblings — see the impl
+/// above. Called by the Lightroom sidecar pass (S67) after synthesizing the
+/// sidecar JPEG records; safe (and a no-op) any other time.
+pub async fn mirror_keyword_rows_across_pairs() -> u64
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+    mirror_keyword_rows_across_pairs_impl(conn)
+}
+
 /// All ACTIVE keyword rows for one image, ordered by path (root->leaf within a
 /// branch). For the detail-panel reconstruction.
 pub async fn keywords_for_image(image_id: i64) -> Vec<KeywordRow>
@@ -5232,6 +5304,80 @@ mod keyword_tests
             predicate_to_sql(&none),
             "(color_label IS NULL AND NOT EXISTS (SELECT 1 FROM keyword k WHERE k.image_id = images.id AND k.color = TRUE))"
         );
+    }
+
+    /// Pair keyword parity on a real in-memory engine (S67): the sidecar
+    /// pass's mirror copies whole rows (status / collection / color ride
+    /// along) across same-stem-same-directory RAW<->JPEG pairs, both
+    /// directions, idempotently — and never touches non-pairs.
+    #[test]
+    fn mirror_keyword_rows_across_pairs_end_to_end()
+    {
+        use duckdb::Connection;
+
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE images (id INTEGER, file_stem VARCHAR, directory_path VARCHAR, image_kind VARCHAR);
+             CREATE SEQUENCE keyword_id_seq START 1;
+             CREATE TABLE keyword (
+                 id INTEGER PRIMARY KEY DEFAULT nextval('keyword_id_seq'),
+                 image_id INTEGER NOT NULL,
+                 label TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 status INTEGER NOT NULL DEFAULT 1,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 hidden_at TIMESTAMP,
+                 collection BOOLEAN NOT NULL DEFAULT FALSE,
+                 color BOOLEAN NOT NULL DEFAULT FALSE
+             );
+             -- 1+2: a RAW+JPEG pair (the synthesized-sidecar shape; keywords on the RAW only).
+             -- 3:   an unpaired RAW with a keyword (must stay untouched).
+             -- 4+5: a pair where the JPEG already carries one of the RAW's rows
+             --      (partial overlap -> only the missing row copies).
+             -- 6:   a JPEG with a keyword and NO raw twin (reverse direction no-op).
+             INSERT INTO images VALUES
+                 (1, 'JAW_1', '/d/a', 'raw'), (2, 'JAW_1', '/d/a', 'jpeg'),
+                 (3, 'JAW_2', '/d/a', 'raw'),
+                 (4, 'JAW_3', '/d/b', 'raw'), (5, 'JAW_3', '/d/b', 'jpeg'),
+                 (6, 'JAW_4', '/d/b', 'jpeg');
+             INSERT INTO keyword (image_id, label, path, status, collection, color) VALUES
+                 (1, 'Dogs',   'Dogs',                      1, FALSE, FALSE),
+                 (1, 'Family', 'Family',                    1, TRUE,  FALSE),  -- collection switch rides
+                 (1, 'Old',    'Old',                       0, FALSE, FALSE),  -- hidden row rides as hidden
+                 (3, 'Lonely', 'Lonely',                    1, FALSE, FALSE),
+                 (4, 'Birds',  'Birds',                     1, FALSE, FALSE),
+                 (4, 'Trips',  'Trips',                     1, FALSE, FALSE),
+                 (5, 'Birds',  'Birds',                     1, FALSE, FALSE),
+                 (6, 'Solo',   'Solo',                      1, FALSE, FALSE);",
+        )
+        .expect("schema + seed");
+
+        // Pair 1+2: all three rows copy. Pair 4+5: only 'Trips' copies down,
+        // 'Birds' already exists; nothing copies UP (4 has both). Image 6's
+        // 'Solo' has no raw twin. Image 3 is unpaired.
+        let copied = mirror_keyword_rows_across_pairs_impl(&conn);
+        assert_eq!(copied, 4, "Dogs+Family+Old onto 2, Trips onto 5");
+
+        // The JPEG twin carries the full three-switch state.
+        let (status, collection): (i64, bool) = conn
+            .query_row("SELECT status, collection FROM keyword WHERE image_id = 2 AND path = 'Family'",
+                       [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((status, collection), (1, true), "collection switch copied intact");
+        let hidden_status: i64 = conn
+            .query_row("SELECT status FROM keyword WHERE image_id = 2 AND path = 'Old'",
+                       [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hidden_status, 0, "hidden rows copy as hidden");
+
+        // Untouched bystanders.
+        let lonely: i64 = conn
+            .query_row("SELECT COUNT(*) FROM keyword WHERE image_id IN (3, 6)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(lonely, 2, "unpaired images gained nothing");
+
+        // Idempotent: a second pass copies nothing.
+        assert_eq!(mirror_keyword_rows_across_pairs_impl(&conn), 0);
     }
 
     /// The color switch end-to-end on a real in-memory engine (S66):

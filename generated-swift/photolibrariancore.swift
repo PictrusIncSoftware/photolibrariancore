@@ -2987,6 +2987,21 @@ public func mergeLightroomVideos(records: [LightroomVideoRecord])async  -> Merge
             
         )
 }
+public func mirrorKeywordRowsAcrossPairs()async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_mirror_keyword_rows_across_pairs(
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func parseFilename(fileName: String) -> ParsedFilename  {
     return try!  FfiConverterTypeParsedFilename_lift(try! rustCall() {
     uniffi_photolibrariancore_fn_func_parse_filename(
@@ -3380,6 +3395,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_merge_lightroom_videos() != 20188) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_mirror_keyword_rows_across_pairs() != 28156) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_parse_filename() != 30612) {

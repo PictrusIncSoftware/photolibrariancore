@@ -139,6 +139,12 @@ namespace photolibrariancore {
     [Async]
     u64 restore_keyword_for_ids(sequence<i64> ids, string path);
 
+    // S67: copy keyword rows across RAW<->JPEG/HEIF pair siblings (same stem +
+    // same directory) so both halves match — the sidecar-import parity heal.
+    // Set-based, idempotent; whole rows (status/collection/color) ride along.
+    [Async]
+    u64 mirror_keyword_rows_across_pairs();
+
     [Async]
     u64 reparent_keyword(sequence<string> source_path, sequence<string> new_parent);
 
