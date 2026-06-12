@@ -2860,6 +2860,32 @@ fn predicate_to_sql(p: &QueryPredicate) -> String
             "(NOT EXISTS (SELECT 1 FROM keyword_visible k WHERE k.image_id = images.id \
               AND (k.color = FALSE OR k.color IS NULL)))"
                 .to_string(),
+        // Sidebar multi-select scopes (S67): one predicate per selected
+        // sidebar node, OR-joined by the caller — the union of the selected
+        // folders/dates rides the same paged query machinery every other
+        // scope uses. `path_prefix` carries a slash-terminated directory
+        // prefix (the caller normalizes); `capture_prefix` carries a
+        // capture_datetime prefix ("2026:", "2026:06:", "2026:06:06") —
+        // the same prefix semantics as the single-node sidebar load, so a
+        // one-node selection and a union behave identically per node.
+        // starts_with(NULL, …) is NULL → undated rows never match a capture
+        // prefix (parity with the single-node date load).
+        "path_prefix" => match p.value.as_deref()
+        {
+            Some(v) if !v.is_empty() => format!(
+                "(starts_with(file_path, '{}'))",
+                v.replace('\'', "''")
+            ),
+            _ => bad(),
+        },
+        "capture_prefix" => match p.value.as_deref()
+        {
+            Some(v) if !v.is_empty() => format!(
+                "(starts_with(capture_datetime, '{}'))",
+                v.replace('\'', "''")
+            ),
+            _ => bad(),
+        },
         // Collection subject (Session 63 — the gallery "Select Collection"
         // scope). Membership = a row in the RAW `keyword` table carrying this
         // label with the `collection` switch ON. Deliberately NOT the
@@ -5397,6 +5423,39 @@ mod keyword_tests
             predicate_to_sql(&none),
             "(color_label IS NULL AND NOT EXISTS (SELECT 1 FROM keyword k WHERE k.image_id = images.id AND k.color = TRUE))"
         );
+    }
+
+    /// The sidebar multi-select prefix arms (S67): slash-terminated path
+    /// prefixes and capture-datetime prefixes, quote-escaped; empty → FALSE.
+    #[test]
+    fn sidebar_prefix_predicate_sql()
+    {
+        let path = QueryPredicate {
+            kind: "path_prefix".to_string(),
+            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            value: Some("/Volumes/Photo's/2026/".to_string()),
+        };
+        assert_eq!(
+            predicate_to_sql(&path),
+            "(starts_with(file_path, '/Volumes/Photo''s/2026/'))"
+        );
+
+        let capture = QueryPredicate {
+            kind: "capture_prefix".to_string(),
+            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            value: Some("2026:06:".to_string()),
+        };
+        assert_eq!(
+            predicate_to_sql(&capture),
+            "(starts_with(capture_datetime, '2026:06:'))"
+        );
+
+        let empty = QueryPredicate {
+            kind: "path_prefix".to_string(),
+            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            value: Some(String::new()),
+        };
+        assert_eq!(predicate_to_sql(&empty), "(FALSE)");
     }
 
     /// Pair keyword parity on a real in-memory engine (S67): the sidecar
