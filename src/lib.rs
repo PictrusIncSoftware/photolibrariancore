@@ -1423,6 +1423,27 @@ const RAW_JPEG_COLLAPSE_PREDICATE: &str = "\
           AND j.directory_path = images.directory_path \
     ))";
 
+/// Inner-WHERE predicate restricting a result set to STILLS (non-video).
+///
+/// S70 folded video into `images`, discriminated by `is_video`. Until
+/// poster-frame thumbnails + playback exist (roadmap Stage 6), the product
+/// stance is "video is catalogued but not shown"
+/// (DESIGN-Video-Schema-Unified-Table.md §7). This constant enforces that at
+/// the shared query chokepoint: it is pushed UNCONDITIONALLY into the
+/// `inner_predicates` of every paginating / count / projection helper, so the
+/// gallery, Browse, ⌘A, filtered counts, and the path/date-prefix queries all
+/// gate on it identically. The two sidebar-count GROUP-BYs
+/// (`directory_image_counts`, `capture_day_image_counts`) reference it too, so
+/// Dates/Sources counts match what the gallery shows.
+///
+/// `IS NOT TRUE` (not `= FALSE`) is deliberate and NULL-safe — equivalent to
+/// `(is_video = FALSE OR is_video IS NULL)`: a row is hidden only when
+/// `is_video` is definitively TRUE, so a still can never be wrongly suppressed.
+///
+/// When Stage 6 display lands, replace the unconditional push with a threaded
+/// media-type filter (stills / video / all). This constant is the single seam.
+const STILLS_ONLY_PREDICATE: &str = "is_video IS NOT TRUE";
+
 /// Build the path/date predicate text from the (path_prefix, date_prefix)
 /// pair.
 ///
@@ -1656,6 +1677,13 @@ fn execute_image_record_query(
     {
         inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
     }
+    // S70 Step 2 — default media stance: video is catalogued but NOT shown
+    // until poster-frame display exists (DESIGN-Video-Schema-Unified-Table.md
+    // §7). Pushed unconditionally at this shared chokepoint so the gallery,
+    // Browse, ⌘A, filtered counts, and path/date-prefix queries all gate
+    // identically. When Stage 6 display lands, swap this for a threaded
+    // media-type filter; STILLS_ONLY_PREDICATE is the single seam to change.
+    inner_predicates.push(STILLS_ONLY_PREDICATE);
     let inner_where = if inner_predicates.is_empty()
     {
         String::new()
@@ -1862,6 +1890,13 @@ fn execute_image_count_query(
     {
         inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
     }
+    // S70 Step 2 — default media stance: video is catalogued but NOT shown
+    // until poster-frame display exists (DESIGN-Video-Schema-Unified-Table.md
+    // §7). Pushed unconditionally at this shared chokepoint so the gallery,
+    // Browse, ⌘A, filtered counts, and path/date-prefix queries all gate
+    // identically. When Stage 6 display lands, swap this for a threaded
+    // media-type filter; STILLS_ONLY_PREDICATE is the single seam to change.
+    inner_predicates.push(STILLS_ONLY_PREDICATE);
     let inner_where = if inner_predicates.is_empty()
     {
         String::new()
@@ -1970,6 +2005,13 @@ fn execute_file_path_projection_query(
     {
         inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
     }
+    // S70 Step 2 — default media stance: video is catalogued but NOT shown
+    // until poster-frame display exists (DESIGN-Video-Schema-Unified-Table.md
+    // §7). Pushed unconditionally at this shared chokepoint so the gallery,
+    // Browse, ⌘A, filtered counts, and path/date-prefix queries all gate
+    // identically. When Stage 6 display lands, swap this for a threaded
+    // media-type filter; STILLS_ONLY_PREDICATE is the single seam to change.
+    inner_predicates.push(STILLS_ONLY_PREDICATE);
     let inner_where = if inner_predicates.is_empty()
     {
         String::new()
@@ -2107,6 +2149,13 @@ fn execute_image_record_projection_query(
     {
         inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
     }
+    // S70 Step 2 — default media stance: video is catalogued but NOT shown
+    // until poster-frame display exists (DESIGN-Video-Schema-Unified-Table.md
+    // §7). Pushed unconditionally at this shared chokepoint so the gallery,
+    // Browse, ⌘A, filtered counts, and path/date-prefix queries all gate
+    // identically. When Stage 6 display lands, swap this for a threaded
+    // media-type filter; STILLS_ONLY_PREDICATE is the single seam to change.
+    inner_predicates.push(STILLS_ONLY_PREDICATE);
     let inner_where = if inner_predicates.is_empty()
     {
         String::new()
@@ -3246,6 +3295,13 @@ fn execute_id_projection_query(
     {
         inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
     }
+    // S70 Step 2 — default media stance: video is catalogued but NOT shown
+    // until poster-frame display exists (DESIGN-Video-Schema-Unified-Table.md
+    // §7). Pushed unconditionally at this shared chokepoint so the gallery,
+    // Browse, ⌘A, filtered counts, and path/date-prefix queries all gate
+    // identically. When Stage 6 display lands, swap this for a threaded
+    // media-type filter; STILLS_ONLY_PREDICATE is the single seam to change.
+    inner_predicates.push(STILLS_ONLY_PREDICATE);
     let inner_where = if inner_predicates.is_empty()
     {
         String::new()
@@ -7198,17 +7254,20 @@ pub async fn directory_image_counts() -> Vec<DirectoryImageCount>
 
     // The S5 directory expression (do NOT rewrite) — see
     // get_distinct_directory_paths for the derivation notes.
-    let query_sql = r#"
+    // S70 Step 2 — sidebar counts are stills-only, matching the hidden-video
+    // default stance (DESIGN-Video-Schema-Unified-Table.md §7) so Dates/Sources
+    // counts equal what the gallery shows. STILLS_ONLY_PREDICATE is the seam.
+    let query_sql = format!(r#"
         SELECT
             SUBSTRING(file_path, 1, LENGTH(file_path) - INSTR(REVERSE(file_path), '/')) as dir_path,
             COUNT(*) as image_count
         FROM images
-        WHERE file_path IS NOT NULL AND file_path LIKE '%/%'
+        WHERE file_path IS NOT NULL AND file_path LIKE '%/%' AND {}
         GROUP BY dir_path
         ORDER BY dir_path ASC
-    "#;
+    "#, STILLS_ONLY_PREDICATE);
 
-    let mut stmt = match conn.prepare(query_sql)
+    let mut stmt = match conn.prepare(&query_sql)
     {
         Ok(s) => s,
         Err(e) =>
@@ -7271,16 +7330,18 @@ pub async fn capture_day_image_counts() -> Vec<CaptureDayImageCount>
         }
     };
 
-    let query_sql = r#"
+    // S70 Step 2 — sidebar counts are stills-only (see directory_image_counts
+    // / DESIGN-Video-Schema-Unified-Table.md §7); STILLS_ONLY_PREDICATE seam.
+    let query_sql = format!(r#"
         SELECT SUBSTRING(capture_datetime, 1, 10) as date_str,
                COUNT(*) as image_count
         FROM images
-        WHERE capture_datetime IS NOT NULL AND capture_datetime != ''
+        WHERE capture_datetime IS NOT NULL AND capture_datetime != '' AND {}
         GROUP BY date_str
         ORDER BY date_str ASC
-    "#;
+    "#, STILLS_ONLY_PREDICATE);
 
-    let mut stmt = match conn.prepare(query_sql)
+    let mut stmt = match conn.prepare(&query_sql)
     {
         Ok(s) => s,
         Err(e) =>
