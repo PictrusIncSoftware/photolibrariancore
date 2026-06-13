@@ -637,6 +637,39 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             color_label TEXT,    -- "red", "green", "blue", etc.
             rotation INTEGER DEFAULT 0,  -- Image rotation in degrees: 0, 90, 180, or 270
 
+            -- === Video / unified-media support (Session 70; Docs/DESIGN-Video-Schema-Unified-Table.md) ===
+            -- is_video discriminates stills (FALSE) from video (TRUE). CREATE-time
+            -- default is safe; the ALTER path below adds it WITHOUT a default then
+            -- backfills FALSE (S62 WAL rule). Video rows leave the EXIF columns NULL
+            -- and stills leave these NULL — columnar storage makes that nearly free.
+            is_video BOOLEAN NOT NULL DEFAULT FALSE,
+
+            -- Video stream (NULL for stills)
+            duration_seconds DOUBLE,             -- container duration, seconds
+            frame_rate DOUBLE,                   -- nominal fps (e.g. 29.97)
+            video_kind TEXT,                     -- container: 'mov' / 'mp4' / 'mxf'
+            video_codec TEXT,                    -- 'hevc' / 'prores' / 'h264'
+            video_bitrate BIGINT,                -- bits per second
+
+            -- Color science (CICP — applies to HDR stills too; distinct from
+            -- color_space above, which is the still's ICC profile name)
+            color_primaries TEXT,                -- 'bt2020' / 'smpte432' (P3) / 'bt709'
+            color_transfer TEXT,                 -- 'arib-std-b67' (HLG) / 'smpte2084' (PQ) / 'bt709'
+            color_matrix TEXT,                   -- 'bt2020nc' / 'smpte170m' / 'bt709'
+            color_range TEXT,                    -- 'tv' (limited) / 'pc' (full)
+            dv_profile INTEGER,                  -- Dolby Vision profile (8 on iPhone); NULL = none
+
+            -- Audio stream (NULL for stills / silent video)
+            has_audio BOOLEAN,
+            audio_codec TEXT,                    -- 'aac' / 'pcm_s16le' / 'pcm_s24le'
+            audio_channels INTEGER,              -- 1 / 2
+            audio_sample_rate INTEGER,           -- 44100 / 48000
+            audio_bitrate BIGINT,                -- bits per second
+
+            -- Live Photo: QuickTime content.identifier UUID, shared by the still +
+            -- motion pair. NULL = not a Live Photo. Pair = rows with equal value.
+            live_photo_id TEXT,
+
             -- Audit timestamp: when this record was added to the catalogue
             indexed_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
@@ -653,6 +686,29 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         ALTER TABLE images ADD COLUMN IF NOT EXISTS file_stem VARCHAR;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS image_kind VARCHAR;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS directory_path VARCHAR;
+
+        -- Video / unified-media columns (Session 70). ADD COLUMN IF NOT EXISTS with
+        -- NO default (an ALTER ... ADD COLUMN ... DEFAULT <expr> does not survive
+        -- WAL replay — S62), then backfill only the is_video discriminator; the
+        -- rest are correctly NULL on existing stills.
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS is_video BOOLEAN;
+        UPDATE images SET is_video = FALSE WHERE is_video IS NULL;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS duration_seconds DOUBLE;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS frame_rate DOUBLE;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS video_kind TEXT;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS video_codec TEXT;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS video_bitrate BIGINT;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS color_primaries TEXT;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS color_transfer TEXT;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS color_matrix TEXT;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS color_range TEXT;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS dv_profile INTEGER;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS has_audio BOOLEAN;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS audio_codec TEXT;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS audio_channels INTEGER;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS audio_sample_rate INTEGER;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS audio_bitrate BIGINT;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS live_photo_id TEXT;
 
         -- Indexes for efficient filtering and querying
         -- These columns are commonly used in WHERE clauses and ORDER BY operations
@@ -684,7 +740,8 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             hidden_at TIMESTAMP,                -- set when status->0; NULL while active
             collection BOOLEAN NOT NULL DEFAULT FALSE,  -- Collections-panel membership; orthogonal to status (keyword search stays oblivious)
-            color BOOLEAN NOT NULL DEFAULT FALSE        -- S66: this label is a COLOR (custom Lightroom color-label text); third independent switch
+            color BOOLEAN NOT NULL DEFAULT FALSE,       -- S66: this label is a COLOR (custom Lightroom color-label text); third independent switch
+            is_video BOOLEAN NOT NULL DEFAULT FALSE     -- S70: denormalized media-type discriminator (= images.is_video of the row this points to); join-free media filtering on keyword
         );
 
         CREATE INDEX IF NOT EXISTS idx_keyword_image_id ON keyword(image_id);
@@ -709,6 +766,17 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         -- them.
         ALTER TABLE keyword ADD COLUMN IF NOT EXISTS color BOOLEAN;
         UPDATE keyword SET color = FALSE WHERE color IS NULL;
+
+        -- S70: denormalized media-type discriminator on each keyword row — a copy
+        -- of images.is_video for the row it points to. is_video is immutable, so
+        -- the copy never drifts; backfilled FROM the referenced image (correlated
+        -- subquery), idempotent via the IS NULL guard so it runs once. Lets the
+        -- keyword-vocabulary / media-count queries filter without a keyword-images
+        -- join on the highest-cardinality table.
+        ALTER TABLE keyword ADD COLUMN IF NOT EXISTS is_video BOOLEAN;
+        UPDATE keyword SET is_video =
+            COALESCE((SELECT i.is_video FROM images i WHERE i.id = keyword.image_id), FALSE)
+            WHERE is_video IS NULL;
 
         -- Active-only view: ALL normal keyword reads/queries hit this so the
         -- status filter can never be forgotten. Recovery reads the raw table.
