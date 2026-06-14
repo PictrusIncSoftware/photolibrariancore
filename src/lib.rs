@@ -96,6 +96,29 @@ pub struct ImageMetadata {
     // INSERT takes the schema default 0, None at UPDATE preserves the row's
     // value (a Lightroom re-import can never clobber an in-app rotation).
     pub rotation: Option<i32>,
+
+    // === Video / unified-media (Step 2a; DESIGN-Video-Schema-Unified-Table.md §4b).
+    // Appended LAST, each with a UDL default (`= false` / `= null`), so every
+    // existing Swift construction site (makeImageMetadata, the LR import) compiles
+    // untouched and produces stills (is_video=false, the rest None). The
+    // AVFoundation extractor (Step 2b) is the only producer that populates these. ===
+    pub is_video: bool,                  // discriminator; false for every still
+    pub duration_seconds: Option<f64>,   // seconds
+    pub frame_rate: Option<f64>,         // fps
+    pub video_kind: Option<String>,      // container: "mov" / "mp4" / "mxf"
+    pub video_codec: Option<String>,     // "hevc" / "prores" / "h264"
+    pub video_bitrate: Option<i64>,      // bits/sec
+    pub color_primaries: Option<String>, // CICP canonical strings (bt2020 / smpte432 / bt709)
+    pub color_transfer: Option<String>,  // arib-std-b67 (HLG) / smpte2084 (PQ) / bt709
+    pub color_matrix: Option<String>,    // bt2020nc / smpte170m / bt709
+    pub color_range: Option<String>,     // "tv" / "pc"
+    pub dv_profile: Option<i32>,         // Dolby Vision profile (8 on iPhone); None = none
+    pub has_audio: Option<bool>,
+    pub audio_codec: Option<String>,     // aac / pcm_s16le / pcm_s24le
+    pub audio_channels: Option<i32>,
+    pub audio_sample_rate: Option<i32>,
+    pub audio_bitrate: Option<i64>,      // bits/sec
+    pub live_photo_id: Option<String>,   // QuickTime content.identifier; pair on equality
 }
 
 /// Represents a complete image record from the database
@@ -1146,13 +1169,25 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
             pixel_width, pixel_height, color_space, bit_depth,
             gps_latitude, gps_longitude, gps_altitude,
             copyright, creator, description,
-            rating, flag, color_label
+            rating, flag, color_label,
+            is_video,
+            duration_seconds, frame_rate, video_kind, video_codec, video_bitrate,
+            color_primaries, color_transfer, color_matrix, color_range, dv_profile,
+            has_audio, audio_codec, audio_channels, audio_sample_rate, audio_bitrate,
+            live_photo_id,
+            rotation
         ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6,
             SUBSTRING(?1, 1, LENGTH(?1) - INSTR(REVERSE(?1), '/')),
             ?7, ?8, ?9, ?10,
             ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-            ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
+            ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
+            ?30,
+            ?31, ?32, ?33, ?34, ?35,
+            ?36, ?37, ?38, ?39, ?40,
+            ?41, ?42, ?43, ?44, ?45,
+            ?46,
+            COALESCE(?47, 0)
         )
     "#;
 
@@ -1213,6 +1248,25 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
                 record.rating.map(|v| v as i64),           // ?27 (u8 → i64)
                 record.flag,                                // ?28
                 record.color_label,                         // ?29
+                // --- Video / unified-media (Step 2a) — false/None for stills ---
+                record.is_video,                            // ?30 (bool)
+                record.duration_seconds,                    // ?31
+                record.frame_rate,                          // ?32
+                record.video_kind,                          // ?33
+                record.video_codec,                         // ?34
+                record.video_bitrate,                       // ?35
+                record.color_primaries,                     // ?36
+                record.color_transfer,                      // ?37
+                record.color_matrix,                        // ?38
+                record.color_range,                         // ?39
+                record.dv_profile,                          // ?40
+                record.has_audio,                           // ?41
+                record.audio_codec,                         // ?42
+                record.audio_channels,                      // ?43
+                record.audio_sample_rate,                   // ?44
+                record.audio_bitrate,                       // ?45
+                record.live_photo_id,                       // ?46
+                record.rotation,                            // ?47 (COALESCE(?,0): None/stills -> 0)
             ],
         );
 
@@ -6397,6 +6451,14 @@ mod lightroom_import_tests
             copyright: None, creator: None, description: None,
             rating: None, flag: None, color_label: None,
             rotation: None,
+            is_video: false,
+            duration_seconds: None, frame_rate: None, video_kind: None,
+            video_codec: None, video_bitrate: None,
+            color_primaries: None, color_transfer: None, color_matrix: None,
+            color_range: None, dv_profile: None,
+            has_audio: None, audio_codec: None, audio_channels: None,
+            audio_sample_rate: None, audio_bitrate: None,
+            live_photo_id: None,
         }
     }
 

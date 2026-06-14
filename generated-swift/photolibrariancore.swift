@@ -827,10 +827,27 @@ public struct ImageMetadata: Equatable, Hashable {
     public var flag: String?
     public var colorLabel: String?
     public var rotation: Int32?
+    public var isVideo: Bool
+    public var durationSeconds: Double?
+    public var frameRate: Double?
+    public var videoKind: String?
+    public var videoCodec: String?
+    public var videoBitrate: Int64?
+    public var colorPrimaries: String?
+    public var colorTransfer: String?
+    public var colorMatrix: String?
+    public var colorRange: String?
+    public var dvProfile: Int32?
+    public var hasAudio: Bool?
+    public var audioCodec: String?
+    public var audioChannels: Int32?
+    public var audioSampleRate: Int32?
+    public var audioBitrate: Int64?
+    public var livePhotoId: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(filePath: String, fileSize: UInt64, fileName: String, fileExtension: String?, createdTimestamp: Int64, modifiedTimestamp: Int64, cameraMake: String?, cameraModel: String?, lensModel: String?, focalLength: Double?, aperture: Double?, shutterSpeed: Double?, iso: UInt32?, captureDatetime: String?, pixelWidth: UInt32?, pixelHeight: UInt32?, colorSpace: String?, bitDepth: UInt32?, gpsLatitude: Double?, gpsLongitude: Double?, gpsAltitude: Double?, copyright: String?, creator: String?, description: String?, rating: UInt8?, flag: String?, colorLabel: String?, rotation: Int32? = nil) {
+    public init(filePath: String, fileSize: UInt64, fileName: String, fileExtension: String?, createdTimestamp: Int64, modifiedTimestamp: Int64, cameraMake: String?, cameraModel: String?, lensModel: String?, focalLength: Double?, aperture: Double?, shutterSpeed: Double?, iso: UInt32?, captureDatetime: String?, pixelWidth: UInt32?, pixelHeight: UInt32?, colorSpace: String?, bitDepth: UInt32?, gpsLatitude: Double?, gpsLongitude: Double?, gpsAltitude: Double?, copyright: String?, creator: String?, description: String?, rating: UInt8?, flag: String?, colorLabel: String?, rotation: Int32? = nil, isVideo: Bool = false, durationSeconds: Double? = nil, frameRate: Double? = nil, videoKind: String? = nil, videoCodec: String? = nil, videoBitrate: Int64? = nil, colorPrimaries: String? = nil, colorTransfer: String? = nil, colorMatrix: String? = nil, colorRange: String? = nil, dvProfile: Int32? = nil, hasAudio: Bool? = nil, audioCodec: String? = nil, audioChannels: Int32? = nil, audioSampleRate: Int32? = nil, audioBitrate: Int64? = nil, livePhotoId: String? = nil) {
         self.filePath = filePath
         self.fileSize = fileSize
         self.fileName = fileName
@@ -859,6 +876,23 @@ public struct ImageMetadata: Equatable, Hashable {
         self.flag = flag
         self.colorLabel = colorLabel
         self.rotation = rotation
+        self.isVideo = isVideo
+        self.durationSeconds = durationSeconds
+        self.frameRate = frameRate
+        self.videoKind = videoKind
+        self.videoCodec = videoCodec
+        self.videoBitrate = videoBitrate
+        self.colorPrimaries = colorPrimaries
+        self.colorTransfer = colorTransfer
+        self.colorMatrix = colorMatrix
+        self.colorRange = colorRange
+        self.dvProfile = dvProfile
+        self.hasAudio = hasAudio
+        self.audioCodec = audioCodec
+        self.audioChannels = audioChannels
+        self.audioSampleRate = audioSampleRate
+        self.audioBitrate = audioBitrate
+        self.livePhotoId = livePhotoId
     }
 
     
@@ -904,7 +938,24 @@ public struct FfiConverterTypeImageMetadata: FfiConverterRustBuffer {
                 rating: FfiConverterOptionUInt8.read(from: &buf), 
                 flag: FfiConverterOptionString.read(from: &buf), 
                 colorLabel: FfiConverterOptionString.read(from: &buf), 
-                rotation: FfiConverterOptionInt32.read(from: &buf)
+                rotation: FfiConverterOptionInt32.read(from: &buf), 
+                isVideo: FfiConverterBool.read(from: &buf), 
+                durationSeconds: FfiConverterOptionDouble.read(from: &buf), 
+                frameRate: FfiConverterOptionDouble.read(from: &buf), 
+                videoKind: FfiConverterOptionString.read(from: &buf), 
+                videoCodec: FfiConverterOptionString.read(from: &buf), 
+                videoBitrate: FfiConverterOptionInt64.read(from: &buf), 
+                colorPrimaries: FfiConverterOptionString.read(from: &buf), 
+                colorTransfer: FfiConverterOptionString.read(from: &buf), 
+                colorMatrix: FfiConverterOptionString.read(from: &buf), 
+                colorRange: FfiConverterOptionString.read(from: &buf), 
+                dvProfile: FfiConverterOptionInt32.read(from: &buf), 
+                hasAudio: FfiConverterOptionBool.read(from: &buf), 
+                audioCodec: FfiConverterOptionString.read(from: &buf), 
+                audioChannels: FfiConverterOptionInt32.read(from: &buf), 
+                audioSampleRate: FfiConverterOptionInt32.read(from: &buf), 
+                audioBitrate: FfiConverterOptionInt64.read(from: &buf), 
+                livePhotoId: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -937,6 +988,23 @@ public struct FfiConverterTypeImageMetadata: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.flag, into: &buf)
         FfiConverterOptionString.write(value.colorLabel, into: &buf)
         FfiConverterOptionInt32.write(value.rotation, into: &buf)
+        FfiConverterBool.write(value.isVideo, into: &buf)
+        FfiConverterOptionDouble.write(value.durationSeconds, into: &buf)
+        FfiConverterOptionDouble.write(value.frameRate, into: &buf)
+        FfiConverterOptionString.write(value.videoKind, into: &buf)
+        FfiConverterOptionString.write(value.videoCodec, into: &buf)
+        FfiConverterOptionInt64.write(value.videoBitrate, into: &buf)
+        FfiConverterOptionString.write(value.colorPrimaries, into: &buf)
+        FfiConverterOptionString.write(value.colorTransfer, into: &buf)
+        FfiConverterOptionString.write(value.colorMatrix, into: &buf)
+        FfiConverterOptionString.write(value.colorRange, into: &buf)
+        FfiConverterOptionInt32.write(value.dvProfile, into: &buf)
+        FfiConverterOptionBool.write(value.hasAudio, into: &buf)
+        FfiConverterOptionString.write(value.audioCodec, into: &buf)
+        FfiConverterOptionInt32.write(value.audioChannels, into: &buf)
+        FfiConverterOptionInt32.write(value.audioSampleRate, into: &buf)
+        FfiConverterOptionInt64.write(value.audioBitrate, into: &buf)
+        FfiConverterOptionString.write(value.livePhotoId, into: &buf)
     }
 }
 

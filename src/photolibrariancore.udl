@@ -663,6 +663,30 @@ dictionary ImageMetadata {
     // growth rule) so every existing Swift construction site compiles
     // untouched. None at INSERT -> schema default 0; None at UPDATE preserves.
     i32? rotation = null;
+
+    // === Video / unified-media (Step 2a; DESIGN-Video-Schema-Unified-Table.md §4b).
+    // Appended LAST, each with a UDL default (= false / = null) per the same
+    // wire-struct growth rule, so every existing Swift construction site
+    // (makeImageMetadata, the LR import) compiles untouched and produces stills
+    // (is_video=false, the rest null). The AVFoundation extractor (Step 2b) is the
+    // only producer that populates these. ===
+    boolean is_video = false;        // discriminator; false for every still
+    f64?    duration_seconds = null;
+    f64?    frame_rate = null;
+    string? video_kind = null;       // container: "mov" / "mp4" / "mxf"
+    string? video_codec = null;      // "hevc" / "prores" / "h264"
+    i64?    video_bitrate = null;    // bits/sec
+    string? color_primaries = null;  // CICP canonical strings (bt2020 / smpte432 / bt709)
+    string? color_transfer = null;   // arib-std-b67 (HLG) / smpte2084 (PQ) / bt709
+    string? color_matrix = null;     // bt2020nc / smpte170m / bt709
+    string? color_range = null;      // "tv" / "pc"
+    i32?    dv_profile = null;        // Dolby Vision profile (8 on iPhone); null = none
+    boolean? has_audio = null;
+    string? audio_codec = null;      // aac / pcm_s16le / pcm_s24le
+    i32?    audio_channels = null;
+    i32?    audio_sample_rate = null;
+    i64?    audio_bitrate = null;    // bits/sec
+    string? live_photo_id = null;    // QuickTime content.identifier; pair on equality
 };
 
 // Represents a complete image record from the database
