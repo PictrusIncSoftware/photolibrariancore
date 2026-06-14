@@ -2048,6 +2048,7 @@ fn execute_file_path_projection_query(
     where_clause: &str,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
+    include_video: bool,
 ) -> Result<Vec<String>, String>
 {
     let mut inner_predicates: Vec<&str> = Vec::new();
@@ -2061,11 +2062,17 @@ fn execute_file_path_projection_query(
     }
     // S70 Step 2 — default media stance: video is catalogued but NOT shown
     // until poster-frame display exists (DESIGN-Video-Schema-Unified-Table.md
-    // §7). Pushed unconditionally at this shared chokepoint so the gallery,
-    // Browse, ⌘A, filtered counts, and path/date-prefix queries all gate
-    // identically. When Stage 6 display lands, swap this for a threaded
-    // media-type filter; STILLS_ONLY_PREDICATE is the single seam to change.
-    inner_predicates.push(STILLS_ONLY_PREDICATE);
+    // §7). Gated at this shared chokepoint so the gallery, Browse, ⌘A, filtered
+    // counts, and path/date-prefix queries all hide video identically. The one
+    // escape hatch is `include_video`: folder-sync's computeDiff passes true so
+    // its disk-vs-catalogue diff sees video on BOTH sides (the disk listing uses
+    // allMediaExtensions); an asymmetric gate would read every catalogued video
+    // as a phantom new arrival. When Stage 6 lands, the threaded media-type
+    // filter absorbs this flag; STILLS_ONLY_PREDICATE stays the single seam.
+    if !include_video
+    {
+        inner_predicates.push(STILLS_ONLY_PREDICATE);
+    }
     let inner_where = if inner_predicates.is_empty()
     {
         String::new()
@@ -2192,6 +2199,7 @@ fn execute_image_record_projection_query(
     where_clause: &str,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
+    include_video: bool,
 ) -> Vec<ImageRecord>
 {
     let mut inner_predicates: Vec<&str> = Vec::new();
@@ -2204,12 +2212,16 @@ fn execute_image_record_projection_query(
         inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
     }
     // S70 Step 2 — default media stance: video is catalogued but NOT shown
-    // until poster-frame display exists (DESIGN-Video-Schema-Unified-Table.md
-    // §7). Pushed unconditionally at this shared chokepoint so the gallery,
-    // Browse, ⌘A, filtered counts, and path/date-prefix queries all gate
-    // identically. When Stage 6 display lands, swap this for a threaded
-    // media-type filter; STILLS_ONLY_PREDICATE is the single seam to change.
-    inner_predicates.push(STILLS_ONLY_PREDICATE);
+    // (DESIGN-Video-Schema-Unified-Table.md §7), so gallery / Browse / ⌘A /
+    // counts hide it identically. `include_video` is the escape hatch:
+    // folder-sync's REMOVAL path resolves missing video paths → ids through
+    // here, so it MUST see video — otherwise it finds 0 ids for a vanished clip
+    // and can never delete it (the S72 −N loop). When Stage 6 lands, the media-
+    // type param absorbs this flag; STILLS_ONLY_PREDICATE stays the single seam.
+    if !include_video
+    {
+        inner_predicates.push(STILLS_ONLY_PREDICATE);
+    }
     let inner_where = if inner_predicates.is_empty()
     {
         String::new()
@@ -3468,7 +3480,7 @@ pub async fn get_images_by_ids(ids: Vec<i64>) -> Vec<ImageRecord>
         }
     };
 
-    execute_image_record_projection_query(conn, &where_clause, false, false)
+    execute_image_record_projection_query(conn, &where_clause, false, false, false)
 }
 
 /// Expand a set of visible record IDs to their RAW+JPEG/HEIF collapse-group:
@@ -7779,11 +7791,16 @@ pub struct FilePathsResult {
 ///   duplicate cluster (caller passes `!show_duplicates`).
 /// - `apply_raw_jpeg_collapse`: When true, suppress RAW siblings of
 ///   JPEGs sharing `file_stem` within the same `directory_path`.
+/// - `include_video`: When true, skip the stills-only gate so the result
+///   includes video rows. Folder-sync's `computeDiff` passes true (its disk
+///   side lists video too, and an asymmetric gate would flag every catalogued
+///   video as a phantom arrival); stills-only surfaces pass false.
 pub async fn get_file_paths_for_filters(
     path_prefix: String,
     date_prefix: String,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
+    include_video: bool,
 ) -> FilePathsResult
 {
     // Acquire lock and validate connection. Catalogue not initialized
@@ -7812,6 +7829,7 @@ pub async fn get_file_paths_for_filters(
         &predicate,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        include_video,
     )
     {
         Ok(paths) => FilePathsResult {
@@ -7867,6 +7885,7 @@ pub async fn get_image_records_for_filters(
     date_prefix: String,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
+    include_video: bool,
 ) -> Vec<ImageRecord>
 {
     let catalogue = CATALOGUE.lock().unwrap();
@@ -7892,6 +7911,7 @@ pub async fn get_image_records_for_filters(
         &predicate,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        include_video,
     )
 }
 
@@ -8311,6 +8331,7 @@ pub async fn get_destination_family_records(
     execute_image_record_projection_query(
         conn,
         &predicate,
+        false,
         false,
         false,
     )

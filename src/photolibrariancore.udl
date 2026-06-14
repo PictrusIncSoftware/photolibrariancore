@@ -307,7 +307,7 @@ namespace photolibrariancore {
     //
     // Order: unspecified. Path strings are returned exactly as stored.
     [Async]
-    FilePathsResult get_file_paths_for_filters(string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
+    FilePathsResult get_file_paths_for_filters(string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse, boolean include_video);
 
     // A10 (sidebar bulk-copy records enumeration): records-returning
     // sibling of `get_file_paths_for_filters`. Returns the full
@@ -324,7 +324,7 @@ namespace photolibrariancore {
     // pass `false, false` (raw catalogue truth, independent of gallery
     // view preferences).
     [Async]
-    sequence<ImageRecord> get_image_records_for_filters(string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
+    sequence<ImageRecord> get_image_records_for_filters(string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse, boolean include_video);
 
     // Session 31: catalogue-only bulk DELETE for the Sources sidebar's
     // "Remove from Catalogue" context-menu action. Deletes every row
