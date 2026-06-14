@@ -33,7 +33,7 @@ namespace photolibrariancore {
     // offset: number of records to skip (page_number * page_size)
     // apply_duplicate_filter / apply_raw_jpeg_collapse: Step 4a filter booleans.
     [Async]
-    sequence<ImageRecord> get_all_images(u32 limit, u32 offset, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
+    sequence<ImageRecord> get_all_images(u32 limit, u32 offset, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse, MediaType media_type);
 
     // Get images from the catalogue with pagination and proper global sort order
     // Returns a paginated list of image records ordered by capture_datetime DESC NULLS LAST, created_timestamp DESC

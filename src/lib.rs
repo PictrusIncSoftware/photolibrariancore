@@ -2415,6 +2415,7 @@ pub async fn get_all_images(
     offset: u32,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
+    media_type: MediaType,
 ) -> Vec<ImageRecord> {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
@@ -2440,7 +2441,7 @@ pub async fn get_all_images(
         offset as i64,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
-        MediaType::StillsOnly,
+        media_type,
     )
 }
 
