@@ -1305,6 +1305,7 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
 pub async fn get_image_count(
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
+    media_type: MediaType,
 ) -> u64 {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
@@ -1324,6 +1325,7 @@ pub async fn get_image_count(
         "",
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        media_type,
     ) as u64
 }
 
@@ -1494,9 +1496,41 @@ const RAW_JPEG_COLLAPSE_PREDICATE: &str = "\
 /// `(is_video = FALSE OR is_video IS NULL)`: a row is hidden only when
 /// `is_video` is definitively TRUE, so a still can never be wrongly suppressed.
 ///
-/// When Stage 6 display lands, replace the unconditional push with a threaded
-/// media-type filter (stills / video / all). This constant is the single seam.
+/// As of the Stage-6 media-type control (DESIGN §11) this is no longer pushed
+/// unconditionally — `media_predicate` selects it / `VIDEOS_ONLY_PREDICATE` /
+/// neither, threaded through the five query helpers + the two sidebar GROUP-BYs.
 const STILLS_ONLY_PREDICATE: &str = "is_video IS NOT TRUE";
+
+/// The videos-only stance — the complement of `STILLS_ONLY_PREDICATE`. `IS TRUE`
+/// is NULL-safe the same way: only a definitively `is_video = TRUE` row passes,
+/// so a still (FALSE after the backfill) can never leak into a videos-only view.
+const VIDEOS_ONLY_PREDICATE: &str = "is_video IS TRUE";
+
+/// The three-state media-type view stance (DESIGN-Video-Schema-Unified-Table.md
+/// §11) — the three-state sibling of the `apply_raw_jpeg_collapse` /
+/// `apply_duplicate_filter` view booleans, threaded through every shared query
+/// helper and the two sidebar-count GROUP-BYs. Order MUST match the UDL `enum
+/// MediaType` (UniFFI maps by position).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaType
+{
+    StillsOnly,
+    VideosOnly,
+    Both,
+}
+
+/// Map a `MediaType` to its WHERE-clause fragment, or `None` for `Both` (no
+/// media predicate — stills and video together). The single place the stance
+/// becomes SQL; every query helper calls this instead of pushing a constant.
+fn media_predicate(media_type: MediaType) -> Option<&'static str>
+{
+    match media_type
+    {
+        MediaType::StillsOnly => Some(STILLS_ONLY_PREDICATE),
+        MediaType::VideosOnly => Some(VIDEOS_ONLY_PREDICATE),
+        MediaType::Both => None,
+    }
+}
 
 /// Build the path/date predicate text from the (path_prefix, date_prefix)
 /// pair.
@@ -1717,6 +1751,7 @@ fn execute_image_record_query(
     offset: i64,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
+    media_type: MediaType,
 ) -> Vec<ImageRecord>
 {
     // Assemble the inner WHERE from the caller-supplied predicate text
@@ -1731,13 +1766,14 @@ fn execute_image_record_query(
     {
         inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
     }
-    // S70 Step 2 — default media stance: video is catalogued but NOT shown
-    // until poster-frame display exists (DESIGN-Video-Schema-Unified-Table.md
-    // §7). Pushed unconditionally at this shared chokepoint so the gallery,
-    // Browse, ⌘A, filtered counts, and path/date-prefix queries all gate
-    // identically. When Stage 6 display lands, swap this for a threaded
-    // media-type filter; STILLS_ONLY_PREDICATE is the single seam to change.
-    inner_predicates.push(STILLS_ONLY_PREDICATE);
+    // Media-type stance (DESIGN-Video-Schema-Unified-Table.md §11): gallery,
+    // Browse, ⌘A, filtered counts, and path/date-prefix queries all gate through
+    // this one seam. `media_predicate` maps the caller's MediaType to its WHERE
+    // fragment — None for Both (stills + video together), so nothing is pushed.
+    if let Some(media_pred) = media_predicate(media_type)
+    {
+        inner_predicates.push(media_pred);
+    }
     let inner_where = if inner_predicates.is_empty()
     {
         String::new()
@@ -1933,6 +1969,7 @@ fn execute_image_count_query(
     where_clause: &str,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
+    media_type: MediaType,
 ) -> i64
 {
     let mut inner_predicates: Vec<&str> = Vec::new();
@@ -1944,13 +1981,14 @@ fn execute_image_count_query(
     {
         inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
     }
-    // S70 Step 2 — default media stance: video is catalogued but NOT shown
-    // until poster-frame display exists (DESIGN-Video-Schema-Unified-Table.md
-    // §7). Pushed unconditionally at this shared chokepoint so the gallery,
-    // Browse, ⌘A, filtered counts, and path/date-prefix queries all gate
-    // identically. When Stage 6 display lands, swap this for a threaded
-    // media-type filter; STILLS_ONLY_PREDICATE is the single seam to change.
-    inner_predicates.push(STILLS_ONLY_PREDICATE);
+    // Media-type stance (DESIGN-Video-Schema-Unified-Table.md §11): gallery,
+    // Browse, ⌘A, filtered counts, and path/date-prefix queries all gate through
+    // this one seam. `media_predicate` maps the caller's MediaType to its WHERE
+    // fragment — None for Both (stills + video together), so nothing is pushed.
+    if let Some(media_pred) = media_predicate(media_type)
+    {
+        inner_predicates.push(media_pred);
+    }
     let inner_where = if inner_predicates.is_empty()
     {
         String::new()
@@ -2048,7 +2086,7 @@ fn execute_file_path_projection_query(
     where_clause: &str,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
-    include_video: bool,
+    media_type: MediaType,
 ) -> Result<Vec<String>, String>
 {
     let mut inner_predicates: Vec<&str> = Vec::new();
@@ -2060,18 +2098,14 @@ fn execute_file_path_projection_query(
     {
         inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
     }
-    // S70 Step 2 — default media stance: video is catalogued but NOT shown
-    // until poster-frame display exists (DESIGN-Video-Schema-Unified-Table.md
-    // §7). Gated at this shared chokepoint so the gallery, Browse, ⌘A, filtered
-    // counts, and path/date-prefix queries all hide video identically. The one
-    // escape hatch is `include_video`: folder-sync's computeDiff passes true so
+    // Media-type stance (DESIGN §11). folder-sync's computeDiff passes Both so
     // its disk-vs-catalogue diff sees video on BOTH sides (the disk listing uses
     // allMediaExtensions); an asymmetric gate would read every catalogued video
-    // as a phantom new arrival. When Stage 6 lands, the threaded media-type
-    // filter absorbs this flag; STILLS_ONLY_PREDICATE stays the single seam.
-    if !include_video
+    // as a phantom new arrival. `media_predicate` maps the stance to its WHERE
+    // fragment — None for Both, so nothing is pushed.
+    if let Some(media_pred) = media_predicate(media_type)
     {
-        inner_predicates.push(STILLS_ONLY_PREDICATE);
+        inner_predicates.push(media_pred);
     }
     let inner_where = if inner_predicates.is_empty()
     {
@@ -2199,7 +2233,7 @@ fn execute_image_record_projection_query(
     where_clause: &str,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
-    include_video: bool,
+    media_type: MediaType,
 ) -> Vec<ImageRecord>
 {
     let mut inner_predicates: Vec<&str> = Vec::new();
@@ -2211,16 +2245,14 @@ fn execute_image_record_projection_query(
     {
         inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
     }
-    // S70 Step 2 — default media stance: video is catalogued but NOT shown
-    // (DESIGN-Video-Schema-Unified-Table.md §7), so gallery / Browse / ⌘A /
-    // counts hide it identically. `include_video` is the escape hatch:
-    // folder-sync's REMOVAL path resolves missing video paths → ids through
-    // here, so it MUST see video — otherwise it finds 0 ids for a vanished clip
-    // and can never delete it (the S72 −N loop). When Stage 6 lands, the media-
-    // type param absorbs this flag; STILLS_ONLY_PREDICATE stays the single seam.
-    if !include_video
+    // Media-type stance (DESIGN §11). folder-sync's REMOVAL path resolves missing
+    // video paths → ids through here passing Both, so it MUST see video —
+    // otherwise it finds 0 ids for a vanished clip and can never delete it (the
+    // S72 −N loop). `media_predicate` maps the stance to its WHERE fragment —
+    // None for Both, so nothing is pushed.
+    if let Some(media_pred) = media_predicate(media_type)
     {
-        inner_predicates.push(STILLS_ONLY_PREDICATE);
+        inner_predicates.push(media_pred);
     }
     let inner_where = if inner_predicates.is_empty()
     {
@@ -2408,6 +2440,7 @@ pub async fn get_all_images(
         offset as i64,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        MediaType::StillsOnly,
     )
 }
 
@@ -2469,6 +2502,7 @@ pub async fn get_images_sorted(
         offset as i64,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        MediaType::StillsOnly,
     )
 }
 
@@ -3259,6 +3293,7 @@ pub async fn query_images(
     offset: u32,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
+    media_type: MediaType,
 ) -> Vec<ImageRecord>
 {
     let catalogue = CATALOGUE.lock().unwrap();
@@ -3283,6 +3318,7 @@ pub async fn query_images(
         offset as i64,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        media_type,
     )
 }
 
@@ -3293,6 +3329,7 @@ pub async fn count_query_images(
     connectors: Vec<Connector>,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
+    media_type: MediaType,
 ) -> u64
 {
     let catalogue = CATALOGUE.lock().unwrap();
@@ -3313,6 +3350,7 @@ pub async fn count_query_images(
         &where_clause,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        media_type,
     );
 
     if count < 0 { 0 } else { count as u64 }
@@ -3350,6 +3388,7 @@ fn execute_id_projection_query(
     where_clause: &str,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
+    media_type: MediaType,
 ) -> Vec<i64>
 {
     let mut inner_predicates: Vec<&str> = Vec::new();
@@ -3361,13 +3400,14 @@ fn execute_id_projection_query(
     {
         inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
     }
-    // S70 Step 2 — default media stance: video is catalogued but NOT shown
-    // until poster-frame display exists (DESIGN-Video-Schema-Unified-Table.md
-    // §7). Pushed unconditionally at this shared chokepoint so the gallery,
-    // Browse, ⌘A, filtered counts, and path/date-prefix queries all gate
-    // identically. When Stage 6 display lands, swap this for a threaded
-    // media-type filter; STILLS_ONLY_PREDICATE is the single seam to change.
-    inner_predicates.push(STILLS_ONLY_PREDICATE);
+    // Media-type stance (DESIGN-Video-Schema-Unified-Table.md §11): gallery,
+    // Browse, ⌘A, filtered counts, and path/date-prefix queries all gate through
+    // this one seam. `media_predicate` maps the caller's MediaType to its WHERE
+    // fragment — None for Both (stills + video together), so nothing is pushed.
+    if let Some(media_pred) = media_predicate(media_type)
+    {
+        inner_predicates.push(media_pred);
+    }
     let inner_where = if inner_predicates.is_empty()
     {
         String::new()
@@ -3440,6 +3480,7 @@ pub async fn query_image_ids(
     connectors: Vec<Connector>,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
+    media_type: MediaType,
 ) -> Vec<i64>
 {
     let catalogue = CATALOGUE.lock().unwrap();
@@ -3454,7 +3495,7 @@ pub async fn query_image_ids(
     };
 
     let where_clause = build_filter_predicate(&predicates, &connectors);
-    execute_id_projection_query(conn, &where_clause, apply_duplicate_filter, apply_raw_jpeg_collapse)
+    execute_id_projection_query(conn, &where_clause, apply_duplicate_filter, apply_raw_jpeg_collapse, media_type)
 }
 
 /// Resolve record IDs to full `ImageRecord`s — turns a Browse selection (which
@@ -3480,7 +3521,11 @@ pub async fn get_images_by_ids(ids: Vec<i64>) -> Vec<ImageRecord>
         }
     };
 
-    execute_image_record_projection_query(conn, &where_clause, false, false, false)
+    // Resolve an explicit id selection to records (Copy / Reveal). Catalogue
+    // truth — `Both`, so a video the user selected once Stage 6 display is live
+    // still resolves; in stills-only mode the selected ids are all stills, so
+    // the result is unchanged from the former stills-only gate.
+    execute_image_record_projection_query(conn, &where_clause, false, false, MediaType::Both)
 }
 
 /// Expand a set of visible record IDs to their RAW+JPEG/HEIF collapse-group:
@@ -6753,6 +6798,16 @@ mod query_builder_tests
 {
     use super::*;
 
+    #[test]
+    fn media_predicate_maps_each_stance()
+    {
+        // The §11 media-type seam: StillsOnly / VideosOnly gate on is_video
+        // (both NULL-safe), Both applies no media filter (None → nothing pushed).
+        assert_eq!(media_predicate(MediaType::StillsOnly), Some("is_video IS NOT TRUE"));
+        assert_eq!(media_predicate(MediaType::VideosOnly), Some("is_video IS TRUE"));
+        assert_eq!(media_predicate(MediaType::Both), None);
+    }
+
     fn qp(kind: &str) -> QueryPredicate
     {
         QueryPredicate
@@ -7312,7 +7367,7 @@ pub struct CaptureDayImageCount
 /// immediate parent ONLY; Swift sums ancestors while walking the trie (an
 /// ancestor's old prefix-count equals the sum over its descendant leaves,
 /// since every image has exactly one parent directory).
-pub async fn directory_image_counts() -> Vec<DirectoryImageCount>
+pub async fn directory_image_counts(media_type: MediaType) -> Vec<DirectoryImageCount>
 {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
@@ -7328,18 +7383,23 @@ pub async fn directory_image_counts() -> Vec<DirectoryImageCount>
 
     // The S5 directory expression (do NOT rewrite) — see
     // get_distinct_directory_paths for the derivation notes.
-    // S70 Step 2 — sidebar counts are stills-only, matching the hidden-video
-    // default stance (DESIGN-Video-Schema-Unified-Table.md §7) so Dates/Sources
-    // counts equal what the gallery shows. STILLS_ONLY_PREDICATE is the seam.
+    // Media-type stance (DESIGN §11): the sidebar counts follow the Photos view's
+    // media type so Dates/Sources counts equal what the gallery shows. None (Both)
+    // → no media filter; the same seam as every query helper, via media_predicate.
+    let media_clause = match media_predicate(media_type)
+    {
+        Some(pred) => format!("AND {}", pred),
+        None => String::new(),
+    };
     let query_sql = format!(r#"
         SELECT
             SUBSTRING(file_path, 1, LENGTH(file_path) - INSTR(REVERSE(file_path), '/')) as dir_path,
             COUNT(*) as image_count
         FROM images
-        WHERE file_path IS NOT NULL AND file_path LIKE '%/%' AND {}
+        WHERE file_path IS NOT NULL AND file_path LIKE '%/%' {}
         GROUP BY dir_path
         ORDER BY dir_path ASC
-    "#, STILLS_ONLY_PREDICATE);
+    "#, media_clause);
 
     let mut stmt = match conn.prepare(&query_sql)
     {
@@ -7390,7 +7450,7 @@ pub async fn directory_image_counts() -> Vec<DirectoryImageCount>
 /// empty capture datetimes (Undated files) are excluded here exactly as they
 /// are from the tree — the "All Photos" total is a separate whole-catalogue
 /// count and still includes them.
-pub async fn capture_day_image_counts() -> Vec<CaptureDayImageCount>
+pub async fn capture_day_image_counts(media_type: MediaType) -> Vec<CaptureDayImageCount>
 {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
@@ -7404,16 +7464,21 @@ pub async fn capture_day_image_counts() -> Vec<CaptureDayImageCount>
         }
     };
 
-    // S70 Step 2 — sidebar counts are stills-only (see directory_image_counts
-    // / DESIGN-Video-Schema-Unified-Table.md §7); STILLS_ONLY_PREDICATE seam.
+    // Media-type stance (DESIGN §11): follows the Photos view's media type (see
+    // directory_image_counts), via media_predicate — None (Both) = no media filter.
+    let media_clause = match media_predicate(media_type)
+    {
+        Some(pred) => format!("AND {}", pred),
+        None => String::new(),
+    };
     let query_sql = format!(r#"
         SELECT SUBSTRING(capture_datetime, 1, 10) as date_str,
                COUNT(*) as image_count
         FROM images
-        WHERE capture_datetime IS NOT NULL AND capture_datetime != '' AND {}
+        WHERE capture_datetime IS NOT NULL AND capture_datetime != '' {}
         GROUP BY date_str
         ORDER BY date_str ASC
-    "#, STILLS_ONLY_PREDICATE);
+    "#, media_clause);
 
     let mut stmt = match conn.prepare(&query_sql)
     {
@@ -7512,6 +7577,7 @@ pub async fn get_images_filtered(
         offset,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        MediaType::StillsOnly,
     )
 }
 
@@ -7536,6 +7602,7 @@ pub async fn get_filtered_image_count(
     date_prefix: String,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
+    media_type: MediaType,
 ) -> i64 {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
@@ -7562,6 +7629,7 @@ pub async fn get_filtered_image_count(
         &predicate,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        media_type,
     )
 }
 
@@ -7606,6 +7674,7 @@ pub async fn get_image_count_for_path_prefix(
         &predicate,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        MediaType::StillsOnly,
     )
 }
 
@@ -7631,6 +7700,7 @@ pub async fn get_images_for_path_prefix(
     date_prefix: String,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
+    media_type: MediaType,
 ) -> Vec<ImageRecord>
 {
     // Acquire lock and validate connection
@@ -7657,6 +7727,7 @@ pub async fn get_images_for_path_prefix(
         offset,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        media_type,
     )
 }
 
@@ -7678,6 +7749,7 @@ pub async fn get_image_count_for_filters(
     date_prefix: String,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
+    media_type: MediaType,
 ) -> i64
 {
     // Acquire lock and validate connection
@@ -7701,6 +7773,7 @@ pub async fn get_image_count_for_filters(
         &predicate,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        media_type,
     )
 }
 
@@ -7791,16 +7864,16 @@ pub struct FilePathsResult {
 ///   duplicate cluster (caller passes `!show_duplicates`).
 /// - `apply_raw_jpeg_collapse`: When true, suppress RAW siblings of
 ///   JPEGs sharing `file_stem` within the same `directory_path`.
-/// - `include_video`: When true, skip the stills-only gate so the result
-///   includes video rows. Folder-sync's `computeDiff` passes true (its disk
-///   side lists video too, and an asymmetric gate would flag every catalogued
-///   video as a phantom arrival); stills-only surfaces pass false.
+/// - `media_type`: the media stance (Stills / Videos / Both). Folder-sync's
+///   `computeDiff` passes `Both` (its disk side lists video too, and an
+///   asymmetric gate would flag every catalogued video as a phantom arrival);
+///   stills-only surfaces pass `StillsOnly`.
 pub async fn get_file_paths_for_filters(
     path_prefix: String,
     date_prefix: String,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
-    include_video: bool,
+    media_type: MediaType,
 ) -> FilePathsResult
 {
     // Acquire lock and validate connection. Catalogue not initialized
@@ -7829,7 +7902,7 @@ pub async fn get_file_paths_for_filters(
         &predicate,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
-        include_video,
+        media_type,
     )
     {
         Ok(paths) => FilePathsResult {
@@ -7885,7 +7958,7 @@ pub async fn get_image_records_for_filters(
     date_prefix: String,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
-    include_video: bool,
+    media_type: MediaType,
 ) -> Vec<ImageRecord>
 {
     let catalogue = CATALOGUE.lock().unwrap();
@@ -7911,7 +7984,7 @@ pub async fn get_image_records_for_filters(
         &predicate,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
-        include_video,
+        media_type,
     )
 }
 
@@ -8333,7 +8406,7 @@ pub async fn get_destination_family_records(
         &predicate,
         false,
         false,
-        false,
+        MediaType::StillsOnly,
     )
 }
 

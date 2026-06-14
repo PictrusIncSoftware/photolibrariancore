@@ -25,7 +25,7 @@ namespace photolibrariancore {
     // (apply_duplicate_filter, apply_raw_jpeg_collapse) so the total matches
     // what the paginated SELECTs will return for the same filter state.
     [Async]
-    u64 get_image_count(boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
+    u64 get_image_count(boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse, MediaType media_type);
 
     // Get images from the catalogue with pagination support
     // Returns a paginated list of image records ordered by ID
@@ -81,7 +81,8 @@ namespace photolibrariancore {
         u32 limit,
         u32 offset,
         boolean apply_duplicate_filter,
-        boolean apply_raw_jpeg_collapse
+        boolean apply_raw_jpeg_collapse,
+        MediaType media_type
     );
 
     [Async]
@@ -89,7 +90,8 @@ namespace photolibrariancore {
         sequence<QueryPredicate> predicates,
         sequence<Connector> connectors,
         boolean apply_duplicate_filter,
-        boolean apply_raw_jpeg_collapse
+        boolean apply_raw_jpeg_collapse,
+        MediaType media_type
     );
 
     // Browse multi-select (Session 44). query_image_ids returns the IDs of
@@ -102,7 +104,8 @@ namespace photolibrariancore {
         sequence<QueryPredicate> predicates,
         sequence<Connector> connectors,
         boolean apply_duplicate_filter,
-        boolean apply_raw_jpeg_collapse
+        boolean apply_raw_jpeg_collapse,
+        MediaType media_type
     );
 
     [Async]
@@ -255,10 +258,10 @@ namespace photolibrariancore {
     // no RAW+JPEG collapse — the §11 sidebar convention); Swift sums
     // ancestors (directories) and months/years (days) in memory.
     [Async]
-    sequence<DirectoryImageCount> directory_image_counts();
+    sequence<DirectoryImageCount> directory_image_counts(MediaType media_type);
 
     [Async]
-    sequence<CaptureDayImageCount> capture_day_image_counts();
+    sequence<CaptureDayImageCount> capture_day_image_counts(MediaType media_type);
 
     // Get images with pagination and optional date filtering
     // date_prefix: Empty string for all images, or "YYYY:", "YYYY:MM:", "YYYY:MM:DD" for filtering
@@ -271,7 +274,7 @@ namespace photolibrariancore {
     // date_prefix: Empty string for all images, or "YYYY:", "YYYY:MM:", "YYYY:MM:DD" for filtering
     // apply_duplicate_filter / apply_raw_jpeg_collapse: Step 4a filter booleans.
     [Async]
-    i64 get_filtered_image_count(string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
+    i64 get_filtered_image_count(string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse, MediaType media_type);
 
     // Get count of images in a directory (matching path prefix)
     // path_prefix: Directory path prefix (e.g., "/Users/richard/Photos/")
@@ -283,12 +286,12 @@ namespace photolibrariancore {
     // Supports both path and date filtering simultaneously.
     // apply_duplicate_filter / apply_raw_jpeg_collapse: Step 4a filter booleans.
     [Async]
-    sequence<ImageRecord> get_images_for_path_prefix(i64 limit, i64 offset, string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
+    sequence<ImageRecord> get_images_for_path_prefix(i64 limit, i64 offset, string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse, MediaType media_type);
 
     // Get count of images matching both path prefix and date filter
     // apply_duplicate_filter / apply_raw_jpeg_collapse: Step 4a filter booleans.
     [Async]
-    i64 get_image_count_for_filters(string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse);
+    i64 get_image_count_for_filters(string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse, MediaType media_type);
 
     // A9 (sidebar bulk-copy enumeration foundation): return the set of
     // `file_path` values matching the gallery's current filter state via
@@ -307,7 +310,7 @@ namespace photolibrariancore {
     //
     // Order: unspecified. Path strings are returned exactly as stored.
     [Async]
-    FilePathsResult get_file_paths_for_filters(string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse, boolean include_video);
+    FilePathsResult get_file_paths_for_filters(string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse, MediaType media_type);
 
     // A10 (sidebar bulk-copy records enumeration): records-returning
     // sibling of `get_file_paths_for_filters`. Returns the full
@@ -324,7 +327,7 @@ namespace photolibrariancore {
     // pass `false, false` (raw catalogue truth, independent of gallery
     // view preferences).
     [Async]
-    sequence<ImageRecord> get_image_records_for_filters(string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse, boolean include_video);
+    sequence<ImageRecord> get_image_records_for_filters(string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse, MediaType media_type);
 
     // Session 31: catalogue-only bulk DELETE for the Sources sidebar's
     // "Remove from Catalogue" context-menu action. Deletes every row
@@ -468,6 +471,17 @@ enum Connector {
     "And",
     "Or",
     "Xor",
+};
+
+// Three-state media-type view stance (DESIGN-Video-Schema-Unified-Table.md §11),
+// the three-state sibling of the apply_duplicate_filter / apply_raw_jpeg_collapse
+// view booleans. Threaded through the shared query helpers + the two sidebar-
+// count fns; selects stills-only / videos-only / both. Variant ORDER must match
+// the Rust `enum MediaType` (UniFFI maps by position).
+enum MediaType {
+    "StillsOnly",
+    "VideosOnly",
+    "Both",
 };
 
 // One filter segment (one clause of the filter sentence), flattened for the
