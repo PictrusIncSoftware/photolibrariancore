@@ -6809,6 +6809,77 @@ mod query_builder_tests
         assert_eq!(media_predicate(MediaType::Both), None);
     }
 
+    // S74 — get_video_details decode: column order, integer down-casts, and the
+    // is_video guard. Builds a minimal images table (the video-only columns this
+    // getter reads), inserts one video row + one still, and runs the production
+    // SELECT through the shared `row_to_video_details` decoder.
+    #[test]
+    fn video_details_decodes_and_guards_on_is_video()
+    {
+        let conn = Connection::open_in_memory().expect("open in-memory duckdb");
+        conn.execute_batch(
+            "CREATE TABLE images (
+                id INTEGER PRIMARY KEY,
+                is_video BOOLEAN,
+                duration_seconds DOUBLE,
+                frame_rate DOUBLE,
+                video_kind TEXT,
+                video_codec TEXT,
+                video_bitrate BIGINT,
+                color_primaries TEXT,
+                color_transfer TEXT,
+                color_matrix TEXT,
+                color_range TEXT,
+                dv_profile INTEGER,
+                has_audio BOOLEAN,
+                audio_codec TEXT,
+                audio_channels INTEGER,
+                audio_sample_rate INTEGER,
+                audio_bitrate BIGINT,
+                live_photo_id TEXT
+             );"
+        ).expect("create images");
+
+        // id=1 video — iPhone HDR shape: HLG transfer + Dolby Vision profile 8,
+        // AAC stereo. (Plain digit literals — no Rust-style underscores in SQL.)
+        conn.execute(
+            "INSERT INTO images VALUES
+             (1, TRUE, 12.5, 29.97, 'mov', 'hevc', 45000000,
+              'bt2020', 'arib-std-b67', 'bt2020nc', 'tv', 8,
+              TRUE, 'aac', 2, 48000, 160000, 'ABC-123')",
+            [],
+        ).expect("insert video");
+
+        // id=2 still — must be invisible to the getter (the is_video guard).
+        conn.execute(
+            "INSERT INTO images (id, is_video) VALUES (2, FALSE)",
+            [],
+        ).expect("insert still");
+
+        let sql = "SELECT duration_seconds, frame_rate, video_kind, video_codec, \
+                   video_bitrate, color_primaries, color_transfer, color_matrix, \
+                   color_range, dv_profile, has_audio, audio_codec, audio_channels, \
+                   audio_sample_rate, audio_bitrate, live_photo_id \
+                   FROM images WHERE id = ?1 AND is_video IS TRUE";
+
+        let v = conn.query_row(sql, params![1i64], row_to_video_details)
+            .expect("video row decodes");
+        assert!((v.duration_seconds.unwrap() - 12.5).abs() < 1e-6);
+        assert!((v.frame_rate.unwrap() - 29.97).abs() < 1e-6);
+        assert_eq!(v.video_codec.as_deref(), Some("hevc"));
+        assert_eq!(v.video_bitrate, Some(45_000_000));     // BIGINT → i64
+        assert_eq!(v.color_transfer.as_deref(), Some("arib-std-b67"));
+        assert_eq!(v.dv_profile, Some(8));                 // INTEGER → i32 down-cast
+        assert_eq!(v.has_audio, Some(true));
+        assert_eq!(v.audio_channels, Some(2));             // INTEGER → i32 down-cast
+        assert_eq!(v.audio_sample_rate, Some(48000));
+        assert_eq!(v.live_photo_id.as_deref(), Some("ABC-123"));
+
+        // The is_video guard hides the still: query_row finds no row → None.
+        let still = conn.query_row(sql, params![2i64], row_to_video_details).ok();
+        assert!(still.is_none(), "is_video IS TRUE must exclude the still row");
+    }
+
     fn qp(kind: &str) -> QueryPredicate
     {
         QueryPredicate
@@ -8675,4 +8746,94 @@ pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord>
 
     // No opposite-kind candidate found.
     None
+}
+
+/// S74 — the video-exclusive columns for the detail panel's Video group,
+/// fetched on demand for the one video being viewed (see `get_video_details`).
+///
+/// Deliberately NOT folded into `ImageRecord`: that struct is lifted in bulk on
+/// every gallery page, ⌘A-whole-query, and the 167k builder load — all through
+/// the @MainActor UniFFI lift (S57's launch-beachball root cause). Weighting it
+/// with 16 fields that only the single-record detail panel consumes would tax
+/// the hottest read path for nothing. The shared fields a video also carries
+/// (capture date, dimensions, rotation, bit depth, color space, GPS) already
+/// ride on ImageRecord; this carries only the video-only set.
+#[derive(Debug, Clone)]
+pub struct VideoDetails
+{
+    pub duration_seconds: Option<f64>,   // container duration, seconds
+    pub frame_rate: Option<f64>,         // nominal fps (e.g. 29.97)
+    pub video_kind: Option<String>,      // container: "mov" / "mp4" / "mxf"
+    pub video_codec: Option<String>,     // "hevc" / "prores" / "h264"
+    pub video_bitrate: Option<i64>,      // bits/sec
+    pub color_primaries: Option<String>, // CICP canonical (bt2020 / smpte432 / bt709)
+    pub color_transfer: Option<String>,  // arib-std-b67 (HLG) / smpte2084 (PQ) / bt709
+    pub color_matrix: Option<String>,    // bt2020nc / smpte170m / bt709
+    pub color_range: Option<String>,     // "tv" / "pc"
+    pub dv_profile: Option<i32>,         // Dolby Vision profile (8 on iPhone); None = none
+    pub has_audio: Option<bool>,
+    pub audio_codec: Option<String>,     // aac / pcm_s16le / pcm_s24le
+    pub audio_channels: Option<i32>,
+    pub audio_sample_rate: Option<i32>,
+    pub audio_bitrate: Option<i64>,      // bits/sec
+    pub live_photo_id: Option<String>,   // QuickTime content.identifier
+}
+
+/// Decode the 16 video-only columns (in the SELECT order used by
+/// `get_video_details`) into a `VideoDetails`. Shared by the FFI fn and its
+/// unit test so the column positions and integer down-casts are verified in one
+/// place. DuckDB hands integer columns back as i64 (mirrors the ImageRecord
+/// decode), so the INTEGER fields cast to i32 explicitly; BIGINT stays i64.
+fn row_to_video_details(row: &duckdb::Row) -> Result<VideoDetails, duckdb::Error>
+{
+    Ok(VideoDetails
+    {
+        duration_seconds: row.get(0)?,
+        frame_rate: row.get(1)?,
+        video_kind: row.get(2)?,
+        video_codec: row.get(3)?,
+        video_bitrate: row.get(4)?,
+        color_primaries: row.get(5)?,
+        color_transfer: row.get(6)?,
+        color_matrix: row.get(7)?,
+        color_range: row.get(8)?,
+        dv_profile: row.get::<_, Option<i64>>(9)?.map(|v| v as i32),
+        has_audio: row.get(10)?,
+        audio_codec: row.get(11)?,
+        audio_channels: row.get::<_, Option<i64>>(12)?.map(|v| v as i32),
+        audio_sample_rate: row.get::<_, Option<i64>>(13)?.map(|v| v as i32),
+        audio_bitrate: row.get(14)?,
+        live_photo_id: row.get(15)?,
+    })
+}
+
+/// S74 — fetch the video-only columns for one image by id, for the detail
+/// panel's Video group. Single-row, by primary key, guarded `is_video IS TRUE`
+/// (the caller only asks for videos). Returns None when the catalogue is
+/// uninitialized, the id is absent, or the row is not a video — all benign
+/// "no Video group" outcomes for the panel, never an error worth surfacing.
+pub async fn get_video_details(image_id: i64) -> Option<VideoDetails>
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return None;
+        }
+    };
+
+    let query_sql = r#"
+        SELECT
+            duration_seconds, frame_rate, video_kind, video_codec, video_bitrate,
+            color_primaries, color_transfer, color_matrix, color_range, dv_profile,
+            has_audio, audio_codec, audio_channels, audio_sample_rate, audio_bitrate,
+            live_photo_id
+        FROM images
+        WHERE id = ?1 AND is_video IS TRUE
+    "#;
+
+    conn.query_row(query_sql, params![image_id], row_to_video_details).ok()
 }

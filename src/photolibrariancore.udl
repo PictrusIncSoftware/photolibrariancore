@@ -408,6 +408,16 @@ namespace photolibrariancore {
     [Async]
     ImageRecord? find_counterpart_image(string file_path);
 
+    // S74 — the video-exclusive columns for the detail panel's Video group,
+    // fetched on demand for one video by id. Returns null when the id is absent
+    // or the row is not a video (`is_video IS TRUE` guards it — the caller only
+    // asks for videos). The shared fields a video also has (capture date,
+    // dimensions, rotation, bit depth, color space, GPS) ride on ImageRecord;
+    // these stay OFF the bulk-lifted record (gallery / ⌘A / builder loads are
+    // @MainActor — S57) so the hot path isn't weighted with panel-only fields.
+    [Async]
+    VideoDetails? get_video_details(i64 image_id);
+
     // Classify a file extension into JPEG, RAW, or Other.
     // SYNCHRONOUS — first sync export in this project. Pure string-to-enum
     // lookup; no I/O, no DuckDB access. Forcing it async would push the
@@ -758,6 +768,30 @@ dictionary ImageRecord {
     // gallery filter shows only rows where Int64(id) == duplicate_group_id
     // when "Show duplicates" is OFF.
     i64? duplicate_group_id;
+};
+
+// S74 — video-exclusive read model for the detail panel (Option-returned by
+// get_video_details). Mirrors the video-only columns on `images`. Kept separate
+// from ImageRecord so the bulk record lift (gallery / ⌘A / 167k builder load,
+// all @MainActor — S57) isn't weighted with fields only the panel reads. The
+// shared fields a video also carries live on ImageRecord.
+dictionary VideoDetails {
+    f64? duration_seconds;       // container duration, seconds
+    f64? frame_rate;             // nominal fps (e.g. 29.97)
+    string? video_kind;          // container: "mov" / "mp4" / "mxf"
+    string? video_codec;         // "hevc" / "prores" / "h264"
+    i64? video_bitrate;          // bits/sec
+    string? color_primaries;     // CICP: "bt2020" / "smpte432" (P3) / "bt709"
+    string? color_transfer;      // "arib-std-b67" (HLG) / "smpte2084" (PQ) / "bt709"
+    string? color_matrix;        // "bt2020nc" / "smpte170m" / "bt709"
+    string? color_range;         // "tv" (limited) / "pc" (full)
+    i32? dv_profile;             // Dolby Vision profile (8 on iPhone); null = none
+    boolean? has_audio;
+    string? audio_codec;         // "aac" / "pcm_s16le" / "pcm_s24le"
+    i32? audio_channels;
+    i32? audio_sample_rate;
+    i64? audio_bitrate;          // bits/sec
+    string? live_photo_id;       // QuickTime content.identifier
 };
 
 // A9: Result wrapper for `get_file_paths_for_filters`.

@@ -404,6 +404,11 @@ RustBuffer uniffi_photolibrariancore_fn_func_get_raw_extensions(RustCallStatus *
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_VIDEO_DETAILS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_GET_VIDEO_DETAILS
+uint64_t uniffi_photolibrariancore_fn_func_get_video_details(int64_t image_id
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_HIDDEN_KEYWORDS_FOR_IMAGE
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_HIDDEN_KEYWORDS_FOR_IMAGE
 uint64_t uniffi_photolibrariancore_fn_func_hidden_keywords_for_image(int64_t image_id
@@ -1006,6 +1011,12 @@ uint16_t uniffi_photolibrariancore_checksum_func_get_jpeg_extensions(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_RAW_EXTENSIONS
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_RAW_EXTENSIONS
 uint16_t uniffi_photolibrariancore_checksum_func_get_raw_extensions(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_VIDEO_DETAILS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_GET_VIDEO_DETAILS
+uint16_t uniffi_photolibrariancore_checksum_func_get_video_details(void
     
 );
 #endif

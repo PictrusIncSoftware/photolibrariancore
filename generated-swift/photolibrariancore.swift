@@ -1783,6 +1783,116 @@ public func FfiConverterTypeSavedQueryPayload_lower(_ value: SavedQueryPayload) 
     return FfiConverterTypeSavedQueryPayload.lower(value)
 }
 
+
+public struct VideoDetails: Equatable, Hashable {
+    public var durationSeconds: Double?
+    public var frameRate: Double?
+    public var videoKind: String?
+    public var videoCodec: String?
+    public var videoBitrate: Int64?
+    public var colorPrimaries: String?
+    public var colorTransfer: String?
+    public var colorMatrix: String?
+    public var colorRange: String?
+    public var dvProfile: Int32?
+    public var hasAudio: Bool?
+    public var audioCodec: String?
+    public var audioChannels: Int32?
+    public var audioSampleRate: Int32?
+    public var audioBitrate: Int64?
+    public var livePhotoId: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(durationSeconds: Double?, frameRate: Double?, videoKind: String?, videoCodec: String?, videoBitrate: Int64?, colorPrimaries: String?, colorTransfer: String?, colorMatrix: String?, colorRange: String?, dvProfile: Int32?, hasAudio: Bool?, audioCodec: String?, audioChannels: Int32?, audioSampleRate: Int32?, audioBitrate: Int64?, livePhotoId: String?) {
+        self.durationSeconds = durationSeconds
+        self.frameRate = frameRate
+        self.videoKind = videoKind
+        self.videoCodec = videoCodec
+        self.videoBitrate = videoBitrate
+        self.colorPrimaries = colorPrimaries
+        self.colorTransfer = colorTransfer
+        self.colorMatrix = colorMatrix
+        self.colorRange = colorRange
+        self.dvProfile = dvProfile
+        self.hasAudio = hasAudio
+        self.audioCodec = audioCodec
+        self.audioChannels = audioChannels
+        self.audioSampleRate = audioSampleRate
+        self.audioBitrate = audioBitrate
+        self.livePhotoId = livePhotoId
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension VideoDetails: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVideoDetails: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VideoDetails {
+        return
+            try VideoDetails(
+                durationSeconds: FfiConverterOptionDouble.read(from: &buf), 
+                frameRate: FfiConverterOptionDouble.read(from: &buf), 
+                videoKind: FfiConverterOptionString.read(from: &buf), 
+                videoCodec: FfiConverterOptionString.read(from: &buf), 
+                videoBitrate: FfiConverterOptionInt64.read(from: &buf), 
+                colorPrimaries: FfiConverterOptionString.read(from: &buf), 
+                colorTransfer: FfiConverterOptionString.read(from: &buf), 
+                colorMatrix: FfiConverterOptionString.read(from: &buf), 
+                colorRange: FfiConverterOptionString.read(from: &buf), 
+                dvProfile: FfiConverterOptionInt32.read(from: &buf), 
+                hasAudio: FfiConverterOptionBool.read(from: &buf), 
+                audioCodec: FfiConverterOptionString.read(from: &buf), 
+                audioChannels: FfiConverterOptionInt32.read(from: &buf), 
+                audioSampleRate: FfiConverterOptionInt32.read(from: &buf), 
+                audioBitrate: FfiConverterOptionInt64.read(from: &buf), 
+                livePhotoId: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: VideoDetails, into buf: inout [UInt8]) {
+        FfiConverterOptionDouble.write(value.durationSeconds, into: &buf)
+        FfiConverterOptionDouble.write(value.frameRate, into: &buf)
+        FfiConverterOptionString.write(value.videoKind, into: &buf)
+        FfiConverterOptionString.write(value.videoCodec, into: &buf)
+        FfiConverterOptionInt64.write(value.videoBitrate, into: &buf)
+        FfiConverterOptionString.write(value.colorPrimaries, into: &buf)
+        FfiConverterOptionString.write(value.colorTransfer, into: &buf)
+        FfiConverterOptionString.write(value.colorMatrix, into: &buf)
+        FfiConverterOptionString.write(value.colorRange, into: &buf)
+        FfiConverterOptionInt32.write(value.dvProfile, into: &buf)
+        FfiConverterOptionBool.write(value.hasAudio, into: &buf)
+        FfiConverterOptionString.write(value.audioCodec, into: &buf)
+        FfiConverterOptionInt32.write(value.audioChannels, into: &buf)
+        FfiConverterOptionInt32.write(value.audioSampleRate, into: &buf)
+        FfiConverterOptionInt64.write(value.audioBitrate, into: &buf)
+        FfiConverterOptionString.write(value.livePhotoId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVideoDetails_lift(_ buf: RustBuffer) throws -> VideoDetails {
+    return try FfiConverterTypeVideoDetails.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVideoDetails_lower(_ value: VideoDetails) -> RustBuffer {
+    return FfiConverterTypeVideoDetails.lower(value)
+}
+
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
@@ -2275,6 +2385,30 @@ fileprivate struct FfiConverterOptionTypeSavedQueryPayload: FfiConverterRustBuff
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeSavedQueryPayload.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeVideoDetails: FfiConverterRustBuffer {
+    typealias SwiftType = VideoDetails?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeVideoDetails.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeVideoDetails.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -3116,6 +3250,21 @@ public func getRawExtensions() -> [String]  {
     )
 })
 }
+public func getVideoDetails(imageId: Int64)async  -> VideoDetails?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_get_video_details(FfiConverterInt64.lower(imageId)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeVideoDetails.lift,
+            errorHandler: nil
+            
+        )
+}
 public func hiddenKeywordsForImage(imageId: Int64)async  -> [KeywordRow]  {
     return
         try!  await uniffiRustCallAsync(
@@ -3680,6 +3829,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_raw_extensions() != 16992) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_get_video_details() != 28966) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_hidden_keywords_for_image() != 10588) {
