@@ -224,6 +224,34 @@ pub struct FocusAnalysisResult {
     pub focus_whole_image_score: Option<f64>,
 }
 
+/// Durable coordinator row for enrichment / intelligent-culling work.
+///
+/// The current focus analyzer still runs in Swift, but the job identity and
+/// counters live in DuckDB so a foreground run and a future helper process can
+/// observe, cancel, and resume the same unit of work.
+#[derive(Debug, Clone)]
+pub struct AnalysisJob {
+    pub id: i64,
+    pub job_kind: String,
+    pub scope_kind: String,
+    pub scope_value: Option<String>,
+    pub algorithm_version: String,
+    pub analysis_run_id: String,
+    pub status: String,
+    pub total_candidate_count: u64,
+    pub processed_count: u64,
+    pub completed_count: u64,
+    pub skipped_count: u64,
+    pub failed_count: u64,
+    pub updated_count: u64,
+    pub cancel_requested: bool,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
 /// Recognized RAW image file extensions
 ///
 /// Compile-time list of file extensions (lowercase, no leading dot) that
@@ -790,6 +818,39 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         CREATE INDEX IF NOT EXISTS idx_focus_animal_pose_score ON images(focus_animal_pose_score);
         CREATE INDEX IF NOT EXISTS idx_focus_whole_image_score ON images(focus_whole_image_score);
         CREATE INDEX IF NOT EXISTS idx_focus_analysis_status ON images(focus_analysis_status);
+
+        -- === Durable analysis jobs (background intelligent culling coordinator) ===
+        -- One row per user/requested enrichment run. The current focus pass uses
+        -- this as durable foreground state; the future helper/agent will claim
+        -- and update the same rows after the app exits. This table is separate
+        -- from image-level scalar facts so curation and analysis remain
+        -- disentangled. New table only: no ALTER ... ADD COLUMN ... DEFAULT path.
+        CREATE SEQUENCE IF NOT EXISTS analysis_job_id_seq START 1;
+
+        CREATE TABLE IF NOT EXISTS analysis_jobs (
+            id INTEGER PRIMARY KEY DEFAULT nextval('analysis_job_id_seq'),
+            job_kind TEXT NOT NULL,              -- focus_quality / subject_detection / ...
+            scope_kind TEXT NOT NULL,            -- whole_catalogue / selection / path_prefix / ...
+            scope_value TEXT,                    -- optional serialized scope payload
+            algorithm_version TEXT NOT NULL,
+            analysis_run_id TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL,                -- queued / running / cancelling / cancelled / completed / failed
+            total_candidate_count BIGINT NOT NULL,
+            processed_count BIGINT NOT NULL,
+            completed_count BIGINT NOT NULL,
+            skipped_count BIGINT NOT NULL,
+            failed_count BIGINT NOT NULL,
+            updated_count BIGINT NOT NULL,
+            cancel_requested BOOLEAN NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            started_at TIMESTAMP,
+            updated_at TIMESTAMP,
+            finished_at TIMESTAMP,
+            last_error TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_analysis_jobs_kind_status ON analysis_jobs(job_kind, status);
+        CREATE INDEX IF NOT EXISTS idx_analysis_jobs_run_id ON analysis_jobs(analysis_run_id);
 
         -- === Keyword system (Session 45; Docs/DESIGN-Keyword-System.md) ===
         -- Hierarchical keywords in ONE table. Each applied keyword PATH is
@@ -4698,6 +4759,361 @@ pub async fn distinct_numeric_values(field: String) -> Vec<f64> {
     }
 }
 
+fn is_valid_analysis_job_status(status: &str) -> bool {
+    matches!(
+        status,
+        "queued" | "running" | "cancelling" | "cancelled" | "completed" | "failed"
+    )
+}
+
+fn is_terminal_analysis_job_status(status: &str) -> bool {
+    matches!(status, "cancelled" | "completed" | "failed")
+}
+
+fn analysis_job_token_is_valid(token: &str) -> bool {
+    let trimmed = token.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 96
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn u64_to_i64_clamped(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
+}
+
+fn i64_to_u64_floor(value: i64) -> u64 {
+    value.max(0) as u64
+}
+
+fn row_to_analysis_job(row: &duckdb::Row) -> Result<AnalysisJob, duckdb::Error> {
+    Ok(AnalysisJob {
+        id: row.get(0)?,
+        job_kind: row.get(1)?,
+        scope_kind: row.get(2)?,
+        scope_value: row.get(3)?,
+        algorithm_version: row.get(4)?,
+        analysis_run_id: row.get(5)?,
+        status: row.get(6)?,
+        total_candidate_count: i64_to_u64_floor(row.get(7)?),
+        processed_count: i64_to_u64_floor(row.get(8)?),
+        completed_count: i64_to_u64_floor(row.get(9)?),
+        skipped_count: i64_to_u64_floor(row.get(10)?),
+        failed_count: i64_to_u64_floor(row.get(11)?),
+        updated_count: i64_to_u64_floor(row.get(12)?),
+        cancel_requested: row.get(13)?,
+        created_at: row.get(14)?,
+        started_at: row.get(15)?,
+        updated_at: row.get(16)?,
+        finished_at: row.get(17)?,
+        last_error: row.get(18)?,
+    })
+}
+
+const ANALYSIS_JOB_SELECT_COLUMNS: &str = "\
+    id, job_kind, scope_kind, scope_value, algorithm_version, analysis_run_id, status, \
+    total_candidate_count, processed_count, completed_count, skipped_count, failed_count, \
+    updated_count, cancel_requested, CAST(created_at AS VARCHAR), CAST(started_at AS VARCHAR), \
+    CAST(updated_at AS VARCHAR), CAST(finished_at AS VARCHAR), last_error";
+
+fn analysis_job_by_id_impl(conn: &Connection, id: i64) -> Option<AnalysisJob> {
+    let sql = format!(
+        "SELECT {} FROM analysis_jobs WHERE id = ?1",
+        ANALYSIS_JOB_SELECT_COLUMNS
+    );
+    conn.query_row(&sql, params![id], row_to_analysis_job).ok()
+}
+
+fn create_analysis_job_impl(
+    conn: &Connection,
+    job_kind: &str,
+    scope_kind: &str,
+    scope_value: Option<String>,
+    algorithm_version: &str,
+    analysis_run_id: &str,
+    total_candidate_count: u64,
+) -> Option<AnalysisJob> {
+    let job_kind = job_kind.trim();
+    let scope_kind = scope_kind.trim();
+    let algorithm_version = algorithm_version.trim();
+    let analysis_run_id = analysis_run_id.trim();
+
+    if !analysis_job_token_is_valid(job_kind)
+        || !analysis_job_token_is_valid(scope_kind)
+        || algorithm_version.is_empty()
+        || analysis_run_id.is_empty()
+    {
+        eprintln!("create_analysis_job: invalid job metadata");
+        return None;
+    }
+
+    let total = u64_to_i64_clamped(total_candidate_count);
+    let inserted = conn.execute(
+        "INSERT INTO analysis_jobs (
+             job_kind, scope_kind, scope_value, algorithm_version, analysis_run_id, status,
+             total_candidate_count, processed_count, completed_count, skipped_count,
+             failed_count, updated_count, cancel_requested
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, 0, 0, 0, 0, 0, FALSE)",
+        params![
+            job_kind,
+            scope_kind,
+            scope_value,
+            algorithm_version,
+            analysis_run_id,
+            total
+        ],
+    );
+
+    if let Err(e) = inserted {
+        eprintln!("create_analysis_job: insert failed: {}", e);
+        return None;
+    }
+
+    let id = match conn.query_row(
+        "SELECT id FROM analysis_jobs WHERE analysis_run_id = ?1",
+        params![analysis_run_id],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("create_analysis_job: id lookup failed: {}", e);
+            return None;
+        }
+    };
+
+    analysis_job_by_id_impl(conn, id)
+}
+
+fn active_analysis_job_impl(conn: &Connection, job_kind: &str) -> Option<AnalysisJob> {
+    let job_kind = job_kind.trim();
+    if !analysis_job_token_is_valid(job_kind) {
+        return None;
+    }
+
+    let sql = format!(
+        "SELECT {}
+         FROM analysis_jobs
+         WHERE job_kind = ?1 AND status IN ('queued', 'running', 'cancelling')
+         ORDER BY id DESC
+         LIMIT 1",
+        ANALYSIS_JOB_SELECT_COLUMNS
+    );
+    conn.query_row(&sql, params![job_kind], row_to_analysis_job)
+        .ok()
+}
+
+fn update_analysis_job_progress_impl(
+    conn: &Connection,
+    id: i64,
+    processed_delta: u64,
+    completed_delta: u64,
+    skipped_delta: u64,
+    failed_delta: u64,
+    updated_delta: u64,
+    total_candidate_count: Option<u64>,
+) -> Option<AnalysisJob> {
+    let processed_delta = u64_to_i64_clamped(processed_delta);
+    let completed_delta = u64_to_i64_clamped(completed_delta);
+    let skipped_delta = u64_to_i64_clamped(skipped_delta);
+    let failed_delta = u64_to_i64_clamped(failed_delta);
+    let updated_delta = u64_to_i64_clamped(updated_delta);
+    let total_candidate_count = total_candidate_count.map(u64_to_i64_clamped);
+
+    let updated = conn.execute(
+        "UPDATE analysis_jobs
+         SET status = CASE WHEN status = 'queued' THEN 'running' ELSE status END,
+             started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+             updated_at = CURRENT_TIMESTAMP,
+             total_candidate_count = COALESCE(?7, total_candidate_count),
+             processed_count = processed_count + ?2,
+             completed_count = completed_count + ?3,
+             skipped_count = skipped_count + ?4,
+             failed_count = failed_count + ?5,
+             updated_count = updated_count + ?6
+         WHERE id = ?1 AND status IN ('queued', 'running', 'cancelling')",
+        params![
+            id,
+            processed_delta,
+            completed_delta,
+            skipped_delta,
+            failed_delta,
+            updated_delta,
+            total_candidate_count
+        ],
+    );
+
+    match updated {
+        Ok(0) => None,
+        Ok(_) => analysis_job_by_id_impl(conn, id),
+        Err(e) => {
+            eprintln!("update_analysis_job_progress: update failed: {}", e);
+            None
+        }
+    }
+}
+
+fn request_cancel_analysis_job_impl(conn: &Connection, id: i64) -> bool {
+    match conn.execute(
+        "UPDATE analysis_jobs
+         SET cancel_requested = TRUE,
+             status = CASE WHEN status IN ('queued', 'running') THEN 'cancelling' ELSE status END,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?1 AND status IN ('queued', 'running', 'cancelling')",
+        params![id],
+    ) {
+        Ok(n) => n > 0,
+        Err(e) => {
+            eprintln!("request_cancel_analysis_job: update failed: {}", e);
+            false
+        }
+    }
+}
+
+fn finish_analysis_job_impl(
+    conn: &Connection,
+    id: i64,
+    status: &str,
+    last_error: Option<String>,
+) -> Option<AnalysisJob> {
+    let status = status.trim();
+    if !is_valid_analysis_job_status(status) || !is_terminal_analysis_job_status(status) {
+        eprintln!("finish_analysis_job: invalid terminal status '{}'", status);
+        return None;
+    }
+
+    let updated = conn.execute(
+        "UPDATE analysis_jobs
+         SET status = ?2,
+             cancel_requested = CASE WHEN ?2 = 'cancelled' THEN TRUE ELSE cancel_requested END,
+             updated_at = CURRENT_TIMESTAMP,
+             finished_at = CURRENT_TIMESTAMP,
+             last_error = ?3
+         WHERE id = ?1 AND status IN ('queued', 'running', 'cancelling')",
+        params![id, status, last_error],
+    );
+
+    match updated {
+        Ok(0) => None,
+        Ok(_) => analysis_job_by_id_impl(conn, id),
+        Err(e) => {
+            eprintln!("finish_analysis_job: update failed: {}", e);
+            None
+        }
+    }
+}
+
+/// Create a durable analysis/enrichment job. The first caller is foreground
+/// focus analysis; the background helper will use the same row shape later.
+pub async fn create_analysis_job(
+    job_kind: String,
+    scope_kind: String,
+    scope_value: Option<String>,
+    algorithm_version: String,
+    analysis_run_id: String,
+    total_candidate_count: u64,
+) -> Option<AnalysisJob> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("create_analysis_job: catalogue not initialized");
+            return None;
+        }
+    };
+
+    create_analysis_job_impl(
+        conn,
+        &job_kind,
+        &scope_kind,
+        scope_value,
+        &algorithm_version,
+        &analysis_run_id,
+        total_candidate_count,
+    )
+}
+
+/// Return the newest non-terminal job for a kind, if any. Used by UI status
+/// checks and, later, by the helper to avoid double-owning foreground work.
+pub async fn active_analysis_job(job_kind: String) -> Option<AnalysisJob> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("active_analysis_job: catalogue not initialized");
+            return None;
+        }
+    };
+
+    active_analysis_job_impl(conn, &job_kind)
+}
+
+/// Increment durable counters and heartbeat a job. Deltas are additive so the
+/// caller can write after each batch without re-reading global state.
+pub async fn update_analysis_job_progress(
+    id: i64,
+    processed_delta: u64,
+    completed_delta: u64,
+    skipped_delta: u64,
+    failed_delta: u64,
+    updated_delta: u64,
+    total_candidate_count: Option<u64>,
+) -> Option<AnalysisJob> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("update_analysis_job_progress: catalogue not initialized");
+            return None;
+        }
+    };
+
+    update_analysis_job_progress_impl(
+        conn,
+        id,
+        processed_delta,
+        completed_delta,
+        skipped_delta,
+        failed_delta,
+        updated_delta,
+        total_candidate_count,
+    )
+}
+
+/// Mark a running/queued job as cancellation-requested. Workers should poll
+/// this row between chunks and finish as `cancelled` when teardown completes.
+pub async fn request_cancel_analysis_job(id: i64) -> bool {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("request_cancel_analysis_job: catalogue not initialized");
+            return false;
+        }
+    };
+
+    request_cancel_analysis_job_impl(conn, id)
+}
+
+/// Close an analysis job with a terminal status.
+pub async fn finish_analysis_job(
+    id: i64,
+    status: String,
+    last_error: Option<String>,
+) -> Option<AnalysisJob> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("finish_analysis_job: catalogue not initialized");
+            return None;
+        }
+    };
+
+    finish_analysis_job_impl(conn, id, &status, last_error)
+}
+
 fn is_valid_focus_status(status: &str) -> bool {
     matches!(status, "complete" | "online_only" | "unreadable" | "failed")
 }
@@ -5904,6 +6320,154 @@ pub async fn merge_lightroom_videos(records: Vec<LightroomVideoRecord>) -> Merge
         }
     };
     merge_videos_into(conn, &records)
+}
+
+#[cfg(test)]
+mod analysis_job_tests {
+    use super::*;
+    use duckdb::Connection;
+
+    fn setup() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE SEQUENCE analysis_job_id_seq START 1;
+             CREATE TABLE analysis_jobs (
+                 id INTEGER PRIMARY KEY DEFAULT nextval('analysis_job_id_seq'),
+                 job_kind TEXT NOT NULL,
+                 scope_kind TEXT NOT NULL,
+                 scope_value TEXT,
+                 algorithm_version TEXT NOT NULL,
+                 analysis_run_id TEXT NOT NULL UNIQUE,
+                 status TEXT NOT NULL,
+                 total_candidate_count BIGINT NOT NULL,
+                 processed_count BIGINT NOT NULL,
+                 completed_count BIGINT NOT NULL,
+                 skipped_count BIGINT NOT NULL,
+                 failed_count BIGINT NOT NULL,
+                 updated_count BIGINT NOT NULL,
+                 cancel_requested BOOLEAN NOT NULL,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 started_at TIMESTAMP,
+                 updated_at TIMESTAMP,
+                 finished_at TIMESTAMP,
+                 last_error TEXT
+             );",
+        )
+        .expect("analysis job DDL");
+        conn
+    }
+
+    #[test]
+    fn create_job_initializes_durable_state() {
+        let conn = setup();
+        let job = create_analysis_job_impl(
+            &conn,
+            "focus_quality",
+            "whole_catalogue",
+            None,
+            "multi-subject-laplacian-v2",
+            "run-1",
+            42,
+        )
+        .expect("job created");
+
+        assert_eq!(job.id, 1);
+        assert_eq!(job.job_kind, "focus_quality");
+        assert_eq!(job.scope_kind, "whole_catalogue");
+        assert_eq!(job.algorithm_version, "multi-subject-laplacian-v2");
+        assert_eq!(job.analysis_run_id, "run-1");
+        assert_eq!(job.status, "queued");
+        assert_eq!(job.total_candidate_count, 42);
+        assert_eq!(job.processed_count, 0);
+        assert_eq!(job.completed_count, 0);
+        assert_eq!(job.skipped_count, 0);
+        assert_eq!(job.failed_count, 0);
+        assert_eq!(job.updated_count, 0);
+        assert!(!job.cancel_requested);
+        assert!(!job.created_at.is_empty());
+        assert!(job.started_at.is_none());
+        assert!(job.finished_at.is_none());
+
+        let active = active_analysis_job_impl(&conn, "focus_quality").expect("active job");
+        assert_eq!(active.id, job.id);
+    }
+
+    #[test]
+    fn progress_cancel_and_finish_follow_state_machine() {
+        let conn = setup();
+        let job = create_analysis_job_impl(
+            &conn,
+            "focus_quality",
+            "whole_catalogue",
+            Some("all".to_string()),
+            "v2",
+            "run-2",
+            10,
+        )
+        .expect("job created");
+
+        let progressed = update_analysis_job_progress_impl(&conn, job.id, 5, 3, 1, 1, 4, Some(12))
+            .expect("progress updated");
+        assert_eq!(progressed.status, "running");
+        assert_eq!(progressed.total_candidate_count, 12);
+        assert_eq!(progressed.processed_count, 5);
+        assert_eq!(progressed.completed_count, 3);
+        assert_eq!(progressed.skipped_count, 1);
+        assert_eq!(progressed.failed_count, 1);
+        assert_eq!(progressed.updated_count, 4);
+        assert!(progressed.started_at.is_some());
+        assert!(progressed.updated_at.is_some());
+
+        assert!(request_cancel_analysis_job_impl(&conn, job.id));
+        let cancelling = analysis_job_by_id_impl(&conn, job.id).expect("job row");
+        assert_eq!(cancelling.status, "cancelling");
+        assert!(cancelling.cancel_requested);
+
+        let finished =
+            finish_analysis_job_impl(&conn, job.id, "cancelled", None).expect("job finished");
+        assert_eq!(finished.status, "cancelled");
+        assert!(finished.cancel_requested);
+        assert!(finished.finished_at.is_some());
+        assert!(active_analysis_job_impl(&conn, "focus_quality").is_none());
+
+        assert!(update_analysis_job_progress_impl(&conn, job.id, 1, 1, 0, 0, 1, None).is_none());
+        assert!(!request_cancel_analysis_job_impl(&conn, job.id));
+        assert!(finish_analysis_job_impl(&conn, job.id, "completed", None).is_none());
+    }
+
+    #[test]
+    fn invalid_job_tokens_and_non_terminal_finish_are_rejected() {
+        let conn = setup();
+        assert!(create_analysis_job_impl(
+            &conn,
+            "Focus Quality",
+            "whole_catalogue",
+            None,
+            "v2",
+            "run-3",
+            0
+        )
+        .is_none());
+
+        let job = create_analysis_job_impl(
+            &conn,
+            "focus_quality",
+            "whole_catalogue",
+            None,
+            "v2",
+            "run-4",
+            0,
+        )
+        .expect("job created");
+        assert!(finish_analysis_job_impl(&conn, job.id, "running", None).is_none());
+        assert!(
+            finish_analysis_job_impl(&conn, job.id, "failed", Some("boom".to_string()))
+                .expect("failed terminal")
+                .last_error
+                .as_deref()
+                == Some("boom")
+        );
+    }
 }
 
 #[cfg(test)]

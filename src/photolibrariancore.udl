@@ -125,6 +125,41 @@ namespace photolibrariancore {
     [Async]
     u64 update_rating_for_ids(sequence<i64> ids, u32 rating);
 
+    // ---- Durable analysis jobs / background enrichment coordinator ----
+    // Generic job rows used by intelligent culling now and by the future
+    // background helper. The current focus queue remains image-column-derived;
+    // these rows track the run identity, scope, counters, cancel request, and
+    // terminal status across app/helper process boundaries.
+    [Async]
+    AnalysisJob? create_analysis_job(
+        string job_kind,
+        string scope_kind,
+        string? scope_value,
+        string algorithm_version,
+        string analysis_run_id,
+        u64 total_candidate_count
+    );
+
+    [Async]
+    AnalysisJob? active_analysis_job(string job_kind);
+
+    [Async]
+    AnalysisJob? update_analysis_job_progress(
+        i64 id,
+        u64 processed_delta,
+        u64 completed_delta,
+        u64 skipped_delta,
+        u64 failed_delta,
+        u64 updated_delta,
+        u64? total_candidate_count
+    );
+
+    [Async]
+    boolean request_cancel_analysis_job(i64 id);
+
+    [Async]
+    AnalysisJob? finish_analysis_job(i64 id, string status, string? last_error);
+
     // ---- Keyword system (Session 45; Docs/DESIGN-Keyword-System.md) ----
     // Hierarchical keywords in a single `keyword` table. assign materializes a
     // path's ancestor chain (one row per level) for each image; remove/restore
@@ -576,6 +611,28 @@ dictionary FocusAnalysisResult {
     f64? focus_saliency_score = null;
     f64? focus_animal_pose_score = null;
     f64? focus_whole_image_score = null;
+};
+
+dictionary AnalysisJob {
+    i64 id;
+    string job_kind;
+    string scope_kind;
+    string? scope_value;
+    string algorithm_version;
+    string analysis_run_id;
+    string status;
+    u64 total_candidate_count;
+    u64 processed_count;
+    u64 completed_count;
+    u64 skipped_count;
+    u64 failed_count;
+    u64 updated_count;
+    boolean cancel_requested;
+    string created_at;
+    string? started_at;
+    string? updated_at;
+    string? finished_at;
+    string? last_error;
 };
 
 // One directory's OWN image tally (S65, Sources sidebar) — directory_path is

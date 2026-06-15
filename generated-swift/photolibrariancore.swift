@@ -578,6 +578,128 @@ fileprivate struct FfiConverterString: FfiConverter {
 }
 
 
+public struct AnalysisJob: Equatable, Hashable {
+    public var id: Int64
+    public var jobKind: String
+    public var scopeKind: String
+    public var scopeValue: String?
+    public var algorithmVersion: String
+    public var analysisRunId: String
+    public var status: String
+    public var totalCandidateCount: UInt64
+    public var processedCount: UInt64
+    public var completedCount: UInt64
+    public var skippedCount: UInt64
+    public var failedCount: UInt64
+    public var updatedCount: UInt64
+    public var cancelRequested: Bool
+    public var createdAt: String
+    public var startedAt: String?
+    public var updatedAt: String?
+    public var finishedAt: String?
+    public var lastError: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: Int64, jobKind: String, scopeKind: String, scopeValue: String?, algorithmVersion: String, analysisRunId: String, status: String, totalCandidateCount: UInt64, processedCount: UInt64, completedCount: UInt64, skippedCount: UInt64, failedCount: UInt64, updatedCount: UInt64, cancelRequested: Bool, createdAt: String, startedAt: String?, updatedAt: String?, finishedAt: String?, lastError: String?) {
+        self.id = id
+        self.jobKind = jobKind
+        self.scopeKind = scopeKind
+        self.scopeValue = scopeValue
+        self.algorithmVersion = algorithmVersion
+        self.analysisRunId = analysisRunId
+        self.status = status
+        self.totalCandidateCount = totalCandidateCount
+        self.processedCount = processedCount
+        self.completedCount = completedCount
+        self.skippedCount = skippedCount
+        self.failedCount = failedCount
+        self.updatedCount = updatedCount
+        self.cancelRequested = cancelRequested
+        self.createdAt = createdAt
+        self.startedAt = startedAt
+        self.updatedAt = updatedAt
+        self.finishedAt = finishedAt
+        self.lastError = lastError
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension AnalysisJob: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAnalysisJob: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AnalysisJob {
+        return
+            try AnalysisJob(
+                id: FfiConverterInt64.read(from: &buf), 
+                jobKind: FfiConverterString.read(from: &buf), 
+                scopeKind: FfiConverterString.read(from: &buf), 
+                scopeValue: FfiConverterOptionString.read(from: &buf), 
+                algorithmVersion: FfiConverterString.read(from: &buf), 
+                analysisRunId: FfiConverterString.read(from: &buf), 
+                status: FfiConverterString.read(from: &buf), 
+                totalCandidateCount: FfiConverterUInt64.read(from: &buf), 
+                processedCount: FfiConverterUInt64.read(from: &buf), 
+                completedCount: FfiConverterUInt64.read(from: &buf), 
+                skippedCount: FfiConverterUInt64.read(from: &buf), 
+                failedCount: FfiConverterUInt64.read(from: &buf), 
+                updatedCount: FfiConverterUInt64.read(from: &buf), 
+                cancelRequested: FfiConverterBool.read(from: &buf), 
+                createdAt: FfiConverterString.read(from: &buf), 
+                startedAt: FfiConverterOptionString.read(from: &buf), 
+                updatedAt: FfiConverterOptionString.read(from: &buf), 
+                finishedAt: FfiConverterOptionString.read(from: &buf), 
+                lastError: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AnalysisJob, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.id, into: &buf)
+        FfiConverterString.write(value.jobKind, into: &buf)
+        FfiConverterString.write(value.scopeKind, into: &buf)
+        FfiConverterOptionString.write(value.scopeValue, into: &buf)
+        FfiConverterString.write(value.algorithmVersion, into: &buf)
+        FfiConverterString.write(value.analysisRunId, into: &buf)
+        FfiConverterString.write(value.status, into: &buf)
+        FfiConverterUInt64.write(value.totalCandidateCount, into: &buf)
+        FfiConverterUInt64.write(value.processedCount, into: &buf)
+        FfiConverterUInt64.write(value.completedCount, into: &buf)
+        FfiConverterUInt64.write(value.skippedCount, into: &buf)
+        FfiConverterUInt64.write(value.failedCount, into: &buf)
+        FfiConverterUInt64.write(value.updatedCount, into: &buf)
+        FfiConverterBool.write(value.cancelRequested, into: &buf)
+        FfiConverterString.write(value.createdAt, into: &buf)
+        FfiConverterOptionString.write(value.startedAt, into: &buf)
+        FfiConverterOptionString.write(value.updatedAt, into: &buf)
+        FfiConverterOptionString.write(value.finishedAt, into: &buf)
+        FfiConverterOptionString.write(value.lastError, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAnalysisJob_lift(_ buf: RustBuffer) throws -> AnalysisJob {
+    return try FfiConverterTypeAnalysisJob.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAnalysisJob_lower(_ value: AnalysisJob) -> RustBuffer {
+    return FfiConverterTypeAnalysisJob.lower(value)
+}
+
+
 public struct CaptureDayImageCount: Equatable, Hashable {
     public var day: String
     public var imageCount: Int64
@@ -2377,6 +2499,30 @@ fileprivate struct FfiConverterOptionInt32: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
+    typealias SwiftType = UInt64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
     typealias SwiftType = Int64?
 
@@ -2465,6 +2611,30 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeAnalysisJob: FfiConverterRustBuffer {
+    typealias SwiftType = AnalysisJob?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeAnalysisJob.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeAnalysisJob.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -3013,6 +3183,21 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
         print("uniffiFutureContinuationCallback invalid handle")
     }
 }
+public func activeAnalysisJob(jobKind: String)async  -> AnalysisJob?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_active_analysis_job(FfiConverterString.lower(jobKind)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeAnalysisJob.lift,
+            errorHandler: nil
+            
+        )
+}
 public func addImagesToCollections(ids: [Int64], labels: [String])async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
@@ -3125,6 +3310,21 @@ public func countQueryImages(predicates: [QueryPredicate], connectors: [Connecto
             
         )
 }
+public func createAnalysisJob(jobKind: String, scopeKind: String, scopeValue: String?, algorithmVersion: String, analysisRunId: String, totalCandidateCount: UInt64)async  -> AnalysisJob?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_create_analysis_job(FfiConverterString.lower(jobKind),FfiConverterString.lower(scopeKind),FfiConverterOptionString.lower(scopeValue),FfiConverterString.lower(algorithmVersion),FfiConverterString.lower(analysisRunId),FfiConverterUInt64.lower(totalCandidateCount)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeAnalysisJob.lift,
+            errorHandler: nil
+            
+        )
+}
 public func deleteSavedQuery(id: Int64)async  -> Bool  {
     return
         try!  await uniffiRustCallAsync(
@@ -3226,6 +3426,21 @@ public func findCounterpartImage(filePath: String)async  -> ImageRecord?  {
             completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeImageRecord.lift,
+            errorHandler: nil
+            
+        )
+}
+public func finishAnalysisJob(id: Int64, status: String, lastError: String?)async  -> AnalysisJob?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_finish_analysis_job(FfiConverterInt64.lower(id),FfiConverterString.lower(status),FfiConverterOptionString.lower(lastError)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeAnalysisJob.lift,
             errorHandler: nil
             
         )
@@ -3804,6 +4019,21 @@ public func reparentKeyword(sourcePath: [String], newParent: [String])async  -> 
             
         )
 }
+public func requestCancelAnalysisJob(id: Int64)async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_request_cancel_analysis_job(FfiConverterInt64.lower(id)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_i8,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_i8,
+            freeFunc: ffi_photolibrariancore_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
+        )
+}
 public func restoreKeywordForIds(ids: [Int64], path: String)async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
@@ -3830,6 +4060,21 @@ public func saveQuery(name: String, predicates: [QueryPredicate], connectors: [C
             completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeSavedQueryInfo.lift,
+            errorHandler: nil
+            
+        )
+}
+public func updateAnalysisJobProgress(id: Int64, processedDelta: UInt64, completedDelta: UInt64, skippedDelta: UInt64, failedDelta: UInt64, updatedDelta: UInt64, totalCandidateCount: UInt64?)async  -> AnalysisJob?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_update_analysis_job_progress(FfiConverterInt64.lower(id),FfiConverterUInt64.lower(processedDelta),FfiConverterUInt64.lower(completedDelta),FfiConverterUInt64.lower(skippedDelta),FfiConverterUInt64.lower(failedDelta),FfiConverterUInt64.lower(updatedDelta),FfiConverterOptionUInt64.lower(totalCandidateCount)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeAnalysisJob.lift,
             errorHandler: nil
             
         )
@@ -3985,6 +4230,9 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_active_analysis_job() != 59426) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_add_images_to_collections() != 9062) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4009,6 +4257,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_count_query_images() != 13157) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_create_analysis_job() != 35443) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_delete_saved_query() != 60302) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4028,6 +4279,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_find_counterpart_image() != 51699) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_finish_analysis_job() != 40102) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_focus_analysis_candidate_count() != 30371) {
@@ -4150,10 +4404,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_reparent_keyword() != 9760) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_request_cancel_analysis_job() != 55113) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_restore_keyword_for_ids() != 5225) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_save_query() != 43330) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_update_analysis_job_progress() != 28376) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_color_label_for_ids() != 9065) {
