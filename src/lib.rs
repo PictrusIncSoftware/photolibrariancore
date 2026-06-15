@@ -3194,6 +3194,14 @@ fn predicate_to_sql(p: &QueryPredicate) -> String
             Some(v) if !v.is_empty() => format!("(creator = '{}')", v.replace('\'', "''")),
             _ => bad(),
         },
+        // Codec (S75 — Query Builder video fields): exact match against the
+        // canonical codec string ("hevc" / "h264" / "prores"), dropdown-sourced
+        // like the other metadata subjects. A NULL column (a still) never matches.
+        "codec_is" => match p.value.as_deref()
+        {
+            Some(v) if !v.is_empty() => format!("(video_codec = '{}')", v.replace('\'', "''")),
+            _ => bad(),
+        },
         // Lens "contains" — free text, case-INDEPENDENT (ILIKE), wildcard-
         // escaped so a literal %/_ matches itself. No autofill by design:
         // the user types a fragment, not an existing value (Richard, S63).
@@ -3212,6 +3220,30 @@ fn predicate_to_sql(p: &QueryPredicate) -> String
         "aperture_num" => numeric_predicate_sql(p, "aperture"),
         "shutter_num" => numeric_predicate_sql(p, "shutter_speed"),
         "focal_num" => numeric_predicate_sql(p, "focal_length"),
+        // Video numeric subjects (S75) — same machinery, new columns. Duration
+        // is seconds (DOUBLE); frame_rate is fps (DOUBLE). A NULL column (a
+        // still) never matches, exactly like the exposure numerics above.
+        "duration_num" => numeric_predicate_sql(p, "duration_seconds"),
+        "framerate_num" => numeric_predicate_sql(p, "frame_rate"),
+        // Video fixed-choice subjects (S75) — the `kind` alone is the predicate
+        // (no value/op), like rating_unrated / unflagged. Dynamic range is derived
+        // from the CICP transfer + Dolby Vision profile: HLG/HDR10 are transfer
+        // matches and DV is the presence of a profile (a still's NULL columns
+        // never match those). SDR = a video that is none of the HDR forms, so it
+        // carries an explicit `is_video` guard. Audio reads the tri-state
+        // has_audio (a still is NULL → excluded by both = TRUE / = FALSE). Live
+        // Photo is video-scoped on the shared content.identifier.
+        "dynrange_hlg" => "(color_transfer = 'arib-std-b67')".to_string(),
+        "dynrange_hdr10" => "(color_transfer = 'smpte2084')".to_string(),
+        "dynrange_dv" => "(dv_profile IS NOT NULL)".to_string(),
+        "dynrange_sdr" =>
+            "(is_video IS TRUE AND dv_profile IS NULL \
+              AND (color_transfer IS NULL OR color_transfer NOT IN ('arib-std-b67', 'smpte2084')))"
+                .to_string(),
+        "audio_present" => "(has_audio = TRUE)".to_string(),
+        "audio_absent" => "(has_audio = FALSE)".to_string(),
+        "livephoto_yes" => "(is_video IS TRUE AND live_photo_id IS NOT NULL)".to_string(),
+        "livephoto_no" => "(is_video IS TRUE AND live_photo_id IS NULL)".to_string(),
         other =>
         {
             eprintln!("Unknown query predicate kind '{}'", other);
@@ -4491,6 +4523,7 @@ pub async fn distinct_image_values(field: String) -> Vec<String>
         "camera_model" => "camera_model",
         "lens_model" => "lens_model",
         "creator" => "creator",
+        "video_codec" => "video_codec",  // S75 — Codec subject dropdown
         other =>
         {
             eprintln!("distinct_image_values: unknown field '{}'", other);
@@ -4550,6 +4583,8 @@ pub async fn distinct_numeric_values(field: String) -> Vec<f64>
         "aperture" => "aperture",
         "shutter_speed" => "shutter_speed",
         "focal_length" => "focal_length",
+        "duration_seconds" => "duration_seconds",  // S75 — Duration subject dropdown
+        "frame_rate" => "frame_rate",               // S75 — Frame rate subject dropdown
         other =>
         {
             eprintln!("distinct_numeric_values: unknown field '{}'", other);
@@ -6938,6 +6973,59 @@ mod query_builder_tests
         let mut fou = qp("flag_or_unflagged");
         fou.value = Some("pick".to_string());
         assert_eq!(predicate_to_sql(&fou), "(flag = 'pick' OR flag IS NULL)");
+    }
+
+    // S75 — Query Builder video fields. Duration / frame rate ride the shared
+    // numeric machinery on new columns; codec is an exact metadata match. Mirrors
+    // the existing numeric + metadata arms; checks the SQL, BETWEEN, quote-escape,
+    // and the (FALSE) backstop for a missing value/op.
+    #[test]
+    fn video_subject_atoms()
+    {
+        let mut dur = qp("duration_num");
+        dur.op = Some("gte".to_string());
+        dur.num = Some(60.0);
+        assert_eq!(predicate_to_sql(&dur), "(duration_seconds >= 60)");
+
+        let mut between = qp("duration_num");
+        between.op = Some("between".to_string());
+        between.num = Some(10.0);
+        between.num_end = Some(30.0);
+        assert_eq!(predicate_to_sql(&between), "(duration_seconds BETWEEN 10 AND 30)");
+
+        let mut fps = qp("framerate_num");
+        fps.op = Some("eq".to_string());
+        fps.num = Some(60.0);
+        assert_eq!(predicate_to_sql(&fps), "(frame_rate = 60)");
+
+        let mut codec = qp("codec_is");
+        codec.value = Some("hevc".to_string());
+        assert_eq!(predicate_to_sql(&codec), "(video_codec = 'hevc')");
+
+        // Single-quote escape — defensive parity with the other metadata arms.
+        let mut q = qp("codec_is");
+        q.value = Some("a'b".to_string());
+        assert_eq!(predicate_to_sql(&q), "(video_codec = 'a''b')");
+
+        // Missing value/op → the (FALSE) backstop.
+        assert_eq!(predicate_to_sql(&qp("codec_is")), "(FALSE)");
+        assert_eq!(predicate_to_sql(&qp("duration_num")), "(FALSE)");
+    }
+
+    // S75 — the video fixed-choice subjects (dynamic range / audio / live photo).
+    // Kind-only predicates: the kind alone is the SQL, no value/op. SDR and
+    // "not a live photo" carry an is_video guard so they never match a still.
+    #[test]
+    fn video_choice_atoms()
+    {
+        assert_eq!(predicate_to_sql(&qp("dynrange_hlg")), "(color_transfer = 'arib-std-b67')");
+        assert_eq!(predicate_to_sql(&qp("dynrange_hdr10")), "(color_transfer = 'smpte2084')");
+        assert_eq!(predicate_to_sql(&qp("dynrange_dv")), "(dv_profile IS NOT NULL)");
+        assert_eq!(predicate_to_sql(&qp("audio_present")), "(has_audio = TRUE)");
+        assert_eq!(predicate_to_sql(&qp("audio_absent")), "(has_audio = FALSE)");
+        assert_eq!(predicate_to_sql(&qp("livephoto_yes")), "(is_video IS TRUE AND live_photo_id IS NOT NULL)");
+        assert!(predicate_to_sql(&qp("dynrange_sdr")).contains("is_video IS TRUE"));
+        assert!(predicate_to_sql(&qp("livephoto_no")).contains("is_video IS TRUE"));
     }
 
     #[test]
