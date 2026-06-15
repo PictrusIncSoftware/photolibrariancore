@@ -276,7 +276,7 @@ RustBuffer uniffi_photolibrariancore_fn_func_classify_extension(RustBuffer ext, 
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_COLLECTION_LABELS
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_COLLECTION_LABELS
 uint64_t uniffi_photolibrariancore_fn_func_collection_labels(void
-    
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_COPY_KEYWORD_ROWS_FOR_IMAGE_PAIRS
@@ -516,6 +516,11 @@ uint64_t uniffi_photolibrariancore_fn_func_query_image_ids(RustBuffer predicates
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_QUERY_IMAGES
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_QUERY_IMAGES
 uint64_t uniffi_photolibrariancore_fn_func_query_images(RustBuffer predicates, RustBuffer connectors, uint32_t limit, uint32_t offset, int8_t apply_duplicate_filter, int8_t apply_raw_jpeg_collapse, RustBuffer media_type
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_RECOVER_INTERRUPTED_ANALYSIS_JOBS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_RECOVER_INTERRUPTED_ANALYSIS_JOBS
+uint64_t uniffi_photolibrariancore_fn_func_recover_interrupted_analysis_jobs(RustBuffer job_kind, RustBuffer terminal_status, RustBuffer last_error
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_RELOCATE_FILE_PATH_PREFIX
@@ -1196,6 +1201,11 @@ uint16_t uniffi_photolibrariancore_checksum_func_query_images(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_RECOVER_INTERRUPTED_ANALYSIS_JOBS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_RECOVER_INTERRUPTED_ANALYSIS_JOBS
+uint16_t uniffi_photolibrariancore_checksum_func_recover_interrupted_analysis_jobs(void
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_RELOCATE_FILE_PATH_PREFIX
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_RELOCATE_FILE_PATH_PREFIX
 uint16_t uniffi_photolibrariancore_checksum_func_relocate_file_path_prefix(void
@@ -1322,4 +1332,3 @@ uint32_t ffi_photolibrariancore_uniffi_contract_version(void
     
 );
 #endif
-

@@ -5004,6 +5004,40 @@ fn finish_analysis_job_impl(
     }
 }
 
+fn recover_interrupted_analysis_jobs_impl(
+    conn: &Connection,
+    job_kind: &str,
+    terminal_status: &str,
+    last_error: Option<String>,
+) -> u64 {
+    let job_kind = job_kind.trim();
+    let terminal_status = terminal_status.trim();
+    if !analysis_job_token_is_valid(job_kind)
+        || !is_valid_analysis_job_status(terminal_status)
+        || !is_terminal_analysis_job_status(terminal_status)
+    {
+        eprintln!("recover_interrupted_analysis_jobs: invalid recovery metadata");
+        return 0;
+    }
+
+    match conn.execute(
+        "UPDATE analysis_jobs
+         SET status = ?2,
+             cancel_requested = CASE WHEN ?2 = 'cancelled' THEN TRUE ELSE cancel_requested END,
+             updated_at = CURRENT_TIMESTAMP,
+             finished_at = CURRENT_TIMESTAMP,
+             last_error = ?3
+         WHERE job_kind = ?1 AND status IN ('queued', 'running', 'cancelling')",
+        params![job_kind, terminal_status, last_error],
+    ) {
+        Ok(n) => n as u64,
+        Err(e) => {
+            eprintln!("recover_interrupted_analysis_jobs: update failed: {}", e);
+            0
+        }
+    }
+}
+
 /// Create a durable analysis/enrichment job. The first caller is foreground
 /// focus analysis; the background helper will use the same row shape later.
 pub async fn create_analysis_job(
@@ -5112,6 +5146,26 @@ pub async fn finish_analysis_job(
     };
 
     finish_analysis_job_impl(conn, id, &status, last_error)
+}
+
+/// Terminalize non-owned jobs left active after an app/helper process exits.
+/// Foreground focus analysis currently recovers these as cancelled on launch;
+/// future background work can use the same primitive with a stricter policy.
+pub async fn recover_interrupted_analysis_jobs(
+    job_kind: String,
+    terminal_status: String,
+    last_error: Option<String>,
+) -> u64 {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("recover_interrupted_analysis_jobs: catalogue not initialized");
+            return 0;
+        }
+    };
+
+    recover_interrupted_analysis_jobs_impl(conn, &job_kind, &terminal_status, last_error)
 }
 
 fn is_valid_focus_status(status: &str) -> bool {
@@ -6648,6 +6702,123 @@ mod analysis_job_tests {
                 .as_deref()
                 == Some("boom")
         );
+    }
+
+    #[test]
+    fn recovery_terminalizes_interrupted_jobs_for_kind_only() {
+        let conn = setup();
+        let queued = create_analysis_job_impl(
+            &conn,
+            "focus_quality",
+            "selection",
+            None,
+            "v2",
+            "recover-queued",
+            10,
+        )
+        .expect("queued job");
+        let running = create_analysis_job_impl(
+            &conn,
+            "focus_quality",
+            "selection",
+            None,
+            "v2",
+            "recover-running",
+            10,
+        )
+        .expect("running job");
+        let cancelling = create_analysis_job_impl(
+            &conn,
+            "focus_quality",
+            "selection",
+            None,
+            "v2",
+            "recover-cancelling",
+            10,
+        )
+        .expect("cancelling job");
+        let completed = create_analysis_job_impl(
+            &conn,
+            "focus_quality",
+            "selection",
+            None,
+            "v2",
+            "recover-completed",
+            10,
+        )
+        .expect("completed job");
+        let other_kind = create_analysis_job_impl(
+            &conn,
+            "thumbnail_quality",
+            "whole_catalogue",
+            None,
+            "v1",
+            "recover-other-kind",
+            10,
+        )
+        .expect("other kind job");
+
+        update_analysis_job_progress_impl(&conn, running.id, 1, 1, 0, 0, 1, None)
+            .expect("running progress");
+        request_cancel_analysis_job_impl(&conn, cancelling.id);
+        finish_analysis_job_impl(&conn, completed.id, "completed", None).expect("completed");
+
+        let recovered = recover_interrupted_analysis_jobs_impl(
+            &conn,
+            "focus_quality",
+            "cancelled",
+            Some("Recovered after launch".to_string()),
+        );
+        assert_eq!(recovered, 3);
+
+        for id in [queued.id, running.id, cancelling.id] {
+            let job = analysis_job_by_id_impl(&conn, id).expect("recovered job");
+            assert_eq!(job.status, "cancelled");
+            assert!(job.cancel_requested);
+            assert!(job.finished_at.is_some());
+            assert_eq!(job.last_error.as_deref(), Some("Recovered after launch"));
+        }
+
+        let completed = analysis_job_by_id_impl(&conn, completed.id).expect("completed job");
+        assert_eq!(completed.status, "completed");
+        assert!(!completed.cancel_requested);
+        assert!(completed.last_error.is_none());
+
+        let other_kind = analysis_job_by_id_impl(&conn, other_kind.id).expect("other kind job");
+        assert_eq!(other_kind.status, "queued");
+        assert!(!other_kind.cancel_requested);
+        assert!(other_kind.finished_at.is_none());
+
+        assert!(active_analysis_job_impl(&conn, "focus_quality").is_none());
+        assert!(active_analysis_job_impl(&conn, "thumbnail_quality").is_some());
+    }
+
+    #[test]
+    fn recovery_rejects_invalid_kind_and_non_terminal_status() {
+        let conn = setup();
+        let job = create_analysis_job_impl(
+            &conn,
+            "focus_quality",
+            "selection",
+            None,
+            "v2",
+            "recover-invalid",
+            10,
+        )
+        .expect("job");
+
+        assert_eq!(
+            recover_interrupted_analysis_jobs_impl(&conn, "Focus Quality", "cancelled", None),
+            0
+        );
+        assert_eq!(
+            recover_interrupted_analysis_jobs_impl(&conn, "focus_quality", "running", None),
+            0
+        );
+
+        let job = analysis_job_by_id_impl(&conn, job.id).expect("job row");
+        assert_eq!(job.status, "queued");
+        assert!(job.finished_at.is_none());
     }
 }
 

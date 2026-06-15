@@ -160,6 +160,13 @@ namespace photolibrariancore {
     [Async]
     AnalysisJob? finish_analysis_job(i64 id, string status, string? last_error);
 
+    [Async]
+    u64 recover_interrupted_analysis_jobs(
+        string job_kind,
+        string terminal_status,
+        string? last_error
+    );
+
     // ---- Keyword system (Session 45; Docs/DESIGN-Keyword-System.md) ----
     // Hierarchical keywords in a single `keyword` table. assign materializes a
     // path's ancestor chain (one row per level) for each image; remove/restore

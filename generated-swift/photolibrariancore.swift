@@ -3195,7 +3195,7 @@ public func activeAnalysisJob(jobKind: String)async  -> AnalysisJob?  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeAnalysisJob.lift,
             errorHandler: nil
-            
+
         )
 }
 public func addImagesToCollections(ids: [Int64], labels: [String])async  -> UInt64  {
@@ -3210,7 +3210,6 @@ public func addImagesToCollections(ids: [Int64], labels: [String])async  -> UInt
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
         )
 }
 public func assignColorKeywordForIds(ids: [Int64], label: String)async  -> UInt64  {
@@ -3944,6 +3943,20 @@ public func queryImages(predicates: [QueryPredicate], connectors: [Connector], l
             
         )
 }
+public func recoverInterruptedAnalysisJobs(jobKind: String, terminalStatus: String, lastError: String?)async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_recover_interrupted_analysis_jobs(FfiConverterString.lower(jobKind),FfiConverterString.lower(terminalStatus),FfiConverterOptionString.lower(lastError)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+        )
+}
 public func relocateFilePathPrefix(oldPrefix: String, newPrefix: String)async  -> RelocateResult  {
     return
         try!  await uniffiRustCallAsync(
@@ -4417,6 +4430,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_query_images() != 21638) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_recover_interrupted_analysis_jobs() != 41065) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_relocate_file_path_prefix() != 30525) {
