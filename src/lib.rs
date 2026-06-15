@@ -2969,89 +2969,139 @@ fn focus_quality_columns(value: Option<&str>) -> Option<Vec<&'static str>> {
     }
 }
 
-fn focus_quality_value_union_sql(columns: &[&str]) -> String {
-    columns
-        .iter()
-        .map(|column| {
-            format!(
-                "SELECT {column} AS score FROM images WHERE {column} IS NOT NULL",
-                column = column
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" UNION ALL ")
-}
-
-fn focus_quality_threshold_sql(num: f64, columns: &[&str]) -> Option<String> {
-    if !num.is_finite() || num < 1.0 || num > 100.0 || num.fract() != 0.0 {
+fn focus_quality_bucket_from_num(num: f64) -> Option<u8> {
+    if !num.is_finite() || num.fract() != 0.0 {
         return None;
     }
-    let position = (num - 1.0) / 99.0;
-    let value_union = focus_quality_value_union_sql(columns);
+    if (1.0..=10.0).contains(&num) {
+        return Some(num as u8);
+    }
+    if (1.0..=100.0).contains(&num) {
+        return Some(((num / 10.0).ceil() as u8).clamp(1, 10));
+    }
+    None
+}
+
+fn focus_quality_bucket_threshold_sql(bucket: u8, column: &str) -> Option<String> {
+    if !(1..=10).contains(&bucket) {
+        return None;
+    }
+    let position = f64::from(bucket - 1) / 10.0;
     Some(format!(
-        "(SELECT MIN(score) + ({position}) * (MAX(score) - MIN(score)) \
-         FROM ({value_union}) focus_values)",
+        "(SELECT quantile_cont(score, {position}) \
+         FROM (SELECT {column} AS score FROM images WHERE {column} IS NOT NULL) focus_values)",
         position = position,
-        value_union = value_union
+        column = column
     ))
 }
 
-fn focus_quality_score_sql(columns: &[&str]) -> String {
-    if columns.len() == 1 {
-        return columns[0].to_string();
+fn focus_quality_threshold_criteria(value: &str) -> Option<Vec<(&'static str, u8)>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || !trimmed.contains('=') {
+        return None;
     }
 
-    format!(
-        "GREATEST({})",
-        columns
-            .iter()
-            .map(|column| format!("COALESCE({}, -1e308)", column))
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
+    let mut criteria = Vec::new();
+    for token in trimmed.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let mut parts = token.splitn(2, '=');
+        let basis = parts.next()?.trim();
+        let threshold = parts.next()?.trim().parse::<u8>().ok()?;
+        if !(1..=10).contains(&threshold) {
+            return None;
+        }
+        let column = focus_quality_column_for_basis(basis)?;
+        if !criteria.iter().any(|(existing, _)| existing == &column) {
+            criteria.push((column, threshold));
+        }
+    }
+
+    if criteria.is_empty() {
+        None
+    } else {
+        Some(criteria)
+    }
 }
 
-fn focus_quality_has_score_sql(columns: &[&str]) -> String {
-    columns
-        .iter()
-        .map(|column| format!("{} IS NOT NULL", column))
-        .collect::<Vec<_>>()
-        .join(" OR ")
+fn focus_quality_compare_sql(column: &str, op: &str, bucket: u8) -> Option<String> {
+    let threshold = focus_quality_bucket_threshold_sql(bucket, column)?;
+    let sym = sql_compare_op(op)?;
+    Some(format!(
+        "({column} IS NOT NULL AND {column} {sym} {threshold})",
+        column = column,
+        sym = sym,
+        threshold = threshold
+    ))
+}
+
+fn focus_quality_between_sql(column: &str, start: u8, end: u8) -> Option<String> {
+    let a = focus_quality_bucket_threshold_sql(start, column)?;
+    let b = focus_quality_bucket_threshold_sql(end, column)?;
+    Some(format!(
+        "({column} IS NOT NULL AND {column} BETWEEN LEAST({a}, {b}) AND GREATEST({a}, {b}))",
+        column = column,
+        a = a,
+        b = b
+    ))
 }
 
 fn focus_quality_predicate_sql(p: &QueryPredicate) -> String {
+    if let Some(value) = p.value.as_deref() {
+        if let Some(criteria) = focus_quality_threshold_criteria(value) {
+            let clauses = criteria
+                .into_iter()
+                .filter_map(|(column, bucket)| focus_quality_compare_sql(column, "gte", bucket))
+                .collect::<Vec<_>>();
+            return if clauses.is_empty() {
+                "(FALSE)".to_string()
+            } else {
+                format!("({})", clauses.join(" OR "))
+            };
+        }
+    }
+
     let Some(columns) = focus_quality_columns(p.value.as_deref()) else {
         return "(FALSE)".to_string();
     };
-    let score_sql = focus_quality_score_sql(&columns);
-    let has_score_sql = focus_quality_has_score_sql(&columns);
 
     match (p.op.as_deref(), p.num) {
         (Some("between"), Some(num)) => {
             let Some(end) = p.num_end else {
                 return "(FALSE)".to_string();
             };
-            let Some(a) = focus_quality_threshold_sql(num, &columns) else {
+            let Some(start_bucket) = focus_quality_bucket_from_num(num) else {
                 return "(FALSE)".to_string();
             };
-            let Some(b) = focus_quality_threshold_sql(end, &columns) else {
+            let Some(end_bucket) = focus_quality_bucket_from_num(end) else {
                 return "(FALSE)".to_string();
             };
-            format!(
-                "(({}) AND {} BETWEEN LEAST({}, {}) AND GREATEST({}, {}))",
-                has_score_sql, score_sql, a, b, a, b
-            )
+            let clauses = columns
+                .iter()
+                .filter_map(|column| focus_quality_between_sql(column, start_bucket, end_bucket))
+                .collect::<Vec<_>>();
+            if clauses.is_empty() {
+                "(FALSE)".to_string()
+            } else {
+                format!("({})", clauses.join(" OR "))
+            }
         }
-        (Some(op), Some(num)) => match sql_compare_op(op) {
-            Some(sym) => match focus_quality_threshold_sql(num, &columns) {
-                Some(threshold) => format!(
-                    "(({}) AND {} {} {})",
-                    has_score_sql, score_sql, sym, threshold
-                ),
-                None => "(FALSE)".to_string(),
-            },
-            None => "(FALSE)".to_string(),
-        },
+        (Some(op), Some(num)) => {
+            let Some(bucket) = focus_quality_bucket_from_num(num) else {
+                return "(FALSE)".to_string();
+            };
+            let clauses = columns
+                .iter()
+                .filter_map(|column| focus_quality_compare_sql(column, op, bucket))
+                .collect::<Vec<_>>();
+            if clauses.is_empty() {
+                "(FALSE)".to_string()
+            } else {
+                format!("({})", clauses.join(" OR "))
+            }
+        }
         _ => "(FALSE)".to_string(),
     }
 }
@@ -6450,12 +6500,20 @@ mod keyword_tests {
             predicate_to_sql(&num("focus_num", "gte", 120.0, None)),
             "(focus_score >= 120)"
         );
-        assert!(predicate_to_sql(&num("focus_quality", "gte", 80.0, None))
-            .contains("MIN(score) + (0.797979797979798) * (MAX(score) - MIN(score))"));
+        assert!(predicate_to_sql(&num("focus_quality", "gte", 8.0, None))
+            .contains("quantile_cont(score, 0.7)"));
         assert!(
-            predicate_to_sql(&num("focus_quality", "between", 40.0, Some(80.0)))
+            predicate_to_sql(&num("focus_quality", "between", 4.0, Some(8.0)))
                 .starts_with("((focus_human_score IS NOT NULL")
         );
+        let mut per_basis_focus = num("focus_quality", "gte", 0.0, None);
+        per_basis_focus.num = None;
+        per_basis_focus.value = Some("human_face=7,whole_image=3".to_string());
+        let per_basis_sql = predicate_to_sql(&per_basis_focus);
+        assert!(per_basis_sql.contains("focus_human_score IS NOT NULL"));
+        assert!(per_basis_sql.contains("quantile_cont(score, 0.6)"));
+        assert!(per_basis_sql.contains("focus_whole_image_score IS NOT NULL"));
+        assert!(per_basis_sql.contains("quantile_cont(score, 0.2)"));
         assert_eq!(
             predicate_to_sql(&num("focus_quality", "gte", 80.5, None)),
             "(FALSE)"
@@ -6520,14 +6578,14 @@ mod keyword_tests {
             stars: None,
             value: None,
             op: Some("gte".to_string()),
-            num: Some(50.0),
+            num: Some(5.0),
             num_end: None,
         };
         let sql = format!(
             "SELECT COUNT(*) FROM images WHERE {}",
             predicate_to_sql(&pred)
         );
-        let count: i64 = conn.query_row(&sql, [], |r| r.get(0)).expect("count 50+");
+        let count: i64 = conn.query_row(&sql, [], |r| r.get(0)).expect("count 5+");
         assert_eq!(count, 2);
 
         let top = QueryPredicate {
@@ -6537,7 +6595,7 @@ mod keyword_tests {
             stars: None,
             value: None,
             op: Some("gte".to_string()),
-            num: Some(100.0),
+            num: Some(10.0),
             num_end: None,
         };
         let top_sql = format!(
@@ -6546,7 +6604,7 @@ mod keyword_tests {
         );
         let top_count: i64 = conn
             .query_row(&top_sql, [], |r| r.get(0))
-            .expect("count 100");
+            .expect("count 10");
         assert_eq!(top_count, 1);
 
         conn.execute("UPDATE images SET focus_animal_score = 90 WHERE id = 1", [])
@@ -6556,9 +6614,9 @@ mod keyword_tests {
             day: None,
             day_end: None,
             stars: None,
-            value: Some("animal".to_string()),
+            value: Some("animal=10".to_string()),
             op: Some("gte".to_string()),
-            num: Some(100.0),
+            num: None,
             num_end: None,
         };
         let animal_sql = format!(
@@ -6567,7 +6625,7 @@ mod keyword_tests {
         );
         let animal_count: i64 = conn
             .query_row(&animal_sql, [], |r| r.get(0))
-            .expect("count animal 100");
+            .expect("count animal 10");
         assert_eq!(animal_count, 1);
     }
 
