@@ -862,15 +862,27 @@ public struct FocusAnalysisResult: Equatable, Hashable {
     public var focusBasis: String?
     public var algorithmVersion: String
     public var status: String
+    public var focusHumanScore: Double?
+    public var focusAnimalScore: Double?
+    public var focusForegroundScore: Double?
+    public var focusSaliencyScore: Double?
+    public var focusAnimalPoseScore: Double?
+    public var focusWholeImageScore: Double?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: Int64, focusScore: Double?, focusBasis: String?, algorithmVersion: String, status: String) {
+    public init(id: Int64, focusScore: Double?, focusBasis: String?, algorithmVersion: String, status: String, focusHumanScore: Double? = nil, focusAnimalScore: Double? = nil, focusForegroundScore: Double? = nil, focusSaliencyScore: Double? = nil, focusAnimalPoseScore: Double? = nil, focusWholeImageScore: Double? = nil) {
         self.id = id
         self.focusScore = focusScore
         self.focusBasis = focusBasis
         self.algorithmVersion = algorithmVersion
         self.status = status
+        self.focusHumanScore = focusHumanScore
+        self.focusAnimalScore = focusAnimalScore
+        self.focusForegroundScore = focusForegroundScore
+        self.focusSaliencyScore = focusSaliencyScore
+        self.focusAnimalPoseScore = focusAnimalPoseScore
+        self.focusWholeImageScore = focusWholeImageScore
     }
 
     
@@ -893,7 +905,13 @@ public struct FfiConverterTypeFocusAnalysisResult: FfiConverterRustBuffer {
                 focusScore: FfiConverterOptionDouble.read(from: &buf), 
                 focusBasis: FfiConverterOptionString.read(from: &buf), 
                 algorithmVersion: FfiConverterString.read(from: &buf), 
-                status: FfiConverterString.read(from: &buf)
+                status: FfiConverterString.read(from: &buf), 
+                focusHumanScore: FfiConverterOptionDouble.read(from: &buf), 
+                focusAnimalScore: FfiConverterOptionDouble.read(from: &buf), 
+                focusForegroundScore: FfiConverterOptionDouble.read(from: &buf), 
+                focusSaliencyScore: FfiConverterOptionDouble.read(from: &buf), 
+                focusAnimalPoseScore: FfiConverterOptionDouble.read(from: &buf), 
+                focusWholeImageScore: FfiConverterOptionDouble.read(from: &buf)
         )
     }
 
@@ -903,6 +921,12 @@ public struct FfiConverterTypeFocusAnalysisResult: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.focusBasis, into: &buf)
         FfiConverterString.write(value.algorithmVersion, into: &buf)
         FfiConverterString.write(value.status, into: &buf)
+        FfiConverterOptionDouble.write(value.focusHumanScore, into: &buf)
+        FfiConverterOptionDouble.write(value.focusAnimalScore, into: &buf)
+        FfiConverterOptionDouble.write(value.focusForegroundScore, into: &buf)
+        FfiConverterOptionDouble.write(value.focusSaliencyScore, into: &buf)
+        FfiConverterOptionDouble.write(value.focusAnimalPoseScore, into: &buf)
+        FfiConverterOptionDouble.write(value.focusWholeImageScore, into: &buf)
     }
 }
 
@@ -3202,6 +3226,21 @@ public func findCounterpartImage(filePath: String)async  -> ImageRecord?  {
             
         )
 }
+public func focusAnalysisCandidateCount(algorithmVersion: String)async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_focus_analysis_candidate_count(FfiConverterString.lower(algorithmVersion)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func focusAnalysisCandidates(limit: UInt32, algorithmVersion: String)async  -> [FocusAnalysisCandidate]  {
     return
         try!  await uniffiRustCallAsync(
@@ -3985,6 +4024,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_find_counterpart_image() != 51699) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_focus_analysis_candidate_count() != 14848) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_focus_analysis_candidates() != 37293) {

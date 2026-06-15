@@ -215,6 +215,12 @@ pub struct FocusAnalysisResult {
     pub focus_basis: Option<String>,
     pub algorithm_version: String,
     pub status: String,
+    pub focus_human_score: Option<f64>,
+    pub focus_animal_score: Option<f64>,
+    pub focus_foreground_score: Option<f64>,
+    pub focus_saliency_score: Option<f64>,
+    pub focus_animal_pose_score: Option<f64>,
+    pub focus_whole_image_score: Option<f64>,
 }
 
 /// Recognized RAW image file extensions
@@ -664,7 +670,13 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             -- untouched; focus analysis is advisory and filterable, never an
             -- automatic rating/flag/color write.
             focus_score DOUBLE,              -- Laplacian-variance score; higher = sharper
-            focus_basis TEXT,                -- whole_image / face / subject / unknown
+            focus_basis TEXT,                -- human_face / animal / foreground / saliency / animal_pose / whole_image / unknown
+            focus_human_score DOUBLE,
+            focus_animal_score DOUBLE,
+            focus_foreground_score DOUBLE,
+            focus_saliency_score DOUBLE,
+            focus_animal_pose_score DOUBLE,
+            focus_whole_image_score DOUBLE,
             focus_algorithm_version TEXT,    -- e.g. "laplacian-v1"
             focus_analysis_status TEXT,      -- complete / online_only / unreadable / failed
             focus_scored_at TIMESTAMP,
@@ -724,6 +736,12 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         -- naturally form the pending analysis queue.
         ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_score DOUBLE;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_basis TEXT;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_human_score DOUBLE;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_animal_score DOUBLE;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_foreground_score DOUBLE;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_saliency_score DOUBLE;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_animal_pose_score DOUBLE;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_whole_image_score DOUBLE;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_algorithm_version TEXT;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_analysis_status TEXT;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_scored_at TIMESTAMP;
@@ -762,6 +780,12 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         CREATE INDEX IF NOT EXISTS idx_flag ON images(flag);
         CREATE INDEX IF NOT EXISTS idx_color_label ON images(color_label);
         CREATE INDEX IF NOT EXISTS idx_focus_score ON images(focus_score);
+        CREATE INDEX IF NOT EXISTS idx_focus_human_score ON images(focus_human_score);
+        CREATE INDEX IF NOT EXISTS idx_focus_animal_score ON images(focus_animal_score);
+        CREATE INDEX IF NOT EXISTS idx_focus_foreground_score ON images(focus_foreground_score);
+        CREATE INDEX IF NOT EXISTS idx_focus_saliency_score ON images(focus_saliency_score);
+        CREATE INDEX IF NOT EXISTS idx_focus_animal_pose_score ON images(focus_animal_pose_score);
+        CREATE INDEX IF NOT EXISTS idx_focus_whole_image_score ON images(focus_whole_image_score);
         CREATE INDEX IF NOT EXISTS idx_focus_analysis_status ON images(focus_analysis_status);
 
         -- === Keyword system (Session 45; Docs/DESIGN-Keyword-System.md) ===
@@ -2891,38 +2915,136 @@ fn numeric_predicate_sql(p: &QueryPredicate, column: &str) -> String {
     }
 }
 
-fn focus_quality_threshold_sql(num: f64) -> Option<String> {
+fn focus_quality_column_for_basis(basis: &str) -> Option<&'static str> {
+    match basis {
+        "human_face" | "face" => Some("focus_human_score"),
+        "animal" | "dog_cat" => Some("focus_animal_score"),
+        "foreground" | "subject" => Some("focus_foreground_score"),
+        "saliency" => Some("focus_saliency_score"),
+        "animal_pose" => Some("focus_animal_pose_score"),
+        "whole_image" => Some("focus_whole_image_score"),
+        _ => None,
+    }
+}
+
+fn focus_quality_default_columns() -> Vec<&'static str> {
+    vec![
+        "focus_human_score",
+        "focus_animal_score",
+        "focus_foreground_score",
+        "focus_saliency_score",
+        "focus_animal_pose_score",
+        "focus_whole_image_score",
+    ]
+}
+
+fn focus_quality_columns(value: Option<&str>) -> Option<Vec<&'static str>> {
+    let Some(value) = value else {
+        return Some(focus_quality_default_columns());
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Some(focus_quality_default_columns());
+    }
+
+    let mut columns = Vec::new();
+    for token in trimmed.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let column = focus_quality_column_for_basis(token)?;
+        if !columns.contains(&column) {
+            columns.push(column);
+        }
+    }
+
+    if columns.is_empty() {
+        None
+    } else {
+        Some(columns)
+    }
+}
+
+fn focus_quality_value_union_sql(columns: &[&str]) -> String {
+    columns
+        .iter()
+        .map(|column| {
+            format!(
+                "SELECT {column} AS score FROM images WHERE {column} IS NOT NULL",
+                column = column
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ")
+}
+
+fn focus_quality_threshold_sql(num: f64, columns: &[&str]) -> Option<String> {
     if !num.is_finite() || num < 1.0 || num > 100.0 || num.fract() != 0.0 {
         return None;
     }
     let position = (num - 1.0) / 99.0;
+    let value_union = focus_quality_value_union_sql(columns);
     Some(format!(
-        "(SELECT MIN(focus_score) + ({}) * (MAX(focus_score) - MIN(focus_score)) \
-         FROM images WHERE focus_score IS NOT NULL)",
-        position
+        "(SELECT MIN(score) + ({position}) * (MAX(score) - MIN(score)) \
+         FROM ({value_union}) focus_values)",
+        position = position,
+        value_union = value_union
     ))
 }
 
+fn focus_quality_score_sql(columns: &[&str]) -> String {
+    if columns.len() == 1 {
+        return columns[0].to_string();
+    }
+
+    format!(
+        "GREATEST({})",
+        columns
+            .iter()
+            .map(|column| format!("COALESCE({}, -1e308)", column))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn focus_quality_has_score_sql(columns: &[&str]) -> String {
+    columns
+        .iter()
+        .map(|column| format!("{} IS NOT NULL", column))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
 fn focus_quality_predicate_sql(p: &QueryPredicate) -> String {
+    let Some(columns) = focus_quality_columns(p.value.as_deref()) else {
+        return "(FALSE)".to_string();
+    };
+    let score_sql = focus_quality_score_sql(&columns);
+    let has_score_sql = focus_quality_has_score_sql(&columns);
+
     match (p.op.as_deref(), p.num) {
         (Some("between"), Some(num)) => {
             let Some(end) = p.num_end else {
                 return "(FALSE)".to_string();
             };
-            let Some(a) = focus_quality_threshold_sql(num) else {
+            let Some(a) = focus_quality_threshold_sql(num, &columns) else {
                 return "(FALSE)".to_string();
             };
-            let Some(b) = focus_quality_threshold_sql(end) else {
+            let Some(b) = focus_quality_threshold_sql(end, &columns) else {
                 return "(FALSE)".to_string();
             };
             format!(
-                "(focus_score BETWEEN LEAST({}, {}) AND GREATEST({}, {}))",
-                a, b, a, b
+                "(({}) AND {} BETWEEN LEAST({}, {}) AND GREATEST({}, {}))",
+                has_score_sql, score_sql, a, b, a, b
             )
         }
         (Some(op), Some(num)) => match sql_compare_op(op) {
-            Some(sym) => match focus_quality_threshold_sql(num) {
-                Some(threshold) => format!("(focus_score {} {})", sym, threshold),
+            Some(sym) => match focus_quality_threshold_sql(num, &columns) {
+                Some(threshold) => format!(
+                    "(({}) AND {} {} {})",
+                    has_score_sql, score_sql, sym, threshold
+                ),
                 None => "(FALSE)".to_string(),
             },
             None => "(FALSE)".to_string(),
@@ -4528,7 +4650,22 @@ fn is_valid_focus_status(status: &str) -> bool {
 }
 
 fn is_valid_focus_basis(basis: &str) -> bool {
-    matches!(basis, "whole_image" | "face" | "subject" | "unknown")
+    matches!(
+        basis,
+        "human_face"
+            | "face"
+            | "animal"
+            | "foreground"
+            | "subject"
+            | "saliency"
+            | "animal_pose"
+            | "whole_image"
+            | "unknown"
+    )
+}
+
+fn focus_score_is_valid(score: Option<f64>) -> bool {
+    score.map(|score| score.is_finite()).unwrap_or(true)
 }
 
 /// Return a narrow page of still-image rows whose focus analysis is missing or
@@ -4584,6 +4721,39 @@ pub async fn focus_analysis_candidates(
     }
 }
 
+/// Count still-image rows whose focus analysis is missing or stale for the
+/// requested algorithm version. This lets the Swift status bar show a
+/// determinate progress bar while analysis runs.
+pub async fn focus_analysis_candidate_count(algorithm_version: String) -> u64 {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    match conn.query_row(
+        "SELECT COUNT(*)
+         FROM images
+         WHERE is_video IS NOT TRUE
+           AND (
+                focus_analysis_status IS NULL
+                OR focus_algorithm_version IS NULL
+                OR focus_algorithm_version <> ?1
+           )",
+        params![algorithm_version],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(count) => count.max(0) as u64,
+        Err(e) => {
+            eprintln!("focus_analysis_candidate_count: query {}", e);
+            0
+        }
+    }
+}
+
 /// Batch writeback for focus-analysis results. Returns the number of rows updated.
 pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) -> u64 {
     if results.is_empty() {
@@ -4614,15 +4784,20 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
             let _ = conn.execute_batch("ROLLBACK;");
             return 0;
         }
-        if let Some(score) = result.focus_score {
-            if !score.is_finite() {
-                eprintln!(
-                    "update_focus_analysis_results: non-finite score for id {}",
-                    result.id
-                );
-                let _ = conn.execute_batch("ROLLBACK;");
-                return 0;
-            }
+        if !focus_score_is_valid(result.focus_score)
+            || !focus_score_is_valid(result.focus_human_score)
+            || !focus_score_is_valid(result.focus_animal_score)
+            || !focus_score_is_valid(result.focus_foreground_score)
+            || !focus_score_is_valid(result.focus_saliency_score)
+            || !focus_score_is_valid(result.focus_animal_pose_score)
+            || !focus_score_is_valid(result.focus_whole_image_score)
+        {
+            eprintln!(
+                "update_focus_analysis_results: non-finite score for id {}",
+                result.id
+            );
+            let _ = conn.execute_batch("ROLLBACK;");
+            return 0;
         }
         if let Some(basis) = result.focus_basis.as_deref() {
             if !is_valid_focus_basis(basis) {
@@ -4637,20 +4812,62 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
         } else {
             None
         };
+        let human_score = if result.status == "complete" {
+            result.focus_human_score
+        } else {
+            None
+        };
+        let animal_score = if result.status == "complete" {
+            result.focus_animal_score
+        } else {
+            None
+        };
+        let foreground_score = if result.status == "complete" {
+            result.focus_foreground_score
+        } else {
+            None
+        };
+        let saliency_score = if result.status == "complete" {
+            result.focus_saliency_score
+        } else {
+            None
+        };
+        let animal_pose_score = if result.status == "complete" {
+            result.focus_animal_pose_score
+        } else {
+            None
+        };
+        let whole_image_score = if result.status == "complete" {
+            result.focus_whole_image_score
+        } else {
+            None
+        };
         let basis = result.focus_basis.unwrap_or_else(|| "unknown".to_string());
 
         match conn.execute(
             "UPDATE images
              SET focus_score = ?2,
                  focus_basis = ?3,
-                 focus_algorithm_version = ?4,
-                 focus_analysis_status = ?5,
+                 focus_human_score = ?4,
+                 focus_animal_score = ?5,
+                 focus_foreground_score = ?6,
+                 focus_saliency_score = ?7,
+                 focus_animal_pose_score = ?8,
+                 focus_whole_image_score = ?9,
+                 focus_algorithm_version = ?10,
+                 focus_analysis_status = ?11,
                  focus_scored_at = CURRENT_TIMESTAMP
              WHERE id = ?1",
             params![
                 result.id,
                 score,
                 basis,
+                human_score,
+                animal_score,
+                foreground_score,
+                saliency_score,
+                animal_pose_score,
+                whole_image_score,
                 result.algorithm_version,
                 result.status,
             ],
@@ -6200,14 +6417,11 @@ mod keyword_tests {
             predicate_to_sql(&num("focus_num", "gte", 120.0, None)),
             "(focus_score >= 120)"
         );
-        assert!(
-            predicate_to_sql(&num("focus_quality", "gte", 80.0, None)).contains(
-                "MIN(focus_score) + (0.797979797979798) * (MAX(focus_score) - MIN(focus_score))"
-            )
-        );
+        assert!(predicate_to_sql(&num("focus_quality", "gte", 80.0, None))
+            .contains("MIN(score) + (0.797979797979798) * (MAX(score) - MIN(score))"));
         assert!(
             predicate_to_sql(&num("focus_quality", "between", 40.0, Some(80.0)))
-                .starts_with("(focus_score BETWEEN LEAST(")
+                .starts_with("((focus_human_score IS NOT NULL")
         );
         assert_eq!(
             predicate_to_sql(&num("focus_quality", "gte", 80.5, None)),
@@ -6248,8 +6462,21 @@ mod keyword_tests {
     fn focus_quality_scale_executes_on_duckdb() {
         let conn = Connection::open_in_memory().expect("in-memory db");
         conn.execute_batch(
-            "CREATE TABLE images (id INTEGER, focus_score DOUBLE);
-             INSERT INTO images VALUES (1, 10), (2, 20), (3, 30), (4, NULL);",
+            "CREATE TABLE images (
+                id INTEGER,
+                focus_score DOUBLE,
+                focus_human_score DOUBLE,
+                focus_animal_score DOUBLE,
+                focus_foreground_score DOUBLE,
+                focus_saliency_score DOUBLE,
+                focus_animal_pose_score DOUBLE,
+                focus_whole_image_score DOUBLE
+             );
+             INSERT INTO images VALUES
+                (1, 10, NULL, NULL, NULL, NULL, NULL, 10),
+                (2, 20, NULL, NULL, NULL, NULL, NULL, 20),
+                (3, 30, NULL, NULL, NULL, NULL, NULL, 30),
+                (4, NULL, NULL, NULL, NULL, NULL, NULL, NULL);",
         )
         .expect("seed focus scores");
 
@@ -6288,6 +6515,27 @@ mod keyword_tests {
             .query_row(&top_sql, [], |r| r.get(0))
             .expect("count 100");
         assert_eq!(top_count, 1);
+
+        conn.execute("UPDATE images SET focus_animal_score = 90 WHERE id = 1", [])
+            .expect("seed animal score");
+        let animal_only = QueryPredicate {
+            kind: "focus_quality".to_string(),
+            day: None,
+            day_end: None,
+            stars: None,
+            value: Some("animal".to_string()),
+            op: Some("gte".to_string()),
+            num: Some(100.0),
+            num_end: None,
+        };
+        let animal_sql = format!(
+            "SELECT COUNT(*) FROM images WHERE {}",
+            predicate_to_sql(&animal_only)
+        );
+        let animal_count: i64 = conn
+            .query_row(&animal_sql, [], |r| r.get(0))
+            .expect("count animal 100");
+        assert_eq!(animal_count, 1);
     }
 
     #[test]

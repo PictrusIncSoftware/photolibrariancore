@@ -242,6 +242,9 @@ namespace photolibrariancore {
     sequence<FocusAnalysisCandidate> focus_analysis_candidates(u32 limit, string algorithm_version);
 
     [Async]
+    u64 focus_analysis_candidate_count(string algorithm_version);
+
+    [Async]
     u64 update_focus_analysis_results(sequence<FocusAnalysisResult> results);
 
     // Update the rotation angle for an image identified by file path
@@ -566,6 +569,12 @@ dictionary FocusAnalysisResult {
     string? focus_basis;
     string algorithm_version;
     string status;
+    f64? focus_human_score = null;
+    f64? focus_animal_score = null;
+    f64? focus_foreground_score = null;
+    f64? focus_saliency_score = null;
+    f64? focus_animal_pose_score = null;
+    f64? focus_whole_image_score = null;
 };
 
 // One directory's OWN image tally (S65, Sources sidebar) — directory_path is
