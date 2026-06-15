@@ -861,6 +861,7 @@ public struct FocusAnalysisResult: Equatable, Hashable {
     public var focusScore: Double?
     public var focusBasis: String?
     public var algorithmVersion: String
+    public var analysisRunId: String
     public var status: String
     public var focusHumanScore: Double?
     public var focusAnimalScore: Double?
@@ -871,11 +872,12 @@ public struct FocusAnalysisResult: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: Int64, focusScore: Double?, focusBasis: String?, algorithmVersion: String, status: String, focusHumanScore: Double? = nil, focusAnimalScore: Double? = nil, focusForegroundScore: Double? = nil, focusSaliencyScore: Double? = nil, focusAnimalPoseScore: Double? = nil, focusWholeImageScore: Double? = nil) {
+    public init(id: Int64, focusScore: Double?, focusBasis: String?, algorithmVersion: String, analysisRunId: String, status: String, focusHumanScore: Double? = nil, focusAnimalScore: Double? = nil, focusForegroundScore: Double? = nil, focusSaliencyScore: Double? = nil, focusAnimalPoseScore: Double? = nil, focusWholeImageScore: Double? = nil) {
         self.id = id
         self.focusScore = focusScore
         self.focusBasis = focusBasis
         self.algorithmVersion = algorithmVersion
+        self.analysisRunId = analysisRunId
         self.status = status
         self.focusHumanScore = focusHumanScore
         self.focusAnimalScore = focusAnimalScore
@@ -905,6 +907,7 @@ public struct FfiConverterTypeFocusAnalysisResult: FfiConverterRustBuffer {
                 focusScore: FfiConverterOptionDouble.read(from: &buf), 
                 focusBasis: FfiConverterOptionString.read(from: &buf), 
                 algorithmVersion: FfiConverterString.read(from: &buf), 
+                analysisRunId: FfiConverterString.read(from: &buf), 
                 status: FfiConverterString.read(from: &buf), 
                 focusHumanScore: FfiConverterOptionDouble.read(from: &buf), 
                 focusAnimalScore: FfiConverterOptionDouble.read(from: &buf), 
@@ -920,6 +923,7 @@ public struct FfiConverterTypeFocusAnalysisResult: FfiConverterRustBuffer {
         FfiConverterOptionDouble.write(value.focusScore, into: &buf)
         FfiConverterOptionString.write(value.focusBasis, into: &buf)
         FfiConverterString.write(value.algorithmVersion, into: &buf)
+        FfiConverterString.write(value.analysisRunId, into: &buf)
         FfiConverterString.write(value.status, into: &buf)
         FfiConverterOptionDouble.write(value.focusHumanScore, into: &buf)
         FfiConverterOptionDouble.write(value.focusAnimalScore, into: &buf)
@@ -3226,11 +3230,11 @@ public func findCounterpartImage(filePath: String)async  -> ImageRecord?  {
             
         )
 }
-public func focusAnalysisCandidateCount(algorithmVersion: String)async  -> UInt64  {
+public func focusAnalysisCandidateCount(algorithmVersion: String, analysisRunId: String)async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_photolibrariancore_fn_func_focus_analysis_candidate_count(FfiConverterString.lower(algorithmVersion)
+                uniffi_photolibrariancore_fn_func_focus_analysis_candidate_count(FfiConverterString.lower(algorithmVersion),FfiConverterString.lower(analysisRunId)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
@@ -3241,11 +3245,11 @@ public func focusAnalysisCandidateCount(algorithmVersion: String)async  -> UInt6
             
         )
 }
-public func focusAnalysisCandidates(limit: UInt32, algorithmVersion: String)async  -> [FocusAnalysisCandidate]  {
+public func focusAnalysisCandidates(limit: UInt32, algorithmVersion: String, analysisRunId: String)async  -> [FocusAnalysisCandidate]  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_photolibrariancore_fn_func_focus_analysis_candidates(FfiConverterUInt32.lower(limit),FfiConverterString.lower(algorithmVersion)
+                uniffi_photolibrariancore_fn_func_focus_analysis_candidates(FfiConverterUInt32.lower(limit),FfiConverterString.lower(algorithmVersion),FfiConverterString.lower(analysisRunId)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
@@ -4026,10 +4030,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_find_counterpart_image() != 51699) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_photolibrariancore_checksum_func_focus_analysis_candidate_count() != 14848) {
+    if (uniffi_photolibrariancore_checksum_func_focus_analysis_candidate_count() != 30371) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_photolibrariancore_checksum_func_focus_analysis_candidates() != 37293) {
+    if (uniffi_photolibrariancore_checksum_func_focus_analysis_candidates() != 55146) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_all_images() != 11357) {

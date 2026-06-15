@@ -239,10 +239,10 @@ namespace photolibrariancore {
     // table. Swift analyzes these candidates off-main and writes scalar results
     // back in batches.
     [Async]
-    sequence<FocusAnalysisCandidate> focus_analysis_candidates(u32 limit, string algorithm_version);
+    sequence<FocusAnalysisCandidate> focus_analysis_candidates(u32 limit, string algorithm_version, string analysis_run_id);
 
     [Async]
-    u64 focus_analysis_candidate_count(string algorithm_version);
+    u64 focus_analysis_candidate_count(string algorithm_version, string analysis_run_id);
 
     [Async]
     u64 update_focus_analysis_results(sequence<FocusAnalysisResult> results);
@@ -568,6 +568,7 @@ dictionary FocusAnalysisResult {
     f64? focus_score;
     string? focus_basis;
     string algorithm_version;
+    string analysis_run_id;
     string status;
     f64? focus_human_score = null;
     f64? focus_animal_score = null;

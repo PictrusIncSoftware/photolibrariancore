@@ -214,6 +214,7 @@ pub struct FocusAnalysisResult {
     pub focus_score: Option<f64>,
     pub focus_basis: Option<String>,
     pub algorithm_version: String,
+    pub analysis_run_id: String,
     pub status: String,
     pub focus_human_score: Option<f64>,
     pub focus_animal_score: Option<f64>,
@@ -679,6 +680,7 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             focus_whole_image_score DOUBLE,
             focus_algorithm_version TEXT,    -- e.g. "laplacian-v1"
             focus_analysis_status TEXT,      -- complete / online_only / unreadable / failed
+            focus_analysis_attempt_id TEXT,
             focus_scored_at TIMESTAMP,
 
             -- === Video / unified-media support (Session 70; Docs/DESIGN-Video-Schema-Unified-Table.md) ===
@@ -744,6 +746,7 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_whole_image_score DOUBLE;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_algorithm_version TEXT;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_analysis_status TEXT;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_analysis_attempt_id TEXT;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_scored_at TIMESTAMP;
 
         -- Video / unified-media columns (Session 70). ADD COLUMN IF NOT EXISTS with
@@ -4668,12 +4671,51 @@ fn focus_score_is_valid(score: Option<f64>) -> bool {
     score.map(|score| score.is_finite()).unwrap_or(true)
 }
 
+fn sanitized_focus_result(mut result: FocusAnalysisResult) -> FocusAnalysisResult {
+    let scores_are_valid = focus_score_is_valid(result.focus_score)
+        && focus_score_is_valid(result.focus_human_score)
+        && focus_score_is_valid(result.focus_animal_score)
+        && focus_score_is_valid(result.focus_foreground_score)
+        && focus_score_is_valid(result.focus_saliency_score)
+        && focus_score_is_valid(result.focus_animal_pose_score)
+        && focus_score_is_valid(result.focus_whole_image_score);
+    let basis_is_valid = result
+        .focus_basis
+        .as_deref()
+        .map(is_valid_focus_basis)
+        .unwrap_or(true);
+    let complete_has_score = result.status != "complete" || result.focus_score.is_some();
+
+    if !is_valid_focus_status(&result.status)
+        || !scores_are_valid
+        || !basis_is_valid
+        || !complete_has_score
+    {
+        eprintln!(
+            "update_focus_analysis_results: quarantining invalid result for id {}",
+            result.id
+        );
+        result.status = "failed".to_string();
+        result.focus_score = None;
+        result.focus_basis = Some("unknown".to_string());
+        result.focus_human_score = None;
+        result.focus_animal_score = None;
+        result.focus_foreground_score = None;
+        result.focus_saliency_score = None;
+        result.focus_animal_pose_score = None;
+        result.focus_whole_image_score = None;
+    }
+
+    result
+}
+
 /// Return a narrow page of still-image rows whose focus analysis is missing or
 /// stale for the requested algorithm version. The NULL columns are the queue; no
 /// separate enrichment table is persisted.
 pub async fn focus_analysis_candidates(
     limit: u32,
     algorithm_version: String,
+    analysis_run_id: String,
 ) -> Vec<FocusAnalysisCandidate> {
     let catalogue = CATALOGUE.lock().unwrap();
     let conn = match catalogue.as_ref() {
@@ -4693,9 +4735,16 @@ pub async fn focus_analysis_candidates(
                 focus_analysis_status IS NULL
                 OR focus_algorithm_version IS NULL
                 OR focus_algorithm_version <> ?1
+                OR (
+                    focus_analysis_status IN ('online_only', 'unreadable', 'failed')
+                    AND (
+                        focus_analysis_attempt_id IS NULL
+                        OR focus_analysis_attempt_id <> ?2
+                    )
+                )
            )
          ORDER BY id
-         LIMIT ?2",
+         LIMIT ?3",
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -4704,13 +4753,16 @@ pub async fn focus_analysis_candidates(
         }
     };
 
-    let mapped = stmt.query_map(params![algorithm_version, capped_limit], |row| {
-        Ok(FocusAnalysisCandidate {
-            id: row.get(0)?,
-            file_path: row.get(1)?,
-            file_size: row.get::<_, i64>(2)? as u64,
-        })
-    });
+    let mapped = stmt.query_map(
+        params![algorithm_version, analysis_run_id, capped_limit],
+        |row| {
+            Ok(FocusAnalysisCandidate {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                file_size: row.get::<_, i64>(2)? as u64,
+            })
+        },
+    );
 
     match mapped {
         Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
@@ -4724,7 +4776,10 @@ pub async fn focus_analysis_candidates(
 /// Count still-image rows whose focus analysis is missing or stale for the
 /// requested algorithm version. This lets the Swift status bar show a
 /// determinate progress bar while analysis runs.
-pub async fn focus_analysis_candidate_count(algorithm_version: String) -> u64 {
+pub async fn focus_analysis_candidate_count(
+    algorithm_version: String,
+    analysis_run_id: String,
+) -> u64 {
     let catalogue = CATALOGUE.lock().unwrap();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
@@ -4742,8 +4797,15 @@ pub async fn focus_analysis_candidate_count(algorithm_version: String) -> u64 {
                 focus_analysis_status IS NULL
                 OR focus_algorithm_version IS NULL
                 OR focus_algorithm_version <> ?1
+                OR (
+                    focus_analysis_status IN ('online_only', 'unreadable', 'failed')
+                    AND (
+                        focus_analysis_attempt_id IS NULL
+                        OR focus_analysis_attempt_id <> ?2
+                    )
+                )
            )",
-        params![algorithm_version],
+        params![algorithm_version, analysis_run_id],
         |row| row.get::<_, i64>(0),
     ) {
         Ok(count) => count.max(0) as u64,
@@ -4776,36 +4838,7 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
 
     let mut updated = 0u64;
     for result in results {
-        if !is_valid_focus_status(&result.status) {
-            eprintln!(
-                "update_focus_analysis_results: invalid status '{}'",
-                result.status
-            );
-            let _ = conn.execute_batch("ROLLBACK;");
-            return 0;
-        }
-        if !focus_score_is_valid(result.focus_score)
-            || !focus_score_is_valid(result.focus_human_score)
-            || !focus_score_is_valid(result.focus_animal_score)
-            || !focus_score_is_valid(result.focus_foreground_score)
-            || !focus_score_is_valid(result.focus_saliency_score)
-            || !focus_score_is_valid(result.focus_animal_pose_score)
-            || !focus_score_is_valid(result.focus_whole_image_score)
-        {
-            eprintln!(
-                "update_focus_analysis_results: non-finite score for id {}",
-                result.id
-            );
-            let _ = conn.execute_batch("ROLLBACK;");
-            return 0;
-        }
-        if let Some(basis) = result.focus_basis.as_deref() {
-            if !is_valid_focus_basis(basis) {
-                eprintln!("update_focus_analysis_results: invalid basis '{}'", basis);
-                let _ = conn.execute_batch("ROLLBACK;");
-                return 0;
-            }
-        }
+        let result = sanitized_focus_result(result);
 
         let score = if result.status == "complete" {
             result.focus_score
@@ -4856,6 +4889,7 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
                  focus_whole_image_score = ?9,
                  focus_algorithm_version = ?10,
                  focus_analysis_status = ?11,
+                 focus_analysis_attempt_id = ?12,
                  focus_scored_at = CURRENT_TIMESTAMP
              WHERE id = ?1",
             params![
@@ -4870,6 +4904,7 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
                 whole_image_score,
                 result.algorithm_version,
                 result.status,
+                result.analysis_run_id,
             ],
         ) {
             Ok(n) => updated += n as u64,
@@ -4878,8 +4913,6 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
                     "update_focus_analysis_results: row {} failed: {}",
                     result.id, e
                 );
-                let _ = conn.execute_batch("ROLLBACK;");
-                return 0;
             }
         }
     }
