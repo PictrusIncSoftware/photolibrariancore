@@ -1806,7 +1806,8 @@ fn execute_image_record_query(
                     gps_latitude, gps_longitude, gps_altitude,
                     copyright, creator, description,
                     rating, flag, color_label, rotation,
-                    {}
+                    {},
+                    focus_score
                 FROM images
                 {}
             )
@@ -2890,6 +2891,46 @@ fn numeric_predicate_sql(p: &QueryPredicate, column: &str) -> String {
     }
 }
 
+fn focus_quality_threshold_sql(num: f64) -> Option<String> {
+    if !num.is_finite() || num < 1.0 || num > 100.0 || num.fract() != 0.0 {
+        return None;
+    }
+    let position = (num - 1.0) / 99.0;
+    Some(format!(
+        "(SELECT MIN(focus_score) + ({}) * (MAX(focus_score) - MIN(focus_score)) \
+         FROM images WHERE focus_score IS NOT NULL)",
+        position
+    ))
+}
+
+fn focus_quality_predicate_sql(p: &QueryPredicate) -> String {
+    match (p.op.as_deref(), p.num) {
+        (Some("between"), Some(num)) => {
+            let Some(end) = p.num_end else {
+                return "(FALSE)".to_string();
+            };
+            let Some(a) = focus_quality_threshold_sql(num) else {
+                return "(FALSE)".to_string();
+            };
+            let Some(b) = focus_quality_threshold_sql(end) else {
+                return "(FALSE)".to_string();
+            };
+            format!(
+                "(focus_score BETWEEN LEAST({}, {}) AND GREATEST({}, {}))",
+                a, b, a, b
+            )
+        }
+        (Some(op), Some(num)) => match sql_compare_op(op) {
+            Some(sym) => match focus_quality_threshold_sql(num) {
+                Some(threshold) => format!("(focus_score {} {})", sym, threshold),
+                None => "(FALSE)".to_string(),
+            },
+            None => "(FALSE)".to_string(),
+        },
+        _ => "(FALSE)".to_string(),
+    }
+}
+
 /// SQL for a connector. XOR is boolean inequality (`<>`) — exactly-one-true.
 fn connector_sql(c: &Connector) -> &'static str {
     match c {
@@ -3174,6 +3215,7 @@ fn predicate_to_sql(p: &QueryPredicate) -> String {
         "shutter_num" => numeric_predicate_sql(p, "shutter_speed"),
         "focal_num" => numeric_predicate_sql(p, "focal_length"),
         "focus_num" => numeric_predicate_sql(p, "focus_score"),
+        "focus_quality" => focus_quality_predicate_sql(p),
         // Video numeric subjects (S75) — same machinery, new columns. Duration
         // is seconds (DOUBLE); frame_rate is fps (DOUBLE). A NULL column (a
         // still) never matches, exactly like the exposure numerics above.
@@ -3259,7 +3301,7 @@ fn order_by_for_filter(predicates: &[QueryPredicate]) -> &'static str {
     match predicates.first() {
         Some(p) => match p.kind.as_str() {
             "rating" | "rating_unrated" => RATING_FILTER_ORDER_BY,
-            "focus_num" => FOCUS_FILTER_ORDER_BY,
+            "focus_num" | "focus_quality" => FOCUS_FILTER_ORDER_BY,
             _ => DEFAULT_FILTER_ORDER_BY,
         },
         None => DEFAULT_FILTER_ORDER_BY,
@@ -6158,6 +6200,23 @@ mod keyword_tests {
             predicate_to_sql(&num("focus_num", "gte", 120.0, None)),
             "(focus_score >= 120)"
         );
+        assert!(
+            predicate_to_sql(&num("focus_quality", "gte", 80.0, None)).contains(
+                "MIN(focus_score) + (0.797979797979798) * (MAX(focus_score) - MIN(focus_score))"
+            )
+        );
+        assert!(
+            predicate_to_sql(&num("focus_quality", "between", 40.0, Some(80.0)))
+                .starts_with("(focus_score BETWEEN LEAST(")
+        );
+        assert_eq!(
+            predicate_to_sql(&num("focus_quality", "gte", 80.5, None)),
+            "(FALSE)"
+        );
+        assert_eq!(
+            predicate_to_sql(&num("focus_quality", "gte", 101.0, None)),
+            "(FALSE)"
+        );
 
         // Malformed -> backstop: between without an upper bound, unknown op,
         // non-finite bounds, missing num / missing op.
@@ -6183,6 +6242,52 @@ mod keyword_tests {
         let mut missing_op = num("iso_num", "eq", 100.0, None);
         missing_op.op = None;
         assert_eq!(predicate_to_sql(&missing_op), "(FALSE)");
+    }
+
+    #[test]
+    fn focus_quality_scale_executes_on_duckdb() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE images (id INTEGER, focus_score DOUBLE);
+             INSERT INTO images VALUES (1, 10), (2, 20), (3, 30), (4, NULL);",
+        )
+        .expect("seed focus scores");
+
+        let pred = QueryPredicate {
+            kind: "focus_quality".to_string(),
+            day: None,
+            day_end: None,
+            stars: None,
+            value: None,
+            op: Some("gte".to_string()),
+            num: Some(50.0),
+            num_end: None,
+        };
+        let sql = format!(
+            "SELECT COUNT(*) FROM images WHERE {}",
+            predicate_to_sql(&pred)
+        );
+        let count: i64 = conn.query_row(&sql, [], |r| r.get(0)).expect("count 50+");
+        assert_eq!(count, 2);
+
+        let top = QueryPredicate {
+            kind: "focus_quality".to_string(),
+            day: None,
+            day_end: None,
+            stars: None,
+            value: None,
+            op: Some("gte".to_string()),
+            num: Some(100.0),
+            num_end: None,
+        };
+        let top_sql = format!(
+            "SELECT COUNT(*) FROM images WHERE {}",
+            predicate_to_sql(&top)
+        );
+        let top_count: i64 = conn
+            .query_row(&top_sql, [], |r| r.get(0))
+            .expect("count 100");
+        assert_eq!(top_count, 1);
     }
 
     #[test]
@@ -7177,6 +7282,14 @@ mod query_builder_tests {
         p
     }
 
+    fn num(kind: &str, op: &str, value: f64, value_end: Option<f64>) -> QueryPredicate {
+        let mut p = qp(kind);
+        p.op = Some(op.to_string());
+        p.num = Some(value);
+        p.num_end = value_end;
+        p
+    }
+
     #[test]
     fn day_validation() {
         assert!(is_valid_day("2026:05:15"));
@@ -7343,6 +7456,10 @@ mod query_builder_tests {
             order_by_for_filter(&[qp("rating_unrated")]),
             RATING_FILTER_ORDER_BY
         );
+        assert_eq!(
+            order_by_for_filter(&[num("focus_quality", "gte", 80.0, None)]),
+            FOCUS_FILTER_ORDER_BY
+        );
         // The FIRST subject wins even when rating appears later.
         assert_eq!(
             order_by_for_filter(&[flag("pick"), rating("gte", 4)]),
@@ -7361,6 +7478,80 @@ mod query_builder_tests {
             DEFAULT_FILTER_ORDER_BY
         );
         assert_eq!(order_by_for_filter(&[]), DEFAULT_FILTER_ORDER_BY);
+    }
+
+    #[test]
+    fn focus_order_survives_duplicate_filter_projection() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE images (
+                id INTEGER,
+                indexed_timestamp TIMESTAMP,
+                file_path TEXT,
+                file_size BIGINT,
+                file_name TEXT,
+                file_extension TEXT,
+                created_timestamp BIGINT,
+                modified_timestamp BIGINT,
+                camera_make TEXT,
+                camera_model TEXT,
+                lens_model TEXT,
+                focal_length DOUBLE,
+                aperture DOUBLE,
+                shutter_speed DOUBLE,
+                iso INTEGER,
+                capture_datetime TEXT,
+                pixel_width INTEGER,
+                pixel_height INTEGER,
+                color_space TEXT,
+                bit_depth INTEGER,
+                gps_latitude DOUBLE,
+                gps_longitude DOUBLE,
+                gps_altitude DOUBLE,
+                copyright TEXT,
+                creator TEXT,
+                description TEXT,
+                rating INTEGER,
+                flag TEXT,
+                color_label TEXT,
+                rotation INTEGER,
+                file_stem TEXT,
+                image_kind TEXT,
+                is_video BOOLEAN,
+                focus_score DOUBLE
+             );",
+        )
+        .expect("create images");
+
+        conn.execute(
+            "INSERT INTO images (
+                id, indexed_timestamp, file_path, file_size, file_name,
+                file_extension, created_timestamp, modified_timestamp,
+                camera_model, capture_datetime, pixel_width, pixel_height,
+                rotation, file_stem, image_kind, is_video, focus_score
+             ) VALUES (
+                1, TIMESTAMP '2026-06-15 10:00:00', '/tmp/a.jpg', 1000, 'a.jpg',
+                'jpg', 1700000000, 1700000001,
+                'Z 8', '2026:06:15 10:00:00', 100, 100,
+                0, 'a', 'jpeg', FALSE, 3.5
+             )",
+            [],
+        )
+        .expect("insert image");
+
+        let records = execute_image_record_query(
+            &conn,
+            "(focus_score >= 3.5)",
+            FOCUS_FILTER_ORDER_BY,
+            10,
+            0,
+            true,
+            false,
+            MediaType::StillsOnly,
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, 1);
     }
 
     #[test]
