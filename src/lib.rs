@@ -1,8 +1,8 @@
 // Import DuckDB for embedded database operations
 // DuckDB is used instead of SQLite for better analytical query performance on large image catalogues
-use duckdb::{Connection, params};
-use std::sync::{Arc, Mutex};
+use duckdb::{params, Connection};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 // UniFFI scaffolding — generates the Rust-to-Swift FFI layer
 // This macro reads the .udl file and creates the necessary C-compatible interface code
@@ -49,44 +49,44 @@ static CATALOGUE: once_cell::sync::Lazy<Arc<Mutex<Option<Connection>>>> =
 #[derive(Debug, Clone)]
 pub struct ImageMetadata {
     // File system properties (always present)
-    pub file_path: String,        // Absolute path; passed from Swift's sandbox-legal picker
+    pub file_path: String, // Absolute path; passed from Swift's sandbox-legal picker
     pub file_size: u64,
-    pub file_name: String,         // Basename extracted from path
-    pub file_extension: Option<String>,  // Lowercase extension (e.g., "jpg", "cr3")
-    pub created_timestamp: i64,    // Unix epoch seconds
-    pub modified_timestamp: i64,   // Unix epoch seconds
+    pub file_name: String,              // Basename extracted from path
+    pub file_extension: Option<String>, // Lowercase extension (e.g., "jpg", "cr3")
+    pub created_timestamp: i64,         // Unix epoch seconds
+    pub modified_timestamp: i64,        // Unix epoch seconds
 
     // Camera/capture metadata (from EXIF, may be absent)
-    pub camera_make: Option<String>,       // e.g., "Canon", "Nikon"
-    pub camera_model: Option<String>,      // e.g., "EOS R5", "D850"
+    pub camera_make: Option<String>,  // e.g., "Canon", "Nikon"
+    pub camera_model: Option<String>, // e.g., "EOS R5", "D850"
     pub lens_model: Option<String>,
-    pub focal_length: Option<f64>,         // Millimeters
-    pub aperture: Option<f64>,             // F-stop value
-    pub shutter_speed: Option<f64>,        // Seconds (e.g., 0.0005 for 1/2000)
-    pub iso: Option<u32>,                  // ISO speed rating
-    pub capture_datetime: Option<String>,  // ISO 8601 string from EXIF
+    pub focal_length: Option<f64>,        // Millimeters
+    pub aperture: Option<f64>,            // F-stop value
+    pub shutter_speed: Option<f64>,       // Seconds (e.g., 0.0005 for 1/2000)
+    pub iso: Option<u32>,                 // ISO speed rating
+    pub capture_datetime: Option<String>, // ISO 8601 string from EXIF
 
     // Image properties (resolution and color)
     pub pixel_width: Option<u32>,
     pub pixel_height: Option<u32>,
-    pub color_space: Option<String>,       // e.g., "sRGB", "Adobe RGB"
-    pub bit_depth: Option<u32>,            // Bits per channel
+    pub color_space: Option<String>, // e.g., "sRGB", "Adobe RGB"
+    pub bit_depth: Option<u32>,      // Bits per channel
 
     // GPS coordinates (from geotagged images)
-    pub gps_latitude: Option<f64>,         // Decimal degrees
-    pub gps_longitude: Option<f64>,        // Decimal degrees
-    pub gps_altitude: Option<f64>,         // Meters above sea level
+    pub gps_latitude: Option<f64>,  // Decimal degrees
+    pub gps_longitude: Option<f64>, // Decimal degrees
+    pub gps_altitude: Option<f64>,  // Meters above sea level
 
     // IPTC/copyright metadata (user-editable in many cameras/software)
     pub copyright: Option<String>,
-    pub creator: Option<String>,           // Photographer name
-    pub description: Option<String>,       // Caption/alt text
+    pub creator: Option<String>,     // Photographer name
+    pub description: Option<String>, // Caption/alt text
 
     // Organization metadata (user-assigned within PhotoLibrarian)
     // These fields are initially None and populated by user interactions in the app
-    pub rating: Option<u8>,                // 0-5 stars
-    pub flag: Option<String>,              // "pick", "reject", or None
-    pub color_label: Option<String>,       // "red", "green", "blue", etc.
+    pub rating: Option<u8>,          // 0-5 stars
+    pub flag: Option<String>,        // "pick", "reject", or None
+    pub color_label: Option<String>, // "red", "green", "blue", etc.
 
     // S67 (Copy and Import): the source record's in-app rotation, inherited by
     // a catalogued copy so it displays like its original (the aliased
@@ -114,11 +114,11 @@ pub struct ImageMetadata {
     pub color_range: Option<String>,     // "tv" / "pc"
     pub dv_profile: Option<i32>,         // Dolby Vision profile (8 on iPhone); None = none
     pub has_audio: Option<bool>,
-    pub audio_codec: Option<String>,     // aac / pcm_s16le / pcm_s24le
+    pub audio_codec: Option<String>, // aac / pcm_s16le / pcm_s24le
     pub audio_channels: Option<i32>,
     pub audio_sample_rate: Option<i32>,
-    pub audio_bitrate: Option<i64>,      // bits/sec
-    pub live_photo_id: Option<String>,   // QuickTime content.identifier; pair on equality
+    pub audio_bitrate: Option<i64>,    // bits/sec
+    pub live_photo_id: Option<String>, // QuickTime content.identifier; pair on equality
 }
 
 /// Represents a complete image record from the database
@@ -131,8 +131,8 @@ pub struct ImageMetadata {
 #[derive(Debug, Clone)]
 pub struct ImageRecord {
     // Database-generated fields
-    pub id: i64,                           // Auto-generated primary key
-    pub indexed_timestamp: String,         // When record was added to catalogue (ISO 8601)
+    pub id: i64,                   // Auto-generated primary key
+    pub indexed_timestamp: String, // When record was added to catalogue (ISO 8601)
 
     // File system properties
     pub file_path: String,
@@ -189,6 +189,34 @@ pub struct ImageRecord {
     pub duplicate_group_id: Option<i64>,
 }
 
+/// One still-image row that needs focus analysis.
+///
+/// This deliberately avoids `ImageRecord`: focus analysis only needs a stable id
+/// and path. Keeping the carrier narrow avoids the hot bulk-record lift while
+/// giving Swift enough information to run a cloud-safe, off-main analyzer.
+#[derive(Debug, Clone)]
+pub struct FocusAnalysisCandidate {
+    pub id: i64,
+    pub file_path: String,
+    pub file_size: u64,
+}
+
+/// One focus-analysis writeback row.
+///
+/// `status` is an allow-listed token owned by the analyzer:
+/// - `complete`: score is present
+/// - `online_only`: source bytes are unavailable without a cloud download
+/// - `unreadable`: source could not be decoded/read
+/// - `failed`: unexpected analyzer failure
+#[derive(Debug, Clone)]
+pub struct FocusAnalysisResult {
+    pub id: i64,
+    pub focus_score: Option<f64>,
+    pub focus_basis: Option<String>,
+    pub algorithm_version: String,
+    pub status: String,
+}
+
 /// Recognized RAW image file extensions
 ///
 /// Compile-time list of file extensions (lowercase, no leading dot) that
@@ -205,17 +233,17 @@ pub struct ImageRecord {
 /// Adding a new RAW format = one-line edit here. User-configurable lists are
 /// an explicit non-goal of the current design.
 const RAW_EXTENSIONS: &[&str] = &[
-    "nef",  // Nikon
-    "cr2",  // Canon (older)
-    "cr3",  // Canon (newer)
-    "arw",  // Sony
+    "nef", // Nikon
+    "cr2", // Canon (older)
+    "cr3", // Canon (newer)
+    "arw", // Sony
     // NOTE: "dng" intentionally NOT here — DNG is its own ImageKind::Dng
     // (Lightroom import, Docs/DESIGN-Lightroom-Catalog-Import.md §7), so it does
     // NOT pair-collapse as a RAW. Re-adding it here would regress that. See
     // DNG_EXTENSIONS below.
-    "raf",  // Fujifilm
-    "rw2",  // Panasonic
-    "orf",  // Olympus / OM System
+    "raf", // Fujifilm
+    "rw2", // Panasonic
+    "orf", // Olympus / OM System
 ];
 
 /// Recognized JPEG image file extensions
@@ -273,8 +301,7 @@ const PNG_EXTENSIONS: &[&str] = &["png"];
 /// `.other` (lowercased first character). Verify casing after binding
 /// generation; surface any deviation before changing call sites.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ImageKind
-{
+pub enum ImageKind {
     Jpeg,
     Raw,
     Other,
@@ -317,40 +344,24 @@ pub enum ImageKind
 /// - ImageKind::Jpeg if ext (lowercased) matches JPEG_EXTENSIONS
 /// - ImageKind::Raw if ext (lowercased) matches RAW_EXTENSIONS
 /// - ImageKind::Other otherwise
-pub fn classify_extension(ext: String) -> ImageKind
-{
+pub fn classify_extension(ext: String) -> ImageKind {
     let lower = ext.to_lowercase();
-    if JPEG_EXTENSIONS.contains(&lower.as_str())
-    {
+    if JPEG_EXTENSIONS.contains(&lower.as_str()) {
         ImageKind::Jpeg
-    }
-    else if HEIF_EXTENSIONS.contains(&lower.as_str())
-    {
+    } else if HEIF_EXTENSIONS.contains(&lower.as_str()) {
         ImageKind::Heif
-    }
-    else if DNG_EXTENSIONS.contains(&lower.as_str())
-    {
+    } else if DNG_EXTENSIONS.contains(&lower.as_str()) {
         // Checked before RAW: DNG is its own kind, not a RAW (see DNG_EXTENSIONS).
         ImageKind::Dng
-    }
-    else if RAW_EXTENSIONS.contains(&lower.as_str())
-    {
+    } else if RAW_EXTENSIONS.contains(&lower.as_str()) {
         ImageKind::Raw
-    }
-    else if PSD_EXTENSIONS.contains(&lower.as_str())
-    {
+    } else if PSD_EXTENSIONS.contains(&lower.as_str()) {
         ImageKind::Psd
-    }
-    else if TIFF_EXTENSIONS.contains(&lower.as_str())
-    {
+    } else if TIFF_EXTENSIONS.contains(&lower.as_str()) {
         ImageKind::Tiff
-    }
-    else if PNG_EXTENSIONS.contains(&lower.as_str())
-    {
+    } else if PNG_EXTENSIONS.contains(&lower.as_str()) {
         ImageKind::Png
-    }
-    else
-    {
+    } else {
         ImageKind::Other
     }
 }
@@ -380,8 +391,7 @@ pub fn classify_extension(ext: String) -> ImageKind
 /// Order matches the declaration order of RAW_EXTENSIONS. Callers
 /// that need a different order should sort Swift-side; this function
 /// preserves the canonical order for predictability.
-pub fn get_raw_extensions() -> Vec<String>
-{
+pub fn get_raw_extensions() -> Vec<String> {
     RAW_EXTENSIONS.iter().map(|s| s.to_string()).collect()
 }
 
@@ -395,8 +405,7 @@ pub fn get_raw_extensions() -> Vec<String>
 /// asking `classify_extension` one extension at a time.
 ///
 /// **Synchronous** — same rationale as `get_raw_extensions`.
-pub fn get_jpeg_extensions() -> Vec<String>
-{
+pub fn get_jpeg_extensions() -> Vec<String> {
     JPEG_EXTENSIONS.iter().map(|s| s.to_string()).collect()
 }
 
@@ -425,8 +434,7 @@ pub fn get_jpeg_extensions() -> Vec<String>
 /// keeps both call sides clean. The lowercased contract is documented by the
 /// field name itself.
 #[derive(Debug, Clone)]
-pub struct ParsedFilename
-{
+pub struct ParsedFilename {
     pub stem: String,
     pub extension_lower: String,
     pub kind: ImageKind,
@@ -473,32 +481,26 @@ pub struct ParsedFilename
 ///
 /// Returns:
 /// - ParsedFilename with the three derived fields populated per the rule.
-pub fn parse_filename(file_name: String) -> ParsedFilename
-{
+pub fn parse_filename(file_name: String) -> ParsedFilename {
     // Empty filename: synthetic stem so the stored column is never empty.
-    if file_name.is_empty()
-    {
-        return ParsedFilename
-        {
+    if file_name.is_empty() {
+        return ParsedFilename {
             stem: "metype".to_string(),
             extension_lower: "metype".to_string(),
             kind: ImageKind::Other,
         };
     }
 
-    match file_name.rfind('.')
-    {
+    match file_name.rfind('.') {
         // No dot at all — case 2.
-        None => ParsedFilename
-        {
+        None => ParsedFilename {
             stem: file_name,
             extension_lower: "metype".to_string(),
             kind: ImageKind::Other,
         },
         // Leading dot, e.g. ".DS_Store" — case 2.
         // The whole name is treated as the stem; there is no extension to parse.
-        Some(0) => ParsedFilename
-        {
+        Some(0) => ParsedFilename {
             stem: file_name,
             extension_lower: "metype".to_string(),
             kind: ImageKind::Other,
@@ -508,20 +510,17 @@ pub fn parse_filename(file_name: String) -> ParsedFilename
         // file_name.len() - 1. Byte offsets are safe here because '.' is single-byte
         // ASCII; rfind on a multi-byte string still returns a byte offset on a code
         // unit boundary.
-        Some(idx) if idx == file_name.len() - 1 => ParsedFilename
-        {
+        Some(idx) if idx == file_name.len() - 1 => ParsedFilename {
             stem: file_name,
             extension_lower: "metype".to_string(),
             kind: ImageKind::Other,
         },
         // Normal case: split at the last dot.
-        Some(idx) =>
-        {
+        Some(idx) => {
             let stem = file_name[..idx].to_string();
             let ext = file_name[idx + 1..].to_lowercase();
             let kind = classify_extension(ext.clone());
-            ParsedFilename
-            {
+            ParsedFilename {
                 stem,
                 extension_lower: ext,
                 kind,
@@ -660,6 +659,16 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             color_label TEXT,    -- "red", "green", "blue", etc.
             rotation INTEGER DEFAULT 0,  -- Image rotation in degrees: 0, 90, 180, or 270
 
+            -- === Intelligent culling / focus analysis (Session 76; Docs/DESIGN-Intelligent-Culling.md) ===
+            -- Scalar machine-derived facts. User curation fields above remain
+            -- untouched; focus analysis is advisory and filterable, never an
+            -- automatic rating/flag/color write.
+            focus_score DOUBLE,              -- Laplacian-variance score; higher = sharper
+            focus_basis TEXT,                -- whole_image / face / subject / unknown
+            focus_algorithm_version TEXT,    -- e.g. "laplacian-v1"
+            focus_analysis_status TEXT,      -- complete / online_only / unreadable / failed
+            focus_scored_at TIMESTAMP,
+
             -- === Video / unified-media support (Session 70; Docs/DESIGN-Video-Schema-Unified-Table.md) ===
             -- is_video discriminates stills (FALSE) from video (TRUE). CREATE-time
             -- default is safe; the ALTER path below adds it WITHOUT a default then
@@ -710,6 +719,15 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         ALTER TABLE images ADD COLUMN IF NOT EXISTS image_kind VARCHAR;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS directory_path VARCHAR;
 
+        -- Intelligent culling / focus-analysis columns (Session 76). ADD COLUMN
+        -- with NO default (S62 WAL rule). Existing rows stay NULL and therefore
+        -- naturally form the pending analysis queue.
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_score DOUBLE;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_basis TEXT;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_algorithm_version TEXT;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_analysis_status TEXT;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_scored_at TIMESTAMP;
+
         -- Video / unified-media columns (Session 70). ADD COLUMN IF NOT EXISTS with
         -- NO default (an ALTER ... ADD COLUMN ... DEFAULT <expr> does not survive
         -- WAL replay — S62), then backfill only the is_video discriminator; the
@@ -743,6 +761,8 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         CREATE INDEX IF NOT EXISTS idx_rating ON images(rating);
         CREATE INDEX IF NOT EXISTS idx_flag ON images(flag);
         CREATE INDEX IF NOT EXISTS idx_color_label ON images(color_label);
+        CREATE INDEX IF NOT EXISTS idx_focus_score ON images(focus_score);
+        CREATE INDEX IF NOT EXISTS idx_focus_analysis_status ON images(focus_analysis_status);
 
         -- === Keyword system (Session 45; Docs/DESIGN-Keyword-System.md) ===
         -- Hierarchical keywords in ONE table. Each applied keyword PATH is
@@ -919,7 +939,7 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
     match conn.query_row(
         "SELECT sql FROM duckdb_tables() WHERE table_name = 'images'",
         [],
-        |row| row.get::<_, String>(0)
+        |row| row.get::<_, String>(0),
     ) {
         Ok(actual_schema) => eprintln!("Actual schema created:\n{}", actual_schema),
         Err(e) => eprintln!("Failed to query schema: {}", e),
@@ -954,64 +974,57 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
     // and image_kind are skipped, rows whose file_extension already matches
     // LOWER(file_extension) are skipped, and rows with non-NULL directory_path
     // are skipped.
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
-    {
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         eprintln!("[migration] Failed to begin transaction: {}", e);
         return false;
     }
 
     // Step 1: backfill file_stem and image_kind.
-    let rows_needing_backfill: Vec<(i64, String)> = match conn.prepare(
-        "SELECT id, file_name FROM images WHERE file_stem IS NULL OR image_kind IS NULL"
-    )
+    let rows_needing_backfill: Vec<(i64, String)> = match conn
+        .prepare("SELECT id, file_name FROM images WHERE file_stem IS NULL OR image_kind IS NULL")
     {
-        Ok(mut stmt) =>
-        {
-            match stmt.query_map([], |row|
-            {
+        Ok(mut stmt) => {
+            match stmt.query_map([], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            {
+            }) {
                 Ok(mapped) => mapped.filter_map(Result::ok).collect(),
-                Err(e) =>
-                {
+                Err(e) => {
                     eprintln!("[migration] Failed to query rows needing backfill: {}", e);
                     Vec::new()
                 }
             }
         }
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("[migration] Failed to prepare backfill query: {}", e);
             Vec::new()
         }
     };
 
     let mut backfilled_count = 0u64;
-    for (row_id, file_name) in &rows_needing_backfill
-    {
+    for (row_id, file_name) in &rows_needing_backfill {
         let parsed = parse_filename(file_name.clone());
-        let kind_str = match parsed.kind
-        {
+        let kind_str = match parsed.kind {
             ImageKind::Jpeg => "jpeg",
-            ImageKind::Raw  => "raw",
+            ImageKind::Raw => "raw",
             ImageKind::Other => "other",
             ImageKind::Heif => "heif",
-            ImageKind::Dng  => "dng",
-            ImageKind::Psd  => "psd",
+            ImageKind::Dng => "dng",
+            ImageKind::Psd => "psd",
             ImageKind::Tiff => "tiff",
-            ImageKind::Png  => "png",
+            ImageKind::Png => "png",
         };
         match conn.execute(
             "UPDATE images SET file_stem = ?1, image_kind = ?2 WHERE id = ?3",
             params![parsed.stem, kind_str, row_id],
-        )
-        {
+        ) {
             Ok(_) => backfilled_count += 1,
             Err(e) => eprintln!("[migration] Failed to update row id={}: {}", row_id, e),
         }
     }
-    eprintln!("[migration] backfilled file_stem/image_kind for {} rows", backfilled_count);
+    eprintln!(
+        "[migration] backfilled file_stem/image_kind for {} rows",
+        backfilled_count
+    );
 
     // Step 2: idempotent lowercase normalization of file_extension.
     // The WHERE clause restricts the UPDATE to rows that actually differ;
@@ -1020,8 +1033,7 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         "UPDATE images SET file_extension = LOWER(file_extension) \
          WHERE file_extension IS NOT NULL AND file_extension != LOWER(file_extension)",
         [],
-    )
-    {
+    ) {
         Ok(changed) => eprintln!("[migration] file_extension lowercased: {} rows", changed),
         Err(e) => eprintln!("[migration] Failed to normalize file_extension: {}", e),
     }
@@ -1055,16 +1067,14 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
     match conn.execute(
         "UPDATE images SET image_kind = 'dng' WHERE file_extension = 'dng' AND image_kind <> 'dng'",
         [],
-    )
-    {
+    ) {
         Ok(changed) => eprintln!("[migration] reclassified {} dng rows", changed),
         Err(e) => eprintln!("[migration] Failed to reclassify dng: {}", e),
     }
     match conn.execute(
         "UPDATE images SET image_kind = 'psd' WHERE file_extension = 'psd' AND image_kind <> 'psd'",
         [],
-    )
-    {
+    ) {
         Ok(changed) => eprintln!("[migration] reclassified {} psd rows", changed),
         Err(e) => eprintln!("[migration] Failed to reclassify psd: {}", e),
     }
@@ -1079,15 +1089,25 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
     match conn.execute(
         "UPDATE images SET image_kind = 'png' WHERE file_extension = 'png' AND image_kind <> 'png'",
         [],
-    )
-    {
+    ) {
         Ok(changed) => eprintln!("[migration] reclassified {} png rows", changed),
         Err(e) => eprintln!("[migration] Failed to reclassify png: {}", e),
     }
 
-    if let Err(e) = conn.execute_batch("COMMIT;")
-    {
+    if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("[migration] Failed to commit migration transaction: {}", e);
+        return false;
+    }
+
+    // DuckDB 1.2.2 can fail WAL replay when a pending ALTER TABLE ADD COLUMN is
+    // replayed against a table whose primary key default references a sequence.
+    // Checkpoint after startup schema/migration work so future launches do not
+    // depend on replaying those DDL records.
+    if let Err(e) = conn.execute_batch("CHECKPOINT;") {
+        eprintln!(
+            "[migration] Failed to checkpoint catalogue after schema migration: {}",
+            e
+        );
         return false;
     }
     // --- End backfill migration --------------------------------------------
@@ -1201,16 +1221,15 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
         // and the case-folding convention; both are enforced here at write time.
         // (DESIGN-Duplicate-Consolidation.md §5, §7.)
         let parsed = parse_filename(record.file_name.clone());
-        let image_kind_str = match parsed.kind
-        {
+        let image_kind_str = match parsed.kind {
             ImageKind::Jpeg => "jpeg",
-            ImageKind::Raw  => "raw",
+            ImageKind::Raw => "raw",
             ImageKind::Other => "other",
             ImageKind::Heif => "heif",
-            ImageKind::Dng  => "dng",
-            ImageKind::Psd  => "psd",
+            ImageKind::Dng => "dng",
+            ImageKind::Psd => "psd",
             ImageKind::Tiff => "tiff",
-            ImageKind::Png  => "png",
+            ImageKind::Png => "png",
         };
 
         // Execute the prepared statement with positional parameters
@@ -1219,54 +1238,54 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
         let result = conn.execute(
             insert_sql,
             params![
-                record.file_path,                           // ?1
-                record.file_size as i64,                    // ?2  (u64 → i64 cast safe for file sizes < 9 exabytes)
-                record.file_name,                           // ?3
-                record.file_extension,                      // ?4
-                parsed.stem,                                // ?5  file_stem (original case preserved)
-                image_kind_str,                             // ?6  image_kind (always lowercase: "jpeg"/"raw"/"other")
-                record.created_timestamp,                   // ?7
-                record.modified_timestamp,                  // ?8
-                record.camera_make,                         // ?9
-                record.camera_model,                        // ?10
-                record.lens_model,                          // ?11
-                record.focal_length,                        // ?12
-                record.aperture,                            // ?13
-                record.shutter_speed,                       // ?14
-                record.iso.map(|v| v as i64),              // ?15 (u32 → i64)
-                record.capture_datetime,                    // ?16
-                record.pixel_width.map(|v| v as i64),      // ?17 (u32 → i64)
-                record.pixel_height.map(|v| v as i64),     // ?18 (u32 → i64)
-                record.color_space,                         // ?19
-                record.bit_depth.map(|v| v as i64),        // ?20 (u32 → i64)
-                record.gps_latitude,                        // ?21
-                record.gps_longitude,                       // ?22
-                record.gps_altitude,                        // ?23
-                record.copyright,                           // ?24
-                record.creator,                             // ?25
-                record.description,                         // ?26
-                record.rating.map(|v| v as i64),           // ?27 (u8 → i64)
-                record.flag,                                // ?28
-                record.color_label,                         // ?29
+                record.file_path,                      // ?1
+                record.file_size as i64, // ?2  (u64 → i64 cast safe for file sizes < 9 exabytes)
+                record.file_name,        // ?3
+                record.file_extension,   // ?4
+                parsed.stem,             // ?5  file_stem (original case preserved)
+                image_kind_str,          // ?6  image_kind (always lowercase: "jpeg"/"raw"/"other")
+                record.created_timestamp, // ?7
+                record.modified_timestamp, // ?8
+                record.camera_make,      // ?9
+                record.camera_model,     // ?10
+                record.lens_model,       // ?11
+                record.focal_length,     // ?12
+                record.aperture,         // ?13
+                record.shutter_speed,    // ?14
+                record.iso.map(|v| v as i64), // ?15 (u32 → i64)
+                record.capture_datetime, // ?16
+                record.pixel_width.map(|v| v as i64), // ?17 (u32 → i64)
+                record.pixel_height.map(|v| v as i64), // ?18 (u32 → i64)
+                record.color_space,      // ?19
+                record.bit_depth.map(|v| v as i64), // ?20 (u32 → i64)
+                record.gps_latitude,     // ?21
+                record.gps_longitude,    // ?22
+                record.gps_altitude,     // ?23
+                record.copyright,        // ?24
+                record.creator,          // ?25
+                record.description,      // ?26
+                record.rating.map(|v| v as i64), // ?27 (u8 → i64)
+                record.flag,             // ?28
+                record.color_label,      // ?29
                 // --- Video / unified-media (Step 2a) — false/None for stills ---
-                record.is_video,                            // ?30 (bool)
-                record.duration_seconds,                    // ?31
-                record.frame_rate,                          // ?32
-                record.video_kind,                          // ?33
-                record.video_codec,                         // ?34
-                record.video_bitrate,                       // ?35
-                record.color_primaries,                     // ?36
-                record.color_transfer,                      // ?37
-                record.color_matrix,                        // ?38
-                record.color_range,                         // ?39
-                record.dv_profile,                          // ?40
-                record.has_audio,                           // ?41
-                record.audio_codec,                         // ?42
-                record.audio_channels,                      // ?43
-                record.audio_sample_rate,                   // ?44
-                record.audio_bitrate,                       // ?45
-                record.live_photo_id,                       // ?46
-                record.rotation,                            // ?47 (COALESCE(?,0): None/stills -> 0)
+                record.is_video,          // ?30 (bool)
+                record.duration_seconds,  // ?31
+                record.frame_rate,        // ?32
+                record.video_kind,        // ?33
+                record.video_codec,       // ?34
+                record.video_bitrate,     // ?35
+                record.color_primaries,   // ?36
+                record.color_transfer,    // ?37
+                record.color_matrix,      // ?38
+                record.color_range,       // ?39
+                record.dv_profile,        // ?40
+                record.has_audio,         // ?41
+                record.audio_codec,       // ?42
+                record.audio_channels,    // ?43
+                record.audio_sample_rate, // ?44
+                record.audio_bitrate,     // ?45
+                record.live_photo_id,     // ?46
+                record.rotation,          // ?47 (COALESCE(?,0): None/stills -> 0)
             ],
         );
 
@@ -1378,8 +1397,10 @@ fn format_epoch_to_iso8601(epoch_secs: i64) -> String {
 
     let day = remaining_days + 1;
 
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            year, month, day, hours, minutes, seconds)
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        year, month, day, hours, minutes, seconds
+    )
 }
 
 fn is_leap_year(year: i64) -> bool {
@@ -1443,8 +1464,7 @@ const DUPLICATE_GROUP_ID_CASE: &str = "\
 ///
 /// Single source of truth — both helpers reference this constant. See
 /// DESIGN-Filter-Aware-Pagination.md §6.
-const DUPLICATE_FILTER_PREDICATE: &str =
-    "(duplicate_group_id IS NULL OR id = duplicate_group_id)";
+const DUPLICATE_FILTER_PREDICATE: &str = "(duplicate_group_id IS NULL OR id = duplicate_group_id)";
 
 /// Inner-WHERE predicate that collapses RAW+JPEG counterpart pairs to the
 /// JPEG.
@@ -1512,8 +1532,7 @@ const VIDEOS_ONLY_PREDICATE: &str = "is_video IS TRUE";
 /// helper and the two sidebar-count GROUP-BYs. Order MUST match the UDL `enum
 /// MediaType` (UniFFI maps by position).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MediaType
-{
+pub enum MediaType {
     StillsOnly,
     VideosOnly,
     Both,
@@ -1522,10 +1541,8 @@ pub enum MediaType
 /// Map a `MediaType` to its WHERE-clause fragment, or `None` for `Both` (no
 /// media predicate — stills and video together). The single place the stance
 /// becomes SQL; every query helper calls this instead of pushing a constant.
-fn media_predicate(media_type: MediaType) -> Option<&'static str>
-{
-    match media_type
-    {
+fn media_predicate(media_type: MediaType) -> Option<&'static str> {
+    match media_type {
         MediaType::StillsOnly => Some(STILLS_ONLY_PREDICATE),
         MediaType::VideosOnly => Some(VIDEOS_ONLY_PREDICATE),
         MediaType::Both => None,
@@ -1557,13 +1574,11 @@ fn media_predicate(media_type: MediaType) -> Option<&'static str>
 /// (`RAW_JPEG_COLLAPSE_PREDICATE`) and with the outer duplicate-filter
 /// wrapper — see `execute_image_record_query` /
 /// `execute_image_count_query` / `execute_file_path_projection_query`.
-fn build_path_date_predicate(path_prefix: &str, date_prefix: &str) -> String
-{
+fn build_path_date_predicate(path_prefix: &str, date_prefix: &str) -> String {
     let escaped_path = path_prefix.replace("'", "''");
     let escaped_date = date_prefix.replace("'", "''");
 
-    match (path_prefix.is_empty(), date_prefix.is_empty())
-    {
+    match (path_prefix.is_empty(), date_prefix.is_empty()) {
         (true, true) => String::new(),
         (false, true) => format!("file_path LIKE '{}%'", escaped_path),
         (true, false) => format!("capture_datetime LIKE '{}%'", escaped_date),
@@ -1592,16 +1607,11 @@ fn build_path_date_predicate(path_prefix: &str, date_prefix: &str) -> String
 /// Does NOT perform SQL single-quote escaping; callers wrap the result
 /// in `'…'` and must follow with the usual `.replace("'", "''")` at
 /// the assembly site (`build_destination_family_predicate` does both).
-fn regex_escape_for_similar_to(s: &str) -> String
-{
+fn regex_escape_for_similar_to(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars()
-    {
-        match c
-        {
-            '\\' | '.' | '^' | '$' | '*' | '+' | '?'
-            | '(' | ')' | '[' | ']' | '{' | '}' | '|' =>
-            {
+    for c in s.chars() {
+        match c {
+            '\\' | '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' => {
                 out.push('\\');
                 out.push(c);
             }
@@ -1662,8 +1672,7 @@ fn regex_escape_for_similar_to(s: &str) -> String
 ///                            - INSTR(REVERSE('/Volumes/Photos/Library/2026/01_january/15/RSW_0001.NEF'), '/'))
 ///   AND (file_name = 'RSW_0001.NEF' OR file_name SIMILAR TO '[0-9][0-9]_version_RSW_0001\.NEF')
 /// ```
-fn build_destination_family_predicate(sample_file_path: &str, canonical_file_name: &str) -> String
-{
+fn build_destination_family_predicate(sample_file_path: &str, canonical_file_name: &str) -> String {
     let escaped_sample_path = sample_file_path.replace("'", "''");
     let escaped_canonical_sql = canonical_file_name.replace("'", "''");
 
@@ -1752,34 +1761,27 @@ fn execute_image_record_query(
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
     media_type: MediaType,
-) -> Vec<ImageRecord>
-{
+) -> Vec<ImageRecord> {
     // Assemble the inner WHERE from the caller-supplied predicate text
     // and the RAW+JPEG collapse predicate (both stored-column references;
     // both safely composable with AND at the inner level).
     let mut inner_predicates: Vec<&str> = Vec::new();
-    if !where_clause.is_empty()
-    {
+    if !where_clause.is_empty() {
         inner_predicates.push(where_clause);
     }
-    if apply_raw_jpeg_collapse
-    {
+    if apply_raw_jpeg_collapse {
         inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
     }
     // Media-type stance (DESIGN-Video-Schema-Unified-Table.md §11): gallery,
     // Browse, ⌘A, filtered counts, and path/date-prefix queries all gate through
     // this one seam. `media_predicate` maps the caller's MediaType to its WHERE
     // fragment — None for Both (stills + video together), so nothing is pushed.
-    if let Some(media_pred) = media_predicate(media_type)
-    {
+    if let Some(media_pred) = media_predicate(media_type) {
         inner_predicates.push(media_pred);
     }
-    let inner_where = if inner_predicates.is_empty()
-    {
+    let inner_where = if inner_predicates.is_empty() {
         String::new()
-    }
-    else
-    {
+    } else {
         format!("WHERE {}", inner_predicates.join(" AND "))
     };
 
@@ -1789,9 +1791,9 @@ fn execute_image_record_query(
     // projection at the top level — the alias is still surfaced on the
     // returned ImageRecord (column 30) for the existing Swift filter and
     // future Filter Builder consumers.
-    let query_sql = if apply_duplicate_filter
-    {
-        format!(r#"
+    let query_sql = if apply_duplicate_filter {
+        format!(
+            r#"
             SELECT * FROM (
                 SELECT
                     id, epoch(indexed_timestamp) as indexed_ts_epoch,
@@ -1812,14 +1814,11 @@ fn execute_image_record_query(
             ORDER BY {}
             LIMIT ?1 OFFSET ?2
         "#,
-            DUPLICATE_GROUP_ID_CASE,
-            inner_where,
-            DUPLICATE_FILTER_PREDICATE,
-            order_by)
-    }
-    else
-    {
-        format!(r#"
+            DUPLICATE_GROUP_ID_CASE, inner_where, DUPLICATE_FILTER_PREDICATE, order_by
+        )
+    } else {
+        format!(
+            r#"
             SELECT
                 id, epoch(indexed_timestamp) as indexed_ts_epoch,
                 file_path, file_size, file_name, file_extension,
@@ -1837,23 +1836,19 @@ fn execute_image_record_query(
             ORDER BY {}
             LIMIT ?1 OFFSET ?2
         "#,
-            DUPLICATE_GROUP_ID_CASE,
-            inner_where,
-            order_by)
+            DUPLICATE_GROUP_ID_CASE, inner_where, order_by
+        )
     };
 
-    let mut stmt = match conn.prepare(&query_sql)
-    {
+    let mut stmt = match conn.prepare(&query_sql) {
         Ok(s) => s,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to prepare query: {}", e);
             return Vec::new();
         }
     };
 
-    let rows = match stmt.query_map(params![limit, offset], |row|
-    {
+    let rows = match stmt.query_map(params![limit, offset], |row| {
         // Format indexed_timestamp from Unix epoch seconds to ISO 8601 string
         let epoch_secs: i64 = row.get(1)?;
         let indexed_ts = format_epoch_to_iso8601(epoch_secs);
@@ -1891,21 +1886,17 @@ fn execute_image_record_query(
             rotation: row.get::<_, i64>(29)? as i32,
             duplicate_group_id: row.get::<_, Option<i64>>(30)?,
         })
-    })
-    {
+    }) {
         Ok(r) => r,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to execute query: {}", e);
             return Vec::new();
         }
     };
 
     let mut records = Vec::new();
-    for row_result in rows
-    {
-        match row_result
-        {
+    for row_result in rows {
+        match row_result {
             Ok(record) => records.push(record),
             Err(e) => eprintln!("Failed to parse row: {}", e),
         }
@@ -1970,31 +1961,24 @@ fn execute_image_count_query(
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
     media_type: MediaType,
-) -> i64
-{
+) -> i64 {
     let mut inner_predicates: Vec<&str> = Vec::new();
-    if !where_clause.is_empty()
-    {
+    if !where_clause.is_empty() {
         inner_predicates.push(where_clause);
     }
-    if apply_raw_jpeg_collapse
-    {
+    if apply_raw_jpeg_collapse {
         inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
     }
     // Media-type stance (DESIGN-Video-Schema-Unified-Table.md §11): gallery,
     // Browse, ⌘A, filtered counts, and path/date-prefix queries all gate through
     // this one seam. `media_predicate` maps the caller's MediaType to its WHERE
     // fragment — None for Both (stills + video together), so nothing is pushed.
-    if let Some(media_pred) = media_predicate(media_type)
-    {
+    if let Some(media_pred) = media_predicate(media_type) {
         inner_predicates.push(media_pred);
     }
-    let inner_where = if inner_predicates.is_empty()
-    {
+    let inner_where = if inner_predicates.is_empty() {
         String::new()
-    }
-    else
-    {
+    } else {
         format!("WHERE {}", inner_predicates.join(" AND "))
     };
 
@@ -2004,9 +1988,9 @@ fn execute_image_count_query(
     // subquery so the outer WHERE can reference the alias; this matches
     // the record helper's wrap-in-subquery shape so totals stay
     // consistent with the paginated page contents.
-    let query_sql = if apply_duplicate_filter
-    {
-        format!(r#"
+    let query_sql = if apply_duplicate_filter {
+        format!(
+            r#"
             SELECT COUNT(*) FROM (
                 SELECT
                     id,
@@ -2016,26 +2000,17 @@ fn execute_image_count_query(
             )
             WHERE {}
         "#,
-            DUPLICATE_GROUP_ID_CASE,
-            inner_where,
-            DUPLICATE_FILTER_PREDICATE)
-    }
-    else
-    {
+            DUPLICATE_GROUP_ID_CASE, inner_where, DUPLICATE_FILTER_PREDICATE
+        )
+    } else {
         format!("SELECT COUNT(*) FROM images {}", inner_where)
     };
 
-    let count_result: Result<i64, _> = conn.query_row(
-        &query_sql,
-        [],
-        |row| row.get(0),
-    );
+    let count_result: Result<i64, _> = conn.query_row(&query_sql, [], |row| row.get(0));
 
-    match count_result
-    {
+    match count_result {
         Ok(count) => count,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to query image count: {}", e);
             0
         }
@@ -2087,15 +2062,12 @@ fn execute_file_path_projection_query(
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
     media_type: MediaType,
-) -> Result<Vec<String>, String>
-{
+) -> Result<Vec<String>, String> {
     let mut inner_predicates: Vec<&str> = Vec::new();
-    if !where_clause.is_empty()
-    {
+    if !where_clause.is_empty() {
         inner_predicates.push(where_clause);
     }
-    if apply_raw_jpeg_collapse
-    {
+    if apply_raw_jpeg_collapse {
         inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
     }
     // Media-type stance (DESIGN §11). folder-sync's computeDiff passes Both so
@@ -2103,16 +2075,12 @@ fn execute_file_path_projection_query(
     // allMediaExtensions); an asymmetric gate would read every catalogued video
     // as a phantom new arrival. `media_predicate` maps the stance to its WHERE
     // fragment — None for Both, so nothing is pushed.
-    if let Some(media_pred) = media_predicate(media_type)
-    {
+    if let Some(media_pred) = media_predicate(media_type) {
         inner_predicates.push(media_pred);
     }
-    let inner_where = if inner_predicates.is_empty()
-    {
+    let inner_where = if inner_predicates.is_empty() {
         String::new()
-    }
-    else
-    {
+    } else {
         format!("WHERE {}", inner_predicates.join(" AND "))
     };
 
@@ -2121,9 +2089,9 @@ fn execute_file_path_projection_query(
     // wrap an (id, file_path, duplicate_group_id) projection in a
     // subquery so the outer WHERE can apply DUPLICATE_FILTER_PREDICATE
     // against the alias.
-    let query_sql = if apply_duplicate_filter
-    {
-        format!(r#"
+    let query_sql = if apply_duplicate_filter {
+        format!(
+            r#"
             SELECT file_path FROM (
                 SELECT
                     id,
@@ -2134,40 +2102,31 @@ fn execute_file_path_projection_query(
             )
             WHERE {}
         "#,
-            DUPLICATE_GROUP_ID_CASE,
-            inner_where,
-            DUPLICATE_FILTER_PREDICATE)
-    }
-    else
-    {
+            DUPLICATE_GROUP_ID_CASE, inner_where, DUPLICATE_FILTER_PREDICATE
+        )
+    } else {
         format!("SELECT file_path FROM images {}", inner_where)
     };
 
-    let mut stmt = match conn.prepare(&query_sql)
-    {
+    let mut stmt = match conn.prepare(&query_sql) {
         Ok(s) => s,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to prepare file_path projection query: {}", e);
             return Err(format!("prepare failed: {}", e));
         }
     };
 
-    let rows = match stmt.query_map([], |row| row.get::<_, String>(0))
-    {
+    let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
         Ok(r) => r,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to execute file_path projection query: {}", e);
             return Err(format!("query failed: {}", e));
         }
     };
 
     let mut paths: Vec<String> = Vec::new();
-    for row_result in rows
-    {
-        match row_result
-        {
+    for row_result in rows {
+        match row_result {
             Ok(path) => paths.push(path),
             Err(e) => eprintln!("Failed to read file_path row: {}", e),
         }
@@ -2234,15 +2193,12 @@ fn execute_image_record_projection_query(
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
     media_type: MediaType,
-) -> Vec<ImageRecord>
-{
+) -> Vec<ImageRecord> {
     let mut inner_predicates: Vec<&str> = Vec::new();
-    if !where_clause.is_empty()
-    {
+    if !where_clause.is_empty() {
         inner_predicates.push(where_clause);
     }
-    if apply_raw_jpeg_collapse
-    {
+    if apply_raw_jpeg_collapse {
         inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
     }
     // Media-type stance (DESIGN §11). folder-sync's REMOVAL path resolves missing
@@ -2250,16 +2206,12 @@ fn execute_image_record_projection_query(
     // otherwise it finds 0 ids for a vanished clip and can never delete it (the
     // S72 −N loop). `media_predicate` maps the stance to its WHERE fragment —
     // None for Both, so nothing is pushed.
-    if let Some(media_pred) = media_predicate(media_type)
-    {
+    if let Some(media_pred) = media_predicate(media_type) {
         inner_predicates.push(media_pred);
     }
-    let inner_where = if inner_predicates.is_empty()
-    {
+    let inner_where = if inner_predicates.is_empty() {
         String::new()
-    }
-    else
-    {
+    } else {
         format!("WHERE {}", inner_predicates.join(" AND "))
     };
 
@@ -2269,9 +2221,9 @@ fn execute_image_record_projection_query(
     // the alias. When inactive, emit the projection at the top level
     // (the alias is still surfaced on the returned ImageRecord, column
     // 30).
-    let query_sql = if apply_duplicate_filter
-    {
-        format!(r#"
+    let query_sql = if apply_duplicate_filter {
+        format!(
+            r#"
             SELECT * FROM (
                 SELECT
                     id, epoch(indexed_timestamp) as indexed_ts_epoch,
@@ -2290,13 +2242,11 @@ fn execute_image_record_projection_query(
             )
             WHERE {}
         "#,
-            DUPLICATE_GROUP_ID_CASE,
-            inner_where,
-            DUPLICATE_FILTER_PREDICATE)
-    }
-    else
-    {
-        format!(r#"
+            DUPLICATE_GROUP_ID_CASE, inner_where, DUPLICATE_FILTER_PREDICATE
+        )
+    } else {
+        format!(
+            r#"
             SELECT
                 id, epoch(indexed_timestamp) as indexed_ts_epoch,
                 file_path, file_size, file_name, file_extension,
@@ -2312,22 +2262,19 @@ fn execute_image_record_projection_query(
             FROM images
             {}
         "#,
-            DUPLICATE_GROUP_ID_CASE,
-            inner_where)
+            DUPLICATE_GROUP_ID_CASE, inner_where
+        )
     };
 
-    let mut stmt = match conn.prepare(&query_sql)
-    {
+    let mut stmt = match conn.prepare(&query_sql) {
         Ok(s) => s,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to prepare image record projection query: {}", e);
             return Vec::new();
         }
     };
 
-    let rows = match stmt.query_map([], |row|
-    {
+    let rows = match stmt.query_map([], |row| {
         let epoch_secs: i64 = row.get(1)?;
         let indexed_ts = format_epoch_to_iso8601(epoch_secs);
 
@@ -2364,21 +2311,17 @@ fn execute_image_record_projection_query(
             rotation: row.get::<_, i64>(29)? as i32,
             duplicate_group_id: row.get::<_, Option<i64>>(30)?,
         })
-    })
-    {
+    }) {
         Ok(r) => r,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to execute image record projection query: {}", e);
             return Vec::new();
         }
     };
 
     let mut records = Vec::new();
-    for row_result in rows
-    {
-        match row_result
-        {
+    for row_result in rows {
+        match row_result {
             Ok(record) => records.push(record),
             Err(e) => eprintln!("Failed to parse image record row: {}", e),
         }
@@ -2631,8 +2574,7 @@ pub async fn update_image_flag(file_path: String, flag: Option<String>) -> bool 
 /// `directory_path` were rewritten; `message` carries a short diagnostic on
 /// failure (e.g. a UNIQUE collision when the new location overlaps another
 /// cataloged root), empty on success.
-pub struct RelocateResult
-{
+pub struct RelocateResult {
     pub ok: bool,
     pub updated: u64,
     pub message: String,
@@ -2650,32 +2592,42 @@ pub struct RelocateResult
 /// sibling like `.../InPutTest2` is never caught by `.../InPutTest`. The SQL
 /// was validated against a real 1,587-row catalogue copy before shipping
 /// (S51 Gate 2).
-pub async fn relocate_file_path_prefix(old_prefix: String, new_prefix: String) -> RelocateResult
-{
+pub async fn relocate_file_path_prefix(old_prefix: String, new_prefix: String) -> RelocateResult {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("relocate_file_path_prefix: catalogue not initialized");
-            return RelocateResult { ok: false, updated: 0, message: "Catalogue not initialized".to_string() };
+            return RelocateResult {
+                ok: false,
+                updated: 0,
+                message: "Catalogue not initialized".to_string(),
+            };
         }
     };
 
-    if old_prefix.is_empty() || new_prefix.is_empty()
-    {
-        return RelocateResult { ok: false, updated: 0, message: "Empty source or destination prefix".to_string() };
+    if old_prefix.is_empty() || new_prefix.is_empty() {
+        return RelocateResult {
+            ok: false,
+            updated: 0,
+            message: "Empty source or destination prefix".to_string(),
+        };
     }
-    if old_prefix == new_prefix
-    {
-        return RelocateResult { ok: true, updated: 0, message: String::new() };
+    if old_prefix == new_prefix {
+        return RelocateResult {
+            ok: true,
+            updated: 0,
+            message: String::new(),
+        };
     }
 
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
-    {
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         eprintln!("relocate_file_path_prefix: begin failed: {}", e);
-        return RelocateResult { ok: false, updated: 0, message: format!("begin failed: {}", e) };
+        return RelocateResult {
+            ok: false,
+            updated: 0,
+            message: format!("begin failed: {}", e),
+        };
     }
 
     // Rewrite file_path AND directory_path from the OLD file_path. The new-path
@@ -2690,26 +2642,38 @@ pub async fn relocate_file_path_prefix(old_prefix: String, new_prefix: String) -
                     - INSTR(REVERSE(?1 || SUBSTR(file_path, LENGTH(?2) + 1)), '/')) \
         WHERE file_path LIKE ?2 || '/%'";
 
-    let changed = match conn.execute(update_sql, params![new_prefix, old_prefix])
-    {
+    let changed = match conn.execute(update_sql, params![new_prefix, old_prefix]) {
         Ok(n) => n as u64,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("relocate_file_path_prefix: update failed: {}", e);
             let _ = conn.execute_batch("ROLLBACK;");
-            return RelocateResult { ok: false, updated: 0, message: format!("rewrite failed (possible path collision): {}", e) };
+            return RelocateResult {
+                ok: false,
+                updated: 0,
+                message: format!("rewrite failed (possible path collision): {}", e),
+            };
         }
     };
 
-    if let Err(e) = conn.execute_batch("COMMIT;")
-    {
+    if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("relocate_file_path_prefix: commit failed: {}", e);
         let _ = conn.execute_batch("ROLLBACK;");
-        return RelocateResult { ok: false, updated: 0, message: format!("commit failed: {}", e) };
+        return RelocateResult {
+            ok: false,
+            updated: 0,
+            message: format!("commit failed: {}", e),
+        };
     }
 
-    eprintln!("relocate_file_path_prefix: moved {} rows '{}' -> '{}'", changed, old_prefix, new_prefix);
-    RelocateResult { ok: true, updated: changed, message: String::new() }
+    eprintln!(
+        "relocate_file_path_prefix: moved {} rows '{}' -> '{}'",
+        changed, old_prefix, new_prefix
+    );
+    RelocateResult {
+        ok: true,
+        updated: changed,
+        message: String::new(),
+    }
 }
 
 /// Update the color label for an image
@@ -2776,8 +2740,7 @@ pub async fn update_image_color_label(file_path: String, color_label: Option<Str
 /// A boolean connector between two filter segments, applied LEFT-TO-RIGHT.
 /// Variant ORDER must match the UDL `enum Connector` (UniFFI maps by position).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Connector
-{
+pub enum Connector {
     And,
     Or,
     Xor,
@@ -2789,8 +2752,7 @@ pub enum Connector
 /// kind→fields map. (`PartialEq` is for the saved-query round-trip tests;
 /// it is not part of the FFI surface.)
 #[derive(Debug, Clone, PartialEq)]
-pub struct QueryPredicate
-{
+pub struct QueryPredicate {
     pub kind: String,
     pub day: Option<String>,
     pub day_end: Option<String>,
@@ -2810,31 +2772,29 @@ pub struct QueryPredicate
 /// and 7; digits elsewhere) — the form produced by `SUBSTRING(capture_datetime,
 /// 1, 10)`. Because only digits + colons can pass, a validated day cannot carry
 /// a SQL-injection payload (defense-in-depth on top of Swift-side validation).
-fn is_valid_day(s: &str) -> bool
-{
+fn is_valid_day(s: &str) -> bool {
     let b = s.as_bytes();
-    if b.len() != 10
-    {
+    if b.len() != 10 {
         return false;
     }
-    for (i, &c) in b.iter().enumerate()
-    {
-        let ok = if i == 4 || i == 7 { c == b':' } else { c.is_ascii_digit() };
-        if !ok
-        {
+    for (i, &c) in b.iter().enumerate() {
+        let ok = if i == 4 || i == 7 {
+            c == b':'
+        } else {
+            c.is_ascii_digit()
+        };
+        if !ok {
             return false;
         }
     }
     true
 }
 
-fn is_valid_flag(s: &str) -> bool
-{
+fn is_valid_flag(s: &str) -> bool {
     matches!(s, "pick" | "reject")
 }
 
-fn is_valid_color(s: &str) -> bool
-{
+fn is_valid_color(s: &str) -> bool {
     matches!(s, "red" | "yellow" | "green" | "blue" | "purple")
 }
 
@@ -2843,34 +2803,37 @@ fn is_valid_color(s: &str) -> bool
 /// (and the escape backslash itself) so typed text matches LITERALLY rather than
 /// acting as a wildcard. The single-quote doubling for the surrounding SQL
 /// string literal is applied separately by `filename_ilike_atom`.
-fn escape_for_ilike(s: &str) -> String
-{
-    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+fn escape_for_ilike(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// Build a parenthesized, case-insensitive file-name match atom from an already
 /// wildcard-escaped `ILIKE` pattern. Doubles single quotes for the SQL literal
 /// and pins the `ESCAPE` character to backslash. `ILIKE` gives the case-
 /// insensitivity the four File Name modes all require.
-fn filename_ilike_atom(pattern: &str) -> String
-{
-    format!("(file_name ILIKE '{}' ESCAPE '\\')", pattern.replace('\'', "''"))
+fn filename_ilike_atom(pattern: &str) -> String {
+    format!(
+        "(file_name ILIKE '{}' ESCAPE '\\')",
+        pattern.replace('\'', "''")
+    )
 }
 
 /// `filename_ilike_atom`'s twin, pointed at `lens_model` — the Lens subject's
 /// "contains" mode (Session 63). The lens string is composite (maker + focal +
 /// aperture + line), so a case-insensitive fragment like "Viltrox" or "85mm"
 /// matches the whole family.
-fn lens_ilike_atom(pattern: &str) -> String
-{
-    format!("(lens_model ILIKE '{}' ESCAPE '\\')", pattern.replace('\'', "''"))
+fn lens_ilike_atom(pattern: &str) -> String {
+    format!(
+        "(lens_model ILIKE '{}' ESCAPE '\\')",
+        pattern.replace('\'', "''")
+    )
 }
 
 /// Map a rating comparison op token to its SQL symbol. Unknown → None.
-fn sql_compare_op(op: &str) -> Option<&'static str>
-{
-    match op
-    {
+fn sql_compare_op(op: &str) -> Option<&'static str> {
+    match op {
         "eq" => Some("="),
         "gt" => Some(">"),
         "lt" => Some("<"),
@@ -2884,10 +2847,8 @@ fn sql_compare_op(op: &str) -> Option<&'static str>
 /// Gate 3). An allow-list, so unit text can never reach the SQL verbatim;
 /// the tokens are the wire vocabulary the Swift `DateUnit` enum emits (and
 /// Lightroom's own smart-collection unit words). Unknown → None.
-fn interval_unit_sql(unit: &str) -> Option<&'static str>
-{
-    match unit
-    {
+fn interval_unit_sql(unit: &str) -> Option<&'static str> {
+    match unit {
         "days" => Some("DAY"),
         "weeks" => Some("WEEK"),
         "months" => Some("MONTH"),
@@ -2903,17 +2864,13 @@ fn interval_unit_sql(unit: &str) -> Option<&'static str>
 /// dropdown-picked value is exact, not approximate. Non-finite numbers and
 /// unknown ops fall to the `(FALSE)` backstop via None. `between` requires
 /// both bounds; the other ops reuse the rating token vocabulary.
-fn numeric_atom(column: &str, op: &str, num: f64, num_end: Option<f64>) -> Option<String>
-{
-    if !num.is_finite()
-    {
+fn numeric_atom(column: &str, op: &str, num: f64, num_end: Option<f64>) -> Option<String> {
+    if !num.is_finite() {
         return None;
     }
-    if op == "between"
-    {
+    if op == "between" {
         let end = num_end?;
-        if !end.is_finite()
-        {
+        if !end.is_finite() {
             return None;
         }
         return Some(format!("({} BETWEEN {} AND {})", column, num, end));
@@ -2924,21 +2881,18 @@ fn numeric_atom(column: &str, op: &str, num: f64, num_end: Option<f64>) -> Optio
 
 /// The shared arm body for the four numeric kinds: op + num are required
 /// (num_end only for "between"); anything malformed matches nothing.
-fn numeric_predicate_sql(p: &QueryPredicate, column: &str) -> String
-{
-    match (p.op.as_deref(), p.num)
-    {
-        (Some(op), Some(num)) => numeric_atom(column, op, num, p.num_end)
-            .unwrap_or_else(|| "(FALSE)".to_string()),
+fn numeric_predicate_sql(p: &QueryPredicate, column: &str) -> String {
+    match (p.op.as_deref(), p.num) {
+        (Some(op), Some(num)) => {
+            numeric_atom(column, op, num, p.num_end).unwrap_or_else(|| "(FALSE)".to_string())
+        }
         _ => "(FALSE)".to_string(),
     }
 }
 
 /// SQL for a connector. XOR is boolean inequality (`<>`) — exactly-one-true.
-fn connector_sql(c: &Connector) -> &'static str
-{
-    match c
-    {
+fn connector_sql(c: &Connector) -> &'static str {
+    match c {
         Connector::And => "AND",
         Connector::Or => "OR",
         Connector::Xor => "<>",
@@ -2951,8 +2905,7 @@ fn connector_sql(c: &Connector) -> &'static str
 /// quote-escaped before interpolation; an invalid or malformed segment becomes
 /// `(FALSE)` (matches nothing) rather than risking malformed or unsafe SQL.
 /// Swift validates before sending, so `(FALSE)` is a defensive backstop.
-fn predicate_to_sql(p: &QueryPredicate) -> String
-{
+fn predicate_to_sql(p: &QueryPredicate) -> String {
     // A segment that should match nothing (invalid input backstop).
     let bad = || "(FALSE)".to_string();
 
@@ -3220,6 +3173,7 @@ fn predicate_to_sql(p: &QueryPredicate) -> String
         "aperture_num" => numeric_predicate_sql(p, "aperture"),
         "shutter_num" => numeric_predicate_sql(p, "shutter_speed"),
         "focal_num" => numeric_predicate_sql(p, "focal_length"),
+        "focus_num" => numeric_predicate_sql(p, "focus_score"),
         // Video numeric subjects (S75) — same machinery, new columns. Duration
         // is seconds (DOUBLE); frame_rate is fps (DOUBLE). A NULL column (a
         // still) never matches, exactly like the exposure numerics above.
@@ -3260,16 +3214,13 @@ fn predicate_to_sql(p: &QueryPredicate) -> String
 /// helpers can AND it with the RAW+JPEG-collapse predicate without precedence
 /// surprises (AND binds tighter than OR; an unwrapped trailing OR would wrongly
 /// bind the collapse predicate to only the last branch).
-fn build_filter_predicate(predicates: &[QueryPredicate], connectors: &[Connector]) -> String
-{
-    if predicates.is_empty()
-    {
+fn build_filter_predicate(predicates: &[QueryPredicate], connectors: &[Connector]) -> String {
+    if predicates.is_empty() {
         return String::new();
     }
 
     let mut acc = predicate_to_sql(&predicates[0]);
-    for i in 1..predicates.len()
-    {
+    for i in 1..predicates.len() {
         // connectors[i-1] joins the running result with segment i. Swift
         // sends predicates.len()-1 connectors; default to AND if short.
         let op = connectors.get(i - 1).map(connector_sql).unwrap_or("AND");
@@ -3289,6 +3240,11 @@ const DEFAULT_FILTER_ORDER_BY: &str = "capture_datetime DESC NULLS LAST, created
 const RATING_FILTER_ORDER_BY: &str =
     "rating DESC NULLS LAST, capture_datetime DESC NULLS LAST, created_timestamp DESC";
 
+/// First-subject-focus order: sharpest analyzed images first, then newest-first
+/// as the ordinary tie-break. NULLS LAST keeps not-yet-analyzed files honest.
+const FOCUS_FILTER_ORDER_BY: &str =
+    "focus_score DESC NULLS LAST, capture_datetime DESC NULLS LAST, created_timestamp DESC";
+
 /// Choose the `ORDER BY` for a filtered query from the FIRST predicate's
 /// subject — the Session-44 "first filter subject drives the sort" rule:
 ///   - rating-first  → stars best-to-worst (`rating DESC`)
@@ -3299,13 +3255,11 @@ const RATING_FILTER_ORDER_BY: &str =
 /// order; the Swift side still allows page-local column re-sorting on top.
 /// `count_query_images` needs no order, so it is unaffected (count/page parity
 /// is about the WHERE, not the ORDER BY).
-fn order_by_for_filter(predicates: &[QueryPredicate]) -> &'static str
-{
-    match predicates.first()
-    {
-        Some(p) => match p.kind.as_str()
-        {
+fn order_by_for_filter(predicates: &[QueryPredicate]) -> &'static str {
+    match predicates.first() {
+        Some(p) => match p.kind.as_str() {
             "rating" | "rating_unrated" => RATING_FILTER_ORDER_BY,
+            "focus_num" => FOCUS_FILTER_ORDER_BY,
             _ => DEFAULT_FILTER_ORDER_BY,
         },
         None => DEFAULT_FILTER_ORDER_BY,
@@ -3327,14 +3281,11 @@ pub async fn query_images(
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
     media_type: MediaType,
-) -> Vec<ImageRecord>
-{
+) -> Vec<ImageRecord> {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
@@ -3363,14 +3314,11 @@ pub async fn count_query_images(
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
     media_type: MediaType,
-) -> u64
-{
+) -> u64 {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return 0;
         }
@@ -3386,7 +3334,11 @@ pub async fn count_query_images(
         media_type,
     );
 
-    if count < 0 { 0 } else { count as u64 }
+    if count < 0 {
+        0
+    } else {
+        count as u64
+    }
 }
 
 // ============================================================================
@@ -3402,13 +3354,15 @@ pub async fn count_query_images(
 /// "WHERE", per the projection-helper convention). The IDs are integers, so
 /// direct interpolation carries no injection risk. `None` for an empty slice —
 /// the caller MUST short-circuit, since `IN ()` is a syntax error.
-fn id_in_list(ids: &[i64]) -> Option<String>
-{
-    if ids.is_empty()
-    {
+fn id_in_list(ids: &[i64]) -> Option<String> {
+    if ids.is_empty() {
         return None;
     }
-    let joined = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+    let joined = ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     Some(format!("id IN ({})", joined))
 }
 
@@ -3422,37 +3376,30 @@ fn execute_id_projection_query(
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
     media_type: MediaType,
-) -> Vec<i64>
-{
+) -> Vec<i64> {
     let mut inner_predicates: Vec<&str> = Vec::new();
-    if !where_clause.is_empty()
-    {
+    if !where_clause.is_empty() {
         inner_predicates.push(where_clause);
     }
-    if apply_raw_jpeg_collapse
-    {
+    if apply_raw_jpeg_collapse {
         inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
     }
     // Media-type stance (DESIGN-Video-Schema-Unified-Table.md §11): gallery,
     // Browse, ⌘A, filtered counts, and path/date-prefix queries all gate through
     // this one seam. `media_predicate` maps the caller's MediaType to its WHERE
     // fragment — None for Both (stills + video together), so nothing is pushed.
-    if let Some(media_pred) = media_predicate(media_type)
-    {
+    if let Some(media_pred) = media_predicate(media_type) {
         inner_predicates.push(media_pred);
     }
-    let inner_where = if inner_predicates.is_empty()
-    {
+    let inner_where = if inner_predicates.is_empty() {
         String::new()
-    }
-    else
-    {
+    } else {
         format!("WHERE {}", inner_predicates.join(" AND "))
     };
 
-    let query_sql = if apply_duplicate_filter
-    {
-        format!(r#"
+    let query_sql = if apply_duplicate_filter {
+        format!(
+            r#"
             SELECT id FROM (
                 SELECT
                     id,
@@ -3462,40 +3409,31 @@ fn execute_id_projection_query(
             )
             WHERE {}
         "#,
-            DUPLICATE_GROUP_ID_CASE,
-            inner_where,
-            DUPLICATE_FILTER_PREDICATE)
-    }
-    else
-    {
+            DUPLICATE_GROUP_ID_CASE, inner_where, DUPLICATE_FILTER_PREDICATE
+        )
+    } else {
         format!("SELECT id FROM images {}", inner_where)
     };
 
-    let mut stmt = match conn.prepare(&query_sql)
-    {
+    let mut stmt = match conn.prepare(&query_sql) {
         Ok(s) => s,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to prepare id projection query: {}", e);
             return Vec::new();
         }
     };
 
-    let rows = match stmt.query_map([], |row| row.get::<_, i64>(0))
-    {
+    let rows = match stmt.query_map([], |row| row.get::<_, i64>(0)) {
         Ok(r) => r,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to execute id projection query: {}", e);
             return Vec::new();
         }
     };
 
     let mut ids: Vec<i64> = Vec::new();
-    for row_result in rows
-    {
-        match row_result
-        {
+    for row_result in rows {
+        match row_result {
             Ok(id) => ids.push(id),
             Err(e) => eprintln!("Failed to read id row: {}", e),
         }
@@ -3514,41 +3452,40 @@ pub async fn query_image_ids(
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
     media_type: MediaType,
-) -> Vec<i64>
-{
+) -> Vec<i64> {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
     };
 
     let where_clause = build_filter_predicate(&predicates, &connectors);
-    execute_id_projection_query(conn, &where_clause, apply_duplicate_filter, apply_raw_jpeg_collapse, media_type)
+    execute_id_projection_query(
+        conn,
+        &where_clause,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+        media_type,
+    )
 }
 
 /// Resolve record IDs to full `ImageRecord`s — turns a Browse selection (which
 /// may span pages, or be the whole query) into records for Copy / Reveal.
 /// The IDs ARE the exact selection, so NO duplicate / raw-collapse filtering is
 /// applied. Order is unspecified (the copy planner re-sorts). Empty → empty.
-pub async fn get_images_by_ids(ids: Vec<i64>) -> Vec<ImageRecord>
-{
-    let where_clause = match id_in_list(&ids)
-    {
+pub async fn get_images_by_ids(ids: Vec<i64>) -> Vec<ImageRecord> {
+    let where_clause = match id_in_list(&ids) {
         Some(w) => w,
         None => return Vec::new(),
     };
 
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
@@ -3570,20 +3507,20 @@ pub async fn get_images_by_ids(ids: Vec<i64>) -> Vec<ImageRecord>
 /// two same-stem JPEGs with no RAW are never falsely merged. Deduped by UNION;
 /// order unspecified. On any error it falls back to the input IDs (degraded:
 /// the action still hits the visible rows, just not the RAW). Empty → empty.
-pub async fn expand_collapse_group_ids(ids: Vec<i64>) -> Vec<i64>
-{
-    if ids.is_empty()
-    {
+pub async fn expand_collapse_group_ids(ids: Vec<i64>) -> Vec<i64> {
+    if ids.is_empty() {
         return Vec::new();
     }
-    let csv = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+    let csv = ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
 
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return ids;
         }
@@ -3602,36 +3539,34 @@ pub async fn expand_collapse_group_ids(ids: Vec<i64>) -> Vec<i64>
         csv = csv
     );
 
-    let mut stmt = match conn.prepare(&query_sql)
-    {
+    let mut stmt = match conn.prepare(&query_sql) {
         Ok(s) => s,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to prepare collapse-group expansion: {}", e);
             return ids;
         }
     };
 
-    let rows = match stmt.query_map([], |row| row.get::<_, i64>(0))
-    {
+    let rows = match stmt.query_map([], |row| row.get::<_, i64>(0)) {
         Ok(r) => r,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to execute collapse-group expansion: {}", e);
             return ids;
         }
     };
 
     let mut result: Vec<i64> = Vec::new();
-    for row_result in rows
-    {
-        if let Ok(id) = row_result
-        {
+    for row_result in rows {
+        if let Ok(id) = row_result {
             result.push(id);
         }
     }
 
-    if result.is_empty() { ids } else { result }
+    if result.is_empty() {
+        ids
+    } else {
+        result
+    }
 }
 
 // === Keyword system (Session 45) ===
@@ -3652,8 +3587,7 @@ const KEYWORD_PATH_SEPARATOR: &str = "\u{001F}";
 
 /// A single materialized keyword row, as returned to Swift.
 #[derive(Debug, Clone)]
-pub struct KeywordRow
-{
+pub struct KeywordRow {
     pub label: String,
     pub path: String,
     pub status: i32,
@@ -3663,8 +3597,7 @@ pub struct KeywordRow
 
 /// A distinct (label, path) node — the vocabulary, for autocomplete + browsing.
 #[derive(Debug, Clone)]
-pub struct KeywordNode
-{
+pub struct KeywordNode {
     pub label: String,
     pub path: String,
 }
@@ -3673,15 +3606,12 @@ pub struct KeywordNode
 /// depth. `["Animals","Dog","Lab"]` -> `[("Animals","Animals"),
 /// ("Dog","Animals␟Dog"), ("Lab","Animals␟Dog␟Lab")]`. Returns empty if any
 /// segment is blank or itself contains the separator (-> caller no-ops).
-fn keyword_materialized_rows(segments: &[String]) -> Vec<(String, String)>
-{
+fn keyword_materialized_rows(segments: &[String]) -> Vec<(String, String)> {
     let mut rows: Vec<(String, String)> = Vec::new();
     let mut prefix: Vec<String> = Vec::new();
-    for seg in segments
-    {
+    for seg in segments {
         let trimmed = seg.trim();
-        if trimmed.is_empty() || trimmed.contains(KEYWORD_PATH_SEPARATOR)
-        {
+        if trimmed.is_empty() || trimmed.contains(KEYWORD_PATH_SEPARATOR) {
             return Vec::new();
         }
         prefix.push(trimmed.to_string());
@@ -3692,13 +3622,15 @@ fn keyword_materialized_rows(segments: &[String]) -> Vec<(String, String)>
 
 /// `image_id IN (...)` for the keyword table — sibling of `id_in_list`, which is
 /// hard-coded to the `images.id` column. `None` on empty.
-fn keyword_image_id_in_list(ids: &[i64]) -> Option<String>
-{
-    if ids.is_empty()
-    {
+fn keyword_image_id_in_list(ids: &[i64]) -> Option<String> {
+    if ids.is_empty() {
         return None;
     }
-    let joined = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+    let joined = ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     Some(format!("image_id IN ({})", joined))
 }
 
@@ -3708,59 +3640,48 @@ fn keyword_image_id_in_list(ids: &[i64]) -> Option<String>
 /// doesn't spam duplicates). A previously-removed (hidden) identical row is NOT
 /// resurrected — a fresh active row is inserted, preserving history. One
 /// transaction. Returns the number of rows inserted.
-pub async fn assign_keyword_for_ids(ids: Vec<i64>, segments: Vec<String>) -> u64
-{
-    if ids.is_empty()
-    {
+pub async fn assign_keyword_for_ids(ids: Vec<i64>, segments: Vec<String>) -> u64 {
+    if ids.is_empty() {
         return 0;
     }
     let rows = keyword_materialized_rows(&segments);
-    if rows.is_empty()
-    {
+    if rows.is_empty() {
         eprintln!("assign_keyword_for_ids: empty or invalid segments");
         return 0;
     }
 
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return 0;
         }
     };
 
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
-    {
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         eprintln!("assign_keyword_for_ids: begin failed: {}", e);
         return 0;
     }
 
     let mut inserted: u64 = 0;
-    for id in &ids
-    {
-        for (label, path) in &rows
-        {
+    for id in &ids {
+        for (label, path) in &rows {
             let existing: Result<i64, _> = conn.query_row(
                 "SELECT 1 FROM keyword WHERE image_id = ? AND path = ? AND status = 1 LIMIT 1",
                 params![id, path],
                 |r| r.get(0),
             );
-            if existing.is_ok()
-            {
+            if existing.is_ok() {
                 continue;
             }
             match conn.execute(
                 "INSERT INTO keyword (image_id, label, path, status, created_at) \
                  VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)",
                 params![id, label, path],
-            )
-            {
+            ) {
                 Ok(_) => inserted += 1,
-                Err(e) =>
-                {
+                Err(e) => {
                     eprintln!("assign_keyword_for_ids: insert failed: {}", e);
                     let _ = conn.execute_batch("ROLLBACK;");
                     return 0;
@@ -3769,8 +3690,7 @@ pub async fn assign_keyword_for_ids(ids: Vec<i64>, segments: Vec<String>) -> u64
         }
     }
 
-    if let Err(e) = conn.execute_batch("COMMIT;")
-    {
+    if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("assign_keyword_for_ids: commit failed: {}", e);
         return 0;
     }
@@ -3780,24 +3700,19 @@ pub async fn assign_keyword_for_ids(ids: Vec<i64>, segments: Vec<String>) -> u64
 /// Remove a keyword from many images — soft-hide the node AND its descendants
 /// (`path = ? OR starts_with(path, ?␟)`) for those images. Ancestors are LEFT
 /// intact (a lone parent is a valid flat keyword). Returns rows hidden.
-pub async fn remove_keyword_for_ids(ids: Vec<i64>, path: String) -> u64
-{
-    if ids.is_empty() || path.is_empty()
-    {
+pub async fn remove_keyword_for_ids(ids: Vec<i64>, path: String) -> u64 {
+    if ids.is_empty() || path.is_empty() {
         return 0;
     }
-    let where_ids = match keyword_image_id_in_list(&ids)
-    {
+    let where_ids = match keyword_image_id_in_list(&ids) {
         Some(w) => w,
         None => return 0,
     };
 
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return 0;
         }
@@ -3809,11 +3724,9 @@ pub async fn remove_keyword_for_ids(ids: Vec<i64>, path: String) -> u64
          WHERE status = 1 AND {} AND (path = ? OR starts_with(path, ?))",
         where_ids
     );
-    match conn.execute(&sql, params![path, prefix])
-    {
+    match conn.execute(&sql, params![path, prefix]) {
         Ok(changed) => changed as u64,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("remove_keyword_for_ids: {}", e);
             0
         }
@@ -3822,24 +3735,19 @@ pub async fn remove_keyword_for_ids(ids: Vec<i64>, path: String) -> u64
 
 /// Restore (un-hide) a previously removed keyword node + descendants for many
 /// images — undo of `remove_keyword_for_ids` and the recovery-screen action.
-pub async fn restore_keyword_for_ids(ids: Vec<i64>, path: String) -> u64
-{
-    if ids.is_empty() || path.is_empty()
-    {
+pub async fn restore_keyword_for_ids(ids: Vec<i64>, path: String) -> u64 {
+    if ids.is_empty() || path.is_empty() {
         return 0;
     }
-    let where_ids = match keyword_image_id_in_list(&ids)
-    {
+    let where_ids = match keyword_image_id_in_list(&ids) {
         Some(w) => w,
         None => return 0,
     };
 
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return 0;
         }
@@ -3851,11 +3759,9 @@ pub async fn restore_keyword_for_ids(ids: Vec<i64>, path: String) -> u64
          WHERE status = 0 AND {} AND (path = ? OR starts_with(path, ?))",
         where_ids
     );
-    match conn.execute(&sql, params![path, prefix])
-    {
+    match conn.execute(&sql, params![path, prefix]) {
         Ok(changed) => changed as u64,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("restore_keyword_for_ids: {}", e);
             0
         }
@@ -3879,19 +3785,21 @@ pub async fn restore_keyword_for_ids(ids: Vec<i64>, path: String) -> u64
 /// (image_id, path) skips anything already there (including a row the user
 /// hid on one half — their history wins); DISTINCT collapses double-sources
 /// (a .nef and a .dng sharing one stem are BOTH raw twins of one JPEG).
-fn mirror_keyword_rows_across_pairs_impl(conn: &Connection) -> u64
-{
+fn mirror_keyword_rows_across_pairs_impl(conn: &Connection) -> u64 {
     // (dst kinds, src kinds) — both directions of the pair.
     const DIRECTIONS: [(&str, &str); 2] = [
-        ("dst.image_kind IN ('jpeg', 'heif') AND src.image_kind = 'raw'",
-         "raw -> jpeg/heif"),
-        ("dst.image_kind = 'raw' AND src.image_kind IN ('jpeg', 'heif')",
-         "jpeg/heif -> raw"),
+        (
+            "dst.image_kind IN ('jpeg', 'heif') AND src.image_kind = 'raw'",
+            "raw -> jpeg/heif",
+        ),
+        (
+            "dst.image_kind = 'raw' AND src.image_kind IN ('jpeg', 'heif')",
+            "jpeg/heif -> raw",
+        ),
     ];
 
     let mut copied: u64 = 0;
-    for (kind_filter, direction_label) in DIRECTIONS
-    {
+    for (kind_filter, direction_label) in DIRECTIONS {
         let sql = format!(
             "INSERT INTO keyword (image_id, label, path, status, created_at, hidden_at, collection, color) \
              SELECT DISTINCT dst.id, k.label, k.path, k.status, CURRENT_TIMESTAMP, k.hidden_at, k.collection, k.color \
@@ -3904,12 +3812,13 @@ fn mirror_keyword_rows_across_pairs_impl(conn: &Connection) -> u64
                                WHERE k2.image_id = dst.id AND k2.path = k.path)",
             kind_filter
         );
-        match conn.execute(&sql, [])
-        {
+        match conn.execute(&sql, []) {
             Ok(changed) => copied += changed as u64,
-            Err(e) =>
-            {
-                eprintln!("mirror_keyword_rows_across_pairs ({}): {}", direction_label, e);
+            Err(e) => {
+                eprintln!(
+                    "mirror_keyword_rows_across_pairs ({}): {}",
+                    direction_label, e
+                );
             }
         }
     }
@@ -3919,14 +3828,11 @@ fn mirror_keyword_rows_across_pairs_impl(conn: &Connection) -> u64
 /// Mirror keyword rows across RAW+JPEG/HEIF pair siblings — see the impl
 /// above. Called by the Lightroom sidecar pass (S67) after synthesizing the
 /// sidecar JPEG records; safe (and a no-op) any other time.
-pub async fn mirror_keyword_rows_across_pairs() -> u64
-{
+pub async fn mirror_keyword_rows_across_pairs() -> u64 {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return 0;
         }
@@ -3945,30 +3851,32 @@ pub async fn mirror_keyword_rows_across_pairs() -> u64
 /// arrays from the copy plan) — the copy lives at a different path, so no
 /// stem/directory identity exists to infer. Idempotent: NOT EXISTS on
 /// (image_id, path) makes a re-copy a no-op. One transaction.
-fn copy_keyword_rows_for_image_pairs_impl(conn: &Connection,
-                                          source_ids: &[i64],
-                                          destination_ids: &[i64]) -> u64
-{
-    if source_ids.is_empty() || source_ids.len() != destination_ids.len()
-    {
-        if source_ids.len() != destination_ids.len()
-        {
-            eprintln!("copy_keyword_rows_for_image_pairs: id arrays differ in length ({} vs {})",
-                      source_ids.len(), destination_ids.len());
+fn copy_keyword_rows_for_image_pairs_impl(
+    conn: &Connection,
+    source_ids: &[i64],
+    destination_ids: &[i64],
+) -> u64 {
+    if source_ids.is_empty() || source_ids.len() != destination_ids.len() {
+        if source_ids.len() != destination_ids.len() {
+            eprintln!(
+                "copy_keyword_rows_for_image_pairs: id arrays differ in length ({} vs {})",
+                source_ids.len(),
+                destination_ids.len()
+            );
         }
         return 0;
     }
 
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
-    {
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         eprintln!("copy_keyword_rows_for_image_pairs: begin failed: {}", e);
         return 0;
     }
 
     let mut copied: u64 = 0;
-    for (src, dst) in source_ids.iter().zip(destination_ids.iter())
-    {
-        if src == dst { continue; }
+    for (src, dst) in source_ids.iter().zip(destination_ids.iter()) {
+        if src == dst {
+            continue;
+        }
         match conn.execute(
             "INSERT INTO keyword (image_id, label, path, status, created_at, hidden_at, collection, color) \
              SELECT ?2, k.label, k.path, k.status, CURRENT_TIMESTAMP, k.hidden_at, k.collection, k.color \
@@ -3989,8 +3897,7 @@ fn copy_keyword_rows_for_image_pairs_impl(conn: &Connection,
         }
     }
 
-    if let Err(e) = conn.execute_batch("COMMIT;")
-    {
+    if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("copy_keyword_rows_for_image_pairs: commit failed: {}", e);
         return 0;
     }
@@ -4000,14 +3907,14 @@ fn copy_keyword_rows_for_image_pairs_impl(conn: &Connection,
 /// Copy keyword rows from source images to their catalogued copies — see the
 /// impl above. Called by the Copy-and-Import pass (S67) with the copy plan's
 /// (source id, destination id) pairs, aligned by index.
-pub async fn copy_keyword_rows_for_image_pairs(source_ids: Vec<i64>, destination_ids: Vec<i64>) -> u64
-{
+pub async fn copy_keyword_rows_for_image_pairs(
+    source_ids: Vec<i64>,
+    destination_ids: Vec<i64>,
+) -> u64 {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return 0;
         }
@@ -4017,14 +3924,11 @@ pub async fn copy_keyword_rows_for_image_pairs(source_ids: Vec<i64>, destination
 
 /// All ACTIVE keyword rows for one image, ordered by path (root->leaf within a
 /// branch). For the detail-panel reconstruction.
-pub async fn keywords_for_image(image_id: i64) -> Vec<KeywordRow>
-{
+pub async fn keywords_for_image(image_id: i64) -> Vec<KeywordRow> {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
@@ -4033,18 +3937,15 @@ pub async fn keywords_for_image(image_id: i64) -> Vec<KeywordRow>
     let mut stmt = match conn.prepare(
         "SELECT label, path, status, CAST(created_at AS VARCHAR), CAST(hidden_at AS VARCHAR) \
          FROM keyword_visible WHERE image_id = ? ORDER BY path",
-    )
-    {
+    ) {
         Ok(s) => s,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("keywords_for_image: prepare {}", e);
             return Vec::new();
         }
     };
 
-    let mapped = stmt.query_map(params![image_id], |row|
-    {
+    let mapped = stmt.query_map(params![image_id], |row| {
         Ok(KeywordRow {
             label: row.get(0)?,
             path: row.get(1)?,
@@ -4054,11 +3955,9 @@ pub async fn keywords_for_image(image_id: i64) -> Vec<KeywordRow>
         })
     });
 
-    match mapped
-    {
+    match mapped {
         Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("keywords_for_image: query {}", e);
             Vec::new()
         }
@@ -4067,39 +3966,35 @@ pub async fn keywords_for_image(image_id: i64) -> Vec<KeywordRow>
 
 /// The DISTINCT (label, path) keyword vocabulary over the active view — for the
 /// assignment-panel autocomplete and (future) tree browser. Ordered by path.
-pub async fn keyword_vocabulary() -> Vec<KeywordNode>
-{
+pub async fn keyword_vocabulary() -> Vec<KeywordNode> {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
     };
 
-    let mut stmt = match conn.prepare("SELECT DISTINCT label, path FROM keyword_visible ORDER BY path")
-    {
-        Ok(s) => s,
-        Err(e) =>
-        {
-            eprintln!("keyword_vocabulary: prepare {}", e);
-            return Vec::new();
-        }
-    };
+    let mut stmt =
+        match conn.prepare("SELECT DISTINCT label, path FROM keyword_visible ORDER BY path") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("keyword_vocabulary: prepare {}", e);
+                return Vec::new();
+            }
+        };
 
-    let mapped = stmt.query_map([], |row|
-    {
-        Ok(KeywordNode { label: row.get(0)?, path: row.get(1)? })
+    let mapped = stmt.query_map([], |row| {
+        Ok(KeywordNode {
+            label: row.get(0)?,
+            path: row.get(1)?,
+        })
     });
 
-    match mapped
-    {
+    match mapped {
         Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("keyword_vocabulary: query {}", e);
             Vec::new()
         }
@@ -4111,40 +4006,32 @@ pub async fn keyword_vocabulary() -> Vec<KeywordNode>
 /// regardless of the `collection` flag, so any keyword can seed a collection and a
 /// dead collection's name still suggests itself. (The Collection TAB picker filters
 /// to `collection = TRUE` instead — a separate read, added with the tab.)
-pub async fn keyword_labels() -> Vec<String>
-{
+pub async fn keyword_labels() -> Vec<String> {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
     };
 
-    let mut stmt = match conn.prepare("SELECT DISTINCT label FROM keyword_visible ORDER BY label")
-    {
+    let mut stmt = match conn.prepare("SELECT DISTINCT label FROM keyword_visible ORDER BY label") {
         Ok(s) => s,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("keyword_labels: prepare {}", e);
             return Vec::new();
         }
     };
 
-    let mapped = stmt.query_map([], |row|
-    {
+    let mapped = stmt.query_map([], |row| {
         let label: String = row.get(0)?;
         Ok(label)
     });
 
-    match mapped
-    {
+    match mapped {
         Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("keyword_labels: query {}", e);
             Vec::new()
         }
@@ -4160,8 +4047,7 @@ pub async fn keyword_labels() -> Vec<String>
 
 /// One saved query's identity (header row), returned to Swift.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SavedQueryInfo
-{
+pub struct SavedQueryInfo {
     pub id: i64,
     pub name: String,
 }
@@ -4169,17 +4055,14 @@ pub struct SavedQueryInfo
 /// A loaded saved query: the same two arrays `query_images` consumes — load,
 /// hand to the sheet, run. Parity by construction with the live builder.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SavedQueryPayload
-{
+pub struct SavedQueryPayload {
     pub predicates: Vec<QueryPredicate>,
     pub connectors: Vec<Connector>,
 }
 
 /// Storage text for a connector (saved_query_criterion.connector).
-fn connector_to_text(c: &Connector) -> &'static str
-{
-    match c
-    {
+fn connector_to_text(c: &Connector) -> &'static str {
+    match c {
         Connector::And => "and",
         Connector::Or => "or",
         Connector::Xor => "xor",
@@ -4188,10 +4071,8 @@ fn connector_to_text(c: &Connector) -> &'static str
 
 /// Inverse of `connector_to_text`. Unknown/garbled → AND (the builder's
 /// default — same forgiveness as `build_filter_predicate`'s short-array rule).
-fn connector_from_text(s: &str) -> Connector
-{
-    match s
-    {
+fn connector_from_text(s: &str) -> Connector {
+    match s {
         "or" => Connector::Or,
         "xor" => Connector::Xor,
         _ => Connector::And,
@@ -4205,36 +4086,37 @@ fn connector_from_text(s: &str) -> Connector
 /// CATALOGUE lock, so two saves can't race to the same name). Returns the
 /// header carrying the FINAL (possibly suffixed) name, or None on invalid
 /// input / DB failure. One transaction.
-fn save_query_impl(conn: &Connection, name: &str,
-                   predicates: &[QueryPredicate], connectors: &[Connector]) -> Option<SavedQueryInfo>
-{
+fn save_query_impl(
+    conn: &Connection,
+    name: &str,
+    predicates: &[QueryPredicate],
+    connectors: &[Connector],
+) -> Option<SavedQueryInfo> {
     let base = name.trim();
-    if base.is_empty() || predicates.is_empty()
-    {
+    if base.is_empty() || predicates.is_empty() {
         return None;
     }
 
-    let exists = |n: &str| -> bool
-    {
-        conn.query_row("SELECT COUNT(*) FROM saved_query WHERE name = ?", [n],
-                       |row| row.get::<_, i64>(0))
-            .unwrap_or(0) > 0
+    let exists = |n: &str| -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM saved_query WHERE name = ?",
+            [n],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            > 0
     };
 
     let mut final_name = base.to_string();
-    if exists(&final_name)
-    {
+    if exists(&final_name) {
         let mut n = 1;
-        loop
-        {
-            if n > 999
-            {
+        loop {
+            if n > 999 {
                 eprintln!("save_query: suffix space exhausted for '{}'", base);
                 return None;
             }
             let candidate = format!("{}-{:02}", base, n);
-            if !exists(&candidate)
-            {
+            if !exists(&candidate) {
                 final_name = candidate;
                 break;
             }
@@ -4242,14 +4124,12 @@ fn save_query_impl(conn: &Connection, name: &str,
         }
     }
 
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
-    {
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         eprintln!("save_query: begin failed: {}", e);
         return None;
     }
 
-    if let Err(e) = conn.execute("INSERT INTO saved_query (name) VALUES (?)", [&final_name])
-    {
+    if let Err(e) = conn.execute("INSERT INTO saved_query (name) VALUES (?)", [&final_name]) {
         eprintln!("save_query: insert header failed: {}", e);
         let _ = conn.execute_batch("ROLLBACK;");
         return None;
@@ -4257,79 +4137,87 @@ fn save_query_impl(conn: &Connection, name: &str,
 
     // The name is unique by construction (checked above, under the lock), so
     // it safely keys the id read-back.
-    let id: i64 = match conn.query_row("SELECT id FROM saved_query WHERE name = ?",
-                                       [&final_name], |row| row.get(0))
-    {
+    let id: i64 = match conn.query_row(
+        "SELECT id FROM saved_query WHERE name = ?",
+        [&final_name],
+        |row| row.get(0),
+    ) {
         Ok(v) => v,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("save_query: id read-back failed: {}", e);
             let _ = conn.execute_batch("ROLLBACK;");
             return None;
         }
     };
 
-    for (i, p) in predicates.iter().enumerate()
-    {
+    for (i, p) in predicates.iter().enumerate() {
         // Row 1 has nothing to its left; row i (1-based) joins via connectors[i-2]
         // (Swift sends predicates.len()-1 connectors; default AND if short —
         // the same rule build_filter_predicate applies at query time).
-        let connector_text: Option<&str> = if i == 0
-        {
+        let connector_text: Option<&str> = if i == 0 {
             None
-        }
-        else
-        {
-            Some(connector_to_text(connectors.get(i - 1).unwrap_or(&Connector::And)))
+        } else {
+            Some(connector_to_text(
+                connectors.get(i - 1).unwrap_or(&Connector::And),
+            ))
         };
 
         if let Err(e) = conn.execute(
             "INSERT INTO saved_query_criterion \
              (query_id, position, connector, kind, op, value, day, day_end, stars, num, num_end) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![id, (i + 1) as i64, connector_text, p.kind, p.op, p.value,
-                    p.day, p.day_end, p.stars.map(|s| s as i32), p.num, p.num_end],
-        )
-        {
+            params![
+                id,
+                (i + 1) as i64,
+                connector_text,
+                p.kind,
+                p.op,
+                p.value,
+                p.day,
+                p.day_end,
+                p.stars.map(|s| s as i32),
+                p.num,
+                p.num_end
+            ],
+        ) {
             eprintln!("save_query: insert criterion failed: {}", e);
             let _ = conn.execute_batch("ROLLBACK;");
             return None;
         }
     }
 
-    if let Err(e) = conn.execute_batch("COMMIT;")
-    {
+    if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("save_query: commit failed: {}", e);
         let _ = conn.execute_batch("ROLLBACK;");
         return None;
     }
 
-    Some(SavedQueryInfo { id, name: final_name })
+    Some(SavedQueryInfo {
+        id,
+        name: final_name,
+    })
 }
 
 /// All saved queries, ordered by name (case-folded) for the picker list.
-fn list_saved_queries_impl(conn: &Connection) -> Vec<SavedQueryInfo>
-{
-    let mut stmt = match conn.prepare("SELECT id, name FROM saved_query ORDER BY LOWER(name), id")
-    {
+fn list_saved_queries_impl(conn: &Connection) -> Vec<SavedQueryInfo> {
+    let mut stmt = match conn.prepare("SELECT id, name FROM saved_query ORDER BY LOWER(name), id") {
         Ok(s) => s,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("list_saved_queries: prepare {}", e);
             return Vec::new();
         }
     };
 
-    let mapped = stmt.query_map([], |row|
-    {
-        Ok(SavedQueryInfo { id: row.get(0)?, name: row.get(1)? })
+    let mapped = stmt.query_map([], |row| {
+        Ok(SavedQueryInfo {
+            id: row.get(0)?,
+            name: row.get(1)?,
+        })
     });
 
-    match mapped
-    {
+    match mapped {
         Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("list_saved_queries: query {}", e);
             Vec::new()
         }
@@ -4338,22 +4226,19 @@ fn list_saved_queries_impl(conn: &Connection) -> Vec<SavedQueryInfo>
 
 /// Load a saved query's criterion rows back into the two arrays the builder
 /// (and `query_images`) consume. None for an unknown id or an empty recipe.
-fn load_saved_query_impl(conn: &Connection, id: i64) -> Option<SavedQueryPayload>
-{
+fn load_saved_query_impl(conn: &Connection, id: i64) -> Option<SavedQueryPayload> {
     let mut stmt = match conn.prepare(
         "SELECT position, connector, kind, op, value, day, day_end, stars, num, num_end \
-         FROM saved_query_criterion WHERE query_id = ? ORDER BY position")
-    {
+         FROM saved_query_criterion WHERE query_id = ? ORDER BY position",
+    ) {
         Ok(s) => s,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("load_saved_query: prepare {}", e);
             return None;
         }
     };
 
-    let mapped = stmt.query_map([id], |row|
-    {
+    let mapped = stmt.query_map([id], |row| {
         Ok((
             row.get::<_, i64>(0)?,            // position
             row.get::<_, Option<String>>(1)?, // connector
@@ -4368,11 +4253,9 @@ fn load_saved_query_impl(conn: &Connection, id: i64) -> Option<SavedQueryPayload
         ))
     });
 
-    let rows = match mapped
-    {
+    let rows = match mapped {
         Ok(iter) => iter.filter_map(|r| r.ok()),
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("load_saved_query: query {}", e);
             return None;
         }
@@ -4380,10 +4263,8 @@ fn load_saved_query_impl(conn: &Connection, id: i64) -> Option<SavedQueryPayload
 
     let mut predicates: Vec<QueryPredicate> = Vec::new();
     let mut connectors: Vec<Connector> = Vec::new();
-    for (position, connector, kind, op, value, day, day_end, stars, num, num_end) in rows
-    {
-        if position > 1
-        {
+    for (position, connector, kind, op, value, day, day_end, stars, num, num_end) in rows {
+        if position > 1 {
             connectors.push(connector_from_text(connector.as_deref().unwrap_or("and")));
         }
         predicates.push(QueryPredicate {
@@ -4398,43 +4279,39 @@ fn load_saved_query_impl(conn: &Connection, id: i64) -> Option<SavedQueryPayload
         });
     }
 
-    if predicates.is_empty()
-    {
+    if predicates.is_empty() {
         return None;
     }
-    Some(SavedQueryPayload { predicates, connectors })
+    Some(SavedQueryPayload {
+        predicates,
+        connectors,
+    })
 }
 
 /// Delete a saved query (header + criterion rows, one transaction). Returns
 /// whether a header row was actually removed.
-fn delete_saved_query_impl(conn: &Connection, id: i64) -> bool
-{
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
-    {
+fn delete_saved_query_impl(conn: &Connection, id: i64) -> bool {
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         eprintln!("delete_saved_query: begin failed: {}", e);
         return false;
     }
 
-    if let Err(e) = conn.execute("DELETE FROM saved_query_criterion WHERE query_id = ?", [id])
-    {
+    if let Err(e) = conn.execute("DELETE FROM saved_query_criterion WHERE query_id = ?", [id]) {
         eprintln!("delete_saved_query: criteria delete failed: {}", e);
         let _ = conn.execute_batch("ROLLBACK;");
         return false;
     }
 
-    let removed = match conn.execute("DELETE FROM saved_query WHERE id = ?", [id])
-    {
+    let removed = match conn.execute("DELETE FROM saved_query WHERE id = ?", [id]) {
         Ok(n) => n,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("delete_saved_query: header delete failed: {}", e);
             let _ = conn.execute_batch("ROLLBACK;");
             return false;
         }
     };
 
-    if let Err(e) = conn.execute_batch("COMMIT;")
-    {
+    if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("delete_saved_query: commit failed: {}", e);
         return false;
     }
@@ -4444,15 +4321,15 @@ fn delete_saved_query_impl(conn: &Connection, id: i64) -> bool
 
 /// FFI: save the current Find in Gallery sentence under `name` (suffixing a
 /// colliding name per the S63 policy). Returns the header with the FINAL name.
-pub async fn save_query(name: String, predicates: Vec<QueryPredicate>,
-                        connectors: Vec<Connector>) -> Option<SavedQueryInfo>
-{
+pub async fn save_query(
+    name: String,
+    predicates: Vec<QueryPredicate>,
+    connectors: Vec<Connector>,
+) -> Option<SavedQueryInfo> {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return None;
         }
@@ -4461,14 +4338,11 @@ pub async fn save_query(name: String, predicates: Vec<QueryPredicate>,
 }
 
 /// FFI: all saved queries (id + name), name-ordered, for the picker.
-pub async fn list_saved_queries() -> Vec<SavedQueryInfo>
-{
+pub async fn list_saved_queries() -> Vec<SavedQueryInfo> {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
@@ -4477,14 +4351,11 @@ pub async fn list_saved_queries() -> Vec<SavedQueryInfo>
 }
 
 /// FFI: load a saved query back into builder arrays. None if id unknown.
-pub async fn load_saved_query(id: i64) -> Option<SavedQueryPayload>
-{
+pub async fn load_saved_query(id: i64) -> Option<SavedQueryPayload> {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return None;
         }
@@ -4493,14 +4364,11 @@ pub async fn load_saved_query(id: i64) -> Option<SavedQueryPayload>
 }
 
 /// FFI: delete a saved query. True if it existed.
-pub async fn delete_saved_query(id: i64) -> bool
-{
+pub async fn delete_saved_query(id: i64) -> bool {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return false;
         }
@@ -4513,30 +4381,25 @@ pub async fn delete_saved_query(id: i64) -> bool
 /// only ask for values that exist). The field token is matched against the
 /// fixed allow-list and mapped to its column identifier HERE — caller strings
 /// are never interpolated into SQL. Unknown token → empty.
-pub async fn distinct_image_values(field: String) -> Vec<String>
-{
-    let column = match field.as_str()
-    {
+pub async fn distinct_image_values(field: String) -> Vec<String> {
+    let column = match field.as_str() {
         "file_extension" => "file_extension",
         "image_kind" => "image_kind",
         "camera_make" => "camera_make",
         "camera_model" => "camera_model",
         "lens_model" => "lens_model",
         "creator" => "creator",
-        "video_codec" => "video_codec",  // S75 — Codec subject dropdown
-        other =>
-        {
+        "video_codec" => "video_codec", // S75 — Codec subject dropdown
+        other => {
             eprintln!("distinct_image_values: unknown field '{}'", other);
             return Vec::new();
         }
     };
 
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
@@ -4546,11 +4409,9 @@ pub async fn distinct_image_values(field: String) -> Vec<String>
         "SELECT DISTINCT {col} FROM images WHERE {col} IS NOT NULL AND {col} <> '' ORDER BY LOWER({col})",
         col = column
     );
-    let mut stmt = match conn.prepare(&sql)
-    {
+    let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("distinct_image_values: prepare {}", e);
             return Vec::new();
         }
@@ -4558,11 +4419,9 @@ pub async fn distinct_image_values(field: String) -> Vec<String>
 
     let mapped = stmt.query_map([], |row| row.get::<_, String>(0));
 
-    match mapped
-    {
+    match mapped {
         Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("distinct_image_values: query {}", e);
             Vec::new()
         }
@@ -4575,29 +4434,25 @@ pub async fn distinct_image_values(field: String) -> Vec<String>
 /// straight back into the predicate, so "is exactly" equality never rides a
 /// string round-trip). ISO is an INTEGER column → CAST keeps one return type.
 /// Ascending numeric order. Unknown token → empty.
-pub async fn distinct_numeric_values(field: String) -> Vec<f64>
-{
-    let column = match field.as_str()
-    {
+pub async fn distinct_numeric_values(field: String) -> Vec<f64> {
+    let column = match field.as_str() {
         "iso" => "iso",
         "aperture" => "aperture",
         "shutter_speed" => "shutter_speed",
         "focal_length" => "focal_length",
-        "duration_seconds" => "duration_seconds",  // S75 — Duration subject dropdown
-        "frame_rate" => "frame_rate",               // S75 — Frame rate subject dropdown
-        other =>
-        {
+        "focus_score" => "focus_score", // S76 — Focus Quality subject dropdown
+        "duration_seconds" => "duration_seconds", // S75 — Duration subject dropdown
+        "frame_rate" => "frame_rate",   // S75 — Frame rate subject dropdown
+        other => {
             eprintln!("distinct_numeric_values: unknown field '{}'", other);
             return Vec::new();
         }
     };
 
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
@@ -4607,11 +4462,9 @@ pub async fn distinct_numeric_values(field: String) -> Vec<f64>
         "SELECT DISTINCT CAST({col} AS DOUBLE) AS v FROM images WHERE {col} IS NOT NULL ORDER BY v",
         col = column
     );
-    let mut stmt = match conn.prepare(&sql)
-    {
+    let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("distinct_numeric_values: prepare {}", e);
             return Vec::new();
         }
@@ -4619,15 +4472,165 @@ pub async fn distinct_numeric_values(field: String) -> Vec<f64>
 
     let mapped = stmt.query_map([], |row| row.get::<_, f64>(0));
 
-    match mapped
-    {
+    match mapped {
         Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("distinct_numeric_values: query {}", e);
             Vec::new()
         }
     }
+}
+
+fn is_valid_focus_status(status: &str) -> bool {
+    matches!(status, "complete" | "online_only" | "unreadable" | "failed")
+}
+
+fn is_valid_focus_basis(basis: &str) -> bool {
+    matches!(basis, "whole_image" | "face" | "subject" | "unknown")
+}
+
+/// Return a narrow page of still-image rows whose focus analysis is missing or
+/// stale for the requested algorithm version. The NULL columns are the queue; no
+/// separate enrichment table is persisted.
+pub async fn focus_analysis_candidates(
+    limit: u32,
+    algorithm_version: String,
+) -> Vec<FocusAnalysisCandidate> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let capped_limit = limit.clamp(1, 5000) as i64;
+    let mut stmt = match conn.prepare(
+        "SELECT id, file_path, file_size
+         FROM images
+         WHERE is_video IS NOT TRUE
+           AND (
+                focus_analysis_status IS NULL
+                OR focus_algorithm_version IS NULL
+                OR focus_algorithm_version <> ?1
+           )
+         ORDER BY id
+         LIMIT ?2",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("focus_analysis_candidates: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mapped = stmt.query_map(params![algorithm_version, capped_limit], |row| {
+        Ok(FocusAnalysisCandidate {
+            id: row.get(0)?,
+            file_path: row.get(1)?,
+            file_size: row.get::<_, i64>(2)? as u64,
+        })
+    });
+
+    match mapped {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            eprintln!("focus_analysis_candidates: query {}", e);
+            Vec::new()
+        }
+    }
+}
+
+/// Batch writeback for focus-analysis results. Returns the number of rows updated.
+pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) -> u64 {
+    if results.is_empty() {
+        return 0;
+    }
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
+        eprintln!("update_focus_analysis_results: begin {}", e);
+        return 0;
+    }
+
+    let mut updated = 0u64;
+    for result in results {
+        if !is_valid_focus_status(&result.status) {
+            eprintln!(
+                "update_focus_analysis_results: invalid status '{}'",
+                result.status
+            );
+            let _ = conn.execute_batch("ROLLBACK;");
+            return 0;
+        }
+        if let Some(score) = result.focus_score {
+            if !score.is_finite() {
+                eprintln!(
+                    "update_focus_analysis_results: non-finite score for id {}",
+                    result.id
+                );
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
+            }
+        }
+        if let Some(basis) = result.focus_basis.as_deref() {
+            if !is_valid_focus_basis(basis) {
+                eprintln!("update_focus_analysis_results: invalid basis '{}'", basis);
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
+            }
+        }
+
+        let score = if result.status == "complete" {
+            result.focus_score
+        } else {
+            None
+        };
+        let basis = result.focus_basis.unwrap_or_else(|| "unknown".to_string());
+
+        match conn.execute(
+            "UPDATE images
+             SET focus_score = ?2,
+                 focus_basis = ?3,
+                 focus_algorithm_version = ?4,
+                 focus_analysis_status = ?5,
+                 focus_scored_at = CURRENT_TIMESTAMP
+             WHERE id = ?1",
+            params![
+                result.id,
+                score,
+                basis,
+                result.algorithm_version,
+                result.status,
+            ],
+        ) {
+            Ok(n) => updated += n as u64,
+            Err(e) => {
+                eprintln!(
+                    "update_focus_analysis_results: row {} failed: {}",
+                    result.id, e
+                );
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
+            }
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;") {
+        eprintln!("update_focus_analysis_results: commit {}", e);
+        return 0;
+    }
+
+    updated
 }
 
 /// Distinct collection names — labels carrying `collection = TRUE` on any row,
@@ -4637,40 +4640,34 @@ pub async fn distinct_numeric_values(field: String) -> Vec<f64>
 /// dialog's flag-agnostic list). A collection whose members were all removed
 /// (every `collection` switch flipped back FALSE) simply doesn't appear here;
 /// its label still re-suggests in the Add dialog and re-creates by name.
-pub async fn collection_labels() -> Vec<String>
-{
+pub async fn collection_labels() -> Vec<String> {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
     };
 
-    let mut stmt = match conn.prepare("SELECT DISTINCT label FROM keyword WHERE collection = TRUE ORDER BY label")
+    let mut stmt = match conn
+        .prepare("SELECT DISTINCT label FROM keyword WHERE collection = TRUE ORDER BY label")
     {
         Ok(s) => s,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("collection_labels: prepare {}", e);
             return Vec::new();
         }
     };
 
-    let mapped = stmt.query_map([], |row|
-    {
+    let mapped = stmt.query_map([], |row| {
         let label: String = row.get(0)?;
         Ok(label)
     });
 
-    match mapped
-    {
+    match mapped {
         Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("collection_labels: query {}", e);
             Vec::new()
         }
@@ -4686,56 +4683,45 @@ pub async fn collection_labels() -> Vec<String>
 /// (already a member -> no-op). `status`/visibility is never touched — `collection`
 /// and visible are independent switches on the row. One transaction. Returns the
 /// number of rows changed (flipped + inserted).
-pub async fn add_images_to_collections(ids: Vec<i64>, labels: Vec<String>) -> u64
-{
-    if ids.is_empty()
-    {
+pub async fn add_images_to_collections(ids: Vec<i64>, labels: Vec<String>) -> u64 {
+    if ids.is_empty() {
         return 0;
     }
 
     // A collection name is a single flat segment — trim, drop empties and any that
     // carry the path separator (mirrors keyword_materialized_rows), then de-dupe.
     let mut clean: Vec<String> = Vec::new();
-    for label in &labels
-    {
+    for label in &labels {
         let trimmed = label.trim();
-        if trimmed.is_empty() || trimmed.contains(KEYWORD_PATH_SEPARATOR)
-        {
+        if trimmed.is_empty() || trimmed.contains(KEYWORD_PATH_SEPARATOR) {
             continue;
         }
         let s = trimmed.to_string();
-        if !clean.contains(&s)
-        {
+        if !clean.contains(&s) {
             clean.push(s);
         }
     }
-    if clean.is_empty()
-    {
+    if clean.is_empty() {
         return 0;
     }
 
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return 0;
         }
     };
 
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
-    {
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         eprintln!("add_images_to_collections: begin failed: {}", e);
         return 0;
     }
 
     let mut changed: u64 = 0;
-    for id in &ids
-    {
-        for label in &clean
-        {
+    for id in &ids {
+        for label in &clean {
             // Flip ON any existing visible row(s) with this label that aren't
             // already a collection (FALSE or, on migrated catalogues, NULL).
             let flipped = match conn.execute(
@@ -4743,18 +4729,15 @@ pub async fn add_images_to_collections(ids: Vec<i64>, labels: Vec<String>) -> u6
                  WHERE image_id = ? AND label = ? AND status = 1 \
                    AND (collection = FALSE OR collection IS NULL)",
                 params![id, label],
-            )
-            {
+            ) {
                 Ok(n) => n as u64,
-                Err(e) =>
-                {
+                Err(e) => {
                     eprintln!("add_images_to_collections: update failed: {}", e);
                     let _ = conn.execute_batch("ROLLBACK;");
                     return 0;
                 }
             };
-            if flipped > 0
-            {
+            if flipped > 0 {
                 changed += flipped;
                 continue;
             }
@@ -4766,8 +4749,7 @@ pub async fn add_images_to_collections(ids: Vec<i64>, labels: Vec<String>) -> u6
                 params![id, label],
                 |r| r.get(0),
             );
-            if already.is_ok()
-            {
+            if already.is_ok() {
                 continue;
             }
 
@@ -4776,11 +4758,9 @@ pub async fn add_images_to_collections(ids: Vec<i64>, labels: Vec<String>) -> u6
                 "INSERT INTO keyword (image_id, label, path, status, created_at, collection) \
                  VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, TRUE)",
                 params![id, label, label],
-            )
-            {
+            ) {
                 Ok(_) => changed += 1,
-                Err(e) =>
-                {
+                Err(e) => {
                     eprintln!("add_images_to_collections: insert failed: {}", e);
                     let _ = conn.execute_batch("ROLLBACK;");
                     return 0;
@@ -4789,8 +4769,7 @@ pub async fn add_images_to_collections(ids: Vec<i64>, labels: Vec<String>) -> u6
         }
     }
 
-    if let Err(e) = conn.execute_batch("COMMIT;")
-    {
+    if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("add_images_to_collections: commit failed: {}", e);
         return 0;
     }
@@ -4803,23 +4782,19 @@ pub async fn add_images_to_collections(ids: Vec<i64>, labels: Vec<String>) -> u6
 /// switch: per image, flip `color = TRUE` on any existing visible row carrying
 /// this label, else insert a flat row (path = label) with `color = TRUE`.
 /// Idempotent; one transaction; returns rows changed (flipped + inserted).
-fn assign_color_keyword_for_ids_impl(conn: &Connection, ids: &[i64], label: &str) -> u64
-{
+fn assign_color_keyword_for_ids_impl(conn: &Connection, ids: &[i64], label: &str) -> u64 {
     let trimmed = label.trim();
-    if ids.is_empty() || trimmed.is_empty() || trimmed.contains(KEYWORD_PATH_SEPARATOR)
-    {
+    if ids.is_empty() || trimmed.is_empty() || trimmed.contains(KEYWORD_PATH_SEPARATOR) {
         return 0;
     }
 
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
-    {
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         eprintln!("assign_color_keyword_for_ids: begin failed: {}", e);
         return 0;
     }
 
     let mut changed: u64 = 0;
-    for id in ids
-    {
+    for id in ids {
         // Flip ON any existing visible row(s) with this label that aren't
         // already marked (FALSE or, on migrated catalogues, NULL).
         let flipped = match conn.execute(
@@ -4827,18 +4802,15 @@ fn assign_color_keyword_for_ids_impl(conn: &Connection, ids: &[i64], label: &str
              WHERE image_id = ? AND label = ? AND status = 1 \
                AND (color = FALSE OR color IS NULL)",
             params![id, trimmed],
-        )
-        {
+        ) {
             Ok(n) => n as u64,
-            Err(e) =>
-            {
+            Err(e) => {
                 eprintln!("assign_color_keyword_for_ids: update failed: {}", e);
                 let _ = conn.execute_batch("ROLLBACK;");
                 return 0;
             }
         };
-        if flipped > 0
-        {
+        if flipped > 0 {
             changed += flipped;
             continue;
         }
@@ -4850,8 +4822,7 @@ fn assign_color_keyword_for_ids_impl(conn: &Connection, ids: &[i64], label: &str
             params![id, trimmed],
             |r| r.get(0),
         );
-        if already.is_ok()
-        {
+        if already.is_ok() {
             continue;
         }
 
@@ -4860,11 +4831,9 @@ fn assign_color_keyword_for_ids_impl(conn: &Connection, ids: &[i64], label: &str
             "INSERT INTO keyword (image_id, label, path, status, created_at, collection, color) \
              VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, FALSE, TRUE)",
             params![id, trimmed, trimmed],
-        )
-        {
+        ) {
             Ok(_) => changed += 1,
-            Err(e) =>
-            {
+            Err(e) => {
                 eprintln!("assign_color_keyword_for_ids: insert failed: {}", e);
                 let _ = conn.execute_batch("ROLLBACK;");
                 return 0;
@@ -4872,8 +4841,7 @@ fn assign_color_keyword_for_ids_impl(conn: &Connection, ids: &[i64], label: &str
         }
     }
 
-    if let Err(e) = conn.execute_batch("COMMIT;")
-    {
+    if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("assign_color_keyword_for_ids: commit failed: {}", e);
         return 0;
     }
@@ -4885,14 +4853,11 @@ fn assign_color_keyword_for_ids_impl(conn: &Connection, ids: &[i64], label: &str
 /// carrying `color = TRUE` — the third independent switch on the row, exactly
 /// parallel to `collection`. The five STANDARD color names never come here
 /// (they live in `images.color_label`); the reader's SQL filters them out.
-pub async fn assign_color_keyword_for_ids(ids: Vec<i64>, label: String) -> u64
-{
+pub async fn assign_color_keyword_for_ids(ids: Vec<i64>, label: String) -> u64 {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return 0;
         }
@@ -4911,10 +4876,8 @@ pub async fn assign_color_keyword_for_ids(ids: Vec<i64>, label: String) -> u64
 /// serves keyword search keeps doing so); a collection whose every switch flips
 /// back FALSE simply stops appearing in `collection_labels`. Idempotent (not a
 /// member -> no-op). One transaction. Returns the number of rows flipped.
-pub async fn remove_images_from_collections(ids: Vec<i64>, labels: Vec<String>) -> u64
-{
-    if ids.is_empty()
-    {
+pub async fn remove_images_from_collections(ids: Vec<i64>, labels: Vec<String>) -> u64 {
+    if ids.is_empty() {
         return 0;
     }
 
@@ -4922,57 +4885,46 @@ pub async fn remove_images_from_collections(ids: Vec<i64>, labels: Vec<String>) 
     // path separator, de-dupe. (Scope labels arrive exact from the picker, but
     // the FFI stays defensive.)
     let mut clean: Vec<String> = Vec::new();
-    for label in &labels
-    {
+    for label in &labels {
         let trimmed = label.trim();
-        if trimmed.is_empty() || trimmed.contains(KEYWORD_PATH_SEPARATOR)
-        {
+        if trimmed.is_empty() || trimmed.contains(KEYWORD_PATH_SEPARATOR) {
             continue;
         }
         let s = trimmed.to_string();
-        if !clean.contains(&s)
-        {
+        if !clean.contains(&s) {
             clean.push(s);
         }
     }
-    if clean.is_empty()
-    {
+    if clean.is_empty() {
         return 0;
     }
 
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return 0;
         }
     };
 
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
-    {
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         eprintln!("remove_images_from_collections: begin failed: {}", e);
         return 0;
     }
 
     let mut changed: u64 = 0;
-    for id in &ids
-    {
-        for label in &clean
-        {
+    for id in &ids {
+        for label in &clean {
             // Flip OFF any row carrying membership — deliberately NO status
             // filter (see the doc comment).
             match conn.execute(
                 "UPDATE keyword SET collection = FALSE \
                  WHERE image_id = ? AND label = ? AND collection = TRUE",
                 params![id, label],
-            )
-            {
+            ) {
                 Ok(n) => changed += n as u64,
-                Err(e) =>
-                {
+                Err(e) => {
                     eprintln!("remove_images_from_collections: update failed: {}", e);
                     let _ = conn.execute_batch("ROLLBACK;");
                     return 0;
@@ -4981,8 +4933,7 @@ pub async fn remove_images_from_collections(ids: Vec<i64>, labels: Vec<String>) 
         }
     }
 
-    if let Err(e) = conn.execute_batch("COMMIT;")
-    {
+    if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("remove_images_from_collections: commit failed: {}", e);
         return 0;
     }
@@ -4991,14 +4942,11 @@ pub async fn remove_images_from_collections(ids: Vec<i64>, labels: Vec<String>) 
 
 /// Hidden (removed) keyword rows for one image — the recovery surface. Reads the
 /// RAW table (not the view), newest-hidden first.
-pub async fn hidden_keywords_for_image(image_id: i64) -> Vec<KeywordRow>
-{
+pub async fn hidden_keywords_for_image(image_id: i64) -> Vec<KeywordRow> {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
@@ -5007,18 +4955,15 @@ pub async fn hidden_keywords_for_image(image_id: i64) -> Vec<KeywordRow>
     let mut stmt = match conn.prepare(
         "SELECT label, path, status, CAST(created_at AS VARCHAR), CAST(hidden_at AS VARCHAR) \
          FROM keyword WHERE image_id = ? AND status = 0 ORDER BY hidden_at DESC",
-    )
-    {
+    ) {
         Ok(s) => s,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("hidden_keywords_for_image: prepare {}", e);
             return Vec::new();
         }
     };
 
-    let mapped = stmt.query_map(params![image_id], |row|
-    {
+    let mapped = stmt.query_map(params![image_id], |row| {
         Ok(KeywordRow {
             label: row.get(0)?,
             path: row.get(1)?,
@@ -5028,11 +4973,9 @@ pub async fn hidden_keywords_for_image(image_id: i64) -> Vec<KeywordRow>
         })
     });
 
-    match mapped
-    {
+    match mapped {
         Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("hidden_keywords_for_image: query {}", e);
             Vec::new()
         }
@@ -5045,16 +4988,12 @@ pub async fn hidden_keywords_for_image(image_id: i64) -> Vec<KeywordRow>
 /// segment>` (labels unchanged, paths re-rooted); (3) hides the old subtree.
 /// Empty `new_parent` moves the node to the top level. One transaction. Returns
 /// the number of old rows hidden.
-pub async fn reparent_keyword(source_path: Vec<String>, new_parent: Vec<String>) -> u64
-{
-    if source_path.is_empty()
-    {
+pub async fn reparent_keyword(source_path: Vec<String>, new_parent: Vec<String>) -> u64 {
+    if source_path.is_empty() {
         return 0;
     }
-    for s in source_path.iter().chain(new_parent.iter())
-    {
-        if s.trim().is_empty() || s.contains(KEYWORD_PATH_SEPARATOR)
-        {
+    for s in source_path.iter().chain(new_parent.iter()) {
+        if s.trim().is_empty() || s.contains(KEYWORD_PATH_SEPARATOR) {
             eprintln!("reparent_keyword: invalid segment");
             return 0;
         }
@@ -5063,13 +5002,15 @@ pub async fn reparent_keyword(source_path: Vec<String>, new_parent: Vec<String>)
     let source_joined = source_path.join(KEYWORD_PATH_SEPARATOR);
     let source_prefix = format!("{}{}", source_joined, KEYWORD_PATH_SEPARATOR);
     let last_seg = source_path.last().unwrap().trim().to_string();
-    let new_root = if new_parent.is_empty()
-    {
+    let new_root = if new_parent.is_empty() {
         last_seg
-    }
-    else
-    {
-        format!("{}{}{}", new_parent.join(KEYWORD_PATH_SEPARATOR), KEYWORD_PATH_SEPARATOR, last_seg)
+    } else {
+        format!(
+            "{}{}{}",
+            new_parent.join(KEYWORD_PATH_SEPARATOR),
+            KEYWORD_PATH_SEPARATOR,
+            last_seg
+        )
     };
     // char count + 1 = 1-indexed position of the first char AFTER source_joined
     // ("" for the subtree root, "␟Yellow" for a descendant).
@@ -5077,31 +5018,29 @@ pub async fn reparent_keyword(source_path: Vec<String>, new_parent: Vec<String>)
     let new_parent_rows = keyword_materialized_rows(&new_parent);
 
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return 0;
         }
     };
 
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
-    {
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         eprintln!("reparent_keyword: begin failed: {}", e);
         return 0;
     }
 
     // (1) Ensure the new-parent ancestor chain exists for every affected image.
-    for (label, path) in &new_parent_rows
-    {
+    for (label, path) in &new_parent_rows {
         let sql = "INSERT INTO keyword (image_id, label, path, status, created_at) \
                    SELECT DISTINCT image_id, ?, ?, 1, CURRENT_TIMESTAMP FROM keyword \
                    WHERE status = 1 AND (path = ? OR starts_with(path, ?)) \
                    AND image_id NOT IN (SELECT image_id FROM keyword WHERE status = 1 AND path = ?)";
-        if let Err(e) = conn.execute(sql, params![label, path, source_joined, source_prefix, path])
-        {
+        if let Err(e) = conn.execute(
+            sql,
+            params![label, path, source_joined, source_prefix, path],
+        ) {
             eprintln!("reparent_keyword: ancestor insert failed: {}", e);
             let _ = conn.execute_batch("ROLLBACK;");
             return 0;
@@ -5112,8 +5051,10 @@ pub async fn reparent_keyword(source_path: Vec<String>, new_parent: Vec<String>)
     let move_sql = "INSERT INTO keyword (image_id, label, path, status, created_at) \
                     SELECT image_id, label, ? || substr(path, ?), 1, CURRENT_TIMESTAMP FROM keyword \
                     WHERE status = 1 AND (path = ? OR starts_with(path, ?))";
-    if let Err(e) = conn.execute(move_sql, params![new_root, suffix_start, source_joined, source_prefix])
-    {
+    if let Err(e) = conn.execute(
+        move_sql,
+        params![new_root, suffix_start, source_joined, source_prefix],
+    ) {
         eprintln!("reparent_keyword: move insert failed: {}", e);
         let _ = conn.execute_batch("ROLLBACK;");
         return 0;
@@ -5122,19 +5063,16 @@ pub async fn reparent_keyword(source_path: Vec<String>, new_parent: Vec<String>)
     // (3) Hide the old subtree.
     let hide_sql = "UPDATE keyword SET status = 0, hidden_at = CURRENT_TIMESTAMP \
                     WHERE status = 1 AND (path = ? OR starts_with(path, ?))";
-    let changed = match conn.execute(hide_sql, params![source_joined, source_prefix])
-    {
+    let changed = match conn.execute(hide_sql, params![source_joined, source_prefix]) {
         Ok(c) => c as u64,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("reparent_keyword: hide failed: {}", e);
             let _ = conn.execute_batch("ROLLBACK;");
             return 0;
         }
     };
 
-    if let Err(e) = conn.execute_batch("COMMIT;")
-    {
+    if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("reparent_keyword: commit failed: {}", e);
         return 0;
     }
@@ -5145,22 +5083,17 @@ pub async fn reparent_keyword(source_path: Vec<String>, new_parent: Vec<String>)
 /// cascading to descendants. Same machinery as reparent, but the subtree is
 /// re-rooted under the SAME parent with the new label (so no ancestor insert is
 /// needed — the parent already exists). One transaction. Returns rows hidden.
-pub async fn rename_keyword(target_path: Vec<String>, new_label: String) -> u64
-{
-    if target_path.is_empty()
-    {
+pub async fn rename_keyword(target_path: Vec<String>, new_label: String) -> u64 {
+    if target_path.is_empty() {
         return 0;
     }
     let new_label = new_label.trim().to_string();
-    if new_label.is_empty() || new_label.contains(KEYWORD_PATH_SEPARATOR)
-    {
+    if new_label.is_empty() || new_label.contains(KEYWORD_PATH_SEPARATOR) {
         eprintln!("rename_keyword: invalid new label");
         return 0;
     }
-    for s in target_path.iter()
-    {
-        if s.trim().is_empty() || s.contains(KEYWORD_PATH_SEPARATOR)
-        {
+    for s in target_path.iter() {
+        if s.trim().is_empty() || s.contains(KEYWORD_PATH_SEPARATOR) {
             eprintln!("rename_keyword: invalid segment");
             return 0;
         }
@@ -5170,28 +5103,27 @@ pub async fn rename_keyword(target_path: Vec<String>, new_label: String) -> u64
     let target_prefix = format!("{}{}", target_joined, KEYWORD_PATH_SEPARATOR);
     let suffix_start = (target_joined.chars().count() + 1) as i64;
     let parent = &target_path[..target_path.len() - 1];
-    let new_root = if parent.is_empty()
-    {
+    let new_root = if parent.is_empty() {
         new_label.clone()
-    }
-    else
-    {
-        format!("{}{}{}", parent.join(KEYWORD_PATH_SEPARATOR), KEYWORD_PATH_SEPARATOR, new_label)
+    } else {
+        format!(
+            "{}{}{}",
+            parent.join(KEYWORD_PATH_SEPARATOR),
+            KEYWORD_PATH_SEPARATOR,
+            new_label
+        )
     };
 
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return 0;
         }
     };
 
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
-    {
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         eprintln!("rename_keyword: begin failed: {}", e);
         return 0;
     }
@@ -5205,9 +5137,15 @@ pub async fn rename_keyword(target_path: Vec<String>, new_label: String) -> u64
                     WHERE status = 1 AND (path = ? OR starts_with(path, ?))";
     if let Err(e) = conn.execute(
         move_sql,
-        params![target_joined, new_label, new_root, suffix_start, target_joined, target_prefix],
-    )
-    {
+        params![
+            target_joined,
+            new_label,
+            new_root,
+            suffix_start,
+            target_joined,
+            target_prefix
+        ],
+    ) {
         eprintln!("rename_keyword: move insert failed: {}", e);
         let _ = conn.execute_batch("ROLLBACK;");
         return 0;
@@ -5215,19 +5153,16 @@ pub async fn rename_keyword(target_path: Vec<String>, new_label: String) -> u64
 
     let hide_sql = "UPDATE keyword SET status = 0, hidden_at = CURRENT_TIMESTAMP \
                     WHERE status = 1 AND (path = ? OR starts_with(path, ?))";
-    let changed = match conn.execute(hide_sql, params![target_joined, target_prefix])
-    {
+    let changed = match conn.execute(hide_sql, params![target_joined, target_prefix]) {
         Ok(c) => c as u64,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("rename_keyword: hide failed: {}", e);
             let _ = conn.execute_batch("ROLLBACK;");
             return 0;
         }
     };
 
-    if let Err(e) = conn.execute_batch("COMMIT;")
-    {
+    if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("rename_keyword: commit failed: {}", e);
         return 0;
     }
@@ -5241,8 +5176,7 @@ pub async fn rename_keyword(target_path: Vec<String>, new_label: String) -> u64
 /// rolled back and a zeroed result is returned (inserted + updated == 0 on a
 /// non-empty input signals a failed chunk to the orchestrator).
 #[derive(Debug, Clone)]
-pub struct MergeChunkResult
-{
+pub struct MergeChunkResult {
     pub inserted: u64,
     pub updated: u64,
     pub image_ids: Vec<i64>,
@@ -5257,22 +5191,22 @@ pub struct MergeChunkResult
 /// explicit path is id-stable by construction (an UPDATE never touches `id` —
 /// `keyword.image_id` FKs depend on it) and yields the inserted/updated tally
 /// for free.
-fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChunkResult
-{
-    let mut out = MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::with_capacity(records.len()) };
-    if records.is_empty()
-    {
+fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChunkResult {
+    let mut out = MergeChunkResult {
+        inserted: 0,
+        updated: 0,
+        image_ids: Vec::with_capacity(records.len()),
+    };
+    if records.is_empty() {
         return out;
     }
 
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
-    {
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         eprintln!("merge_records_into: begin failed: {}", e);
         return out;
     }
 
-    for record in records
-    {
+    for record in records {
         // Pre-check: an existing row keeps its id (UPDATE); else a fresh INSERT.
         let existing: Result<i64, _> = conn.query_row(
             "SELECT id FROM images WHERE file_path = ?1",
@@ -5281,8 +5215,7 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
         );
 
         // Each arm yields Result<(was_insert, id), Error>.
-        let row_result: Result<(bool, i64), _> = if let Ok(id) = existing
-        {
+        let row_result: Result<(bool, i64), _> = if let Ok(id) = existing {
             // UPDATE — facts fill-if-missing, curation Lightroom-wins (§4/§5).
             conn.execute(
                 "UPDATE images SET \
@@ -5324,23 +5257,21 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
                     record.color_label,
                     record.rotation.map(|v| v as i64),
                 ],
-            ).map(|_| (false, id))
-        }
-        else
-        {
+            )
+            .map(|_| (false, id))
+        } else {
             // INSERT — mirror ingest_metadata's column set + the canonical
             // directory_path expression; RETURNING id (a plain insert is reliable).
             let parsed = parse_filename(record.file_name.clone());
-            let image_kind_str = match parsed.kind
-            {
+            let image_kind_str = match parsed.kind {
                 ImageKind::Jpeg => "jpeg",
-                ImageKind::Raw  => "raw",
+                ImageKind::Raw => "raw",
                 ImageKind::Other => "other",
                 ImageKind::Heif => "heif",
-                ImageKind::Dng  => "dng",
-                ImageKind::Psd  => "psd",
+                ImageKind::Dng => "dng",
+                ImageKind::Psd => "psd",
                 ImageKind::Tiff => "tiff",
-                ImageKind::Png  => "png",
+                ImageKind::Png => "png",
             };
             conn.query_row(
                 "INSERT INTO images ( \
@@ -5392,26 +5323,41 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
                     record.rotation.unwrap_or(0),
                 ],
                 |r| r.get::<_, i64>(0),
-            ).map(|new_id| (true, new_id))
+            )
+            .map(|new_id| (true, new_id))
         };
 
-        match row_result
-        {
-            Ok((true, id))  => { out.inserted += 1; out.image_ids.push(id); }
-            Ok((false, id)) => { out.updated  += 1; out.image_ids.push(id); }
-            Err(e) =>
-            {
-                eprintln!("merge_records_into: row failed for {}: {}", record.file_path, e);
+        match row_result {
+            Ok((true, id)) => {
+                out.inserted += 1;
+                out.image_ids.push(id);
+            }
+            Ok((false, id)) => {
+                out.updated += 1;
+                out.image_ids.push(id);
+            }
+            Err(e) => {
+                eprintln!(
+                    "merge_records_into: row failed for {}: {}",
+                    record.file_path, e
+                );
                 let _ = conn.execute_batch("ROLLBACK;");
-                return MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::new() };
+                return MergeChunkResult {
+                    inserted: 0,
+                    updated: 0,
+                    image_ids: Vec::new(),
+                };
             }
         }
     }
 
-    if let Err(e) = conn.execute_batch("COMMIT;")
-    {
+    if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("merge_records_into: commit failed: {}", e);
-        return MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::new() };
+        return MergeChunkResult {
+            inserted: 0,
+            updated: 0,
+            image_ids: Vec::new(),
+        };
     }
     out
 }
@@ -5420,20 +5366,24 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
 /// catalogue (matched on file_path). Reuses `ImageMetadata` as the input — it is
 /// an exact superset of what LR provides (§10). Returns per-chunk stats + the
 /// resulting catalogue ids (aligned to input order) for the keyword pass.
-pub async fn merge_lightroom_records(records: Vec<ImageMetadata>) -> MergeChunkResult
-{
-    if records.is_empty()
-    {
-        return MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::new() };
+pub async fn merge_lightroom_records(records: Vec<ImageMetadata>) -> MergeChunkResult {
+    if records.is_empty() {
+        return MergeChunkResult {
+            inserted: 0,
+            updated: 0,
+            image_ids: Vec::new(),
+        };
     }
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("merge_lightroom_records: catalogue not initialized");
-            return MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::new() };
+            return MergeChunkResult {
+                inserted: 0,
+                updated: 0,
+                image_ids: Vec::new(),
+            };
         }
     };
     merge_records_into(conn, &records)
@@ -5443,8 +5393,7 @@ pub async fn merge_lightroom_records(records: Vec<ImageMetadata>) -> MergeChunkR
 /// `ImageMetadata` analogue — videos carry duration/frame_rate/has_audio/
 /// video_kind and no EXIF. `directory_path` is derived Rust-side (like images).
 #[derive(Debug, Clone)]
-pub struct LightroomVideoRecord
-{
+pub struct LightroomVideoRecord {
     pub file_path: String,
     pub file_size: u64,
     pub file_name: String,
@@ -5467,30 +5416,29 @@ pub struct LightroomVideoRecord
 /// check-then-UPDATE-or-INSERT pattern as `merge_records_into` (§4), into the
 /// `videos` table. The result's `image_ids` holds the VIDEO-row ids (aligned to
 /// input) — the field name is shared for one `MergeChunkResult` shape.
-fn merge_videos_into(conn: &Connection, records: &[LightroomVideoRecord]) -> MergeChunkResult
-{
-    let mut out = MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::with_capacity(records.len()) };
-    if records.is_empty()
-    {
+fn merge_videos_into(conn: &Connection, records: &[LightroomVideoRecord]) -> MergeChunkResult {
+    let mut out = MergeChunkResult {
+        inserted: 0,
+        updated: 0,
+        image_ids: Vec::with_capacity(records.len()),
+    };
+    if records.is_empty() {
         return out;
     }
 
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
-    {
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         eprintln!("merge_videos_into: begin failed: {}", e);
         return out;
     }
 
-    for record in records
-    {
+    for record in records {
         let existing: Result<i64, _> = conn.query_row(
             "SELECT id FROM videos WHERE file_path = ?1",
             params![record.file_path],
             |r| r.get(0),
         );
 
-        let row_result: Result<(bool, i64), _> = if let Ok(id) = existing
-        {
+        let row_result: Result<(bool, i64), _> = if let Ok(id) = existing {
             // UPDATE — facts fill-if-missing, curation Lightroom-wins.
             conn.execute(
                 "UPDATE videos SET \
@@ -5518,10 +5466,9 @@ fn merge_videos_into(conn: &Connection, records: &[LightroomVideoRecord]) -> Mer
                     record.flag,
                     record.color_label,
                 ],
-            ).map(|_| (false, id))
-        }
-        else
-        {
+            )
+            .map(|_| (false, id))
+        } else {
             conn.query_row(
                 "INSERT INTO videos ( \
                     file_path, file_size, file_name, file_extension, directory_path, \
@@ -5553,59 +5500,76 @@ fn merge_videos_into(conn: &Connection, records: &[LightroomVideoRecord]) -> Mer
                     record.color_label,
                 ],
                 |r| r.get::<_, i64>(0),
-            ).map(|new_id| (true, new_id))
+            )
+            .map(|new_id| (true, new_id))
         };
 
-        match row_result
-        {
-            Ok((true, id))  => { out.inserted += 1; out.image_ids.push(id); }
-            Ok((false, id)) => { out.updated  += 1; out.image_ids.push(id); }
-            Err(e) =>
-            {
-                eprintln!("merge_videos_into: row failed for {}: {}", record.file_path, e);
+        match row_result {
+            Ok((true, id)) => {
+                out.inserted += 1;
+                out.image_ids.push(id);
+            }
+            Ok((false, id)) => {
+                out.updated += 1;
+                out.image_ids.push(id);
+            }
+            Err(e) => {
+                eprintln!(
+                    "merge_videos_into: row failed for {}: {}",
+                    record.file_path, e
+                );
                 let _ = conn.execute_batch("ROLLBACK;");
-                return MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::new() };
+                return MergeChunkResult {
+                    inserted: 0,
+                    updated: 0,
+                    image_ids: Vec::new(),
+                };
             }
         }
     }
 
-    if let Err(e) = conn.execute_batch("COMMIT;")
-    {
+    if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("merge_videos_into: commit failed: {}", e);
-        return MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::new() };
+        return MergeChunkResult {
+            inserted: 0,
+            updated: 0,
+            image_ids: Vec::new(),
+        };
     }
     out
 }
 
 /// FFI entry: merge a chunk of Lightroom-sourced VIDEO records into the `videos`
 /// table (matched on file_path). Returns per-chunk stats + the video-row ids.
-pub async fn merge_lightroom_videos(records: Vec<LightroomVideoRecord>) -> MergeChunkResult
-{
-    if records.is_empty()
-    {
-        return MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::new() };
+pub async fn merge_lightroom_videos(records: Vec<LightroomVideoRecord>) -> MergeChunkResult {
+    if records.is_empty() {
+        return MergeChunkResult {
+            inserted: 0,
+            updated: 0,
+            image_ids: Vec::new(),
+        };
     }
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("merge_lightroom_videos: catalogue not initialized");
-            return MergeChunkResult { inserted: 0, updated: 0, image_ids: Vec::new() };
+            return MergeChunkResult {
+                inserted: 0,
+                updated: 0,
+                image_ids: Vec::new(),
+            };
         }
     };
     merge_videos_into(conn, &records)
 }
 
 #[cfg(test)]
-mod keyword_tests
-{
+mod keyword_tests {
     use super::*;
 
     #[test]
-    fn materialized_rows_builds_ancestor_chain()
-    {
+    fn materialized_rows_builds_ancestor_chain() {
         let rows = keyword_materialized_rows(&vec![
             "Animals".to_string(),
             "Dog".to_string(),
@@ -5615,14 +5579,18 @@ mod keyword_tests
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0], ("Animals".to_string(), "Animals".to_string()));
         assert_eq!(rows[1], ("Dog".to_string(), format!("Animals{sep}Dog")));
-        assert_eq!(rows[2], ("Lab".to_string(), format!("Animals{sep}Dog{sep}Lab")));
+        assert_eq!(
+            rows[2],
+            ("Lab".to_string(), format!("Animals{sep}Dog{sep}Lab"))
+        );
     }
 
     #[test]
-    fn materialized_rows_trims_and_rejects_bad_segments()
-    {
+    fn materialized_rows_trims_and_rejects_bad_segments() {
         // Blank segment -> whole path rejected (empty).
-        assert!(keyword_materialized_rows(&vec!["Animals".to_string(), "  ".to_string()]).is_empty());
+        assert!(
+            keyword_materialized_rows(&vec!["Animals".to_string(), "  ".to_string()]).is_empty()
+        );
         // Segment containing the separator -> rejected.
         assert!(keyword_materialized_rows(&vec![format!("a{KEYWORD_PATH_SEPARATOR}b")]).is_empty());
         // Trimming.
@@ -5631,18 +5599,24 @@ mod keyword_tests
     }
 
     #[test]
-    fn keyword_image_id_in_list_assembly()
-    {
+    fn keyword_image_id_in_list_assembly() {
         assert_eq!(keyword_image_id_in_list(&[]), None);
-        assert_eq!(keyword_image_id_in_list(&[5, 9, 12]), Some("image_id IN (5, 9, 12)".to_string()));
+        assert_eq!(
+            keyword_image_id_in_list(&[5, 9, 12]),
+            Some("image_id IN (5, 9, 12)".to_string())
+        );
     }
 
     #[test]
-    fn keyword_predicate_sql()
-    {
+    fn keyword_predicate_sql() {
         let has = QueryPredicate {
             kind: "keyword_has".to_string(),
-            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            day: None,
+            day_end: None,
+            op: None,
+            stars: None,
+            num: None,
+            num_end: None,
             value: Some("Wagner".to_string()),
         };
         assert_eq!(
@@ -5652,7 +5626,12 @@ mod keyword_tests
 
         let not = QueryPredicate {
             kind: "keyword_not".to_string(),
-            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            day: None,
+            day_end: None,
+            op: None,
+            stars: None,
+            num: None,
+            num_end: None,
             value: Some("snapshot".to_string()),
         };
         assert_eq!(
@@ -5663,7 +5642,12 @@ mod keyword_tests
         // Empty value -> backstop.
         let empty = QueryPredicate {
             kind: "keyword_has".to_string(),
-            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            day: None,
+            day_end: None,
+            op: None,
+            stars: None,
+            num: None,
+            num_end: None,
             value: Some(String::new()),
         };
         assert_eq!(predicate_to_sql(&empty), "(FALSE)");
@@ -5672,7 +5656,12 @@ mod keyword_tests
         // keyword row (color-marked rows are color labels, not keywords).
         let none = QueryPredicate {
             kind: "keyword_none".to_string(),
-            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            day: None,
+            day_end: None,
+            op: None,
+            stars: None,
+            num: None,
+            num_end: None,
             value: None,
         };
         assert_eq!(
@@ -5682,15 +5671,19 @@ mod keyword_tests
     }
 
     #[test]
-    fn color_predicate_sql_knows_both_halves()
-    {
+    fn color_predicate_sql_knows_both_halves() {
         // S66: standard colors live in images.color_label; custom color-label
         // text is a keyword row with the color switch ON. any_color/no_color
         // are exact complements across BOTH halves (raw table — hiding a
         // keyword doesn't un-color the photo).
         let any = QueryPredicate {
             kind: "any_color".to_string(),
-            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            day: None,
+            day_end: None,
+            op: None,
+            stars: None,
+            num: None,
+            num_end: None,
             value: None,
         };
         assert_eq!(
@@ -5700,7 +5693,12 @@ mod keyword_tests
 
         let none = QueryPredicate {
             kind: "no_color".to_string(),
-            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            day: None,
+            day_end: None,
+            op: None,
+            stars: None,
+            num: None,
+            num_end: None,
             value: None,
         };
         assert_eq!(
@@ -5712,11 +5710,15 @@ mod keyword_tests
     /// The sidebar multi-select prefix arms (S67): slash-terminated path
     /// prefixes and capture-datetime prefixes, quote-escaped; empty → FALSE.
     #[test]
-    fn sidebar_prefix_predicate_sql()
-    {
+    fn sidebar_prefix_predicate_sql() {
         let path = QueryPredicate {
             kind: "path_prefix".to_string(),
-            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            day: None,
+            day_end: None,
+            op: None,
+            stars: None,
+            num: None,
+            num_end: None,
             value: Some("/Volumes/Photo's/2026/".to_string()),
         };
         assert_eq!(
@@ -5726,7 +5728,12 @@ mod keyword_tests
 
         let capture = QueryPredicate {
             kind: "capture_prefix".to_string(),
-            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            day: None,
+            day_end: None,
+            op: None,
+            stars: None,
+            num: None,
+            num_end: None,
             value: Some("2026:06:".to_string()),
         };
         assert_eq!(
@@ -5736,7 +5743,12 @@ mod keyword_tests
 
         let empty = QueryPredicate {
             kind: "path_prefix".to_string(),
-            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            day: None,
+            day_end: None,
+            op: None,
+            stars: None,
+            num: None,
+            num_end: None,
             value: Some(String::new()),
         };
         assert_eq!(predicate_to_sql(&empty), "(FALSE)");
@@ -5747,8 +5759,7 @@ mod keyword_tests
     /// along) across same-stem-same-directory RAW<->JPEG pairs, both
     /// directions, idempotently — and never touches non-pairs.
     #[test]
-    fn mirror_keyword_rows_across_pairs_end_to_end()
-    {
+    fn mirror_keyword_rows_across_pairs_end_to_end() {
         use duckdb::Connection;
 
         let conn = Connection::open_in_memory().expect("in-memory db");
@@ -5796,19 +5807,33 @@ mod keyword_tests
 
         // The JPEG twin carries the full three-switch state.
         let (status, collection): (i64, bool) = conn
-            .query_row("SELECT status, collection FROM keyword WHERE image_id = 2 AND path = 'Family'",
-                       [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(
+                "SELECT status, collection FROM keyword WHERE image_id = 2 AND path = 'Family'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
-        assert_eq!((status, collection), (1, true), "collection switch copied intact");
+        assert_eq!(
+            (status, collection),
+            (1, true),
+            "collection switch copied intact"
+        );
         let hidden_status: i64 = conn
-            .query_row("SELECT status FROM keyword WHERE image_id = 2 AND path = 'Old'",
-                       [], |r| r.get(0))
+            .query_row(
+                "SELECT status FROM keyword WHERE image_id = 2 AND path = 'Old'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(hidden_status, 0, "hidden rows copy as hidden");
 
         // Untouched bystanders.
         let lonely: i64 = conn
-            .query_row("SELECT COUNT(*) FROM keyword WHERE image_id IN (3, 6)", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM keyword WHERE image_id IN (3, 6)",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(lonely, 2, "unpaired images gained nothing");
 
@@ -5820,8 +5845,7 @@ mod keyword_tests
     /// explicit (source, destination) pairs copy whole rows — status,
     /// collection, color — idempotently; length-mismatched arrays no-op.
     #[test]
-    fn copy_keyword_rows_for_image_pairs_end_to_end()
-    {
+    fn copy_keyword_rows_for_image_pairs_end_to_end() {
         use duckdb::Connection;
 
         let conn = Connection::open_in_memory().expect("in-memory db");
@@ -5852,28 +5876,44 @@ mod keyword_tests
         assert_eq!(copied, 1, "only the missing 'Family' row copies onto 11");
 
         let (status, collection): (i64, bool) = conn
-            .query_row("SELECT status, collection FROM keyword WHERE image_id = 11 AND path = 'Family'",
-                       [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(
+                "SELECT status, collection FROM keyword WHERE image_id = 11 AND path = 'Family'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
-        assert_eq!((status, collection), (1, true), "collection switch rode the copy");
+        assert_eq!(
+            (status, collection),
+            (1, true),
+            "collection switch rode the copy"
+        );
 
         let copy12: i64 = conn
-            .query_row("SELECT COUNT(*) FROM keyword WHERE image_id = 12", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM keyword WHERE image_id = 12",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(copy12, 0, "a keywordless source copies nothing");
 
         // Idempotent + guard rails.
-        assert_eq!(copy_keyword_rows_for_image_pairs_impl(&conn, &[1, 2], &[11, 12]), 0);
-        assert_eq!(copy_keyword_rows_for_image_pairs_impl(&conn, &[1], &[11, 12]), 0,
-                   "length mismatch no-ops");
+        assert_eq!(
+            copy_keyword_rows_for_image_pairs_impl(&conn, &[1, 2], &[11, 12]),
+            0
+        );
+        assert_eq!(
+            copy_keyword_rows_for_image_pairs_impl(&conn, &[1], &[11, 12]),
+            0,
+            "length mismatch no-ops"
+        );
     }
 
     /// The color switch end-to-end on a real in-memory engine (S66):
     /// flip-or-insert marking, idempotence, and the three predicates that
     /// read it (any_color / no_color / keyword_none).
     #[test]
-    fn color_keyword_switch_end_to_end()
-    {
+    fn color_keyword_switch_end_to_end() {
         use duckdb::Connection;
 
         let conn = Connection::open_in_memory().expect("in-memory db");
@@ -5909,21 +5949,36 @@ mod keyword_tests
 
         // Photo 3 must still have exactly ONE 'Approved' row (flipped, not duplicated).
         let rows3: i64 = conn
-            .query_row("SELECT COUNT(*) FROM keyword WHERE image_id = 3 AND label = 'Approved'",
-                       [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM keyword WHERE image_id = 3 AND label = 'Approved'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(rows3, 1);
 
         // Idempotent: a second pass changes nothing.
-        assert_eq!(assign_color_keyword_for_ids_impl(&conn, &[2, 3], "Approved"), 0);
+        assert_eq!(
+            assign_color_keyword_for_ids_impl(&conn, &[2, 3], "Approved"),
+            0
+        );
 
         let count = |pred: &QueryPredicate| -> i64 {
-            let sql = format!("SELECT COUNT(*) FROM images WHERE {}", predicate_to_sql(pred));
-            conn.query_row(&sql, [], |r| r.get(0)).expect("predicate executes")
+            let sql = format!(
+                "SELECT COUNT(*) FROM images WHERE {}",
+                predicate_to_sql(pred)
+            );
+            conn.query_row(&sql, [], |r| r.get(0))
+                .expect("predicate executes")
         };
         let bare = |kind: &str| QueryPredicate {
             kind: kind.to_string(),
-            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            day: None,
+            day_end: None,
+            op: None,
+            stars: None,
+            num: None,
+            num_end: None,
             value: None,
         };
 
@@ -5941,11 +5996,15 @@ mod keyword_tests
     }
 
     #[test]
-    fn filename_predicate_sql()
-    {
+    fn filename_predicate_sql() {
         let fname = |kind: &str, v: &str| QueryPredicate {
             kind: kind.to_string(),
-            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            day: None,
+            day_end: None,
+            op: None,
+            stars: None,
+            num: None,
+            num_end: None,
             value: Some(v.to_string()),
         };
 
@@ -5980,11 +6039,15 @@ mod keyword_tests
     }
 
     #[test]
-    fn collection_predicate_sql()
-    {
+    fn collection_predicate_sql() {
         let coll = |v: &str| QueryPredicate {
             kind: "collection_is".to_string(),
-            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            day: None,
+            day_end: None,
+            op: None,
+            stars: None,
+            num: None,
+            num_end: None,
             value: Some(v.to_string()),
         };
 
@@ -6006,34 +6069,54 @@ mod keyword_tests
     }
 
     #[test]
-    fn metadata_predicate_sql()
-    {
+    fn metadata_predicate_sql() {
         let meta = |kind: &str, v: &str| QueryPredicate {
             kind: kind.to_string(),
-            day: None, day_end: None, op: None, stars: None, num: None, num_end: None,
+            day: None,
+            day_end: None,
+            op: None,
+            stars: None,
+            num: None,
+            num_end: None,
             value: Some(v.to_string()),
         };
 
         // The six "is" subjects: exact equality on the picked catalogue value.
-        assert_eq!(predicate_to_sql(&meta("extension_is", "nef")),
-                   "(file_extension = 'nef')");
-        assert_eq!(predicate_to_sql(&meta("kind_is", "raw")),
-                   "(image_kind = 'raw')");
-        assert_eq!(predicate_to_sql(&meta("camera_make_is", "NIKON CORPORATION")),
-                   "(camera_make = 'NIKON CORPORATION')");
-        assert_eq!(predicate_to_sql(&meta("camera_model_is", "NIKON Z 8")),
-                   "(camera_model = 'NIKON Z 8')");
-        assert_eq!(predicate_to_sql(&meta("lens_is", "NIKKOR Z 85mm f/1.8 S")),
-                   "(lens_model = 'NIKKOR Z 85mm f/1.8 S')");
+        assert_eq!(
+            predicate_to_sql(&meta("extension_is", "nef")),
+            "(file_extension = 'nef')"
+        );
+        assert_eq!(
+            predicate_to_sql(&meta("kind_is", "raw")),
+            "(image_kind = 'raw')"
+        );
+        assert_eq!(
+            predicate_to_sql(&meta("camera_make_is", "NIKON CORPORATION")),
+            "(camera_make = 'NIKON CORPORATION')"
+        );
+        assert_eq!(
+            predicate_to_sql(&meta("camera_model_is", "NIKON Z 8")),
+            "(camera_model = 'NIKON Z 8')"
+        );
+        assert_eq!(
+            predicate_to_sql(&meta("lens_is", "NIKKOR Z 85mm f/1.8 S")),
+            "(lens_model = 'NIKKOR Z 85mm f/1.8 S')"
+        );
         // The apostrophe doubles for the SQL literal.
-        assert_eq!(predicate_to_sql(&meta("creator_is", "Richard O'Wagner")),
-                   "(creator = 'Richard O''Wagner')");
+        assert_eq!(
+            predicate_to_sql(&meta("creator_is", "Richard O'Wagner")),
+            "(creator = 'Richard O''Wagner')"
+        );
 
         // Lens "contains": case-insensitive ILIKE, wildcard-escaped fragment.
-        assert_eq!(predicate_to_sql(&meta("lens_contains", "85mm")),
-                   "(lens_model ILIKE '%85mm%' ESCAPE '\\')");
-        assert_eq!(predicate_to_sql(&meta("lens_contains", "100%_O'N")),
-                   "(lens_model ILIKE '%100\\%\\_O''N%' ESCAPE '\\')");
+        assert_eq!(
+            predicate_to_sql(&meta("lens_contains", "85mm")),
+            "(lens_model ILIKE '%85mm%' ESCAPE '\\')"
+        );
+        assert_eq!(
+            predicate_to_sql(&meta("lens_contains", "100%_O'N")),
+            "(lens_model ILIKE '%100\\%\\_O''N%' ESCAPE '\\')"
+        );
 
         // Empty value -> backstop (matches nothing).
         assert_eq!(predicate_to_sql(&meta("extension_is", "")), "(FALSE)");
@@ -6041,11 +6124,13 @@ mod keyword_tests
     }
 
     #[test]
-    fn numeric_predicate_sql_arms()
-    {
+    fn numeric_predicate_sql_arms() {
         let num = |kind: &str, op: &str, n: f64, end: Option<f64>| QueryPredicate {
             kind: kind.to_string(),
-            day: None, day_end: None, stars: None, value: None,
+            day: None,
+            day_end: None,
+            stars: None,
+            value: None,
             op: Some(op.to_string()),
             num: Some(n),
             num_end: end,
@@ -6053,21 +6138,45 @@ mod keyword_tests
 
         // The four columns, one mode each — shortest-round-trip literals
         // (1600 prints bare, 2.8 prints "2.8", 0.0005 prints "0.0005").
-        assert_eq!(predicate_to_sql(&num("iso_num", "eq", 1600.0, None)),
-                   "(iso = 1600)");
-        assert_eq!(predicate_to_sql(&num("aperture_num", "lte", 2.8, None)),
-                   "(aperture <= 2.8)");
-        assert_eq!(predicate_to_sql(&num("shutter_num", "gte", 0.0005, None)),
-                   "(shutter_speed >= 0.0005)");
-        assert_eq!(predicate_to_sql(&num("focal_num", "between", 70.0, Some(200.0))),
-                   "(focal_length BETWEEN 70 AND 200)");
+        assert_eq!(
+            predicate_to_sql(&num("iso_num", "eq", 1600.0, None)),
+            "(iso = 1600)"
+        );
+        assert_eq!(
+            predicate_to_sql(&num("aperture_num", "lte", 2.8, None)),
+            "(aperture <= 2.8)"
+        );
+        assert_eq!(
+            predicate_to_sql(&num("shutter_num", "gte", 0.0005, None)),
+            "(shutter_speed >= 0.0005)"
+        );
+        assert_eq!(
+            predicate_to_sql(&num("focal_num", "between", 70.0, Some(200.0))),
+            "(focal_length BETWEEN 70 AND 200)"
+        );
+        assert_eq!(
+            predicate_to_sql(&num("focus_num", "gte", 120.0, None)),
+            "(focus_score >= 120)"
+        );
 
         // Malformed -> backstop: between without an upper bound, unknown op,
         // non-finite bounds, missing num / missing op.
-        assert_eq!(predicate_to_sql(&num("focal_num", "between", 70.0, None)), "(FALSE)");
-        assert_eq!(predicate_to_sql(&num("iso_num", "approximately", 100.0, None)), "(FALSE)");
-        assert_eq!(predicate_to_sql(&num("iso_num", "eq", f64::NAN, None)), "(FALSE)");
-        assert_eq!(predicate_to_sql(&num("focal_num", "between", 70.0, Some(f64::INFINITY))), "(FALSE)");
+        assert_eq!(
+            predicate_to_sql(&num("focal_num", "between", 70.0, None)),
+            "(FALSE)"
+        );
+        assert_eq!(
+            predicate_to_sql(&num("iso_num", "approximately", 100.0, None)),
+            "(FALSE)"
+        );
+        assert_eq!(
+            predicate_to_sql(&num("iso_num", "eq", f64::NAN, None)),
+            "(FALSE)"
+        );
+        assert_eq!(
+            predicate_to_sql(&num("focal_num", "between", 70.0, Some(f64::INFINITY))),
+            "(FALSE)"
+        );
         let mut missing_num = num("iso_num", "eq", 0.0, None);
         missing_num.num = None;
         assert_eq!(predicate_to_sql(&missing_num), "(FALSE)");
@@ -6077,11 +6186,14 @@ mod keyword_tests
     }
 
     #[test]
-    fn date_in_last_predicate_sql()
-    {
+    fn date_in_last_predicate_sql() {
         let dil = |count: &str, unit: &str| QueryPredicate {
             kind: "date_in_last".to_string(),
-            day: None, day_end: None, stars: None, num: None, num_end: None,
+            day: None,
+            day_end: None,
+            stars: None,
+            num: None,
+            num_end: None,
             op: Some(unit.to_string()),
             value: Some(count.to_string()),
         };
@@ -6126,8 +6238,7 @@ mod keyword_tests
     /// the host clock and cannot go stale. (All assertions stay correct even
     /// across a midnight boundary between seed and query.)
     #[test]
-    fn date_in_last_executes_on_duckdb()
-    {
+    fn date_in_last_executes_on_duckdb() {
         use duckdb::Connection;
 
         let conn = Connection::open_in_memory().expect("in-memory db");
@@ -6143,13 +6254,18 @@ mod keyword_tests
 
         let dil = |count: &str, unit: &str| QueryPredicate {
             kind: "date_in_last".to_string(),
-            day: None, day_end: None, stars: None, num: None, num_end: None,
+            day: None,
+            day_end: None,
+            stars: None,
+            num: None,
+            num_end: None,
             op: Some(unit.to_string()),
             value: Some(count.to_string()),
         };
         let count_for = |p: &QueryPredicate| -> i64 {
             let sql = format!("SELECT COUNT(*) FROM images WHERE {}", predicate_to_sql(p));
-            conn.query_row(&sql, [], |row| row.get(0)).expect("predicate executes")
+            conn.query_row(&sql, [], |row| row.get(0))
+                .expect("predicate executes")
         };
 
         // 5-day-old row only; the 400-day row, 1999 row, and NULL never match.
@@ -6162,14 +6278,12 @@ mod keyword_tests
 }
 
 #[cfg(test)]
-mod saved_query_tests
-{
+mod saved_query_tests {
     use super::*;
     use duckdb::Connection;
 
     /// The saved-query DDL, as in the main schema (fresh CREATEs, no ALTERs).
-    fn setup() -> Connection
-    {
+    fn setup() -> Connection {
         let conn = Connection::open_in_memory().expect("in-memory db");
         conn.execute_batch(
             "CREATE SEQUENCE saved_query_id_seq START 1;
@@ -6196,9 +6310,14 @@ mod saved_query_tests
         conn
     }
 
-    fn pred(kind: &str, day: Option<&str>, day_end: Option<&str>,
-            op: Option<&str>, stars: Option<u8>, value: Option<&str>) -> QueryPredicate
-    {
+    fn pred(
+        kind: &str,
+        day: Option<&str>,
+        day_end: Option<&str>,
+        op: Option<&str>,
+        stars: Option<u8>,
+        value: Option<&str>,
+    ) -> QueryPredicate {
         QueryPredicate {
             kind: kind.to_string(),
             day: day.map(str::to_string),
@@ -6212,8 +6331,7 @@ mod saved_query_tests
     }
 
     /// A numeric-subject predicate (S65) — kind + op + the bound(s).
-    fn npred(kind: &str, op: &str, num: f64, num_end: Option<f64>) -> QueryPredicate
-    {
+    fn npred(kind: &str, op: &str, num: f64, num_end: Option<f64>) -> QueryPredicate {
         QueryPredicate {
             kind: kind.to_string(),
             day: None,
@@ -6227,24 +6345,43 @@ mod saved_query_tests
     }
 
     #[test]
-    fn round_trip_preserves_sentence()
-    {
+    fn round_trip_preserves_sentence() {
         let conn = setup();
 
         // The design doc's "Spring picks": two date ranges EITHER, color AND,
         // color EITHER, rating AND — repeated subjects + every connector slot —
         // plus two numeric criteria (S65: num + num_end must survive the trip).
         let predicates = vec![
-            pred("date_between", Some("2024:01:01"), Some("2024:02:15"), None, None, None),
-            pred("date_between", Some("2025:06:01"), Some("2025:07:04"), None, None, None),
+            pred(
+                "date_between",
+                Some("2024:01:01"),
+                Some("2024:02:15"),
+                None,
+                None,
+                None,
+            ),
+            pred(
+                "date_between",
+                Some("2025:06:01"),
+                Some("2025:07:04"),
+                None,
+                None,
+                None,
+            ),
             pred("color", None, None, None, None, Some("blue")),
             pred("color", None, None, None, None, Some("green")),
             pred("rating", None, None, Some("gte"), Some(3), None),
             npred("iso_num", "gte", 3200.0, None),
             npred("focal_num", "between", 70.0, Some(200.0)),
         ];
-        let connectors = vec![Connector::Or, Connector::And, Connector::Or,
-                              Connector::And, Connector::And, Connector::And];
+        let connectors = vec![
+            Connector::Or,
+            Connector::And,
+            Connector::Or,
+            Connector::And,
+            Connector::And,
+            Connector::And,
+        ];
 
         let info = save_query_impl(&conn, "Spring picks", &predicates, &connectors)
             .expect("save succeeds");
@@ -6256,8 +6393,7 @@ mod saved_query_tests
     }
 
     #[test]
-    fn name_collisions_gain_numeric_suffixes()
-    {
+    fn name_collisions_gain_numeric_suffixes() {
         let conn = setup();
         let predicates = vec![pred("rating", None, None, Some("gte"), Some(1), None)];
 
@@ -6269,13 +6405,15 @@ mod saved_query_tests
         assert_eq!(c.name, "Dogs-02");
 
         // The list shows all three, name-ordered.
-        let names: Vec<String> = list_saved_queries_impl(&conn).into_iter().map(|q| q.name).collect();
+        let names: Vec<String> = list_saved_queries_impl(&conn)
+            .into_iter()
+            .map(|q| q.name)
+            .collect();
         assert_eq!(names, vec!["Dogs", "Dogs-01", "Dogs-02"]);
     }
 
     #[test]
-    fn empty_name_or_empty_sentence_rejected()
-    {
+    fn empty_name_or_empty_sentence_rejected() {
         let conn = setup();
         let predicates = vec![pred("rating", None, None, Some("gte"), Some(1), None)];
         assert!(save_query_impl(&conn, "   ", &predicates, &[]).is_none());
@@ -6283,8 +6421,7 @@ mod saved_query_tests
     }
 
     #[test]
-    fn delete_removes_header_and_criteria()
-    {
+    fn delete_removes_header_and_criteria() {
         let conn = setup();
         let predicates = vec![
             pred("flag", None, None, None, None, Some("pick")),
@@ -6301,23 +6438,23 @@ mod saved_query_tests
 
         // No orphaned criterion rows.
         let leftover: i64 = conn
-            .query_row("SELECT COUNT(*) FROM saved_query_criterion", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM saved_query_criterion", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(leftover, 0);
     }
 }
 
 #[cfg(test)]
-mod lightroom_import_tests
-{
+mod lightroom_import_tests {
     use super::*;
-    use duckdb::{Connection, params};
+    use duckdb::{params, Connection};
 
     // ---- classify_extension: the new ImageKind promotions (§7) ----
 
     #[test]
-    fn classify_promotes_new_kinds()
-    {
+    fn classify_promotes_new_kinds() {
         // DNG out of Raw (its own kind, checked BEFORE the RAW table).
         assert_eq!(classify_extension("dng".to_string()), ImageKind::Dng);
         // PSD / TIFF / PNG out of the Other bucket.
@@ -6328,8 +6465,7 @@ mod lightroom_import_tests
     }
 
     #[test]
-    fn classify_preserves_existing_kinds()
-    {
+    fn classify_preserves_existing_kinds() {
         // The promotions must not disturb the existing classifications.
         assert_eq!(classify_extension("nef".to_string()), ImageKind::Raw);
         assert_eq!(classify_extension("cr3".to_string()), ImageKind::Raw);
@@ -6341,8 +6477,7 @@ mod lightroom_import_tests
     }
 
     #[test]
-    fn classify_is_case_insensitive_for_new_kinds()
-    {
+    fn classify_is_case_insensitive_for_new_kinds() {
         assert_eq!(classify_extension("DNG".to_string()), ImageKind::Dng);
         assert_eq!(classify_extension("Psd".to_string()), ImageKind::Psd);
         assert_eq!(classify_extension("TIFF".to_string()), ImageKind::Tiff);
@@ -6359,8 +6494,7 @@ mod lightroom_import_tests
     //   - FACTS    (fill-if-missing): COALESCE(t.x, excluded.x)
     // and that an LR-NULL value never erases an existing curation value.
     #[test]
-    fn duckdb_on_conflict_upsert_behaves()
-    {
+    fn duckdb_on_conflict_upsert_behaves() {
         let conn = Connection::open_in_memory().expect("open in-memory duckdb");
         conn.execute_batch("CREATE TABLE t (fp TEXT UNIQUE, rating INTEGER, cam TEXT);")
             .expect("create table");
@@ -6372,27 +6506,40 @@ mod lightroom_import_tests
                         cam    = COALESCE(t.cam, excluded.cam)";
 
         // 1. First insert (no conflict): the row is created.
-        conn.execute(upsert, params!["a", 3i32, "CanonX"]).expect("insert 1");
+        conn.execute(upsert, params!["a", 3i32, "CanonX"])
+            .expect("insert 1");
 
         // 2. Conflict with a NEW rating + a different cam:
         //    rating -> 5 (Lightroom-wins), cam stays CanonX (fact, fill-if-missing).
-        conn.execute(upsert, params!["a", 5i32, "CanonY"]).expect("insert 2");
-        let (rating, cam): (i64, String) = conn.query_row(
-            "SELECT rating, cam FROM t WHERE fp = 'a'", [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).expect("select 2");
+        conn.execute(upsert, params!["a", 5i32, "CanonY"])
+            .expect("insert 2");
+        let (rating, cam): (i64, String) = conn
+            .query_row("SELECT rating, cam FROM t WHERE fp = 'a'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .expect("select 2");
         assert_eq!(rating, 5, "Lightroom-wins should overwrite rating");
-        assert_eq!(cam, "CanonX", "fact should be fill-if-missing (keep existing)");
+        assert_eq!(
+            cam, "CanonX",
+            "fact should be fill-if-missing (keep existing)"
+        );
 
         // 3. Conflict with a NULL rating must NOT erase the existing 5.
-        conn.execute(upsert, params!["a", Option::<i32>::None, "CanonZ"]).expect("insert 3");
-        let rating_after: Option<i64> = conn.query_row(
-            "SELECT rating FROM t WHERE fp = 'a'", [], |r| r.get(0),
-        ).expect("select 3");
-        assert_eq!(rating_after, Some(5), "LR-null must not erase existing curation");
+        conn.execute(upsert, params!["a", Option::<i32>::None, "CanonZ"])
+            .expect("insert 3");
+        let rating_after: Option<i64> = conn
+            .query_row("SELECT rating FROM t WHERE fp = 'a'", [], |r| r.get(0))
+            .expect("select 3");
+        assert_eq!(
+            rating_after,
+            Some(5),
+            "LR-null must not erase existing curation"
+        );
 
         // Upserts, not duplicate inserts: exactly one row.
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0)).expect("count");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .expect("count");
         assert_eq!(count, 1);
     }
 
@@ -6402,8 +6549,7 @@ mod lightroom_import_tests
     // sequence-default PK (DuckDB drops IDENTITY), and the DOUBLE / BOOLEAN /
     // BIGINT column types not otherwise exercised by the images schema.
     #[test]
-    fn videos_table_ddl_and_insert()
-    {
+    fn videos_table_ddl_and_insert() {
         let conn = Connection::open_in_memory().expect("open in-memory duckdb");
         conn.execute_batch(
             "CREATE SEQUENCE videos_id_seq START 1;
@@ -6427,8 +6573,9 @@ mod lightroom_import_tests
                 flag TEXT,
                 color_label TEXT,
                 indexed_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-             );"
-        ).expect("create videos table");
+             );",
+        )
+        .expect("create videos table");
 
         // Insert omitting id (sequence default) + exercising DOUBLE/BOOLEAN/BIGINT.
         conn.execute(
@@ -6439,19 +6586,35 @@ mod lightroom_import_tests
                  video_kind, rating, flag, color_label)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
-                "/v/clip.mov", 4_087_595_000i64, "clip.mov", "mov", "/v",
-                1_700_000_000i64, 1_700_000_000i64, "2025-01-02T03:04:05",
-                1920i32, 1080i32, 204.4f64, 59.94f64, true,
-                "mov", 4i32, "pick", "blue"
+                "/v/clip.mov",
+                4_087_595_000i64,
+                "clip.mov",
+                "mov",
+                "/v",
+                1_700_000_000i64,
+                1_700_000_000i64,
+                "2025-01-02T03:04:05",
+                1920i32,
+                1080i32,
+                204.4f64,
+                59.94f64,
+                true,
+                "mov",
+                4i32,
+                "pick",
+                "blue"
             ],
-        ).expect("insert video");
+        )
+        .expect("insert video");
 
-        let (id, dur, fps, audio, kind): (i64, f64, f64, bool, String) = conn.query_row(
-            "SELECT id, duration_seconds, frame_rate, has_audio, video_kind \
+        let (id, dur, fps, audio, kind): (i64, f64, f64, bool, String) = conn
+            .query_row(
+                "SELECT id, duration_seconds, frame_rate, has_audio, video_kind \
              FROM videos WHERE file_path = '/v/clip.mov'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        ).expect("read video");
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("read video");
 
         assert_eq!(id, 1, "sequence default should auto-assign id = 1");
         assert!((dur - 204.4).abs() < 1e-6, "DOUBLE round-trips");
@@ -6471,36 +6634,45 @@ mod lightroom_import_tests
     // RETURNING; if the STORED id were unstable we'd abandon ON CONFLICT for an
     // explicit check-then-UPDATE-or-INSERT, which never touches id.)
     #[test]
-    fn duckdb_upsert_keeps_stored_id_stable()
-    {
+    fn duckdb_upsert_keeps_stored_id_stable() {
         let conn = Connection::open_in_memory().expect("open in-memory duckdb");
         conn.execute_batch(
             "CREATE SEQUENCE s START 1;
              CREATE TABLE m (id INTEGER PRIMARY KEY DEFAULT nextval('s'), fp TEXT UNIQUE, rating INTEGER);"
         ).expect("create");
 
-        conn.execute("INSERT INTO m (fp, rating) VALUES ('a', 3)", []).expect("insert a");
-        let id_before: i64 = conn.query_row("SELECT id FROM m WHERE fp = 'a'", [], |r| r.get(0)).expect("id before");
+        conn.execute("INSERT INTO m (fp, rating) VALUES ('a', 3)", [])
+            .expect("insert a");
+        let id_before: i64 = conn
+            .query_row("SELECT id FROM m WHERE fp = 'a'", [], |r| r.get(0))
+            .expect("id before");
 
         // Conflicting upsert (curation COALESCE direction).
         conn.execute(
             "INSERT INTO m (fp, rating) VALUES ('a', 5) \
              ON CONFLICT (fp) DO UPDATE SET rating = COALESCE(excluded.rating, m.rating)",
             [],
-        ).expect("upsert a");
+        )
+        .expect("upsert a");
 
-        let id_after: i64 = conn.query_row("SELECT id FROM m WHERE fp = 'a'", [], |r| r.get(0)).expect("id after");
-        let rating_after: i64 = conn.query_row("SELECT rating FROM m WHERE fp = 'a'", [], |r| r.get(0)).expect("rating after");
+        let id_after: i64 = conn
+            .query_row("SELECT id FROM m WHERE fp = 'a'", [], |r| r.get(0))
+            .expect("id after");
+        let rating_after: i64 = conn
+            .query_row("SELECT rating FROM m WHERE fp = 'a'", [], |r| r.get(0))
+            .expect("rating after");
 
-        assert_eq!(id_before, id_after, "STORED id must be stable across ON CONFLICT update (keyword FKs depend on it)");
+        assert_eq!(
+            id_before, id_after,
+            "STORED id must be stable across ON CONFLICT update (keyword FKs depend on it)"
+        );
         assert_eq!(rating_after, 5, "curation still updates (Lightroom-wins)");
     }
 
     // ---- merge_records_into: insert / update / policies / id-stability ----
 
     // A minimal `images` table covering exactly the columns the merge touches.
-    fn create_images(conn: &Connection)
-    {
+    fn create_images(conn: &Connection) {
         conn.execute_batch(
             "CREATE SEQUENCE images_id_seq START 1;
              CREATE TABLE images (
@@ -6522,13 +6694,13 @@ mod lightroom_import_tests
                 copyright TEXT, creator TEXT, description TEXT,
                 rating INTEGER, flag TEXT, color_label TEXT,
                 rotation INTEGER DEFAULT 0
-             );"
-        ).expect("create images");
+             );",
+        )
+        .expect("create images");
     }
 
     // A default ImageMetadata; override fields per test.
-    fn img(file_path: &str, file_name: &str) -> ImageMetadata
-    {
+    fn img(file_path: &str, file_name: &str) -> ImageMetadata {
         ImageMetadata {
             file_path: file_path.to_string(),
             file_size: 1000,
@@ -6536,28 +6708,50 @@ mod lightroom_import_tests
             file_extension: Some("nef".to_string()),
             created_timestamp: 1_700_000_000,
             modified_timestamp: 1_700_000_000,
-            camera_make: None, camera_model: None, lens_model: None,
-            focal_length: None, aperture: None, shutter_speed: None, iso: None,
+            camera_make: None,
+            camera_model: None,
+            lens_model: None,
+            focal_length: None,
+            aperture: None,
+            shutter_speed: None,
+            iso: None,
             capture_datetime: None,
-            pixel_width: None, pixel_height: None, color_space: None, bit_depth: None,
-            gps_latitude: None, gps_longitude: None, gps_altitude: None,
-            copyright: None, creator: None, description: None,
-            rating: None, flag: None, color_label: None,
+            pixel_width: None,
+            pixel_height: None,
+            color_space: None,
+            bit_depth: None,
+            gps_latitude: None,
+            gps_longitude: None,
+            gps_altitude: None,
+            copyright: None,
+            creator: None,
+            description: None,
+            rating: None,
+            flag: None,
+            color_label: None,
             rotation: None,
             is_video: false,
-            duration_seconds: None, frame_rate: None, video_kind: None,
-            video_codec: None, video_bitrate: None,
-            color_primaries: None, color_transfer: None, color_matrix: None,
-            color_range: None, dv_profile: None,
-            has_audio: None, audio_codec: None, audio_channels: None,
-            audio_sample_rate: None, audio_bitrate: None,
+            duration_seconds: None,
+            frame_rate: None,
+            video_kind: None,
+            video_codec: None,
+            video_bitrate: None,
+            color_primaries: None,
+            color_transfer: None,
+            color_matrix: None,
+            color_range: None,
+            dv_profile: None,
+            has_audio: None,
+            audio_codec: None,
+            audio_channels: None,
+            audio_sample_rate: None,
+            audio_bitrate: None,
             live_photo_id: None,
         }
     }
 
     #[test]
-    fn merge_inserts_then_updates_with_policies()
-    {
+    fn merge_inserts_then_updates_with_policies() {
         let conn = Connection::open_in_memory().expect("open in-memory duckdb");
         create_images(&conn);
 
@@ -6573,23 +6767,29 @@ mod lightroom_import_tests
         let id_a = r1.image_ids[0];
 
         // Derived columns: nef -> 'raw'; directory_path from file_path.
-        let (kind, dir): (String, String) = conn.query_row(
-            "SELECT image_kind, directory_path FROM images WHERE file_path = '/p/a.nef'", [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).expect("derived cols");
+        let (kind, dir): (String, String) = conn
+            .query_row(
+                "SELECT image_kind, directory_path FROM images WHERE file_path = '/p/a.nef'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("derived cols");
         assert_eq!(kind, "raw");
         assert_eq!(dir, "/p");
 
         // 2. Re-merge 'a': new rating (LR-wins), a fact that was missing (fills),
         //    and a fact already set (must NOT overwrite).
         let mut a2 = img("/p/a.nef", "a.nef");
-        a2.rating = Some(5);                                            // LR-wins -> 5
+        a2.rating = Some(5); // LR-wins -> 5
         a2.capture_datetime = Some("2025-01-01T00:00:00".to_string()); // fact was NULL -> fills
-        a2.camera_model = Some("WRONG".to_string());                   // fact set -> keep "Nikon Z8"
+        a2.camera_model = Some("WRONG".to_string()); // fact set -> keep "Nikon Z8"
         let r2 = merge_records_into(&conn, &[a2]);
         assert_eq!(r2.inserted, 0);
         assert_eq!(r2.updated, 1);
-        assert_eq!(r2.image_ids[0], id_a, "id stable across re-merge (FK safety)");
+        assert_eq!(
+            r2.image_ids[0], id_a,
+            "id stable across re-merge (FK safety)"
+        );
 
         let (rating, cap, cam): (i64, String, String) = conn.query_row(
             "SELECT rating, capture_datetime, camera_model FROM images WHERE file_path = '/p/a.nef'", [],
@@ -6597,47 +6797,71 @@ mod lightroom_import_tests
         ).expect("post-update");
         assert_eq!(rating, 5, "curation: Lightroom wins");
         assert_eq!(cap, "2025-01-01T00:00:00", "fact: filled when missing");
-        assert_eq!(cam, "Nikon Z8", "fact: existing value kept, not overwritten");
+        assert_eq!(
+            cam, "Nikon Z8",
+            "fact: existing value kept, not overwritten"
+        );
 
         // 3. LR-null rating must NOT erase the existing 5.
         let a3 = img("/p/a.nef", "a.nef"); // rating None
         let r3 = merge_records_into(&conn, &[a3]);
         assert_eq!(r3.updated, 1);
-        let rating2: i64 = conn.query_row(
-            "SELECT rating FROM images WHERE file_path = '/p/a.nef'", [], |r| r.get(0),
-        ).expect("rating after null");
+        let rating2: i64 = conn
+            .query_row(
+                "SELECT rating FROM images WHERE file_path = '/p/a.nef'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("rating after null");
         assert_eq!(rating2, 5, "LR-null must not erase existing curation");
 
         // 4. rotation (S67): None at INSERT takes the schema default 0; Some
         //    at INSERT lands; None at UPDATE preserves (an LR re-import can
         //    never clobber an in-app rotation).
-        let rot_default: i64 = conn.query_row(
-            "SELECT rotation FROM images WHERE file_path = '/p/b.nef'", [], |r| r.get(0),
-        ).expect("rotation default");
-        assert_eq!(rot_default, 0, "rotation: None at insert -> schema default 0");
+        let rot_default: i64 = conn
+            .query_row(
+                "SELECT rotation FROM images WHERE file_path = '/p/b.nef'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("rotation default");
+        assert_eq!(
+            rot_default, 0,
+            "rotation: None at insert -> schema default 0"
+        );
 
         let mut c = img("/p/c.jpg", "c.jpg");
         c.rotation = Some(90);
         let rc = merge_records_into(&conn, &[c]);
         assert_eq!(rc.inserted, 1);
-        let rot_c: i64 = conn.query_row(
-            "SELECT rotation FROM images WHERE file_path = '/p/c.jpg'", [], |r| r.get(0),
-        ).expect("rotation inserted");
+        let rot_c: i64 = conn
+            .query_row(
+                "SELECT rotation FROM images WHERE file_path = '/p/c.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("rotation inserted");
         assert_eq!(rot_c, 90, "rotation: Some at insert lands");
 
         let c2 = img("/p/c.jpg", "c.jpg"); // rotation None
         let rc2 = merge_records_into(&conn, &[c2]);
         assert_eq!(rc2.updated, 1);
-        let rot_c2: i64 = conn.query_row(
-            "SELECT rotation FROM images WHERE file_path = '/p/c.jpg'", [], |r| r.get(0),
-        ).expect("rotation after null update");
-        assert_eq!(rot_c2, 90, "rotation: None at update preserves the row's value");
+        let rot_c2: i64 = conn
+            .query_row(
+                "SELECT rotation FROM images WHERE file_path = '/p/c.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("rotation after null update");
+        assert_eq!(
+            rot_c2, 90,
+            "rotation: None at update preserves the row's value"
+        );
     }
 
     // ---- merge_videos_into: insert / update / policies (the videos table) ----
 
-    fn create_videos(conn: &Connection)
-    {
+    fn create_videos(conn: &Connection) {
         conn.execute_batch(
             "CREATE SEQUENCE videos_id_seq START 1;
              CREATE TABLE videos (
@@ -6649,12 +6873,12 @@ mod lightroom_import_tests
                 duration_seconds DOUBLE, frame_rate DOUBLE, has_audio BOOLEAN, video_kind TEXT,
                 rating INTEGER, flag TEXT, color_label TEXT,
                 indexed_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-             );"
-        ).expect("create videos");
+             );",
+        )
+        .expect("create videos");
     }
 
-    fn vid(file_path: &str, file_name: &str) -> LightroomVideoRecord
-    {
+    fn vid(file_path: &str, file_name: &str) -> LightroomVideoRecord {
         LightroomVideoRecord {
             file_path: file_path.to_string(),
             file_size: 5000,
@@ -6662,16 +6886,21 @@ mod lightroom_import_tests
             file_extension: Some("mov".to_string()),
             created_timestamp: 1_700_000_000,
             modified_timestamp: 1_700_000_000,
-            capture_datetime: None, pixel_width: None, pixel_height: None,
-            duration_seconds: None, frame_rate: None, has_audio: None,
+            capture_datetime: None,
+            pixel_width: None,
+            pixel_height: None,
+            duration_seconds: None,
+            frame_rate: None,
+            has_audio: None,
             video_kind: Some("mov".to_string()),
-            rating: None, flag: None, color_label: None,
+            rating: None,
+            flag: None,
+            color_label: None,
         }
     }
 
     #[test]
-    fn merge_videos_inserts_then_updates()
-    {
+    fn merge_videos_inserts_then_updates() {
         let conn = Connection::open_in_memory().expect("open in-memory duckdb");
         create_videos(&conn);
 
@@ -6682,9 +6911,13 @@ mod lightroom_import_tests
         let r1 = merge_videos_into(&conn, &[a]);
         assert_eq!(r1.inserted, 1);
         let id = r1.image_ids[0];
-        let dir: String = conn.query_row(
-            "SELECT directory_path FROM videos WHERE file_path = '/v/a.mov'", [], |r| r.get(0),
-        ).expect("dir");
+        let dir: String = conn
+            .query_row(
+                "SELECT directory_path FROM videos WHERE file_path = '/v/a.mov'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("dir");
         assert_eq!(dir, "/v");
 
         // 2. Re-merge: rating LR-wins; duration (fact, already set) must NOT change.
@@ -6695,12 +6928,18 @@ mod lightroom_import_tests
         assert_eq!(r2.updated, 1);
         assert_eq!(r2.image_ids[0], id, "video id stable across re-merge");
 
-        let (rating, dur): (i64, f64) = conn.query_row(
-            "SELECT rating, duration_seconds FROM videos WHERE file_path = '/v/a.mov'", [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).expect("post-update");
+        let (rating, dur): (i64, f64) = conn
+            .query_row(
+                "SELECT rating, duration_seconds FROM videos WHERE file_path = '/v/a.mov'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("post-update");
         assert_eq!(rating, 4, "curation: Lightroom wins");
-        assert!((dur - 204.4).abs() < 1e-6, "fact: existing duration kept, not overwritten");
+        assert!(
+            (dur - 204.4).abs() < 1e-6,
+            "fact: existing duration kept, not overwritten"
+        );
     }
 }
 
@@ -6708,42 +6947,34 @@ mod lightroom_import_tests
 /// "Set Flag" on a selection / the whole query). Mirrors `update_image_flag`'s
 /// allow-list guard: `None` clears; any value outside {pick, reject} rejects
 /// the WHOLE update (→ 0). Returns the number of rows changed.
-pub async fn update_flag_for_ids(ids: Vec<i64>, flag: Option<String>) -> u64
-{
-    let flag_value: Option<String> = match flag.as_deref()
-    {
+pub async fn update_flag_for_ids(ids: Vec<i64>, flag: Option<String>) -> u64 {
+    let flag_value: Option<String> = match flag.as_deref() {
         None => None,
         Some(v @ ("pick" | "reject")) => Some(v.to_string()),
-        Some(other) =>
-        {
+        Some(other) => {
             eprintln!("Rejected invalid flag value '{}' for bulk update", other);
             return 0;
         }
     };
 
-    let where_clause = match id_in_list(&ids)
-    {
+    let where_clause = match id_in_list(&ids) {
         Some(w) => w,
         None => return 0,
     };
 
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return 0;
         }
     };
 
     let update_sql = format!("UPDATE images SET flag = ? WHERE {}", where_clause);
-    match conn.execute(&update_sql, params![flag_value])
-    {
+    match conn.execute(&update_sql, params![flag_value]) {
         Ok(changed) => changed as u64,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to bulk-update flag: {}", e);
             0
         }
@@ -6752,42 +6983,34 @@ pub async fn update_flag_for_ids(ids: Vec<i64>, flag: Option<String>) -> u64
 
 /// Bulk-set the color label on many records in ONE statement. Mirrors
 /// `update_image_color_label`'s allow-list guard. Returns rows changed.
-pub async fn update_color_label_for_ids(ids: Vec<i64>, color_label: Option<String>) -> u64
-{
-    let label_value: Option<String> = match color_label.as_deref()
-    {
+pub async fn update_color_label_for_ids(ids: Vec<i64>, color_label: Option<String>) -> u64 {
+    let label_value: Option<String> = match color_label.as_deref() {
         None => None,
         Some(v @ ("red" | "yellow" | "green" | "blue" | "purple")) => Some(v.to_string()),
-        Some(other) =>
-        {
+        Some(other) => {
             eprintln!("Rejected invalid color label '{}' for bulk update", other);
             return 0;
         }
     };
 
-    let where_clause = match id_in_list(&ids)
-    {
+    let where_clause = match id_in_list(&ids) {
         Some(w) => w,
         None => return 0,
     };
 
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return 0;
         }
     };
 
     let update_sql = format!("UPDATE images SET color_label = ? WHERE {}", where_clause);
-    match conn.execute(&update_sql, params![label_value])
-    {
+    match conn.execute(&update_sql, params![label_value]) {
         Ok(changed) => changed as u64,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to bulk-update color label: {}", e);
             0
         }
@@ -6796,33 +7019,31 @@ pub async fn update_color_label_for_ids(ids: Vec<i64>, color_label: Option<Strin
 
 /// Bulk-set the star rating on many records in ONE statement. Rating 0 clears
 /// (NULL), mirroring `update_image_rating`. Returns rows changed.
-pub async fn update_rating_for_ids(ids: Vec<i64>, rating: u32) -> u64
-{
-    let rating_value: Option<i64> = if rating == 0 { None } else { Some(rating as i64) };
+pub async fn update_rating_for_ids(ids: Vec<i64>, rating: u32) -> u64 {
+    let rating_value: Option<i64> = if rating == 0 {
+        None
+    } else {
+        Some(rating as i64)
+    };
 
-    let where_clause = match id_in_list(&ids)
-    {
+    let where_clause = match id_in_list(&ids) {
         Some(w) => w,
         None => return 0,
     };
 
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return 0;
         }
     };
 
     let update_sql = format!("UPDATE images SET rating = ? WHERE {}", where_clause);
-    match conn.execute(&update_sql, params![rating_value])
-    {
+    match conn.execute(&update_sql, params![rating_value]) {
         Ok(changed) => changed as u64,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to bulk-update rating: {}", e);
             0
         }
@@ -6830,17 +7051,21 @@ pub async fn update_rating_for_ids(ids: Vec<i64>, rating: u32) -> u64
 }
 
 #[cfg(test)]
-mod query_builder_tests
-{
+mod query_builder_tests {
     use super::*;
 
     #[test]
-    fn media_predicate_maps_each_stance()
-    {
+    fn media_predicate_maps_each_stance() {
         // The §11 media-type seam: StillsOnly / VideosOnly gate on is_video
         // (both NULL-safe), Both applies no media filter (None → nothing pushed).
-        assert_eq!(media_predicate(MediaType::StillsOnly), Some("is_video IS NOT TRUE"));
-        assert_eq!(media_predicate(MediaType::VideosOnly), Some("is_video IS TRUE"));
+        assert_eq!(
+            media_predicate(MediaType::StillsOnly),
+            Some("is_video IS NOT TRUE")
+        );
+        assert_eq!(
+            media_predicate(MediaType::VideosOnly),
+            Some("is_video IS TRUE")
+        );
         assert_eq!(media_predicate(MediaType::Both), None);
     }
 
@@ -6849,8 +7074,7 @@ mod query_builder_tests
     // getter reads), inserts one video row + one still, and runs the production
     // SELECT through the shared `row_to_video_details` decoder.
     #[test]
-    fn video_details_decodes_and_guards_on_is_video()
-    {
+    fn video_details_decodes_and_guards_on_is_video() {
         let conn = Connection::open_in_memory().expect("open in-memory duckdb");
         conn.execute_batch(
             "CREATE TABLE images (
@@ -6872,8 +7096,9 @@ mod query_builder_tests
                 audio_sample_rate INTEGER,
                 audio_bitrate BIGINT,
                 live_photo_id TEXT
-             );"
-        ).expect("create images");
+             );",
+        )
+        .expect("create images");
 
         // id=1 video — iPhone HDR shape: HLG transfer + Dolby Vision profile 8,
         // AAC stereo. (Plain digit literals — no Rust-style underscores in SQL.)
@@ -6883,13 +7108,12 @@ mod query_builder_tests
               'bt2020', 'arib-std-b67', 'bt2020nc', 'tv', 8,
               TRUE, 'aac', 2, 48000, 160000, 'ABC-123')",
             [],
-        ).expect("insert video");
+        )
+        .expect("insert video");
 
         // id=2 still — must be invisible to the getter (the is_video guard).
-        conn.execute(
-            "INSERT INTO images (id, is_video) VALUES (2, FALSE)",
-            [],
-        ).expect("insert still");
+        conn.execute("INSERT INTO images (id, is_video) VALUES (2, FALSE)", [])
+            .expect("insert still");
 
         let sql = "SELECT duration_seconds, frame_rate, video_kind, video_codec, \
                    video_bitrate, color_primaries, color_transfer, color_matrix, \
@@ -6897,28 +7121,32 @@ mod query_builder_tests
                    audio_sample_rate, audio_bitrate, live_photo_id \
                    FROM images WHERE id = ?1 AND is_video IS TRUE";
 
-        let v = conn.query_row(sql, params![1i64], row_to_video_details)
+        let v = conn
+            .query_row(sql, params![1i64], row_to_video_details)
             .expect("video row decodes");
         assert!((v.duration_seconds.unwrap() - 12.5).abs() < 1e-6);
         assert!((v.frame_rate.unwrap() - 29.97).abs() < 1e-6);
         assert_eq!(v.video_codec.as_deref(), Some("hevc"));
-        assert_eq!(v.video_bitrate, Some(45_000_000));     // BIGINT → i64
+        assert_eq!(v.video_bitrate, Some(45_000_000)); // BIGINT → i64
         assert_eq!(v.color_transfer.as_deref(), Some("arib-std-b67"));
-        assert_eq!(v.dv_profile, Some(8));                 // INTEGER → i32 down-cast
+        assert_eq!(v.dv_profile, Some(8)); // INTEGER → i32 down-cast
         assert_eq!(v.has_audio, Some(true));
-        assert_eq!(v.audio_channels, Some(2));             // INTEGER → i32 down-cast
+        assert_eq!(v.audio_channels, Some(2)); // INTEGER → i32 down-cast
         assert_eq!(v.audio_sample_rate, Some(48000));
         assert_eq!(v.live_photo_id.as_deref(), Some("ABC-123"));
 
         // The is_video guard hides the still: query_row finds no row → None.
-        let still = conn.query_row(sql, params![2i64], row_to_video_details).ok();
-        assert!(still.is_none(), "is_video IS TRUE must exclude the still row");
+        let still = conn
+            .query_row(sql, params![2i64], row_to_video_details)
+            .ok();
+        assert!(
+            still.is_none(),
+            "is_video IS TRUE must exclude the still row"
+        );
     }
 
-    fn qp(kind: &str) -> QueryPredicate
-    {
-        QueryPredicate
-        {
+    fn qp(kind: &str) -> QueryPredicate {
+        QueryPredicate {
             kind: kind.to_string(),
             day: None,
             day_end: None,
@@ -6930,31 +7158,27 @@ mod query_builder_tests
         }
     }
 
-    fn rating(op: &str, stars: u8) -> QueryPredicate
-    {
+    fn rating(op: &str, stars: u8) -> QueryPredicate {
         let mut p = qp("rating");
         p.op = Some(op.to_string());
         p.stars = Some(stars);
         p
     }
 
-    fn flag(value: &str) -> QueryPredicate
-    {
+    fn flag(value: &str) -> QueryPredicate {
         let mut p = qp("flag");
         p.value = Some(value.to_string());
         p
     }
 
-    fn color(value: &str) -> QueryPredicate
-    {
+    fn color(value: &str) -> QueryPredicate {
         let mut p = qp("color");
         p.value = Some(value.to_string());
         p
     }
 
     #[test]
-    fn day_validation()
-    {
+    fn day_validation() {
         assert!(is_valid_day("2026:05:15"));
         assert!(!is_valid_day("2026-05-15")); // dashes, not colons
         assert!(!is_valid_day("2026:5:15")); // wrong length
@@ -6963,8 +7187,7 @@ mod query_builder_tests
     }
 
     #[test]
-    fn atom_sql()
-    {
+    fn atom_sql() {
         assert_eq!(predicate_to_sql(&rating("gte", 4)), "(rating >= 4)");
         assert_eq!(predicate_to_sql(&flag("pick")), "(flag = 'pick')");
         assert_eq!(predicate_to_sql(&color("red")), "(color_label = 'red')");
@@ -6980,8 +7203,7 @@ mod query_builder_tests
     // the existing numeric + metadata arms; checks the SQL, BETWEEN, quote-escape,
     // and the (FALSE) backstop for a missing value/op.
     #[test]
-    fn video_subject_atoms()
-    {
+    fn video_subject_atoms() {
         let mut dur = qp("duration_num");
         dur.op = Some("gte".to_string());
         dur.num = Some(60.0);
@@ -6991,7 +7213,10 @@ mod query_builder_tests
         between.op = Some("between".to_string());
         between.num = Some(10.0);
         between.num_end = Some(30.0);
-        assert_eq!(predicate_to_sql(&between), "(duration_seconds BETWEEN 10 AND 30)");
+        assert_eq!(
+            predicate_to_sql(&between),
+            "(duration_seconds BETWEEN 10 AND 30)"
+        );
 
         let mut fps = qp("framerate_num");
         fps.op = Some("eq".to_string());
@@ -7016,50 +7241,77 @@ mod query_builder_tests
     // Kind-only predicates: the kind alone is the SQL, no value/op. SDR and
     // "not a live photo" carry an is_video guard so they never match a still.
     #[test]
-    fn video_choice_atoms()
-    {
-        assert_eq!(predicate_to_sql(&qp("dynrange_hlg")), "(color_transfer = 'arib-std-b67')");
-        assert_eq!(predicate_to_sql(&qp("dynrange_hdr10")), "(color_transfer = 'smpte2084')");
-        assert_eq!(predicate_to_sql(&qp("dynrange_dv")), "(dv_profile IS NOT NULL)");
+    fn video_choice_atoms() {
+        assert_eq!(
+            predicate_to_sql(&qp("dynrange_hlg")),
+            "(color_transfer = 'arib-std-b67')"
+        );
+        assert_eq!(
+            predicate_to_sql(&qp("dynrange_hdr10")),
+            "(color_transfer = 'smpte2084')"
+        );
+        assert_eq!(
+            predicate_to_sql(&qp("dynrange_dv")),
+            "(dv_profile IS NOT NULL)"
+        );
         assert_eq!(predicate_to_sql(&qp("audio_present")), "(has_audio = TRUE)");
         assert_eq!(predicate_to_sql(&qp("audio_absent")), "(has_audio = FALSE)");
-        assert_eq!(predicate_to_sql(&qp("livephoto_yes")), "(is_video IS TRUE AND live_photo_id IS NOT NULL)");
+        assert_eq!(
+            predicate_to_sql(&qp("livephoto_yes")),
+            "(is_video IS TRUE AND live_photo_id IS NOT NULL)"
+        );
         assert!(predicate_to_sql(&qp("dynrange_sdr")).contains("is_video IS TRUE"));
         assert!(predicate_to_sql(&qp("livephoto_no")).contains("is_video IS TRUE"));
     }
 
     #[test]
-    fn date_atoms()
-    {
+    fn date_atoms() {
         let mut eq = qp("date_equals");
         eq.day = Some("2026:05:15".to_string());
-        assert_eq!(predicate_to_sql(&eq), "(SUBSTRING(capture_datetime, 1, 10) = '2026:05:15')");
+        assert_eq!(
+            predicate_to_sql(&eq),
+            "(SUBSTRING(capture_datetime, 1, 10) = '2026:05:15')"
+        );
 
         let mut ge = qp("date_after");
         ge.day = Some("2026:05:15".to_string());
-        assert_eq!(predicate_to_sql(&ge), "(SUBSTRING(capture_datetime, 1, 10) >= '2026:05:15')");
+        assert_eq!(
+            predicate_to_sql(&ge),
+            "(SUBSTRING(capture_datetime, 1, 10) >= '2026:05:15')"
+        );
 
         let mut le = qp("date_before");
         le.day = Some("2026:05:15".to_string());
-        assert_eq!(predicate_to_sql(&le), "(SUBSTRING(capture_datetime, 1, 10) <= '2026:05:15')");
+        assert_eq!(
+            predicate_to_sql(&le),
+            "(SUBSTRING(capture_datetime, 1, 10) <= '2026:05:15')"
+        );
 
         let mut gt = qp("date_gt");
         gt.day = Some("2026:05:15".to_string());
-        assert_eq!(predicate_to_sql(&gt), "(SUBSTRING(capture_datetime, 1, 10) > '2026:05:15')");
+        assert_eq!(
+            predicate_to_sql(&gt),
+            "(SUBSTRING(capture_datetime, 1, 10) > '2026:05:15')"
+        );
 
         let mut lt = qp("date_lt");
         lt.day = Some("2026:05:15".to_string());
-        assert_eq!(predicate_to_sql(&lt), "(SUBSTRING(capture_datetime, 1, 10) < '2026:05:15')");
+        assert_eq!(
+            predicate_to_sql(&lt),
+            "(SUBSTRING(capture_datetime, 1, 10) < '2026:05:15')"
+        );
 
         let mut bt = qp("date_between");
         bt.day = Some("2026:01:01".to_string());
         bt.day_end = Some("2026:03:31".to_string());
-        assert_eq!(predicate_to_sql(&bt), "(SUBSTRING(capture_datetime, 1, 10) BETWEEN '2026:01:01' AND '2026:03:31')");
+        assert_eq!(
+            predicate_to_sql(&bt),
+            "(SUBSTRING(capture_datetime, 1, 10) BETWEEN '2026:01:01' AND '2026:03:31')"
+        );
     }
 
     #[test]
-    fn invalid_atoms_become_false()
-    {
+    fn invalid_atoms_become_false() {
         assert_eq!(predicate_to_sql(&flag("bogus")), "(FALSE)");
         assert_eq!(predicate_to_sql(&rating("gte", 6)), "(FALSE)"); // stars out of range
         assert_eq!(predicate_to_sql(&color("teal")), "(FALSE)");
@@ -7069,25 +7321,28 @@ mod query_builder_tests
     }
 
     #[test]
-    fn empty_predicates_no_where()
-    {
+    fn empty_predicates_no_where() {
         assert_eq!(build_filter_predicate(&[], &[]), "");
     }
 
     #[test]
-    fn id_in_list_assembly()
-    {
+    fn id_in_list_assembly() {
         assert_eq!(id_in_list(&[]), None);
         assert_eq!(id_in_list(&[5]), Some("id IN (5)".to_string()));
         assert_eq!(id_in_list(&[1, 2, 3]), Some("id IN (1, 2, 3)".to_string()));
     }
 
     #[test]
-    fn order_by_follows_first_subject()
-    {
+    fn order_by_follows_first_subject() {
         // Rating-first → stars best-to-worst.
-        assert_eq!(order_by_for_filter(&[rating("gte", 4)]), RATING_FILTER_ORDER_BY);
-        assert_eq!(order_by_for_filter(&[qp("rating_unrated")]), RATING_FILTER_ORDER_BY);
+        assert_eq!(
+            order_by_for_filter(&[rating("gte", 4)]),
+            RATING_FILTER_ORDER_BY
+        );
+        assert_eq!(
+            order_by_for_filter(&[qp("rating_unrated")]),
+            RATING_FILTER_ORDER_BY
+        );
         // The FIRST subject wins even when rating appears later.
         assert_eq!(
             order_by_for_filter(&[flag("pick"), rating("gte", 4)]),
@@ -7097,20 +7352,27 @@ mod query_builder_tests
         let mut d = qp("date_after");
         d.day = Some("2026:05:15".to_string());
         assert_eq!(order_by_for_filter(&[d]), DEFAULT_FILTER_ORDER_BY);
-        assert_eq!(order_by_for_filter(&[flag("pick")]), DEFAULT_FILTER_ORDER_BY);
-        assert_eq!(order_by_for_filter(&[color("red")]), DEFAULT_FILTER_ORDER_BY);
+        assert_eq!(
+            order_by_for_filter(&[flag("pick")]),
+            DEFAULT_FILTER_ORDER_BY
+        );
+        assert_eq!(
+            order_by_for_filter(&[color("red")]),
+            DEFAULT_FILTER_ORDER_BY
+        );
         assert_eq!(order_by_for_filter(&[]), DEFAULT_FILTER_ORDER_BY);
     }
 
     #[test]
-    fn single_predicate_wrapped()
-    {
-        assert_eq!(build_filter_predicate(&[rating("gte", 4)], &[]), "((rating >= 4))");
+    fn single_predicate_wrapped() {
+        assert_eq!(
+            build_filter_predicate(&[rating("gte", 4)], &[]),
+            "((rating >= 4))"
+        );
     }
 
     #[test]
-    fn left_to_right_accumulation()
-    {
+    fn left_to_right_accumulation() {
         // "A and B or C" → ((A AND B) OR C), left-to-right, NO precedence.
         let preds = vec![rating("gte", 4), flag("pick"), color("red")];
         let conns = vec![Connector::And, Connector::Or];
@@ -7121,8 +7383,7 @@ mod query_builder_tests
     }
 
     #[test]
-    fn xor_is_boolean_inequality()
-    {
+    fn xor_is_boolean_inequality() {
         let preds = vec![flag("pick"), color("red")];
         let conns = vec![Connector::Xor];
         assert_eq!(
@@ -7133,13 +7394,11 @@ mod query_builder_tests
 }
 
 #[cfg(test)]
-mod folder_sync_tests
-{
+mod folder_sync_tests {
     use super::*;
     use duckdb::Connection;
 
-    fn setup() -> Connection
-    {
+    fn setup() -> Connection {
         let conn = Connection::open_in_memory().expect("in-memory db");
         conn.execute_batch(
             "CREATE TABLE directory_sync_state (
@@ -7165,8 +7424,7 @@ mod folder_sync_tests
     }
 
     #[test]
-    fn sync_state_upsert_read_and_prune()
-    {
+    fn sync_state_upsert_read_and_prune() {
         let conn = setup();
         // Both directories exist in the catalogue (prune must keep them).
         conn.execute_batch(
@@ -7181,35 +7439,52 @@ mod folder_sync_tests
 
         // First write: two inserts.
         let first = vec![
-            DirectorySyncState { directory_path: "/A".into(), last_sync_mtime: 1_000 },
-            DirectorySyncState { directory_path: "/B".into(), last_sync_mtime: 2_000 },
+            DirectorySyncState {
+                directory_path: "/A".into(),
+                last_sync_mtime: 1_000,
+            },
+            DirectorySyncState {
+                directory_path: "/B".into(),
+                last_sync_mtime: 2_000,
+            },
         ];
         assert_eq!(update_directory_sync_states_impl(&conn, &first), 2);
 
         // Read back, indexed by path.
         let rows = directory_sync_states_impl(&conn);
         assert_eq!(rows.len(), 2);
-        let mtime_of = |p: &str| rows.iter().find(|r| r.directory_path == p).map(|r| r.last_sync_mtime);
+        let mtime_of = |p: &str| {
+            rows.iter()
+                .find(|r| r.directory_path == p)
+                .map(|r| r.last_sync_mtime)
+        };
         assert_eq!(mtime_of("/A"), Some(1_000));
         assert_eq!(mtime_of("/B"), Some(2_000));
 
         // Second write: /A moves (an UPDATE, not a duplicate row) — including
         // BACKWARD (the restore-from-backup case the != compare exists for).
-        let second = vec![
-            DirectorySyncState { directory_path: "/A".into(), last_sync_mtime: 500 },
-        ];
+        let second = vec![DirectorySyncState {
+            directory_path: "/A".into(),
+            last_sync_mtime: 500,
+        }];
         assert_eq!(update_directory_sync_states_impl(&conn, &second), 1);
         let rows = directory_sync_states_impl(&conn);
         assert_eq!(rows.len(), 2, "update in place — no duplicate /A row");
-        let mtime_of = |p: &str| rows.iter().find(|r| r.directory_path == p).map(|r| r.last_sync_mtime);
+        let mtime_of = |p: &str| {
+            rows.iter()
+                .find(|r| r.directory_path == p)
+                .map(|r| r.last_sync_mtime)
+        };
         assert_eq!(mtime_of("/A"), Some(500));
 
         // Prune: /B's last record leaves the catalogue → the next upsert call
         // drops /B's bookkeeping row (and the upsert itself still counts 1).
-        conn.execute_batch("DELETE FROM images WHERE id = 2;").expect("remove /B record");
-        let third = vec![
-            DirectorySyncState { directory_path: "/A".into(), last_sync_mtime: 600 },
-        ];
+        conn.execute_batch("DELETE FROM images WHERE id = 2;")
+            .expect("remove /B record");
+        let third = vec![DirectorySyncState {
+            directory_path: "/A".into(),
+            last_sync_mtime: 600,
+        }];
         assert_eq!(update_directory_sync_states_impl(&conn, &third), 1);
         let rows = directory_sync_states_impl(&conn);
         assert_eq!(rows.len(), 1, "departed directory pruned");
@@ -7218,8 +7493,7 @@ mod folder_sync_tests
     }
 
     #[test]
-    fn remove_images_by_ids_explicit_rows_keyword_rows_survive()
-    {
+    fn remove_images_by_ids_explicit_rows_keyword_rows_survive() {
         let conn = setup();
         conn.execute_batch(
             "INSERT INTO images VALUES
@@ -7260,15 +7534,12 @@ mod folder_sync_tests
     }
 
     #[test]
-    fn remove_images_by_ids_chunks_past_500()
-    {
+    fn remove_images_by_ids_chunks_past_500() {
         let conn = setup();
-        if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
-        {
+        if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
             panic!("begin failed: {}", e);
         }
-        for id in 1..=1_205i64
-        {
+        for id in 1..=1_205i64 {
             conn.execute(
                 "INSERT INTO images VALUES (?, ?, '/A')",
                 params![id, format!("/A/f{}.jpg", id)],
@@ -7308,15 +7579,12 @@ mod folder_sync_tests
 /// Returns:
 /// - true if update succeeded
 /// - false if catalogue not initialized, file not found, or query failed
-pub async fn update_image_rotation(file_path: String, degrees: i32) -> bool
-{
+pub async fn update_image_rotation(file_path: String, degrees: i32) -> bool {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return false;
         }
@@ -7325,24 +7593,18 @@ pub async fn update_image_rotation(file_path: String, degrees: i32) -> bool
     // Update the rotation for the specified file path
     let update_sql = "UPDATE images SET rotation = ? WHERE file_path = ?";
 
-    match conn.execute(update_sql, params![degrees, file_path])
-    {
-        Ok(changed) =>
-        {
-            if changed == 0
-            {
+    match conn.execute(update_sql, params![degrees, file_path]) {
+        Ok(changed) => {
+            if changed == 0 {
                 // No rows updated - file path not found
                 eprintln!("No image found with file_path: {}", file_path);
                 false
-            }
-            else
-            {
+            } else {
                 // Successfully updated
                 true
             }
         }
-        Err(e) =>
-        {
+        Err(e) => {
             // Log error but don't crash
             eprintln!("Failed to update rotation for {}: {}", file_path, e);
             false
@@ -7393,9 +7655,7 @@ pub async fn get_distinct_date_strings() -> Vec<String> {
         }
     };
 
-    let rows = match stmt.query_map([], |row| {
-        row.get::<_, String>(0)
-    }) {
+    let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Failed to execute query: {}", e);
@@ -7428,15 +7688,12 @@ pub async fn get_distinct_date_strings() -> Vec<String> {
 /// Returns:
 /// - Vec of directory path strings, sorted alphabetically
 /// - Empty vec if catalogue is empty or not initialized
-pub async fn get_distinct_directory_paths() -> Vec<String>
-{
+pub async fn get_distinct_directory_paths() -> Vec<String> {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
@@ -7457,24 +7714,17 @@ pub async fn get_distinct_directory_paths() -> Vec<String>
         ORDER BY dir_path ASC
     "#;
 
-    let mut stmt = match conn.prepare(query_sql)
-    {
+    let mut stmt = match conn.prepare(query_sql) {
         Ok(s) => s,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to prepare query: {}", e);
             return Vec::new();
         }
     };
 
-    let rows = match stmt.query_map([], |row|
-    {
-        row.get::<_, String>(0)
-    })
-    {
+    let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
         Ok(r) => r,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to execute query: {}", e);
             return Vec::new();
         }
@@ -7482,10 +7732,8 @@ pub async fn get_distinct_directory_paths() -> Vec<String>
 
     // Collect results, logging errors but continuing for other rows
     let mut paths = Vec::new();
-    for row_result in rows
-    {
-        match row_result
-        {
+    for row_result in rows {
+        match row_result {
             Ok(path) => paths.push(path),
             Err(e) => eprintln!("Failed to parse row: {}", e),
         }
@@ -7501,8 +7749,7 @@ pub async fn get_distinct_directory_paths() -> Vec<String>
 /// the stored `directory_path` column), so the key set is byte-identical to
 /// the tree's and one call can feed both structure and counts.
 #[derive(Debug, Clone, PartialEq)]
-pub struct DirectoryImageCount
-{
+pub struct DirectoryImageCount {
     pub directory_path: String,
     pub image_count: i64,
 }
@@ -7511,8 +7758,7 @@ pub struct DirectoryImageCount
 /// "YYYY:MM:DD" prefix — the same 10-character SUBSTRING
 /// `get_distinct_date_strings` returns, so the key set is byte-identical.
 #[derive(Debug, Clone, PartialEq)]
-pub struct CaptureDayImageCount
-{
+pub struct CaptureDayImageCount {
     pub day: String,
     pub image_count: i64,
 }
@@ -7527,15 +7773,12 @@ pub struct CaptureDayImageCount
 /// immediate parent ONLY; Swift sums ancestors while walking the trie (an
 /// ancestor's old prefix-count equals the sum over its descendant leaves,
 /// since every image has exactly one parent directory).
-pub async fn directory_image_counts(media_type: MediaType) -> Vec<DirectoryImageCount>
-{
+pub async fn directory_image_counts(media_type: MediaType) -> Vec<DirectoryImageCount> {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
@@ -7546,12 +7789,12 @@ pub async fn directory_image_counts(media_type: MediaType) -> Vec<DirectoryImage
     // Media-type stance (DESIGN §11): the sidebar counts follow the Photos view's
     // media type so Dates/Sources counts equal what the gallery shows. None (Both)
     // → no media filter; the same seam as every query helper, via media_predicate.
-    let media_clause = match media_predicate(media_type)
-    {
+    let media_clause = match media_predicate(media_type) {
         Some(pred) => format!("AND {}", pred),
         None => String::new(),
     };
-    let query_sql = format!(r#"
+    let query_sql = format!(
+        r#"
         SELECT
             SUBSTRING(file_path, 1, LENGTH(file_path) - INSTR(REVERSE(file_path), '/')) as dir_path,
             COUNT(*) as image_count
@@ -7559,40 +7802,34 @@ pub async fn directory_image_counts(media_type: MediaType) -> Vec<DirectoryImage
         WHERE file_path IS NOT NULL AND file_path LIKE '%/%' {}
         GROUP BY dir_path
         ORDER BY dir_path ASC
-    "#, media_clause);
+    "#,
+        media_clause
+    );
 
-    let mut stmt = match conn.prepare(&query_sql)
-    {
+    let mut stmt = match conn.prepare(&query_sql) {
         Ok(s) => s,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("directory_image_counts: prepare {}", e);
             return Vec::new();
         }
     };
 
-    let rows = match stmt.query_map([], |row|
-    {
-        Ok(DirectoryImageCount
-        {
+    let rows = match stmt.query_map([], |row| {
+        Ok(DirectoryImageCount {
             directory_path: row.get::<_, String>(0)?,
             image_count: row.get::<_, i64>(1)?,
         })
-    })
-    {
+    }) {
         Ok(r) => r,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("directory_image_counts: query {}", e);
             return Vec::new();
         }
     };
 
     let mut counts = Vec::new();
-    for row_result in rows
-    {
-        match row_result
-        {
+    for row_result in rows {
+        match row_result {
             Ok(c) => counts.push(c),
             Err(e) => eprintln!("directory_image_counts: row {}", e),
         }
@@ -7610,15 +7847,12 @@ pub async fn directory_image_counts(media_type: MediaType) -> Vec<DirectoryImage
 /// empty capture datetimes (Undated files) are excluded here exactly as they
 /// are from the tree — the "All Photos" total is a separate whole-catalogue
 /// count and still includes them.
-pub async fn capture_day_image_counts(media_type: MediaType) -> Vec<CaptureDayImageCount>
-{
+pub async fn capture_day_image_counts(media_type: MediaType) -> Vec<CaptureDayImageCount> {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
@@ -7626,52 +7860,46 @@ pub async fn capture_day_image_counts(media_type: MediaType) -> Vec<CaptureDayIm
 
     // Media-type stance (DESIGN §11): follows the Photos view's media type (see
     // directory_image_counts), via media_predicate — None (Both) = no media filter.
-    let media_clause = match media_predicate(media_type)
-    {
+    let media_clause = match media_predicate(media_type) {
         Some(pred) => format!("AND {}", pred),
         None => String::new(),
     };
-    let query_sql = format!(r#"
+    let query_sql = format!(
+        r#"
         SELECT SUBSTRING(capture_datetime, 1, 10) as date_str,
                COUNT(*) as image_count
         FROM images
         WHERE capture_datetime IS NOT NULL AND capture_datetime != '' {}
         GROUP BY date_str
         ORDER BY date_str ASC
-    "#, media_clause);
+    "#,
+        media_clause
+    );
 
-    let mut stmt = match conn.prepare(&query_sql)
-    {
+    let mut stmt = match conn.prepare(&query_sql) {
         Ok(s) => s,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("capture_day_image_counts: prepare {}", e);
             return Vec::new();
         }
     };
 
-    let rows = match stmt.query_map([], |row|
-    {
-        Ok(CaptureDayImageCount
-        {
+    let rows = match stmt.query_map([], |row| {
+        Ok(CaptureDayImageCount {
             day: row.get::<_, String>(0)?,
             image_count: row.get::<_, i64>(1)?,
         })
-    })
-    {
+    }) {
         Ok(r) => r,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("capture_day_image_counts: query {}", e);
             return Vec::new();
         }
     };
 
     let mut counts = Vec::new();
-    for row_result in rows
-    {
-        match row_result
-        {
+    for row_result in rows {
+        match row_result {
             Ok(c) => counts.push(c),
             Err(e) => eprintln!("capture_day_image_counts: row {}", e),
         }
@@ -7808,15 +8036,12 @@ pub async fn get_image_count_for_path_prefix(
     path_prefix: String,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
-) -> i64
-{
+) -> i64 {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return 0;
         }
@@ -7861,15 +8086,12 @@ pub async fn get_images_for_path_prefix(
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
     media_type: MediaType,
-) -> Vec<ImageRecord>
-{
+) -> Vec<ImageRecord> {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
@@ -7910,15 +8132,12 @@ pub async fn get_image_count_for_filters(
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
     media_type: MediaType,
-) -> i64
-{
+) -> i64 {
     // Acquire lock and validate connection
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return 0;
         }
@@ -8034,16 +8253,13 @@ pub async fn get_file_paths_for_filters(
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
     media_type: MediaType,
-) -> FilePathsResult
-{
+) -> FilePathsResult {
     // Acquire lock and validate connection. Catalogue not initialized
     // is a hard failure — caller must distinguish from "zero matches".
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return FilePathsResult {
                 ok: false,
@@ -8063,8 +8279,7 @@ pub async fn get_file_paths_for_filters(
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
         media_type,
-    )
-    {
+    ) {
         Ok(paths) => FilePathsResult {
             ok: true,
             paths,
@@ -8119,14 +8334,11 @@ pub async fn get_image_records_for_filters(
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
     media_type: MediaType,
-) -> Vec<ImageRecord>
-{
+) -> Vec<ImageRecord> {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
@@ -8176,25 +8388,18 @@ pub async fn get_image_records_for_filters(
 /// stderr. The caller cannot distinguish "zero matched" from "error";
 /// the Swift trace and the post-remove notification carry the user-
 /// facing surface, and a zero return correctly produces no UI change.
-pub async fn remove_images_for_filters(
-    path_prefix: String,
-    date_prefix: String,
-) -> i64
-{
+pub async fn remove_images_for_filters(path_prefix: String, date_prefix: String) -> i64 {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return 0;
         }
     };
 
     let predicate = build_path_date_predicate(&path_prefix, &date_prefix);
-    if predicate.is_empty()
-    {
+    if predicate.is_empty() {
         eprintln!(
             "remove_images_for_filters refused: empty predicate \
              (path_prefix and date_prefix both empty)"
@@ -8203,11 +8408,9 @@ pub async fn remove_images_for_filters(
     }
 
     let delete_sql = format!("DELETE FROM images WHERE {}", predicate);
-    match conn.execute(&delete_sql, [])
-    {
+    match conn.execute(&delete_sql, []) {
         Ok(rows_changed) => rows_changed as i64,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("remove_images_for_filters DELETE failed: {}", e);
             0
         }
@@ -8230,8 +8433,7 @@ pub async fn remove_images_for_filters(
 /// last scanned or synced. The monitor sweep flags a directory when a fresh
 /// stat DIFFERS (`!=`, never `>` — a restore-from-backup moves mtime backward
 /// and the directory is still changed). Mirrors the UDL `DirectorySyncState`.
-pub struct DirectorySyncState
-{
+pub struct DirectorySyncState {
     pub directory_path: String,
     pub last_sync_mtime: i64,
 }
@@ -8240,34 +8442,26 @@ pub struct DirectorySyncState
 /// impl/wrapper pattern, for in-memory unit tests). Returns the whole table,
 /// unordered; the Swift sweep indexes it by path. Empty on any error
 /// (failure-as-empty, the record-returning convention).
-fn directory_sync_states_impl(conn: &Connection) -> Vec<DirectorySyncState>
-{
-    let mut stmt = match conn.prepare(
-        "SELECT directory_path, last_sync_mtime FROM directory_sync_state",
-    )
-    {
-        Ok(s) => s,
-        Err(e) =>
-        {
-            eprintln!("directory_sync_states: prepare {}", e);
-            return Vec::new();
-        }
-    };
+fn directory_sync_states_impl(conn: &Connection) -> Vec<DirectorySyncState> {
+    let mut stmt =
+        match conn.prepare("SELECT directory_path, last_sync_mtime FROM directory_sync_state") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("directory_sync_states: prepare {}", e);
+                return Vec::new();
+            }
+        };
 
-    let mapped = stmt.query_map([], |row|
-    {
-        Ok(DirectorySyncState
-        {
+    let mapped = stmt.query_map([], |row| {
+        Ok(DirectorySyncState {
             directory_path: row.get(0)?,
             last_sync_mtime: row.get(1)?,
         })
     });
 
-    match mapped
-    {
+    match mapped {
         Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("directory_sync_states: query {}", e);
             Vec::new()
         }
@@ -8280,14 +8474,11 @@ fn directory_sync_states_impl(conn: &Connection) -> Vec<DirectorySyncState>
 /// table supplies the mtime each is compared against. A directory with no row
 /// here (never scanned since the feature landed) compares as changed, which is
 /// correct — its first sync records the baseline.
-pub async fn directory_sync_states() -> Vec<DirectorySyncState>
-{
+pub async fn directory_sync_states() -> Vec<DirectorySyncState> {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
@@ -8304,39 +8495,32 @@ pub async fn directory_sync_states() -> Vec<DirectorySyncState>
 /// a few thousand rows. Returns rows changed (updated + inserted; the prune
 /// does not count). 0 on any failure (failure-as-zero, transaction rolled
 /// back).
-fn update_directory_sync_states_impl(conn: &Connection, states: &[DirectorySyncState]) -> u64
-{
-    if states.is_empty()
-    {
+fn update_directory_sync_states_impl(conn: &Connection, states: &[DirectorySyncState]) -> u64 {
+    if states.is_empty() {
         return 0;
     }
 
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
-    {
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         eprintln!("update_directory_sync_states: begin failed: {}", e);
         return 0;
     }
 
     let mut changed: u64 = 0;
-    for state in states
-    {
+    for state in states {
         // UPDATE first; an existing row is the common case after the first sync.
         let updated = match conn.execute(
             "UPDATE directory_sync_state SET last_sync_mtime = ? \
              WHERE directory_path = ?",
             params![state.last_sync_mtime, state.directory_path],
-        )
-        {
+        ) {
             Ok(n) => n as u64,
-            Err(e) =>
-            {
+            Err(e) => {
                 eprintln!("update_directory_sync_states: update failed: {}", e);
                 let _ = conn.execute_batch("ROLLBACK;");
                 return 0;
             }
         };
-        if updated > 0
-        {
+        if updated > 0 {
             changed += updated;
             continue;
         }
@@ -8345,11 +8529,9 @@ fn update_directory_sync_states_impl(conn: &Connection, states: &[DirectorySyncS
             "INSERT INTO directory_sync_state (directory_path, last_sync_mtime) \
              VALUES (?, ?)",
             params![state.directory_path, state.last_sync_mtime],
-        )
-        {
+        ) {
             Ok(_) => changed += 1,
-            Err(e) =>
-            {
+            Err(e) => {
                 eprintln!("update_directory_sync_states: insert failed: {}", e);
                 let _ = conn.execute_batch("ROLLBACK;");
                 return 0;
@@ -8367,14 +8549,15 @@ fn update_directory_sync_states_impl(conn: &Connection, states: &[DirectorySyncS
              SELECT DISTINCT directory_path FROM images \
              WHERE directory_path IS NOT NULL)",
         [],
-    )
-    {
+    ) {
         // Non-fatal: the upserts above are the contract; stale rows are inert.
-        eprintln!("update_directory_sync_states: prune failed (non-fatal): {}", e);
+        eprintln!(
+            "update_directory_sync_states: prune failed (non-fatal): {}",
+            e
+        );
     }
 
-    if let Err(e) = conn.execute_batch("COMMIT;")
-    {
+    if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("update_directory_sync_states: commit failed: {}", e);
         return 0;
     }
@@ -8385,14 +8568,11 @@ fn update_directory_sync_states_impl(conn: &Connection, states: &[DirectorySyncS
 /// mtimes as of the scan/sync that just looked inside them. Called at the end
 /// of every directory scan and every sync (and, on first run, seeded for
 /// already-catalogued directories so the first sweep has a baseline).
-pub async fn update_directory_sync_states(states: Vec<DirectorySyncState>) -> u64
-{
+pub async fn update_directory_sync_states(states: Vec<DirectorySyncState>) -> u64 {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return 0;
         }
@@ -8407,33 +8587,26 @@ pub async fn update_directory_sync_states(states: Vec<DirectorySyncState>) -> u6
 /// recovery surface, and orphans are invisible because every keyword consumer
 /// joins through `images.id`. Returns rows deleted; 0 on failure (rolled
 /// back) or empty input (refusal — no ids must never mean "all ids").
-fn remove_images_by_ids_impl(conn: &Connection, ids: &[i64]) -> u64
-{
-    if ids.is_empty()
-    {
+fn remove_images_by_ids_impl(conn: &Connection, ids: &[i64]) -> u64 {
+    if ids.is_empty() {
         return 0;
     }
 
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
-    {
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         eprintln!("remove_images_by_ids: begin failed: {}", e);
         return 0;
     }
 
     let mut deleted: u64 = 0;
-    for chunk in ids.chunks(500)
-    {
-        let predicate = match id_in_list(chunk)
-        {
+    for chunk in ids.chunks(500) {
+        let predicate = match id_in_list(chunk) {
             Some(p) => p,
             None => continue,
         };
         let delete_sql = format!("DELETE FROM images WHERE {}", predicate);
-        match conn.execute(&delete_sql, [])
-        {
+        match conn.execute(&delete_sql, []) {
             Ok(n) => deleted += n as u64,
-            Err(e) =>
-            {
+            Err(e) => {
                 eprintln!("remove_images_by_ids: DELETE failed: {}", e);
                 let _ = conn.execute_batch("ROLLBACK;");
                 return 0;
@@ -8441,8 +8614,7 @@ fn remove_images_by_ids_impl(conn: &Connection, ids: &[i64]) -> u64
         }
     }
 
-    if let Err(e) = conn.execute_batch("COMMIT;")
-    {
+    if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("remove_images_by_ids: commit failed: {}", e);
         return 0;
     }
@@ -8456,14 +8628,11 @@ fn remove_images_by_ids_impl(conn: &Connection, ids: &[i64]) -> u64
 /// (2) shown the user a confirm naming the vanished files. Touches NO files
 /// and NO thumbnails (Swift owns cache hygiene for the removed paths).
 /// Refuses an empty list. Returns rows deleted, 0 on any failure.
-pub async fn remove_images_by_ids(ids: Vec<i64>) -> u64
-{
+pub async fn remove_images_by_ids(ids: Vec<i64>) -> u64 {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return 0;
         }
@@ -8543,31 +8712,19 @@ pub async fn remove_images_by_ids(ids: Vec<i64>) -> u64
 pub async fn get_destination_family_records(
     sample_file_path: String,
     canonical_file_name: String,
-) -> Vec<ImageRecord>
-{
+) -> Vec<ImageRecord> {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
     };
 
-    let predicate = build_destination_family_predicate(
-        &sample_file_path,
-        &canonical_file_name,
-    );
+    let predicate = build_destination_family_predicate(&sample_file_path, &canonical_file_name);
 
-    execute_image_record_projection_query(
-        conn,
-        &predicate,
-        false,
-        false,
-        MediaType::StillsOnly,
-    )
+    execute_image_record_projection_query(conn, &predicate, false, false, MediaType::StillsOnly)
 }
 
 /// Find the JPEG+RAW counterpart of an image in the catalogue
@@ -8626,16 +8783,13 @@ pub async fn get_destination_family_records(
 ///   chosen as the alphabetically-first matching file_extension
 /// - None if input is Other-kind, malformed, or has no counterpart in the
 ///   catalogue
-pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord>
-{
+pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord> {
     // 1. Parse parent directory and basename from the input path.
     //    Pure string operation — no filesystem I/O, no canonicalization.
     //    Trusts the input. Risk 3 in DESIGN-image-classification.md.
-    let last_slash = match file_path.rfind('/')
-    {
+    let last_slash = match file_path.rfind('/') {
         Some(pos) => pos,
-        None =>
-        {
+        None => {
             // No slash → no parent directory. Cannot be a real file path.
             return None;
         }
@@ -8647,11 +8801,9 @@ pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord>
     // 2. Parse stem and extension from the basename.
     //    rfind('.') finds the LAST dot, which handles multi-dot filenames
     //    such as IMG.2024-05-13.NEF correctly (stem = "IMG.2024-05-13").
-    let last_dot = match basename.rfind('.')
-    {
+    let last_dot = match basename.rfind('.') {
         Some(pos) => pos,
-        None =>
-        {
+        None => {
             // No extension → cannot be classified as JPEG or RAW.
             return None;
         }
@@ -8662,8 +8814,7 @@ pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord>
 
     // 3. Classify the input extension; Other-kind inputs have no counterpart.
     let input_kind = classify_extension(ext.to_string());
-    let target_kind = match input_kind
-    {
+    let target_kind = match input_kind {
         ImageKind::Jpeg => ImageKind::Raw,
         ImageKind::Raw => ImageKind::Jpeg,
         ImageKind::Other => return None,
@@ -8680,11 +8831,9 @@ pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord>
 
     // 4. Acquire lock and validate connection.
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return None;
         }
@@ -8743,18 +8892,15 @@ pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord>
         ORDER BY file_extension ASC
     "#;
 
-    let mut stmt = match conn.prepare(query_sql)
-    {
+    let mut stmt = match conn.prepare(query_sql) {
         Ok(s) => s,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to prepare counterpart query: {}", e);
             return None;
         }
     };
 
-    let rows = match stmt.query_map(params![parent_dir, stem, file_path], |row|
-    {
+    let rows = match stmt.query_map(params![parent_dir, stem, file_path], |row| {
         // Standard ImageRecord row decode — mirrors get_images_for_path_prefix.
         // Format indexed_timestamp from Unix epoch seconds to ISO 8601 string.
         let epoch_secs: i64 = row.get(1)?;
@@ -8793,11 +8939,9 @@ pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord>
             rotation: row.get::<_, i64>(29)? as i32,
             duplicate_group_id: row.get::<_, Option<i64>>(30)?,
         })
-    })
-    {
+    }) {
         Ok(r) => r,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to execute counterpart query: {}", e);
             return None;
         }
@@ -8808,23 +8952,18 @@ pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord>
     //    the input. The SQL ORDER BY guarantees determinism across runs;
     //    the Rust-side filter ensures we don't accidentally return a same-
     //    kind sibling (multi-RAW edge case).
-    for row_result in rows
-    {
-        match row_result
-        {
-            Ok(record) =>
-            {
+    for row_result in rows {
+        match row_result {
+            Ok(record) => {
                 // file_extension is filtered NOT NULL/non-empty in SQL,
                 // but match defensively in case future schema changes
                 // weaken that guard.
-                let candidate_ext = match &record.file_extension
-                {
+                let candidate_ext = match &record.file_extension {
                     Some(e) => e.clone(),
                     None => continue,
                 };
 
-                if classify_extension(candidate_ext) == target_kind
-                {
+                if classify_extension(candidate_ext) == target_kind {
                     return Some(record);
                 }
             }
@@ -8847,8 +8986,7 @@ pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord>
 /// (capture date, dimensions, rotation, bit depth, color space, GPS) already
 /// ride on ImageRecord; this carries only the video-only set.
 #[derive(Debug, Clone)]
-pub struct VideoDetails
-{
+pub struct VideoDetails {
     pub duration_seconds: Option<f64>,   // container duration, seconds
     pub frame_rate: Option<f64>,         // nominal fps (e.g. 29.97)
     pub video_kind: Option<String>,      // container: "mov" / "mp4" / "mxf"
@@ -8860,11 +8998,11 @@ pub struct VideoDetails
     pub color_range: Option<String>,     // "tv" / "pc"
     pub dv_profile: Option<i32>,         // Dolby Vision profile (8 on iPhone); None = none
     pub has_audio: Option<bool>,
-    pub audio_codec: Option<String>,     // aac / pcm_s16le / pcm_s24le
+    pub audio_codec: Option<String>, // aac / pcm_s16le / pcm_s24le
     pub audio_channels: Option<i32>,
     pub audio_sample_rate: Option<i32>,
-    pub audio_bitrate: Option<i64>,      // bits/sec
-    pub live_photo_id: Option<String>,   // QuickTime content.identifier
+    pub audio_bitrate: Option<i64>,    // bits/sec
+    pub live_photo_id: Option<String>, // QuickTime content.identifier
 }
 
 /// Decode the 16 video-only columns (in the SELECT order used by
@@ -8872,10 +9010,8 @@ pub struct VideoDetails
 /// unit test so the column positions and integer down-casts are verified in one
 /// place. DuckDB hands integer columns back as i64 (mirrors the ImageRecord
 /// decode), so the INTEGER fields cast to i32 explicitly; BIGINT stays i64.
-fn row_to_video_details(row: &duckdb::Row) -> Result<VideoDetails, duckdb::Error>
-{
-    Ok(VideoDetails
-    {
+fn row_to_video_details(row: &duckdb::Row) -> Result<VideoDetails, duckdb::Error> {
+    Ok(VideoDetails {
         duration_seconds: row.get(0)?,
         frame_rate: row.get(1)?,
         video_kind: row.get(2)?,
@@ -8900,14 +9036,11 @@ fn row_to_video_details(row: &duckdb::Row) -> Result<VideoDetails, duckdb::Error
 /// (the caller only asks for videos). Returns None when the catalogue is
 /// uninitialized, the id is absent, or the row is not a video — all benign
 /// "no Video group" outcomes for the panel, never an error worth surfacing.
-pub async fn get_video_details(image_id: i64) -> Option<VideoDetails>
-{
+pub async fn get_video_details(image_id: i64) -> Option<VideoDetails> {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return None;
         }
@@ -8923,5 +9056,6 @@ pub async fn get_video_details(image_id: i64) -> Option<VideoDetails>
         WHERE id = ?1 AND is_video IS TRUE
     "#;
 
-    conn.query_row(query_sql, params![image_id], row_to_video_details).ok()
+    conn.query_row(query_sql, params![image_id], row_to_video_details)
+        .ok()
 }

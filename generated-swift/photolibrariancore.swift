@@ -798,6 +798,130 @@ public func FfiConverterTypeFilePathsResult_lower(_ value: FilePathsResult) -> R
 }
 
 
+public struct FocusAnalysisCandidate: Equatable, Hashable {
+    public var id: Int64
+    public var filePath: String
+    public var fileSize: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: Int64, filePath: String, fileSize: UInt64) {
+        self.id = id
+        self.filePath = filePath
+        self.fileSize = fileSize
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FocusAnalysisCandidate: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFocusAnalysisCandidate: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FocusAnalysisCandidate {
+        return
+            try FocusAnalysisCandidate(
+                id: FfiConverterInt64.read(from: &buf), 
+                filePath: FfiConverterString.read(from: &buf), 
+                fileSize: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FocusAnalysisCandidate, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.id, into: &buf)
+        FfiConverterString.write(value.filePath, into: &buf)
+        FfiConverterUInt64.write(value.fileSize, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFocusAnalysisCandidate_lift(_ buf: RustBuffer) throws -> FocusAnalysisCandidate {
+    return try FfiConverterTypeFocusAnalysisCandidate.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFocusAnalysisCandidate_lower(_ value: FocusAnalysisCandidate) -> RustBuffer {
+    return FfiConverterTypeFocusAnalysisCandidate.lower(value)
+}
+
+
+public struct FocusAnalysisResult: Equatable, Hashable {
+    public var id: Int64
+    public var focusScore: Double?
+    public var focusBasis: String?
+    public var algorithmVersion: String
+    public var status: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: Int64, focusScore: Double?, focusBasis: String?, algorithmVersion: String, status: String) {
+        self.id = id
+        self.focusScore = focusScore
+        self.focusBasis = focusBasis
+        self.algorithmVersion = algorithmVersion
+        self.status = status
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FocusAnalysisResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFocusAnalysisResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FocusAnalysisResult {
+        return
+            try FocusAnalysisResult(
+                id: FfiConverterInt64.read(from: &buf), 
+                focusScore: FfiConverterOptionDouble.read(from: &buf), 
+                focusBasis: FfiConverterOptionString.read(from: &buf), 
+                algorithmVersion: FfiConverterString.read(from: &buf), 
+                status: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FocusAnalysisResult, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.id, into: &buf)
+        FfiConverterOptionDouble.write(value.focusScore, into: &buf)
+        FfiConverterOptionString.write(value.focusBasis, into: &buf)
+        FfiConverterString.write(value.algorithmVersion, into: &buf)
+        FfiConverterString.write(value.status, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFocusAnalysisResult_lift(_ buf: RustBuffer) throws -> FocusAnalysisResult {
+    return try FfiConverterTypeFocusAnalysisResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFocusAnalysisResult_lower(_ value: FocusAnalysisResult) -> RustBuffer {
+    return FfiConverterTypeFocusAnalysisResult.lower(value)
+}
+
+
 public struct ImageMetadata: Equatable, Hashable {
     public var filePath: String
     public var fileSize: UInt64
@@ -2567,6 +2691,56 @@ fileprivate struct FfiConverterSequenceTypeDirectorySyncState: FfiConverterRustB
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFocusAnalysisCandidate: FfiConverterRustBuffer {
+    typealias SwiftType = [FocusAnalysisCandidate]
+
+    public static func write(_ value: [FocusAnalysisCandidate], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFocusAnalysisCandidate.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FocusAnalysisCandidate] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FocusAnalysisCandidate]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFocusAnalysisCandidate.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFocusAnalysisResult: FfiConverterRustBuffer {
+    typealias SwiftType = [FocusAnalysisResult]
+
+    public static func write(_ value: [FocusAnalysisResult], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFocusAnalysisResult.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FocusAnalysisResult] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FocusAnalysisResult]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFocusAnalysisResult.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeImageMetadata: FfiConverterRustBuffer {
     typealias SwiftType = [ImageMetadata]
 
@@ -3024,6 +3198,21 @@ public func findCounterpartImage(filePath: String)async  -> ImageRecord?  {
             completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeImageRecord.lift,
+            errorHandler: nil
+            
+        )
+}
+public func focusAnalysisCandidates(limit: UInt32, algorithmVersion: String)async  -> [FocusAnalysisCandidate]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_focus_analysis_candidates(FfiConverterUInt32.lower(limit),FfiConverterString.lower(algorithmVersion)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeFocusAnalysisCandidate.lift,
             errorHandler: nil
             
         )
@@ -3647,6 +3836,21 @@ public func updateFlagForIds(ids: [Int64], flag: String?)async  -> UInt64  {
             
         )
 }
+public func updateFocusAnalysisResults(results: [FocusAnalysisResult])async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_update_focus_analysis_results(FfiConverterSequenceTypeFocusAnalysisResult.lower(results)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func updateImageColorLabel(filePath: String, colorLabel: String?)async  -> Bool  {
     return
         try!  await uniffiRustCallAsync(
@@ -3783,6 +3987,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_find_counterpart_image() != 51699) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_focus_analysis_candidates() != 37293) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_get_all_images() != 11357) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3910,6 +4117,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_flag_for_ids() != 57492) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_update_focus_analysis_results() != 3614) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_image_color_label() != 55337) {
