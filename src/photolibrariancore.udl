@@ -277,7 +277,13 @@ namespace photolibrariancore {
     sequence<FocusAnalysisCandidate> focus_analysis_candidates(u32 limit, string algorithm_version, string analysis_run_id);
 
     [Async]
+    sequence<FocusAnalysisCandidate> focus_analysis_candidates_for_ids(sequence<i64> ids, u32 limit, string algorithm_version, string analysis_run_id);
+
+    [Async]
     u64 focus_analysis_candidate_count(string algorithm_version, string analysis_run_id);
+
+    [Async]
+    u64 focus_analysis_candidate_count_for_ids(sequence<i64> ids, string algorithm_version, string analysis_run_id);
 
     [Async]
     u64 update_focus_analysis_results(sequence<FocusAnalysisResult> results);

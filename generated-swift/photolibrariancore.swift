@@ -3460,11 +3460,41 @@ public func focusAnalysisCandidateCount(algorithmVersion: String, analysisRunId:
             
         )
 }
+public func focusAnalysisCandidateCountForIds(ids: [Int64], algorithmVersion: String, analysisRunId: String)async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_focus_analysis_candidate_count_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterString.lower(algorithmVersion),FfiConverterString.lower(analysisRunId)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func focusAnalysisCandidates(limit: UInt32, algorithmVersion: String, analysisRunId: String)async  -> [FocusAnalysisCandidate]  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_photolibrariancore_fn_func_focus_analysis_candidates(FfiConverterUInt32.lower(limit),FfiConverterString.lower(algorithmVersion),FfiConverterString.lower(analysisRunId)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeFocusAnalysisCandidate.lift,
+            errorHandler: nil
+            
+        )
+}
+public func focusAnalysisCandidatesForIds(ids: [Int64], limit: UInt32, algorithmVersion: String, analysisRunId: String)async  -> [FocusAnalysisCandidate]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_focus_analysis_candidates_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterUInt32.lower(limit),FfiConverterString.lower(algorithmVersion),FfiConverterString.lower(analysisRunId)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
@@ -4287,7 +4317,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_focus_analysis_candidate_count() != 30371) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_focus_analysis_candidate_count_for_ids() != 64336) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_focus_analysis_candidates() != 55146) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_focus_analysis_candidates_for_ids() != 16933) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_all_images() != 11357) {

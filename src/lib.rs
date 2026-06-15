@@ -5175,43 +5175,55 @@ fn sanitized_focus_result(mut result: FocusAnalysisResult) -> FocusAnalysisResul
     result
 }
 
-/// Return a narrow page of still-image rows whose focus analysis is missing or
-/// stale for the requested algorithm version. The NULL columns are the queue; no
-/// separate enrichment table is persisted.
-pub async fn focus_analysis_candidates(
-    limit: u32,
-    algorithm_version: String,
-    analysis_run_id: String,
-) -> Vec<FocusAnalysisCandidate> {
-    let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref() {
-        Some(c) => c,
-        None => {
-            eprintln!("Catalogue not initialized");
-            return Vec::new();
-        }
-    };
+fn focus_analysis_queue_where_clause(id_predicate: Option<&str>) -> String {
+    let mut predicates = vec![
+        "is_video IS NOT TRUE".to_string(),
+        "(
+             focus_analysis_status IS NULL
+             OR focus_algorithm_version IS NULL
+             OR focus_algorithm_version <> ?1
+             OR (
+                 focus_analysis_status IN ('online_only', 'unreadable', 'failed')
+                 AND (
+                     focus_analysis_attempt_id IS NULL
+                     OR focus_analysis_attempt_id <> ?2
+                 )
+             )
+         )"
+        .to_string(),
+    ];
+    if let Some(predicate) = id_predicate {
+        predicates.push(format!("({})", predicate));
+    }
 
+    format!("WHERE {}", predicates.join(" AND "))
+}
+
+fn focus_analysis_candidates_impl(
+    conn: &Connection,
+    limit: u32,
+    algorithm_version: &str,
+    analysis_run_id: &str,
+    scoped_ids: Option<&[i64]>,
+) -> Vec<FocusAnalysisCandidate> {
+    let id_filter = match scoped_ids {
+        Some(ids) => match id_in_list(ids) {
+            Some(filter) => Some(filter),
+            None => return Vec::new(),
+        },
+        None => None,
+    };
+    let where_clause = focus_analysis_queue_where_clause(id_filter.as_deref());
     let capped_limit = limit.clamp(1, 5000) as i64;
-    let mut stmt = match conn.prepare(
+    let sql = format!(
         "SELECT id, file_path, file_size
          FROM images
-         WHERE is_video IS NOT TRUE
-           AND (
-                focus_analysis_status IS NULL
-                OR focus_algorithm_version IS NULL
-                OR focus_algorithm_version <> ?1
-                OR (
-                    focus_analysis_status IN ('online_only', 'unreadable', 'failed')
-                    AND (
-                        focus_analysis_attempt_id IS NULL
-                        OR focus_analysis_attempt_id <> ?2
-                    )
-                )
-           )
+         {}
          ORDER BY id
          LIMIT ?3",
-    ) {
+        where_clause
+    );
+    let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("focus_analysis_candidates: prepare {}", e);
@@ -5239,6 +5251,79 @@ pub async fn focus_analysis_candidates(
     }
 }
 
+fn focus_analysis_candidate_count_impl(
+    conn: &Connection,
+    algorithm_version: &str,
+    analysis_run_id: &str,
+    scoped_ids: Option<&[i64]>,
+) -> u64 {
+    let id_filter = match scoped_ids {
+        Some(ids) => match id_in_list(ids) {
+            Some(filter) => Some(filter),
+            None => return 0,
+        },
+        None => None,
+    };
+    let where_clause = focus_analysis_queue_where_clause(id_filter.as_deref());
+    let sql = format!("SELECT COUNT(*) FROM images {}", where_clause);
+
+    match conn.query_row(&sql, params![algorithm_version, analysis_run_id], |row| {
+        row.get::<_, i64>(0)
+    }) {
+        Ok(count) => count.max(0) as u64,
+        Err(e) => {
+            eprintln!("focus_analysis_candidate_count: query {}", e);
+            0
+        }
+    }
+}
+
+/// Return a narrow page of still-image rows whose focus analysis is missing or
+/// stale for the requested algorithm version. The NULL columns are the queue; no
+/// separate enrichment table is persisted.
+pub async fn focus_analysis_candidates(
+    limit: u32,
+    algorithm_version: String,
+    analysis_run_id: String,
+) -> Vec<FocusAnalysisCandidate> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    focus_analysis_candidates_impl(conn, limit, &algorithm_version, &analysis_run_id, None)
+}
+
+/// Return focus-analysis candidates intersected with an explicit image-id
+/// selection. Empty selection means empty queue.
+pub async fn focus_analysis_candidates_for_ids(
+    ids: Vec<i64>,
+    limit: u32,
+    algorithm_version: String,
+    analysis_run_id: String,
+) -> Vec<FocusAnalysisCandidate> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    focus_analysis_candidates_impl(
+        conn,
+        limit,
+        &algorithm_version,
+        &analysis_run_id,
+        Some(&ids),
+    )
+}
+
 /// Count still-image rows whose focus analysis is missing or stale for the
 /// requested algorithm version. This lets the Swift status bar show a
 /// determinate progress bar while analysis runs.
@@ -5255,31 +5340,26 @@ pub async fn focus_analysis_candidate_count(
         }
     };
 
-    match conn.query_row(
-        "SELECT COUNT(*)
-         FROM images
-         WHERE is_video IS NOT TRUE
-           AND (
-                focus_analysis_status IS NULL
-                OR focus_algorithm_version IS NULL
-                OR focus_algorithm_version <> ?1
-                OR (
-                    focus_analysis_status IN ('online_only', 'unreadable', 'failed')
-                    AND (
-                        focus_analysis_attempt_id IS NULL
-                        OR focus_analysis_attempt_id <> ?2
-                    )
-                )
-           )",
-        params![algorithm_version, analysis_run_id],
-        |row| row.get::<_, i64>(0),
-    ) {
-        Ok(count) => count.max(0) as u64,
-        Err(e) => {
-            eprintln!("focus_analysis_candidate_count: query {}", e);
-            0
+    focus_analysis_candidate_count_impl(conn, &algorithm_version, &analysis_run_id, None)
+}
+
+/// Count focus-analysis candidates intersected with an explicit image-id
+/// selection. Empty selection means zero candidates.
+pub async fn focus_analysis_candidate_count_for_ids(
+    ids: Vec<i64>,
+    algorithm_version: String,
+    analysis_run_id: String,
+) -> u64 {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return 0;
         }
-    }
+    };
+
+    focus_analysis_candidate_count_impl(conn, &algorithm_version, &analysis_run_id, Some(&ids))
 }
 
 /// Batch writeback for focus-analysis results. Returns the number of rows updated.
@@ -6320,6 +6400,107 @@ pub async fn merge_lightroom_videos(records: Vec<LightroomVideoRecord>) -> Merge
         }
     };
     merge_videos_into(conn, &records)
+}
+
+#[cfg(test)]
+mod focus_analysis_queue_tests {
+    use super::*;
+    use duckdb::Connection;
+
+    fn setup() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE images (
+                 id INTEGER PRIMARY KEY,
+                 file_path TEXT NOT NULL,
+                 file_size BIGINT NOT NULL,
+                 is_video BOOLEAN,
+                 focus_analysis_status TEXT,
+                 focus_algorithm_version TEXT,
+                 focus_analysis_attempt_id TEXT
+             );
+             INSERT INTO images (
+                 id, file_path, file_size, is_video,
+                 focus_analysis_status, focus_algorithm_version, focus_analysis_attempt_id
+             ) VALUES
+                 (1, '/a/missing.jpg', 10, FALSE, NULL, NULL, NULL),
+                 (2, '/a/current-complete.jpg', 10, FALSE, 'complete', 'v2', 'old-run'),
+                 (3, '/a/stale-complete.jpg', 10, FALSE, 'complete', 'v1', 'old-run'),
+                 (4, '/a/retry-offline.jpg', 10, FALSE, 'online_only', 'v2', 'old-run'),
+                 (5, '/a/same-run-unreadable.jpg', 10, FALSE, 'unreadable', 'v2', 'run-1'),
+                 (6, '/a/retry-failed.jpg', 10, FALSE, 'failed', 'v2', NULL),
+                 (7, '/a/video.mov', 10, TRUE, NULL, NULL, NULL);",
+        )
+        .expect("focus queue DDL");
+        conn
+    }
+
+    fn candidate_ids(rows: Vec<FocusAnalysisCandidate>) -> Vec<i64> {
+        rows.into_iter().map(|row| row.id).collect()
+    }
+
+    #[test]
+    fn whole_catalogue_focus_queue_retries_later_runs_without_video() {
+        let conn = setup();
+
+        assert_eq!(
+            focus_analysis_candidate_count_impl(&conn, "v2", "run-1", None),
+            4
+        );
+        assert_eq!(
+            candidate_ids(focus_analysis_candidates_impl(
+                &conn, 500, "v2", "run-1", None
+            )),
+            vec![1, 3, 4, 6]
+        );
+    }
+
+    #[test]
+    fn explicit_id_focus_queue_intersects_selection_with_retry_rules() {
+        let conn = setup();
+        let ids = vec![2, 3, 4, 5, 7];
+
+        assert_eq!(
+            focus_analysis_candidate_count_impl(&conn, "v2", "run-1", Some(&ids)),
+            2
+        );
+        assert_eq!(
+            candidate_ids(focus_analysis_candidates_impl(
+                &conn,
+                500,
+                "v2",
+                "run-1",
+                Some(&ids)
+            )),
+            vec![3, 4]
+        );
+        assert_eq!(
+            focus_analysis_candidate_count_impl(&conn, "v2", "run-2", Some(&ids)),
+            3
+        );
+        assert_eq!(
+            candidate_ids(focus_analysis_candidates_impl(
+                &conn,
+                500,
+                "v2",
+                "run-2",
+                Some(&ids)
+            )),
+            vec![3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn explicit_empty_id_focus_queue_is_empty() {
+        let conn = setup();
+        let ids: Vec<i64> = Vec::new();
+
+        assert_eq!(
+            focus_analysis_candidate_count_impl(&conn, "v2", "run-1", Some(&ids)),
+            0
+        );
+        assert!(focus_analysis_candidates_impl(&conn, 500, "v2", "run-1", Some(&ids)).is_empty());
+    }
 }
 
 #[cfg(test)]
