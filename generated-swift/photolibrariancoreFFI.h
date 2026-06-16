@@ -248,6 +248,12 @@ typedef void (*UniffiForeignFutureCompleteVoid)(uint64_t, UniffiForeignFutureRes
 uint64_t uniffi_photolibrariancore_fn_func_active_analysis_job(RustBuffer job_kind
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_ACTIVE_ANALYSIS_JOBS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_ACTIVE_ANALYSIS_JOBS
+uint64_t uniffi_photolibrariancore_fn_func_active_analysis_jobs(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_ADD_IMAGES_TO_COLLECTIONS
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_ADD_IMAGES_TO_COLLECTIONS
 uint64_t uniffi_photolibrariancore_fn_func_add_images_to_collections(RustBuffer ids, RustBuffer labels
@@ -276,7 +282,7 @@ RustBuffer uniffi_photolibrariancore_fn_func_classify_extension(RustBuffer ext, 
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_COLLECTION_LABELS
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_COLLECTION_LABELS
 uint64_t uniffi_photolibrariancore_fn_func_collection_labels(void
-
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_COPY_KEYWORD_ROWS_FOR_IMAGE_PAIRS
@@ -889,6 +895,12 @@ uint16_t uniffi_photolibrariancore_checksum_func_active_analysis_job(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_ACTIVE_ANALYSIS_JOBS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_ACTIVE_ANALYSIS_JOBS
+uint16_t uniffi_photolibrariancore_checksum_func_active_analysis_jobs(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_ADD_IMAGES_TO_COLLECTIONS
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_ADD_IMAGES_TO_COLLECTIONS
 uint16_t uniffi_photolibrariancore_checksum_func_add_images_to_collections(void
@@ -1204,6 +1216,7 @@ uint16_t uniffi_photolibrariancore_checksum_func_query_images(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_RECOVER_INTERRUPTED_ANALYSIS_JOBS
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_RECOVER_INTERRUPTED_ANALYSIS_JOBS
 uint16_t uniffi_photolibrariancore_checksum_func_recover_interrupted_analysis_jobs(void
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_RELOCATE_FILE_PATH_PREFIX
@@ -1332,3 +1345,4 @@ uint32_t ffi_photolibrariancore_uniffi_contract_version(void
     
 );
 #endif
+

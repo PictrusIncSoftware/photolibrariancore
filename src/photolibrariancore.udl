@@ -144,6 +144,9 @@ namespace photolibrariancore {
     AnalysisJob? active_analysis_job(string job_kind);
 
     [Async]
+    sequence<AnalysisJob> active_analysis_jobs();
+
+    [Async]
     AnalysisJob? update_analysis_job_progress(
         i64 id,
         u64 processed_delta,

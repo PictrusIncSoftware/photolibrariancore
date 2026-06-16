@@ -2814,6 +2814,31 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeAnalysisJob: FfiConverterRustBuffer {
+    typealias SwiftType = [AnalysisJob]
+
+    public static func write(_ value: [AnalysisJob], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeAnalysisJob.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [AnalysisJob] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [AnalysisJob]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeAnalysisJob.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeCaptureDayImageCount: FfiConverterRustBuffer {
     typealias SwiftType = [CaptureDayImageCount]
 
@@ -3195,7 +3220,22 @@ public func activeAnalysisJob(jobKind: String)async  -> AnalysisJob?  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeAnalysisJob.lift,
             errorHandler: nil
-
+            
+        )
+}
+public func activeAnalysisJobs()async  -> [AnalysisJob]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_active_analysis_jobs(
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeAnalysisJob.lift,
+            errorHandler: nil
+            
         )
 }
 public func addImagesToCollections(ids: [Int64], labels: [String])async  -> UInt64  {
@@ -3210,6 +3250,7 @@ public func addImagesToCollections(ids: [Int64], labels: [String])async  -> UInt
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
+            
         )
 }
 public func assignColorKeywordForIds(ids: [Int64], label: String)async  -> UInt64  {
@@ -3955,6 +3996,7 @@ public func recoverInterruptedAnalysisJobs(jobKind: String, terminalStatus: Stri
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
+            
         )
 }
 public func relocateFilePathPrefix(oldPrefix: String, newPrefix: String)async  -> RelocateResult  {
@@ -4274,6 +4316,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.contractVersionMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_active_analysis_job() != 59426) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_active_analysis_jobs() != 25434) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_add_images_to_collections() != 9062) {

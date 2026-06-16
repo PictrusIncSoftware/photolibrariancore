@@ -4904,6 +4904,32 @@ fn active_analysis_job_impl(conn: &Connection, job_kind: &str) -> Option<Analysi
         .ok()
 }
 
+fn active_analysis_jobs_impl(conn: &Connection) -> Vec<AnalysisJob> {
+    let sql = format!(
+        "SELECT {}
+         FROM analysis_jobs
+         WHERE status IN ('queued', 'running', 'cancelling')
+         ORDER BY id DESC",
+        ANALYSIS_JOB_SELECT_COLUMNS
+    );
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            eprintln!("active_analysis_jobs: prepare failed: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mapped = stmt.query_map([], row_to_analysis_job);
+    match mapped {
+        Ok(iter) => iter.filter_map(|job| job.ok()).collect(),
+        Err(e) => {
+            eprintln!("active_analysis_jobs: query failed: {}", e);
+            Vec::new()
+        }
+    }
+}
+
 fn update_analysis_job_progress_impl(
     conn: &Connection,
     id: i64,
@@ -5081,6 +5107,22 @@ pub async fn active_analysis_job(job_kind: String) -> Option<AnalysisJob> {
     };
 
     active_analysis_job_impl(conn, &job_kind)
+}
+
+/// Return every non-terminal analysis job. This is the generic app-facing
+/// status surface for background work; callers can filter by job kind for
+/// command-specific actions.
+pub async fn active_analysis_jobs() -> Vec<AnalysisJob> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("active_analysis_jobs: catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    active_analysis_jobs_impl(conn)
 }
 
 /// Increment durable counters and heartbeat a job. Deltas are additive so the
@@ -6625,6 +6667,49 @@ mod analysis_job_tests {
 
         let active = active_analysis_job_impl(&conn, "focus_quality").expect("active job");
         assert_eq!(active.id, job.id);
+    }
+
+    #[test]
+    fn active_job_list_returns_all_non_terminal_jobs() {
+        let conn = setup();
+        let foreground = create_analysis_job_impl(
+            &conn,
+            "focus_quality",
+            "selection",
+            Some("1,2,3".to_string()),
+            "v2",
+            "active-list-foreground",
+            3,
+        )
+        .expect("foreground job");
+        let background = create_analysis_job_impl(
+            &conn,
+            "focus_enrichment",
+            "whole_catalogue",
+            None,
+            "v2",
+            "active-list-background",
+            100,
+        )
+        .expect("background job");
+        let completed = create_analysis_job_impl(
+            &conn,
+            "focus_quality",
+            "whole_catalogue",
+            None,
+            "v2",
+            "active-list-completed",
+            10,
+        )
+        .expect("completed job");
+        finish_analysis_job_impl(&conn, completed.id, "completed", None)
+            .expect("completed terminal");
+
+        let ids: Vec<i64> = active_analysis_jobs_impl(&conn)
+            .into_iter()
+            .map(|job| job.id)
+            .collect();
+        assert_eq!(ids, vec![background.id, foreground.id]);
     }
 
     #[test]
