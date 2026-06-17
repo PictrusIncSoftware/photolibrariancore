@@ -119,6 +119,14 @@ pub struct ImageMetadata {
     pub audio_sample_rate: Option<i32>,
     pub audio_bitrate: Option<i64>,    // bits/sec
     pub live_photo_id: Option<String>, // QuickTime content.identifier; pair on equality
+
+    // Apple Photos import (in-place catalogue-everything model). The asset's
+    // Apple identity (ZASSET.ZUUID) — durable provenance and the PhotoKit handle
+    // for the future on-demand materialize of an iCloud-only original. Non-null
+    // marks an Apple-managed row. APPENDED LAST with a UDL `= null` default (the
+    // S65 wire-struct growth rule) so every existing construction site (scan
+    // ingest, the Lightroom import) compiles untouched and writes NULL.
+    pub external_source_id: Option<String>,
 }
 
 /// Represents a complete image record from the database
@@ -744,6 +752,12 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             -- motion pair. NULL = not a Live Photo. Pair = rows with equal value.
             live_photo_id TEXT,
 
+            -- Apple Photos import provenance (Apple Photos in-place catalogue).
+            -- ZASSET.ZUUID of the source asset; non-NULL marks an Apple-managed
+            -- row and is the PhotoKit handle for on-demand materialize. NULL for
+            -- scanned / Lightroom-imported rows.
+            external_source_id TEXT,
+
             -- Audit timestamp: when this record was added to the catalogue
             indexed_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
@@ -799,6 +813,11 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         ALTER TABLE images ADD COLUMN IF NOT EXISTS audio_sample_rate INTEGER;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS audio_bitrate BIGINT;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS live_photo_id TEXT;
+
+        -- Apple Photos import provenance (Apple Photos in-place catalogue).
+        -- ADD COLUMN with NO default (S62 WAL rule); existing rows stay NULL,
+        -- which correctly means "not an Apple-managed asset".
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS external_source_id TEXT;
 
         -- Indexes for efficient filtering and querying
         -- These columns are commonly used in WHERE clauses and ORDER BY operations
@@ -6169,7 +6188,8 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
                     rating      = COALESCE(?15, rating), \
                     flag        = COALESCE(?16, flag), \
                     color_label = COALESCE(?17, color_label), \
-                    rotation    = COALESCE(?18, rotation) \
+                    rotation    = COALESCE(?18, rotation), \
+                    external_source_id = COALESCE(?19, external_source_id) \
                  WHERE id = ?1",
                 params![
                     id,
@@ -6190,6 +6210,7 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
                     record.flag,
                     record.color_label,
                     record.rotation.map(|v| v as i64),
+                    record.external_source_id,
                 ],
             )
             .map(|_| (false, id))
@@ -6217,12 +6238,22 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
                     capture_datetime, pixel_width, pixel_height, color_space, bit_depth, \
                     gps_latitude, gps_longitude, gps_altitude, \
                     copyright, creator, description, \
-                    rating, flag, color_label, rotation \
+                    rating, flag, color_label, rotation, external_source_id, \
+                    is_video, \
+                    duration_seconds, frame_rate, video_kind, video_codec, video_bitrate, \
+                    color_primaries, color_transfer, color_matrix, color_range, dv_profile, \
+                    has_audio, audio_codec, audio_channels, audio_sample_rate, audio_bitrate, \
+                    live_photo_id \
                  ) VALUES ( \
                     ?1, ?2, ?3, ?4, ?5, ?6, \
                     SUBSTRING(?1, 1, LENGTH(?1) - INSTR(REVERSE(?1), '/')), \
                     ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
-                    ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30 \
+                    ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, \
+                    ?32, \
+                    ?33, ?34, ?35, ?36, ?37, \
+                    ?38, ?39, ?40, ?41, ?42, \
+                    ?43, ?44, ?45, ?46, ?47, \
+                    ?48 \
                  ) RETURNING id",
                 params![
                     record.file_path,
@@ -6255,6 +6286,25 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
                     record.flag,
                     record.color_label,
                     record.rotation.unwrap_or(0),
+                    record.external_source_id,
+                    // Video / unified-media columns (mirror ingest_metadata) — false/None for stills.
+                    record.is_video,
+                    record.duration_seconds,
+                    record.frame_rate,
+                    record.video_kind,
+                    record.video_codec,
+                    record.video_bitrate,
+                    record.color_primaries,
+                    record.color_transfer,
+                    record.color_matrix,
+                    record.color_range,
+                    record.dv_profile,
+                    record.has_audio,
+                    record.audio_codec,
+                    record.audio_channels,
+                    record.audio_sample_rate,
+                    record.audio_bitrate,
+                    record.live_photo_id,
                 ],
                 |r| r.get::<_, i64>(0),
             )
@@ -8138,7 +8188,13 @@ mod lightroom_import_tests {
                 gps_latitude REAL, gps_longitude REAL, gps_altitude REAL,
                 copyright TEXT, creator TEXT, description TEXT,
                 rating INTEGER, flag TEXT, color_label TEXT,
-                rotation INTEGER DEFAULT 0
+                rotation INTEGER DEFAULT 0,
+                external_source_id TEXT,
+                is_video BOOLEAN DEFAULT FALSE,
+                duration_seconds DOUBLE, frame_rate DOUBLE, video_kind TEXT, video_codec TEXT, video_bitrate BIGINT,
+                color_primaries TEXT, color_transfer TEXT, color_matrix TEXT, color_range TEXT, dv_profile INTEGER,
+                has_audio BOOLEAN, audio_codec TEXT, audio_channels INTEGER, audio_sample_rate INTEGER, audio_bitrate BIGINT,
+                live_photo_id TEXT
              );",
         )
         .expect("create images");
@@ -8192,6 +8248,7 @@ mod lightroom_import_tests {
             audio_sample_rate: None,
             audio_bitrate: None,
             live_photo_id: None,
+            external_source_id: None,
         }
     }
 
@@ -8302,6 +8359,63 @@ mod lightroom_import_tests {
             rot_c2, 90,
             "rotation: None at update preserves the row's value"
         );
+    }
+
+    #[test]
+    fn merge_inserts_video_row_into_images() {
+        // The media-aware merge writes is_video + the video columns into the
+        // images table (Apple Photos import + the LR video fold-in rely on this;
+        // it mirrors ingest_metadata's video binding).
+        let conn = Connection::open_in_memory().expect("open in-memory duckdb");
+        create_images(&conn);
+
+        let mut v = img("/v/clip.mov", "clip.mov");
+        v.is_video = true;
+        v.duration_seconds = Some(12.5);
+        v.frame_rate = Some(29.97);
+        v.video_kind = Some("mov".to_string());
+        v.video_codec = Some("hevc".to_string());
+        v.has_audio = Some(true);
+        v.audio_codec = Some("aac".to_string());
+        v.live_photo_id = Some("ABC-123".to_string());
+        v.external_source_id = Some("ZUUID-1".to_string());
+
+        let r = merge_records_into(&conn, &[v]);
+        assert_eq!(r.inserted, 1);
+        assert_eq!(r.updated, 0);
+
+        let (is_video, codec, ext_id): (bool, String, String) = conn
+            .query_row(
+                "SELECT is_video, video_codec, external_source_id \
+                 FROM images WHERE file_path = '/v/clip.mov'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("video row round-trips");
+        assert!(is_video, "is_video persisted true");
+        assert_eq!(codec, "hevc");
+        assert_eq!(ext_id, "ZUUID-1");
+
+        let dur: f64 = conn
+            .query_row(
+                "SELECT duration_seconds FROM images WHERE file_path = '/v/clip.mov'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("duration round-trips");
+        assert_eq!(dur, 12.5);
+
+        // A still still inserts with is_video = false (no regression).
+        let rs = merge_records_into(&conn, &[img("/p/still.jpg", "still.jpg")]);
+        assert_eq!(rs.inserted, 1);
+        let still_is_video: bool = conn
+            .query_row(
+                "SELECT is_video FROM images WHERE file_path = '/p/still.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("still is_video");
+        assert!(!still_is_video, "still inserts is_video = false");
     }
 
     // ---- merge_videos_into: insert / update / policies (the videos table) ----

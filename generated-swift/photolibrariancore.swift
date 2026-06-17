@@ -1118,10 +1118,11 @@ public struct ImageMetadata: Equatable, Hashable {
     public var audioSampleRate: Int32?
     public var audioBitrate: Int64?
     public var livePhotoId: String?
+    public var externalSourceId: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(filePath: String, fileSize: UInt64, fileName: String, fileExtension: String?, createdTimestamp: Int64, modifiedTimestamp: Int64, cameraMake: String?, cameraModel: String?, lensModel: String?, focalLength: Double?, aperture: Double?, shutterSpeed: Double?, iso: UInt32?, captureDatetime: String?, pixelWidth: UInt32?, pixelHeight: UInt32?, colorSpace: String?, bitDepth: UInt32?, gpsLatitude: Double?, gpsLongitude: Double?, gpsAltitude: Double?, copyright: String?, creator: String?, description: String?, rating: UInt8?, flag: String?, colorLabel: String?, rotation: Int32? = nil, isVideo: Bool = false, durationSeconds: Double? = nil, frameRate: Double? = nil, videoKind: String? = nil, videoCodec: String? = nil, videoBitrate: Int64? = nil, colorPrimaries: String? = nil, colorTransfer: String? = nil, colorMatrix: String? = nil, colorRange: String? = nil, dvProfile: Int32? = nil, hasAudio: Bool? = nil, audioCodec: String? = nil, audioChannels: Int32? = nil, audioSampleRate: Int32? = nil, audioBitrate: Int64? = nil, livePhotoId: String? = nil) {
+    public init(filePath: String, fileSize: UInt64, fileName: String, fileExtension: String?, createdTimestamp: Int64, modifiedTimestamp: Int64, cameraMake: String?, cameraModel: String?, lensModel: String?, focalLength: Double?, aperture: Double?, shutterSpeed: Double?, iso: UInt32?, captureDatetime: String?, pixelWidth: UInt32?, pixelHeight: UInt32?, colorSpace: String?, bitDepth: UInt32?, gpsLatitude: Double?, gpsLongitude: Double?, gpsAltitude: Double?, copyright: String?, creator: String?, description: String?, rating: UInt8?, flag: String?, colorLabel: String?, rotation: Int32? = nil, isVideo: Bool = false, durationSeconds: Double? = nil, frameRate: Double? = nil, videoKind: String? = nil, videoCodec: String? = nil, videoBitrate: Int64? = nil, colorPrimaries: String? = nil, colorTransfer: String? = nil, colorMatrix: String? = nil, colorRange: String? = nil, dvProfile: Int32? = nil, hasAudio: Bool? = nil, audioCodec: String? = nil, audioChannels: Int32? = nil, audioSampleRate: Int32? = nil, audioBitrate: Int64? = nil, livePhotoId: String? = nil, externalSourceId: String? = nil) {
         self.filePath = filePath
         self.fileSize = fileSize
         self.fileName = fileName
@@ -1167,6 +1168,7 @@ public struct ImageMetadata: Equatable, Hashable {
         self.audioSampleRate = audioSampleRate
         self.audioBitrate = audioBitrate
         self.livePhotoId = livePhotoId
+        self.externalSourceId = externalSourceId
     }
 
     
@@ -1229,7 +1231,8 @@ public struct FfiConverterTypeImageMetadata: FfiConverterRustBuffer {
                 audioChannels: FfiConverterOptionInt32.read(from: &buf), 
                 audioSampleRate: FfiConverterOptionInt32.read(from: &buf), 
                 audioBitrate: FfiConverterOptionInt64.read(from: &buf), 
-                livePhotoId: FfiConverterOptionString.read(from: &buf)
+                livePhotoId: FfiConverterOptionString.read(from: &buf), 
+                externalSourceId: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -1279,6 +1282,7 @@ public struct FfiConverterTypeImageMetadata: FfiConverterRustBuffer {
         FfiConverterOptionInt32.write(value.audioSampleRate, into: &buf)
         FfiConverterOptionInt64.write(value.audioBitrate, into: &buf)
         FfiConverterOptionString.write(value.livePhotoId, into: &buf)
+        FfiConverterOptionString.write(value.externalSourceId, into: &buf)
     }
 }
 

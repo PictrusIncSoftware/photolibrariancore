@@ -818,6 +818,10 @@ dictionary ImageMetadata {
     i32?    audio_sample_rate = null;
     i64?    audio_bitrate = null;    // bits/sec
     string? live_photo_id = null;    // QuickTime content.identifier; pair on equality
+
+    // Apple Photos import provenance (ZASSET.ZUUID); non-null marks an
+    // Apple-managed row and is the PhotoKit handle for on-demand materialize.
+    string? external_source_id = null;
 };
 
 // Represents a complete image record from the database
