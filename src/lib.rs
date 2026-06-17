@@ -8704,6 +8704,49 @@ mod query_builder_tests {
         );
     }
 
+    // S87 — get_external_source_id decode: a present Apple row returns its stored
+    // ZUUID; a NULL column (an ordinary non-Apple row) and an absent id both read
+    // as None. Mirrors the production SELECT + Option-flatten decode (the getter
+    // itself locks CATALOGUE, so the SQL is exercised in-test the same way the
+    // video_details test does).
+    #[test]
+    fn external_source_id_reads_present_null_and_absent() {
+        let conn = Connection::open_in_memory().expect("open in-memory duckdb");
+        conn.execute_batch(
+            "CREATE TABLE images (
+                id INTEGER PRIMARY KEY,
+                external_source_id TEXT
+             );",
+        )
+        .expect("create images");
+
+        // id=1 — an Apple-managed row carrying its ZASSET.ZUUID.
+        // id=2 — an ordinary row (scan / Lightroom import): external_source_id NULL.
+        conn.execute(
+            "INSERT INTO images VALUES (1, '937830D8-1234-5678-9ABC-9FB11190D51D'), (2, NULL)",
+            [],
+        )
+        .expect("insert rows");
+
+        let sql = "SELECT external_source_id FROM images WHERE id = ?1";
+        let read = |id: i64| -> Option<String> {
+            conn.query_row(sql, params![id], |row| row.get::<_, Option<String>>(0))
+                .ok()
+                .flatten()
+        };
+
+        assert_eq!(
+            read(1).as_deref(),
+            Some("937830D8-1234-5678-9ABC-9FB11190D51D")
+        );
+        assert_eq!(
+            read(2),
+            None,
+            "a NULL external_source_id (non-Apple row) reads as None"
+        );
+        assert_eq!(read(99), None, "an absent id reads as None");
+    }
+
     fn qp(kind: &str) -> QueryPredicate {
         QueryPredicate {
             kind: kind.to_string(),
@@ -10703,4 +10746,33 @@ pub async fn get_video_details(image_id: i64) -> Option<VideoDetails> {
 
     conn.query_row(query_sql, params![image_id], row_to_video_details)
         .ok()
+}
+
+/// S87 (Apple Photos Phase 2 prerequisite) — fetch the Apple asset UUID
+/// (`external_source_id`, the ZASSET.ZUUID stored at import) for one image by id.
+/// Single-row, by primary key. Deliberately NOT folded onto `ImageRecord`: that
+/// struct is lifted in bulk on every gallery page, ⌘A-whole-query, and the 167k
+/// builder load — all through the @MainActor UniFFI lift (S57's launch-beachball
+/// root cause) — and this provenance/PhotoKit handle is read only when a single
+/// cloud-only Apple row needs materializing. Mirrors `get_video_details`. Returns
+/// None when the catalogue is uninitialized, the id is absent, or the column is
+/// NULL (an ordinary non-Apple row) — all benign "no Apple handle" outcomes, never
+/// an error worth surfacing.
+pub async fn get_external_source_id(image_id: i64) -> Option<String> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return None;
+        }
+    };
+
+    conn.query_row(
+        "SELECT external_source_id FROM images WHERE id = ?1",
+        params![image_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
 }

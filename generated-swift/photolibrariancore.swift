@@ -3609,6 +3609,21 @@ public func getDistinctDirectoryPaths()async  -> [String]  {
             
         )
 }
+public func getExternalSourceId(imageId: Int64)async  -> String?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_get_external_source_id(FfiConverterInt64.lower(imageId)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionString.lift,
+            errorHandler: nil
+            
+        )
+}
 public func getFilePathsForFilters(pathPrefix: String, datePrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, mediaType: MediaType)async  -> FilePathsResult  {
     return
         try!  await uniffiRustCallAsync(
@@ -4398,6 +4413,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_distinct_directory_paths() != 54232) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_get_external_source_id() != 38483) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_file_paths_for_filters() != 50884) {

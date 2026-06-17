@@ -482,6 +482,15 @@ namespace photolibrariancore {
     [Async]
     VideoDetails? get_video_details(i64 image_id);
 
+    // S87 — the Apple asset UUID (external_source_id, the ZASSET.ZUUID stored at
+    // Apple Photos import) for one image by id. The Phase 2 PhotoKit handle for
+    // materializing a cloud-only Apple original on demand. Single-row, by id;
+    // returns null when the id is absent or the column is NULL (an ordinary
+    // non-Apple row). Kept OFF the bulk ImageRecord lift (gallery / ⌘A / builder
+    // loads are @MainActor — S57), mirroring get_video_details.
+    [Async]
+    string? get_external_source_id(i64 image_id);
+
     // Classify a file extension into JPEG, RAW, or Other.
     // SYNCHRONOUS — first sync export in this project. Pure string-to-enum
     // lookup; no I/O, no DuckDB access. Forcing it async would push the
