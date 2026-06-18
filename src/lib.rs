@@ -1685,13 +1685,29 @@ fn build_path_date_predicate(path_prefix: &str, date_prefix: &str) -> String {
     let escaped_path = path_prefix.replace("'", "''");
     let escaped_date = date_prefix.replace("'", "''");
 
+    // Apple Photos library originals live INSIDE a `.photoslibrary` package and are
+    // surfaced under their own "Apple Libraries" sidebar scope — the Sources folder
+    // tree (SourceLocationsView) and its counts exclude them. But a folder node's
+    // path PREFIX still string-matches them when the library is nested under that
+    // folder (e.g. `~/Pictures/X.photoslibrary` under `/Users/<name>`), which wrongly
+    // pulls the whole Apple library into a folder scope (its count says 1,148, the
+    // query returned 45k). So a NON-EMPTY folder prefix excludes Apple-package files —
+    // UNLESS the prefix itself points into a `.photoslibrary` (the Apple Library node's
+    // own scope, which legitimately shows only those files). An empty prefix
+    // (All Sources) excludes nothing. Mirrors `ScanService.isInsideApplePhotosLibrary`.
+    let apple_exclusion = if !path_prefix.is_empty() && !path_prefix.contains(".photoslibrary") {
+        " AND file_path NOT LIKE '%.photoslibrary/%'"
+    } else {
+        ""
+    };
+
     match (path_prefix.is_empty(), date_prefix.is_empty()) {
         (true, true) => String::new(),
-        (false, true) => format!("file_path LIKE '{}%'", escaped_path),
+        (false, true) => format!("file_path LIKE '{}%'{}", escaped_path, apple_exclusion),
         (true, false) => format!("capture_datetime LIKE '{}%'", escaped_date),
         (false, false) => format!(
-            "file_path LIKE '{}%' AND capture_datetime LIKE '{}%'",
-            escaped_path, escaped_date
+            "file_path LIKE '{}%' AND capture_datetime LIKE '{}%'{}",
+            escaped_path, escaped_date, apple_exclusion
         ),
     }
 }
@@ -3352,10 +3368,28 @@ fn predicate_to_sql(p: &QueryPredicate) -> String {
         // prefix (parity with the single-node date load).
         "path_prefix" => match p.value.as_deref()
         {
-            Some(v) if !v.is_empty() => format!(
-                "(starts_with(file_path, '{}'))",
-                v.replace('\'', "''")
-            ),
+            Some(v) if !v.is_empty() =>
+            {
+                // Folder-scope prefixes exclude Apple Photos library originals
+                // (their own "Apple Libraries" scope; nested under a folder path
+                // they'd otherwise be string-matched in — see
+                // build_path_date_predicate). A prefix that IS inside a
+                // `.photoslibrary` (the Apple Library node) is exempt. The whole
+                // atom stays parenthesized so OR-joining several is safe.
+                let apple_exclusion = if v.contains(".photoslibrary")
+                {
+                    ""
+                }
+                else
+                {
+                    " AND file_path NOT LIKE '%.photoslibrary/%'"
+                };
+                format!(
+                    "(starts_with(file_path, '{}'){})",
+                    v.replace('\'', "''"),
+                    apple_exclusion
+                )
+            },
             _ => bad(),
         },
         "capture_prefix" => match p.value.as_deref()
@@ -7104,6 +7138,10 @@ mod keyword_tests {
     /// prefixes and capture-datetime prefixes, quote-escaped; empty → FALSE.
     #[test]
     fn sidebar_prefix_predicate_sql() {
+        // A folder-scope path prefix now also EXCLUDES Apple Photos library
+        // originals (their own sidebar scope; a folder prefix can string-match a
+        // nested `.photoslibrary`). The whole atom stays parenthesized so OR-joins
+        // are safe.
         let path = QueryPredicate {
             kind: "path_prefix".to_string(),
             day: None,
@@ -7116,7 +7154,24 @@ mod keyword_tests {
         };
         assert_eq!(
             predicate_to_sql(&path),
-            "(starts_with(file_path, '/Volumes/Photo''s/2026/'))"
+            "(starts_with(file_path, '/Volumes/Photo''s/2026/') AND file_path NOT LIKE '%.photoslibrary/%')"
+        );
+
+        // A prefix that IS inside a `.photoslibrary` (the Apple Library node's own
+        // scope) is EXEMPT — it must keep showing those originals.
+        let apple = QueryPredicate {
+            kind: "path_prefix".to_string(),
+            day: None,
+            day_end: None,
+            op: None,
+            stars: None,
+            num: None,
+            num_end: None,
+            value: Some("/Users/x/Pictures/Photos Library.photoslibrary/".to_string()),
+        };
+        assert_eq!(
+            predicate_to_sql(&apple),
+            "(starts_with(file_path, '/Users/x/Pictures/Photos Library.photoslibrary/'))"
         );
 
         let capture = QueryPredicate {
@@ -7145,6 +7200,39 @@ mod keyword_tests {
             value: Some(String::new()),
         };
         assert_eq!(predicate_to_sql(&empty), "(FALSE)");
+    }
+
+    /// The single-node Sources/Dates path-prefix builder (S65/S86): a folder
+    /// prefix excludes Apple Photos library originals; an empty prefix (All
+    /// Sources), a date-only filter, and an Apple-library prefix do NOT.
+    #[test]
+    fn path_date_predicate_excludes_apple_library_for_folder_scope() {
+        // Empty (All Sources) → no filter at all, nothing excluded.
+        assert_eq!(build_path_date_predicate("", ""), "");
+
+        // A folder prefix → its files MINUS any nested Apple library.
+        assert_eq!(
+            build_path_date_predicate("/Users/richardwagner/", ""),
+            "file_path LIKE '/Users/richardwagner/%' AND file_path NOT LIKE '%.photoslibrary/%'"
+        );
+
+        // The Apple Library scope (prefix inside a `.photoslibrary`) is exempt.
+        assert_eq!(
+            build_path_date_predicate("/Users/x/Pictures/Photos Library.photoslibrary/", ""),
+            "file_path LIKE '/Users/x/Pictures/Photos Library.photoslibrary/%'"
+        );
+
+        // Date-only (no folder) is unchanged — Apple is not excluded from Dates.
+        assert_eq!(
+            build_path_date_predicate("", "2026:06:"),
+            "capture_datetime LIKE '2026:06:%'"
+        );
+
+        // Folder + date → exclusion still appended after both clauses.
+        assert_eq!(
+            build_path_date_predicate("/Users/richardwagner/", "2026:06:"),
+            "file_path LIKE '/Users/richardwagner/%' AND capture_datetime LIKE '2026:06:%' AND file_path NOT LIKE '%.photoslibrary/%'"
+        );
     }
 
     /// Pair keyword parity on a real in-memory engine (S67): the sidecar
