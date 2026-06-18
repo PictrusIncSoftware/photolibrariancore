@@ -4007,9 +4007,12 @@ pub async fn assign_keyword_for_ids(ids: Vec<i64>, segments: Vec<String>) -> u64
                 continue;
             }
             match conn.execute(
-                "INSERT INTO keyword (image_id, label, path, status, created_at) \
-                 VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)",
-                params![id, label, path],
+                // Carry the denormalized is_video from the referenced image so a video's
+                // keyword row gets the right discriminator (it was defaulting to FALSE —
+                // the S72 "is_video at the keyword-write sites" closeout).
+                "INSERT INTO keyword (image_id, label, path, status, created_at, is_video) \
+                 VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, COALESCE((SELECT is_video FROM images WHERE id = ?), FALSE))",
+                params![id, label, path, id],
             ) {
                 Ok(_) => inserted += 1,
                 Err(e) => {
@@ -4209,8 +4212,11 @@ fn copy_keyword_rows_for_image_pairs_impl(
             continue;
         }
         match conn.execute(
-            "INSERT INTO keyword (image_id, label, path, status, created_at, hidden_at, collection, color) \
-             SELECT ?2, k.label, k.path, k.status, CURRENT_TIMESTAMP, k.hidden_at, k.collection, k.color \
+            // Carry is_video from the source keyword rows — a byte copy keeps the media
+            // type, so the source image's is_video is the copy's (was defaulting to
+            // FALSE) — S72 closeout.
+            "INSERT INTO keyword (image_id, label, path, status, created_at, hidden_at, collection, color, is_video) \
+             SELECT ?2, k.label, k.path, k.status, CURRENT_TIMESTAMP, k.hidden_at, k.collection, k.color, k.is_video \
              FROM keyword k \
              WHERE k.image_id = ?1 \
                AND NOT EXISTS (SELECT 1 FROM keyword k2 \
@@ -5742,9 +5748,10 @@ pub async fn add_images_to_collections(ids: Vec<i64>, labels: Vec<String>) -> u6
 
             // No visible row with this label → insert a flat collection row.
             match conn.execute(
-                "INSERT INTO keyword (image_id, label, path, status, created_at, collection) \
-                 VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, TRUE)",
-                params![id, label, label],
+                // Carry is_video from the image (was defaulting to FALSE) — S72 closeout.
+                "INSERT INTO keyword (image_id, label, path, status, created_at, collection, is_video) \
+                 VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, TRUE, COALESCE((SELECT is_video FROM images WHERE id = ?), FALSE))",
+                params![id, label, label, id],
             ) {
                 Ok(_) => changed += 1,
                 Err(e) => {
@@ -5815,9 +5822,10 @@ fn assign_color_keyword_for_ids_impl(conn: &Connection, ids: &[i64], label: &str
 
         // No visible row with this label → insert a flat color row.
         match conn.execute(
-            "INSERT INTO keyword (image_id, label, path, status, created_at, collection, color) \
-             VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, FALSE, TRUE)",
-            params![id, trimmed, trimmed],
+            // Carry is_video from the image (was defaulting to FALSE) — S72 closeout.
+            "INSERT INTO keyword (image_id, label, path, status, created_at, collection, color, is_video) \
+             VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, FALSE, TRUE, COALESCE((SELECT is_video FROM images WHERE id = ?), FALSE))",
+            params![id, trimmed, trimmed, id],
         ) {
             Ok(_) => changed += 1,
             Err(e) => {
@@ -6020,8 +6028,8 @@ pub async fn reparent_keyword(source_path: Vec<String>, new_parent: Vec<String>)
 
     // (1) Ensure the new-parent ancestor chain exists for every affected image.
     for (label, path) in &new_parent_rows {
-        let sql = "INSERT INTO keyword (image_id, label, path, status, created_at) \
-                   SELECT DISTINCT image_id, ?, ?, 1, CURRENT_TIMESTAMP FROM keyword \
+        let sql = "INSERT INTO keyword (image_id, label, path, status, created_at, is_video) \
+                   SELECT DISTINCT image_id, ?, ?, 1, CURRENT_TIMESTAMP, is_video FROM keyword \
                    WHERE status = 1 AND (path = ? OR starts_with(path, ?)) \
                    AND image_id NOT IN (SELECT image_id FROM keyword WHERE status = 1 AND path = ?)";
         if let Err(e) = conn.execute(
@@ -6035,8 +6043,8 @@ pub async fn reparent_keyword(source_path: Vec<String>, new_parent: Vec<String>)
     }
 
     // (2) Re-root the moved subtree (label unchanged; path = new_root || suffix).
-    let move_sql = "INSERT INTO keyword (image_id, label, path, status, created_at) \
-                    SELECT image_id, label, ? || substr(path, ?), 1, CURRENT_TIMESTAMP FROM keyword \
+    let move_sql = "INSERT INTO keyword (image_id, label, path, status, created_at, is_video) \
+                    SELECT image_id, label, ? || substr(path, ?), 1, CURRENT_TIMESTAMP, is_video FROM keyword \
                     WHERE status = 1 AND (path = ? OR starts_with(path, ?))";
     if let Err(e) = conn.execute(
         move_sql,
@@ -6117,10 +6125,10 @@ pub async fn rename_keyword(target_path: Vec<String>, new_label: String) -> u64 
 
     // Re-root the subtree; the root row's label becomes new_label (descendants
     // keep theirs), path re-rooted for the whole subtree.
-    let move_sql = "INSERT INTO keyword (image_id, label, path, status, created_at) \
+    let move_sql = "INSERT INTO keyword (image_id, label, path, status, created_at, is_video) \
                     SELECT image_id, \
                            CASE WHEN path = ? THEN ? ELSE label END, \
-                           ? || substr(path, ?), 1, CURRENT_TIMESTAMP FROM keyword \
+                           ? || substr(path, ?), 1, CURRENT_TIMESTAMP, is_video FROM keyword \
                     WHERE status = 1 AND (path = ? OR starts_with(path, ?))";
     if let Err(e) = conn.execute(
         move_sql,
@@ -7341,15 +7349,16 @@ mod keyword_tests {
                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                  hidden_at TIMESTAMP,
                  collection BOOLEAN NOT NULL DEFAULT FALSE,
-                 color BOOLEAN NOT NULL DEFAULT FALSE
+                 color BOOLEAN NOT NULL DEFAULT FALSE,
+                 is_video BOOLEAN NOT NULL DEFAULT FALSE
              );
-             -- Source 1 (-> copy 11): a plain keyword + a collection-marked row.
+             -- Source 1 (a VIDEO -> copy 11): a plain keyword + a collection-marked row.
              -- Source 2 (-> copy 12): nothing (the copy must gain nothing).
              -- Copy 11 already carries one of source 1's paths (partial overlap).
-             INSERT INTO keyword (image_id, label, path, status, collection, color) VALUES
-                 (1, 'Dogs',   'Dogs',   1, FALSE, FALSE),
-                 (1, 'Family', 'Family', 1, TRUE,  FALSE),
-                 (11, 'Dogs',  'Dogs',   1, FALSE, FALSE);",
+             INSERT INTO keyword (image_id, label, path, status, collection, color, is_video) VALUES
+                 (1, 'Dogs',   'Dogs',   1, FALSE, FALSE, TRUE),
+                 (1, 'Family', 'Family', 1, TRUE,  FALSE, TRUE),
+                 (11, 'Dogs',  'Dogs',   1, FALSE, FALSE, TRUE);",
         )
         .expect("schema + seed");
 
@@ -7367,6 +7376,19 @@ mod keyword_tests {
             (status, collection),
             (1, true),
             "collection switch rode the copy"
+        );
+
+        // S72 closeout: is_video rides the copy (source 1 is a video).
+        let copied_is_video: bool = conn
+            .query_row(
+                "SELECT is_video FROM keyword WHERE image_id = 11 AND path = 'Family'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            copied_is_video,
+            "the copied keyword row carries the source's is_video"
         );
 
         let copy12: i64 = conn
@@ -7399,7 +7421,7 @@ mod keyword_tests {
 
         let conn = Connection::open_in_memory().expect("in-memory db");
         conn.execute_batch(
-            "CREATE TABLE images (id INTEGER, color_label TEXT);
+            "CREATE TABLE images (id INTEGER, color_label TEXT, is_video BOOLEAN);
              CREATE SEQUENCE keyword_id_seq START 1;
              CREATE TABLE keyword (
                  id INTEGER PRIMARY KEY DEFAULT nextval('keyword_id_seq'),
@@ -7410,16 +7432,17 @@ mod keyword_tests {
                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                  hidden_at TIMESTAMP,
                  collection BOOLEAN NOT NULL DEFAULT FALSE,
-                 color BOOLEAN NOT NULL DEFAULT FALSE
+                 color BOOLEAN NOT NULL DEFAULT FALSE,
+                 is_video BOOLEAN NOT NULL DEFAULT FALSE
              );
              CREATE OR REPLACE VIEW keyword_visible AS
                  SELECT * FROM keyword WHERE status = 1;
              -- Photo 1: standard red via color_label, no keywords.
-             -- Photo 2: will get a CUSTOM color label 'Approved' (keyword row).
+             -- Photo 2: a VIDEO; will get a CUSTOM color label 'Approved' (keyword row).
              -- Photo 3: a real keyword 'Approved' ALREADY applied -> the mark
              --          must flip THAT row, not insert a second.
              -- Photo 4: nothing at all.
-             INSERT INTO images VALUES (1, 'red'), (2, NULL), (3, NULL), (4, NULL);
+             INSERT INTO images VALUES (1, 'red', FALSE), (2, NULL, TRUE), (3, NULL, FALSE), (4, NULL, FALSE);
              INSERT INTO keyword (image_id, label, path) VALUES (3, 'Approved', 'Approved');",
         )
         .expect("schema + seed");
@@ -7437,6 +7460,16 @@ mod keyword_tests {
             )
             .unwrap();
         assert_eq!(rows3, 1);
+
+        // S72 closeout: photo 2 is a video, so its new color-keyword row carries is_video.
+        let v2: bool = conn
+            .query_row(
+                "SELECT is_video FROM keyword WHERE image_id = 2 AND label = 'Approved'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(v2, "the video's color-keyword row carries is_video = TRUE");
 
         // Idempotent: a second pass changes nothing.
         assert_eq!(
