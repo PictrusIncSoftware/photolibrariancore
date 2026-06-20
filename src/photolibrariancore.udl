@@ -158,6 +158,14 @@ namespace photolibrariancore {
     );
 
     [Async]
+    AnalysisJob? update_analysis_job_breadcrumb(
+        i64 id,
+        i64? current_image_id,
+        string? current_file_path,
+        boolean timed_out
+    );
+
+    [Async]
     boolean request_cancel_analysis_job(i64 id);
 
     [Async]
@@ -636,6 +644,8 @@ dictionary FocusAnalysisResult {
     f64? focus_saliency_score = null;
     f64? focus_animal_pose_score = null;
     f64? focus_whole_image_score = null;
+    i32? face_count = null;
+    sequence<string> auto_keywords;
 };
 
 dictionary AnalysisJob {
@@ -658,6 +668,12 @@ dictionary AnalysisJob {
     string? updated_at;
     string? finished_at;
     string? last_error;
+    i64? current_image_id;
+    string? current_file_path;
+    string? current_started_at;
+    i64? last_timeout_image_id;
+    string? last_timeout_file_path;
+    string? last_timeout_at;
 };
 
 // One directory's OWN image tally (S65, Sources sidebar) — directory_path is

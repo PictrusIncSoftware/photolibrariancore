@@ -230,6 +230,8 @@ pub struct FocusAnalysisResult {
     pub focus_saliency_score: Option<f64>,
     pub focus_animal_pose_score: Option<f64>,
     pub focus_whole_image_score: Option<f64>,
+    pub face_count: Option<i32>,
+    pub auto_keywords: Vec<String>,
 }
 
 /// Durable coordinator row for enrichment / intelligent-culling work.
@@ -258,6 +260,12 @@ pub struct AnalysisJob {
     pub updated_at: Option<String>,
     pub finished_at: Option<String>,
     pub last_error: Option<String>,
+    pub current_image_id: Option<i64>,
+    pub current_file_path: Option<String>,
+    pub current_started_at: Option<String>,
+    pub last_timeout_image_id: Option<i64>,
+    pub last_timeout_file_path: Option<String>,
+    pub last_timeout_at: Option<String>,
 }
 
 /// Recognized RAW image file extensions
@@ -718,6 +726,7 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             focus_analysis_status TEXT,      -- complete / online_only / unreadable / failed
             focus_analysis_attempt_id TEXT,
             focus_scored_at TIMESTAMP,
+            face_count INTEGER,              -- Vision-detected people count (0 = no faces detected)
 
             -- === Video / unified-media support (Session 70; Docs/DESIGN-Video-Schema-Unified-Table.md) ===
             -- is_video discriminates stills (FALSE) from video (TRUE). CREATE-time
@@ -790,6 +799,7 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_analysis_status TEXT;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_analysis_attempt_id TEXT;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_scored_at TIMESTAMP;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS face_count INTEGER;
 
         -- Video / unified-media columns (Session 70). ADD COLUMN IF NOT EXISTS with
         -- NO default (an ALTER ... ADD COLUMN ... DEFAULT <expr> does not survive
@@ -837,6 +847,7 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         CREATE INDEX IF NOT EXISTS idx_focus_animal_pose_score ON images(focus_animal_pose_score);
         CREATE INDEX IF NOT EXISTS idx_focus_whole_image_score ON images(focus_whole_image_score);
         CREATE INDEX IF NOT EXISTS idx_focus_analysis_status ON images(focus_analysis_status);
+        CREATE INDEX IF NOT EXISTS idx_face_count ON images(face_count);
 
         -- === Durable analysis jobs (background intelligent culling coordinator) ===
         -- One row per user/requested enrichment run. The current focus pass uses
@@ -865,8 +876,21 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             started_at TIMESTAMP,
             updated_at TIMESTAMP,
             finished_at TIMESTAMP,
-            last_error TEXT
+            last_error TEXT,
+            current_image_id BIGINT,
+            current_file_path TEXT,
+            current_started_at TIMESTAMP,
+            last_timeout_image_id BIGINT,
+            last_timeout_file_path TEXT,
+            last_timeout_at TIMESTAMP
         );
+
+        ALTER TABLE analysis_jobs ADD COLUMN IF NOT EXISTS current_image_id BIGINT;
+        ALTER TABLE analysis_jobs ADD COLUMN IF NOT EXISTS current_file_path TEXT;
+        ALTER TABLE analysis_jobs ADD COLUMN IF NOT EXISTS current_started_at TIMESTAMP;
+        ALTER TABLE analysis_jobs ADD COLUMN IF NOT EXISTS last_timeout_image_id BIGINT;
+        ALTER TABLE analysis_jobs ADD COLUMN IF NOT EXISTS last_timeout_file_path TEXT;
+        ALTER TABLE analysis_jobs ADD COLUMN IF NOT EXISTS last_timeout_at TIMESTAMP;
 
         CREATE INDEX IF NOT EXISTS idx_analysis_jobs_kind_status ON analysis_jobs(job_kind, status);
         CREATE INDEX IF NOT EXISTS idx_analysis_jobs_run_id ON analysis_jobs(analysis_run_id);
@@ -3014,6 +3038,26 @@ fn numeric_predicate_sql(p: &QueryPredicate, column: &str) -> String {
     }
 }
 
+fn people_count_predicate_sql(p: &QueryPredicate) -> String {
+    let Some(op) = p.op.as_deref() else {
+        return "(FALSE)".to_string();
+    };
+    let Some(num) = p.num else {
+        return "(FALSE)".to_string();
+    };
+    if !num.is_finite() || num.fract() != 0.0 {
+        return "(FALSE)".to_string();
+    }
+
+    let count = num as i32;
+    match op {
+        "eq" if (1..=3).contains(&count) => format!("(face_count = {})", count),
+        "gt" if (1..=3).contains(&count) => format!("(face_count > {})", count),
+        "lt" if (2..=3).contains(&count) => format!("(face_count >= 1 AND face_count < {})", count),
+        _ => "(FALSE)".to_string(),
+    }
+}
+
 fn focus_quality_column_for_basis(basis: &str) -> Option<&'static str> {
     match basis {
         "human_face" | "face" => Some("focus_human_score"),
@@ -3505,6 +3549,7 @@ fn predicate_to_sql(p: &QueryPredicate) -> String {
         "focal_num" => numeric_predicate_sql(p, "focal_length"),
         "focus_num" => numeric_predicate_sql(p, "focus_score"),
         "focus_quality" => focus_quality_predicate_sql(p),
+        "people_count" => people_count_predicate_sql(p),
         // Video numeric subjects (S75) — same machinery, new columns. Duration
         // is seconds (DOUBLE); frame_rate is fps (DOUBLE). A NULL column (a
         // still) never matches, exactly like the exposure numerics above.
@@ -4778,6 +4823,7 @@ pub async fn distinct_numeric_values(field: String) -> Vec<f64> {
         "shutter_speed" => "shutter_speed",
         "focal_length" => "focal_length",
         "focus_score" => "focus_score", // S76 — Focus Quality subject dropdown
+        "face_count" => "face_count",   // Vision enrichment — People Present subject
         "duration_seconds" => "duration_seconds", // S75 — Duration subject dropdown
         "frame_rate" => "frame_rate",   // S75 — Frame rate subject dropdown
         other => {
@@ -4867,6 +4913,12 @@ fn row_to_analysis_job(row: &duckdb::Row) -> Result<AnalysisJob, duckdb::Error> 
         updated_at: row.get(16)?,
         finished_at: row.get(17)?,
         last_error: row.get(18)?,
+        current_image_id: row.get(19)?,
+        current_file_path: row.get(20)?,
+        current_started_at: row.get(21)?,
+        last_timeout_image_id: row.get(22)?,
+        last_timeout_file_path: row.get(23)?,
+        last_timeout_at: row.get(24)?,
     })
 }
 
@@ -4874,7 +4926,9 @@ const ANALYSIS_JOB_SELECT_COLUMNS: &str = "\
     id, job_kind, scope_kind, scope_value, algorithm_version, analysis_run_id, status, \
     total_candidate_count, processed_count, completed_count, skipped_count, failed_count, \
     updated_count, cancel_requested, CAST(created_at AS VARCHAR), CAST(started_at AS VARCHAR), \
-    CAST(updated_at AS VARCHAR), CAST(finished_at AS VARCHAR), last_error";
+    CAST(updated_at AS VARCHAR), CAST(finished_at AS VARCHAR), last_error, \
+    current_image_id, current_file_path, CAST(current_started_at AS VARCHAR), \
+    last_timeout_image_id, last_timeout_file_path, CAST(last_timeout_at AS VARCHAR)";
 
 fn analysis_job_by_id_impl(conn: &Connection, id: i64) -> Option<AnalysisJob> {
     let sql = format!(
@@ -5039,6 +5093,41 @@ fn update_analysis_job_progress_impl(
     }
 }
 
+fn update_analysis_job_breadcrumb_impl(
+    conn: &Connection,
+    id: i64,
+    current_image_id: Option<i64>,
+    current_file_path: Option<String>,
+    timed_out: bool,
+) -> Option<AnalysisJob> {
+    if current_image_id.is_some() != current_file_path.is_some() {
+        eprintln!("update_analysis_job_breadcrumb: image id/path mismatch");
+        return None;
+    }
+
+    let updated = conn.execute(
+        "UPDATE analysis_jobs
+         SET updated_at = CURRENT_TIMESTAMP,
+             current_image_id = ?2,
+             current_file_path = ?3,
+             current_started_at = CASE WHEN ?2 IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END,
+             last_timeout_image_id = CASE WHEN ?4 THEN ?2 ELSE last_timeout_image_id END,
+             last_timeout_file_path = CASE WHEN ?4 THEN ?3 ELSE last_timeout_file_path END,
+             last_timeout_at = CASE WHEN ?4 THEN CURRENT_TIMESTAMP ELSE last_timeout_at END
+         WHERE id = ?1 AND status IN ('queued', 'running', 'cancelling')",
+        params![id, current_image_id, current_file_path, timed_out],
+    );
+
+    match updated {
+        Ok(0) => None,
+        Ok(_) => analysis_job_by_id_impl(conn, id),
+        Err(e) => {
+            eprintln!("update_analysis_job_breadcrumb: update failed: {}", e);
+            None
+        }
+    }
+}
+
 fn request_cancel_analysis_job_impl(conn: &Connection, id: i64) -> bool {
     match conn.execute(
         "UPDATE analysis_jobs
@@ -5074,7 +5163,10 @@ fn finish_analysis_job_impl(
              cancel_requested = CASE WHEN ?2 = 'cancelled' THEN TRUE ELSE cancel_requested END,
              updated_at = CURRENT_TIMESTAMP,
              finished_at = CURRENT_TIMESTAMP,
-             last_error = ?3
+             last_error = ?3,
+             current_image_id = NULL,
+             current_file_path = NULL,
+             current_started_at = NULL
          WHERE id = ?1 AND status IN ('queued', 'running', 'cancelling')",
         params![id, status, last_error],
     );
@@ -5111,7 +5203,10 @@ fn recover_interrupted_analysis_jobs_impl(
              cancel_requested = CASE WHEN ?2 = 'cancelled' THEN TRUE ELSE cancel_requested END,
              updated_at = CURRENT_TIMESTAMP,
              finished_at = CURRENT_TIMESTAMP,
-             last_error = ?3
+             last_error = ?3,
+             current_image_id = NULL,
+             current_file_path = NULL,
+             current_started_at = NULL
          WHERE job_kind = ?1 AND status IN ('queued', 'running', 'cancelling')",
         params![job_kind, terminal_status, last_error],
     ) {
@@ -5216,6 +5311,27 @@ pub async fn update_analysis_job_progress(
     )
 }
 
+/// Heartbeat the per-image breadcrumb for the currently running enrichment item.
+/// Passing nil id/path clears the current breadcrumb; `timed_out` also preserves
+/// the timed-out item as the latest timeout diagnostic.
+pub async fn update_analysis_job_breadcrumb(
+    id: i64,
+    current_image_id: Option<i64>,
+    current_file_path: Option<String>,
+    timed_out: bool,
+) -> Option<AnalysisJob> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("update_analysis_job_breadcrumb: catalogue not initialized");
+            return None;
+        }
+    };
+
+    update_analysis_job_breadcrumb_impl(conn, id, current_image_id, current_file_path, timed_out)
+}
+
 /// Mark a running/queued job as cancellation-requested. Workers should poll
 /// this row between chunks and finish as `cancelled` when teardown completes.
 pub async fn request_cancel_analysis_job(id: i64) -> bool {
@@ -5292,6 +5408,12 @@ fn focus_score_is_valid(score: Option<f64>) -> bool {
     score.map(|score| score.is_finite()).unwrap_or(true)
 }
 
+fn face_count_is_valid(count: Option<i32>) -> bool {
+    count
+        .map(|count| (0..=10_000).contains(&count))
+        .unwrap_or(true)
+}
+
 fn sanitized_focus_result(mut result: FocusAnalysisResult) -> FocusAnalysisResult {
     let scores_are_valid = focus_score_is_valid(result.focus_score)
         && focus_score_is_valid(result.focus_human_score)
@@ -5310,6 +5432,7 @@ fn sanitized_focus_result(mut result: FocusAnalysisResult) -> FocusAnalysisResul
     if !is_valid_focus_status(&result.status)
         || !scores_are_valid
         || !basis_is_valid
+        || !face_count_is_valid(result.face_count)
         || !complete_has_score
     {
         eprintln!(
@@ -5325,9 +5448,40 @@ fn sanitized_focus_result(mut result: FocusAnalysisResult) -> FocusAnalysisResul
         result.focus_saliency_score = None;
         result.focus_animal_pose_score = None;
         result.focus_whole_image_score = None;
+        result.face_count = None;
+        result.auto_keywords.clear();
     }
 
     result
+}
+
+fn insert_active_keyword_for_image(conn: &Connection, image_id: i64, segments: &[String]) -> bool {
+    let rows = keyword_materialized_rows(segments);
+    if rows.is_empty() {
+        return true;
+    }
+
+    for (label, path) in rows {
+        let existing: Result<i64, _> = conn.query_row(
+            "SELECT 1 FROM keyword WHERE image_id = ? AND path = ? AND status = 1 LIMIT 1",
+            params![image_id, path],
+            |r| r.get(0),
+        );
+        if existing.is_ok() {
+            continue;
+        }
+
+        if let Err(e) = conn.execute(
+            "INSERT INTO keyword (image_id, label, path, status, created_at, is_video) \
+             VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, COALESCE((SELECT is_video FROM images WHERE id = ?), FALSE))",
+            params![image_id, label, path, image_id],
+        ) {
+            eprintln!("insert_active_keyword_for_image: insert failed: {}", e);
+            return false;
+        }
+    }
+
+    true
 }
 
 fn focus_analysis_queue_where_clause(id_predicate: Option<&str>) -> String {
@@ -5540,42 +5694,44 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
     let mut updated = 0u64;
     for result in results {
         let result = sanitized_focus_result(result);
+        let is_complete = result.status == "complete";
 
-        let score = if result.status == "complete" {
+        let score = if is_complete {
             result.focus_score
         } else {
             None
         };
-        let human_score = if result.status == "complete" {
+        let human_score = if is_complete {
             result.focus_human_score
         } else {
             None
         };
-        let animal_score = if result.status == "complete" {
+        let animal_score = if is_complete {
             result.focus_animal_score
         } else {
             None
         };
-        let foreground_score = if result.status == "complete" {
+        let foreground_score = if is_complete {
             result.focus_foreground_score
         } else {
             None
         };
-        let saliency_score = if result.status == "complete" {
+        let saliency_score = if is_complete {
             result.focus_saliency_score
         } else {
             None
         };
-        let animal_pose_score = if result.status == "complete" {
+        let animal_pose_score = if is_complete {
             result.focus_animal_pose_score
         } else {
             None
         };
-        let whole_image_score = if result.status == "complete" {
+        let whole_image_score = if is_complete {
             result.focus_whole_image_score
         } else {
             None
         };
+        let face_count = if is_complete { result.face_count } else { None };
         let basis = result.focus_basis.unwrap_or_else(|| "unknown".to_string());
 
         match conn.execute(
@@ -5591,7 +5747,8 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
                  focus_algorithm_version = ?10,
                  focus_analysis_status = ?11,
                  focus_analysis_attempt_id = ?12,
-                 focus_scored_at = CURRENT_TIMESTAMP
+                 focus_scored_at = CURRENT_TIMESTAMP,
+                 face_count = ?13
              WHERE id = ?1",
             params![
                 result.id,
@@ -5606,9 +5763,29 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
                 result.algorithm_version,
                 result.status,
                 result.analysis_run_id,
+                face_count,
             ],
         ) {
-            Ok(n) => updated += n as u64,
+            Ok(n) => {
+                updated += n as u64;
+                if n > 0 && is_complete {
+                    let mut labels = result
+                        .auto_keywords
+                        .iter()
+                        .map(|label| label.trim().to_string())
+                        .filter(|label| !label.is_empty())
+                        .collect::<Vec<_>>();
+                    labels.sort_by_key(|label| label.to_lowercase());
+                    labels.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+
+                    for label in labels {
+                        if !insert_active_keyword_for_image(conn, result.id, &[label]) {
+                            let _ = conn.execute_batch("ROLLBACK;");
+                            return 0;
+                        }
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!(
                     "update_focus_analysis_results: row {} failed: {}",
@@ -6719,7 +6896,13 @@ mod analysis_job_tests {
                  started_at TIMESTAMP,
                  updated_at TIMESTAMP,
                  finished_at TIMESTAMP,
-                 last_error TEXT
+                 last_error TEXT,
+                 current_image_id BIGINT,
+                 current_file_path TEXT,
+                 current_started_at TIMESTAMP,
+                 last_timeout_image_id BIGINT,
+                 last_timeout_file_path TEXT,
+                 last_timeout_at TIMESTAMP
              );",
         )
         .expect("analysis job DDL");
@@ -6756,6 +6939,12 @@ mod analysis_job_tests {
         assert!(!job.created_at.is_empty());
         assert!(job.started_at.is_none());
         assert!(job.finished_at.is_none());
+        assert!(job.current_image_id.is_none());
+        assert!(job.current_file_path.is_none());
+        assert!(job.current_started_at.is_none());
+        assert!(job.last_timeout_image_id.is_none());
+        assert!(job.last_timeout_file_path.is_none());
+        assert!(job.last_timeout_at.is_none());
 
         let active = active_analysis_job_impl(&conn, "focus_quality").expect("active job");
         assert_eq!(active.id, job.id);
@@ -6845,6 +7034,59 @@ mod analysis_job_tests {
         assert!(update_analysis_job_progress_impl(&conn, job.id, 1, 1, 0, 0, 1, None).is_none());
         assert!(!request_cancel_analysis_job_impl(&conn, job.id));
         assert!(finish_analysis_job_impl(&conn, job.id, "completed", None).is_none());
+    }
+
+    #[test]
+    fn breadcrumb_tracks_current_and_last_timeout() {
+        let conn = setup();
+        let job = create_analysis_job_impl(
+            &conn,
+            "focus_quality",
+            "whole_catalogue",
+            None,
+            "v2",
+            "breadcrumb-run",
+            2,
+        )
+        .expect("job created");
+
+        let current = update_analysis_job_breadcrumb_impl(
+            &conn,
+            job.id,
+            Some(42),
+            Some("/photos/wedged.nef".to_string()),
+            false,
+        )
+        .expect("breadcrumb set");
+        assert_eq!(current.current_image_id, Some(42));
+        assert_eq!(
+            current.current_file_path.as_deref(),
+            Some("/photos/wedged.nef")
+        );
+        assert!(current.current_started_at.is_some());
+        assert!(current.last_timeout_image_id.is_none());
+
+        let timed_out = update_analysis_job_breadcrumb_impl(
+            &conn,
+            job.id,
+            Some(42),
+            Some("/photos/wedged.nef".to_string()),
+            true,
+        )
+        .expect("timeout recorded");
+        assert_eq!(timed_out.last_timeout_image_id, Some(42));
+        assert_eq!(
+            timed_out.last_timeout_file_path.as_deref(),
+            Some("/photos/wedged.nef")
+        );
+        assert!(timed_out.last_timeout_at.is_some());
+
+        let cleared =
+            update_analysis_job_breadcrumb_impl(&conn, job.id, None, None, false).expect("cleared");
+        assert!(cleared.current_image_id.is_none());
+        assert!(cleared.current_file_path.is_none());
+        assert!(cleared.current_started_at.is_none());
+        assert_eq!(cleared.last_timeout_image_id, Some(42));
     }
 
     #[test]
@@ -7719,6 +7961,29 @@ mod keyword_tests {
         let mut missing_op = num("iso_num", "eq", 100.0, None);
         missing_op.op = None;
         assert_eq!(predicate_to_sql(&missing_op), "(FALSE)");
+    }
+
+    #[test]
+    fn people_count_predicate_sql() {
+        let num = |op: &str, n: f64| QueryPredicate {
+            kind: "people_count".to_string(),
+            day: None,
+            day_end: None,
+            stars: None,
+            value: None,
+            op: Some(op.to_string()),
+            num: Some(n),
+            num_end: None,
+        };
+
+        assert_eq!(predicate_to_sql(&num("eq", 1.0)), "(face_count = 1)");
+        assert_eq!(predicate_to_sql(&num("gt", 3.0)), "(face_count > 3)");
+        assert_eq!(
+            predicate_to_sql(&num("lt", 2.0)),
+            "(face_count >= 1 AND face_count < 2)"
+        );
+        assert_eq!(predicate_to_sql(&num("lt", 1.0)), "(FALSE)");
+        assert_eq!(predicate_to_sql(&num("gte", 1.0)), "(FALSE)");
     }
 
     #[test]

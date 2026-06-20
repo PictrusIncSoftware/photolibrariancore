@@ -598,10 +598,16 @@ public struct AnalysisJob: Equatable, Hashable {
     public var updatedAt: String?
     public var finishedAt: String?
     public var lastError: String?
+    public var currentImageId: Int64?
+    public var currentFilePath: String?
+    public var currentStartedAt: String?
+    public var lastTimeoutImageId: Int64?
+    public var lastTimeoutFilePath: String?
+    public var lastTimeoutAt: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: Int64, jobKind: String, scopeKind: String, scopeValue: String?, algorithmVersion: String, analysisRunId: String, status: String, totalCandidateCount: UInt64, processedCount: UInt64, completedCount: UInt64, skippedCount: UInt64, failedCount: UInt64, updatedCount: UInt64, cancelRequested: Bool, createdAt: String, startedAt: String?, updatedAt: String?, finishedAt: String?, lastError: String?) {
+    public init(id: Int64, jobKind: String, scopeKind: String, scopeValue: String?, algorithmVersion: String, analysisRunId: String, status: String, totalCandidateCount: UInt64, processedCount: UInt64, completedCount: UInt64, skippedCount: UInt64, failedCount: UInt64, updatedCount: UInt64, cancelRequested: Bool, createdAt: String, startedAt: String?, updatedAt: String?, finishedAt: String?, lastError: String?, currentImageId: Int64?, currentFilePath: String?, currentStartedAt: String?, lastTimeoutImageId: Int64?, lastTimeoutFilePath: String?, lastTimeoutAt: String?) {
         self.id = id
         self.jobKind = jobKind
         self.scopeKind = scopeKind
@@ -621,6 +627,12 @@ public struct AnalysisJob: Equatable, Hashable {
         self.updatedAt = updatedAt
         self.finishedAt = finishedAt
         self.lastError = lastError
+        self.currentImageId = currentImageId
+        self.currentFilePath = currentFilePath
+        self.currentStartedAt = currentStartedAt
+        self.lastTimeoutImageId = lastTimeoutImageId
+        self.lastTimeoutFilePath = lastTimeoutFilePath
+        self.lastTimeoutAt = lastTimeoutAt
     }
 
     
@@ -657,7 +669,13 @@ public struct FfiConverterTypeAnalysisJob: FfiConverterRustBuffer {
                 startedAt: FfiConverterOptionString.read(from: &buf), 
                 updatedAt: FfiConverterOptionString.read(from: &buf), 
                 finishedAt: FfiConverterOptionString.read(from: &buf), 
-                lastError: FfiConverterOptionString.read(from: &buf)
+                lastError: FfiConverterOptionString.read(from: &buf), 
+                currentImageId: FfiConverterOptionInt64.read(from: &buf), 
+                currentFilePath: FfiConverterOptionString.read(from: &buf), 
+                currentStartedAt: FfiConverterOptionString.read(from: &buf), 
+                lastTimeoutImageId: FfiConverterOptionInt64.read(from: &buf), 
+                lastTimeoutFilePath: FfiConverterOptionString.read(from: &buf), 
+                lastTimeoutAt: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -681,6 +699,12 @@ public struct FfiConverterTypeAnalysisJob: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.updatedAt, into: &buf)
         FfiConverterOptionString.write(value.finishedAt, into: &buf)
         FfiConverterOptionString.write(value.lastError, into: &buf)
+        FfiConverterOptionInt64.write(value.currentImageId, into: &buf)
+        FfiConverterOptionString.write(value.currentFilePath, into: &buf)
+        FfiConverterOptionString.write(value.currentStartedAt, into: &buf)
+        FfiConverterOptionInt64.write(value.lastTimeoutImageId, into: &buf)
+        FfiConverterOptionString.write(value.lastTimeoutFilePath, into: &buf)
+        FfiConverterOptionString.write(value.lastTimeoutAt, into: &buf)
     }
 }
 
@@ -991,10 +1015,12 @@ public struct FocusAnalysisResult: Equatable, Hashable {
     public var focusSaliencyScore: Double?
     public var focusAnimalPoseScore: Double?
     public var focusWholeImageScore: Double?
+    public var faceCount: Int32?
+    public var autoKeywords: [String]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: Int64, focusScore: Double?, focusBasis: String?, algorithmVersion: String, analysisRunId: String, status: String, focusHumanScore: Double? = nil, focusAnimalScore: Double? = nil, focusForegroundScore: Double? = nil, focusSaliencyScore: Double? = nil, focusAnimalPoseScore: Double? = nil, focusWholeImageScore: Double? = nil) {
+    public init(id: Int64, focusScore: Double?, focusBasis: String?, algorithmVersion: String, analysisRunId: String, status: String, focusHumanScore: Double? = nil, focusAnimalScore: Double? = nil, focusForegroundScore: Double? = nil, focusSaliencyScore: Double? = nil, focusAnimalPoseScore: Double? = nil, focusWholeImageScore: Double? = nil, faceCount: Int32? = nil, autoKeywords: [String]) {
         self.id = id
         self.focusScore = focusScore
         self.focusBasis = focusBasis
@@ -1007,6 +1033,8 @@ public struct FocusAnalysisResult: Equatable, Hashable {
         self.focusSaliencyScore = focusSaliencyScore
         self.focusAnimalPoseScore = focusAnimalPoseScore
         self.focusWholeImageScore = focusWholeImageScore
+        self.faceCount = faceCount
+        self.autoKeywords = autoKeywords
     }
 
     
@@ -1036,7 +1064,9 @@ public struct FfiConverterTypeFocusAnalysisResult: FfiConverterRustBuffer {
                 focusForegroundScore: FfiConverterOptionDouble.read(from: &buf), 
                 focusSaliencyScore: FfiConverterOptionDouble.read(from: &buf), 
                 focusAnimalPoseScore: FfiConverterOptionDouble.read(from: &buf), 
-                focusWholeImageScore: FfiConverterOptionDouble.read(from: &buf)
+                focusWholeImageScore: FfiConverterOptionDouble.read(from: &buf), 
+                faceCount: FfiConverterOptionInt32.read(from: &buf), 
+                autoKeywords: FfiConverterSequenceString.read(from: &buf)
         )
     }
 
@@ -1053,6 +1083,8 @@ public struct FfiConverterTypeFocusAnalysisResult: FfiConverterRustBuffer {
         FfiConverterOptionDouble.write(value.focusSaliencyScore, into: &buf)
         FfiConverterOptionDouble.write(value.focusAnimalPoseScore, into: &buf)
         FfiConverterOptionDouble.write(value.focusWholeImageScore, into: &buf)
+        FfiConverterOptionInt32.write(value.faceCount, into: &buf)
+        FfiConverterSequenceString.write(value.autoKeywords, into: &buf)
     }
 }
 
@@ -4168,6 +4200,21 @@ public func saveQuery(name: String, predicates: [QueryPredicate], connectors: [C
             
         )
 }
+public func updateAnalysisJobBreadcrumb(id: Int64, currentImageId: Int64?, currentFilePath: String?, timedOut: Bool)async  -> AnalysisJob?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_update_analysis_job_breadcrumb(FfiConverterInt64.lower(id),FfiConverterOptionInt64.lower(currentImageId),FfiConverterOptionString.lower(currentFilePath),FfiConverterBool.lower(timedOut)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeAnalysisJob.lift,
+            errorHandler: nil
+            
+        )
+}
 public func updateAnalysisJobProgress(id: Int64, processedDelta: UInt64, completedDelta: UInt64, skippedDelta: UInt64, failedDelta: UInt64, updatedDelta: UInt64, totalCandidateCount: UInt64?)async  -> AnalysisJob?  {
     return
         try!  await uniffiRustCallAsync(
@@ -4530,6 +4577,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_save_query() != 43330) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_update_analysis_job_breadcrumb() != 10254) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_analysis_job_progress() != 28376) {
