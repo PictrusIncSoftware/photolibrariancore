@@ -645,6 +645,11 @@ dictionary FocusAnalysisResult {
     f64? focus_animal_pose_score = null;
     f64? focus_whole_image_score = null;
     i32? face_count = null;
+    f64? face_quality_best = null;
+    f64? face_quality_average = null;
+    f64? face_quality_min = null;
+    i32? face_eyes_open_count = null;
+    i32? face_blink_risk_count = null;
     sequence<string> auto_keywords;
 };
 

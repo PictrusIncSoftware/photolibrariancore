@@ -1016,11 +1016,16 @@ public struct FocusAnalysisResult: Equatable, Hashable {
     public var focusAnimalPoseScore: Double?
     public var focusWholeImageScore: Double?
     public var faceCount: Int32?
+    public var faceQualityBest: Double?
+    public var faceQualityAverage: Double?
+    public var faceQualityMin: Double?
+    public var faceEyesOpenCount: Int32?
+    public var faceBlinkRiskCount: Int32?
     public var autoKeywords: [String]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: Int64, focusScore: Double?, focusBasis: String?, algorithmVersion: String, analysisRunId: String, status: String, focusHumanScore: Double? = nil, focusAnimalScore: Double? = nil, focusForegroundScore: Double? = nil, focusSaliencyScore: Double? = nil, focusAnimalPoseScore: Double? = nil, focusWholeImageScore: Double? = nil, faceCount: Int32? = nil, autoKeywords: [String]) {
+    public init(id: Int64, focusScore: Double?, focusBasis: String?, algorithmVersion: String, analysisRunId: String, status: String, focusHumanScore: Double? = nil, focusAnimalScore: Double? = nil, focusForegroundScore: Double? = nil, focusSaliencyScore: Double? = nil, focusAnimalPoseScore: Double? = nil, focusWholeImageScore: Double? = nil, faceCount: Int32? = nil, faceQualityBest: Double? = nil, faceQualityAverage: Double? = nil, faceQualityMin: Double? = nil, faceEyesOpenCount: Int32? = nil, faceBlinkRiskCount: Int32? = nil, autoKeywords: [String]) {
         self.id = id
         self.focusScore = focusScore
         self.focusBasis = focusBasis
@@ -1034,6 +1039,11 @@ public struct FocusAnalysisResult: Equatable, Hashable {
         self.focusAnimalPoseScore = focusAnimalPoseScore
         self.focusWholeImageScore = focusWholeImageScore
         self.faceCount = faceCount
+        self.faceQualityBest = faceQualityBest
+        self.faceQualityAverage = faceQualityAverage
+        self.faceQualityMin = faceQualityMin
+        self.faceEyesOpenCount = faceEyesOpenCount
+        self.faceBlinkRiskCount = faceBlinkRiskCount
         self.autoKeywords = autoKeywords
     }
 
@@ -1066,6 +1076,11 @@ public struct FfiConverterTypeFocusAnalysisResult: FfiConverterRustBuffer {
                 focusAnimalPoseScore: FfiConverterOptionDouble.read(from: &buf), 
                 focusWholeImageScore: FfiConverterOptionDouble.read(from: &buf), 
                 faceCount: FfiConverterOptionInt32.read(from: &buf), 
+                faceQualityBest: FfiConverterOptionDouble.read(from: &buf), 
+                faceQualityAverage: FfiConverterOptionDouble.read(from: &buf), 
+                faceQualityMin: FfiConverterOptionDouble.read(from: &buf), 
+                faceEyesOpenCount: FfiConverterOptionInt32.read(from: &buf), 
+                faceBlinkRiskCount: FfiConverterOptionInt32.read(from: &buf), 
                 autoKeywords: FfiConverterSequenceString.read(from: &buf)
         )
     }
@@ -1084,6 +1099,11 @@ public struct FfiConverterTypeFocusAnalysisResult: FfiConverterRustBuffer {
         FfiConverterOptionDouble.write(value.focusAnimalPoseScore, into: &buf)
         FfiConverterOptionDouble.write(value.focusWholeImageScore, into: &buf)
         FfiConverterOptionInt32.write(value.faceCount, into: &buf)
+        FfiConverterOptionDouble.write(value.faceQualityBest, into: &buf)
+        FfiConverterOptionDouble.write(value.faceQualityAverage, into: &buf)
+        FfiConverterOptionDouble.write(value.faceQualityMin, into: &buf)
+        FfiConverterOptionInt32.write(value.faceEyesOpenCount, into: &buf)
+        FfiConverterOptionInt32.write(value.faceBlinkRiskCount, into: &buf)
         FfiConverterSequenceString.write(value.autoKeywords, into: &buf)
     }
 }

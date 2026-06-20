@@ -231,6 +231,11 @@ pub struct FocusAnalysisResult {
     pub focus_animal_pose_score: Option<f64>,
     pub focus_whole_image_score: Option<f64>,
     pub face_count: Option<i32>,
+    pub face_quality_best: Option<f64>,
+    pub face_quality_average: Option<f64>,
+    pub face_quality_min: Option<f64>,
+    pub face_eyes_open_count: Option<i32>,
+    pub face_blink_risk_count: Option<i32>,
     pub auto_keywords: Vec<String>,
 }
 
@@ -727,6 +732,11 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             focus_analysis_attempt_id TEXT,
             focus_scored_at TIMESTAMP,
             face_count INTEGER,              -- Vision-detected people count (0 = no faces detected)
+            face_quality_best DOUBLE,        -- Best Apple Vision faceCaptureQuality in image
+            face_quality_average DOUBLE,     -- Average faceCaptureQuality across scored faces
+            face_quality_min DOUBLE,         -- Lowest faceCaptureQuality across scored faces
+            face_eyes_open_count INTEGER,    -- Heuristic count of faces whose eyes appear open
+            face_blink_risk_count INTEGER,   -- Heuristic count of faces with likely blink/closed eyes
 
             -- === Video / unified-media support (Session 70; Docs/DESIGN-Video-Schema-Unified-Table.md) ===
             -- is_video discriminates stills (FALSE) from video (TRUE). CREATE-time
@@ -800,6 +810,11 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_analysis_attempt_id TEXT;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS focus_scored_at TIMESTAMP;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS face_count INTEGER;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS face_quality_best DOUBLE;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS face_quality_average DOUBLE;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS face_quality_min DOUBLE;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS face_eyes_open_count INTEGER;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS face_blink_risk_count INTEGER;
 
         -- Video / unified-media columns (Session 70). ADD COLUMN IF NOT EXISTS with
         -- NO default (an ALTER ... ADD COLUMN ... DEFAULT <expr> does not survive
@@ -848,6 +863,11 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         CREATE INDEX IF NOT EXISTS idx_focus_whole_image_score ON images(focus_whole_image_score);
         CREATE INDEX IF NOT EXISTS idx_focus_analysis_status ON images(focus_analysis_status);
         CREATE INDEX IF NOT EXISTS idx_face_count ON images(face_count);
+        CREATE INDEX IF NOT EXISTS idx_face_quality_best ON images(face_quality_best);
+        CREATE INDEX IF NOT EXISTS idx_face_quality_average ON images(face_quality_average);
+        CREATE INDEX IF NOT EXISTS idx_face_quality_min ON images(face_quality_min);
+        CREATE INDEX IF NOT EXISTS idx_face_eyes_open_count ON images(face_eyes_open_count);
+        CREATE INDEX IF NOT EXISTS idx_face_blink_risk_count ON images(face_blink_risk_count);
 
         -- === Durable analysis jobs (background intelligent culling coordinator) ===
         -- One row per user/requested enrichment run. The current focus pass uses
@@ -3135,14 +3155,64 @@ fn focus_quality_bucket_threshold_sql(bucket: u8, column: &str) -> Option<String
     ))
 }
 
-fn focus_quality_threshold_criteria(value: &str) -> Option<Vec<(&'static str, u8)>> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PredicateGroupMode {
+    Any,
+    All,
+    ExactlyOne,
+}
+
+fn predicate_group_mode(token: &str) -> Option<PredicateGroupMode> {
+    match token {
+        "any" | "or" => Some(PredicateGroupMode::Any),
+        "all" | "and" => Some(PredicateGroupMode::All),
+        "one" | "xor" | "exactly_one" => Some(PredicateGroupMode::ExactlyOne),
+        _ => None,
+    }
+}
+
+fn split_group_mode_prefix(value: &str) -> Option<(PredicateGroupMode, &str)> {
+    let trimmed = value.trim();
+    let Some((prefix, rest)) = trimmed.split_once(';') else {
+        return Some((PredicateGroupMode::Any, trimmed));
+    };
+    let Some(mode_token) = prefix.trim().strip_prefix("mode=") else {
+        return None;
+    };
+    let mode = predicate_group_mode(mode_token.trim())?;
+    Some((mode, rest.trim()))
+}
+
+fn combine_group_clauses(clauses: Vec<String>, mode: PredicateGroupMode) -> String {
+    if clauses.is_empty() {
+        return "(FALSE)".to_string();
+    }
+
+    match mode {
+        PredicateGroupMode::Any => format!("({})", clauses.join(" OR ")),
+        PredicateGroupMode::All => format!("({})", clauses.join(" AND ")),
+        PredicateGroupMode::ExactlyOne => {
+            let sum = clauses
+                .into_iter()
+                .map(|clause| format!("(CASE WHEN {} THEN 1 ELSE 0 END)", clause))
+                .collect::<Vec<_>>()
+                .join(" + ");
+            format!("(({}) = 1)", sum)
+        }
+    }
+}
+
+fn focus_quality_threshold_criteria(
+    value: &str,
+) -> Option<(PredicateGroupMode, Vec<(&'static str, u8)>)> {
     let trimmed = value.trim();
     if trimmed.is_empty() || !trimmed.contains('=') {
         return None;
     }
+    let (mode, criteria_value) = split_group_mode_prefix(trimmed)?;
 
     let mut criteria = Vec::new();
-    for token in trimmed.split(',') {
+    for token in criteria_value.split(',') {
         let token = token.trim();
         if token.is_empty() {
             continue;
@@ -3162,7 +3232,7 @@ fn focus_quality_threshold_criteria(value: &str) -> Option<Vec<(&'static str, u8
     if criteria.is_empty() {
         None
     } else {
-        Some(criteria)
+        Some((mode, criteria))
     }
 }
 
@@ -3190,16 +3260,12 @@ fn focus_quality_between_sql(column: &str, start: u8, end: u8) -> Option<String>
 
 fn focus_quality_predicate_sql(p: &QueryPredicate) -> String {
     if let Some(value) = p.value.as_deref() {
-        if let Some(criteria) = focus_quality_threshold_criteria(value) {
+        if let Some((mode, criteria)) = focus_quality_threshold_criteria(value) {
             let clauses = criteria
                 .into_iter()
                 .filter_map(|(column, bucket)| focus_quality_compare_sql(column, "gte", bucket))
                 .collect::<Vec<_>>();
-            return if clauses.is_empty() {
-                "(FALSE)".to_string()
-            } else {
-                format!("({})", clauses.join(" OR "))
-            };
+            return combine_group_clauses(clauses, mode);
         }
     }
 
@@ -3244,6 +3310,72 @@ fn focus_quality_predicate_sql(p: &QueryPredicate) -> String {
         }
         _ => "(FALSE)".to_string(),
     }
+}
+
+fn face_quality_column_for_metric(metric: &str) -> Option<&'static str> {
+    match metric {
+        "best" | "face" => Some("face_quality_best"),
+        "average" | "avg" => Some("face_quality_average"),
+        "lowest" | "min" | "minimum" => Some("face_quality_min"),
+        _ => None,
+    }
+}
+
+fn face_quality_threshold_criteria(
+    value: &str,
+) -> Option<(PredicateGroupMode, Vec<(&'static str, u8)>)> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || !trimmed.contains('=') {
+        return None;
+    }
+    let (mode, criteria_value) = split_group_mode_prefix(trimmed)?;
+
+    let mut criteria = Vec::new();
+    for token in criteria_value.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let mut parts = token.splitn(2, '=');
+        let metric = parts.next()?.trim();
+        let threshold = parts.next()?.trim().parse::<u8>().ok()?;
+        if threshold > 100 {
+            return None;
+        }
+        let column = face_quality_column_for_metric(metric)?;
+        if !criteria.iter().any(|(existing, _)| existing == &column) {
+            criteria.push((column, threshold));
+        }
+    }
+
+    if criteria.is_empty() {
+        None
+    } else {
+        Some((mode, criteria))
+    }
+}
+
+fn face_quality_compare_sql(column: &str, percent: u8) -> String {
+    let threshold = f64::from(percent) / 100.0;
+    format!(
+        "({column} IS NOT NULL AND {column} >= {threshold})",
+        column = column,
+        threshold = threshold
+    )
+}
+
+fn face_quality_predicate_sql(p: &QueryPredicate) -> String {
+    let Some(value) = p.value.as_deref() else {
+        return "(FALSE)".to_string();
+    };
+    let Some((mode, criteria)) = face_quality_threshold_criteria(value) else {
+        return "(FALSE)".to_string();
+    };
+    let clauses = criteria
+        .into_iter()
+        .map(|(column, percent)| face_quality_compare_sql(column, percent))
+        .collect::<Vec<_>>();
+    combine_group_clauses(clauses, mode)
 }
 
 /// SQL for a connector. XOR is boolean inequality (`<>`) — exactly-one-true.
@@ -3550,6 +3682,12 @@ fn predicate_to_sql(p: &QueryPredicate) -> String {
         "focus_num" => numeric_predicate_sql(p, "focus_score"),
         "focus_quality" => focus_quality_predicate_sql(p),
         "people_count" => people_count_predicate_sql(p),
+        "face_quality" => face_quality_predicate_sql(p),
+        "face_quality_best_num" => numeric_predicate_sql(p, "face_quality_best"),
+        "face_quality_average_num" => numeric_predicate_sql(p, "face_quality_average"),
+        "face_quality_min_num" => numeric_predicate_sql(p, "face_quality_min"),
+        "eyes_open_count_num" => numeric_predicate_sql(p, "face_eyes_open_count"),
+        "blink_risk_count_num" => numeric_predicate_sql(p, "face_blink_risk_count"),
         // Video numeric subjects (S75) — same machinery, new columns. Duration
         // is seconds (DOUBLE); frame_rate is fps (DOUBLE). A NULL column (a
         // still) never matches, exactly like the exposure numerics above.
@@ -4824,8 +4962,13 @@ pub async fn distinct_numeric_values(field: String) -> Vec<f64> {
         "focal_length" => "focal_length",
         "focus_score" => "focus_score", // S76 — Focus Quality subject dropdown
         "face_count" => "face_count",   // Vision enrichment — People Present subject
+        "face_quality_best" => "face_quality_best",
+        "face_quality_average" => "face_quality_average",
+        "face_quality_min" => "face_quality_min",
+        "face_eyes_open_count" => "face_eyes_open_count",
+        "face_blink_risk_count" => "face_blink_risk_count",
         "duration_seconds" => "duration_seconds", // S75 — Duration subject dropdown
-        "frame_rate" => "frame_rate",   // S75 — Frame rate subject dropdown
+        "frame_rate" => "frame_rate",             // S75 — Frame rate subject dropdown
         other => {
             eprintln!("distinct_numeric_values: unknown field '{}'", other);
             return Vec::new();
@@ -5414,6 +5557,10 @@ fn face_count_is_valid(count: Option<i32>) -> bool {
         .unwrap_or(true)
 }
 
+fn face_quality_is_valid(score: Option<f64>) -> bool {
+    score.map(|score| score.is_finite()).unwrap_or(true)
+}
+
 fn sanitized_focus_result(mut result: FocusAnalysisResult) -> FocusAnalysisResult {
     let scores_are_valid = focus_score_is_valid(result.focus_score)
         && focus_score_is_valid(result.focus_human_score)
@@ -5433,6 +5580,11 @@ fn sanitized_focus_result(mut result: FocusAnalysisResult) -> FocusAnalysisResul
         || !scores_are_valid
         || !basis_is_valid
         || !face_count_is_valid(result.face_count)
+        || !face_quality_is_valid(result.face_quality_best)
+        || !face_quality_is_valid(result.face_quality_average)
+        || !face_quality_is_valid(result.face_quality_min)
+        || !face_count_is_valid(result.face_eyes_open_count)
+        || !face_count_is_valid(result.face_blink_risk_count)
         || !complete_has_score
     {
         eprintln!(
@@ -5449,6 +5601,11 @@ fn sanitized_focus_result(mut result: FocusAnalysisResult) -> FocusAnalysisResul
         result.focus_animal_pose_score = None;
         result.focus_whole_image_score = None;
         result.face_count = None;
+        result.face_quality_best = None;
+        result.face_quality_average = None;
+        result.face_quality_min = None;
+        result.face_eyes_open_count = None;
+        result.face_blink_risk_count = None;
         result.auto_keywords.clear();
     }
 
@@ -5732,6 +5889,31 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
             None
         };
         let face_count = if is_complete { result.face_count } else { None };
+        let face_quality_best = if is_complete {
+            result.face_quality_best
+        } else {
+            None
+        };
+        let face_quality_average = if is_complete {
+            result.face_quality_average
+        } else {
+            None
+        };
+        let face_quality_min = if is_complete {
+            result.face_quality_min
+        } else {
+            None
+        };
+        let face_eyes_open_count = if is_complete {
+            result.face_eyes_open_count
+        } else {
+            None
+        };
+        let face_blink_risk_count = if is_complete {
+            result.face_blink_risk_count
+        } else {
+            None
+        };
         let basis = result.focus_basis.unwrap_or_else(|| "unknown".to_string());
 
         match conn.execute(
@@ -5748,7 +5930,12 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
                  focus_analysis_status = ?11,
                  focus_analysis_attempt_id = ?12,
                  focus_scored_at = CURRENT_TIMESTAMP,
-                 face_count = ?13
+                 face_count = ?13,
+                 face_quality_best = ?14,
+                 face_quality_average = ?15,
+                 face_quality_min = ?16,
+                 face_eyes_open_count = ?17,
+                 face_blink_risk_count = ?18
              WHERE id = ?1",
             params![
                 result.id,
@@ -5764,6 +5951,11 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
                 result.status,
                 result.analysis_run_id,
                 face_count,
+                face_quality_best,
+                face_quality_average,
+                face_quality_min,
+                face_eyes_open_count,
+                face_blink_risk_count,
             ],
         ) {
             Ok(n) => {
@@ -7914,6 +8106,26 @@ mod keyword_tests {
             predicate_to_sql(&num("focus_num", "gte", 120.0, None)),
             "(focus_score >= 120)"
         );
+        assert_eq!(
+            predicate_to_sql(&num("face_quality_best_num", "gte", 0.7, None)),
+            "(face_quality_best >= 0.7)"
+        );
+        assert_eq!(
+            predicate_to_sql(&num("face_quality_average_num", "lte", 0.5, None)),
+            "(face_quality_average <= 0.5)"
+        );
+        assert_eq!(
+            predicate_to_sql(&num("face_quality_min_num", "between", 0.2, Some(0.9))),
+            "(face_quality_min BETWEEN 0.2 AND 0.9)"
+        );
+        assert_eq!(
+            predicate_to_sql(&num("eyes_open_count_num", "gte", 2.0, None)),
+            "(face_eyes_open_count >= 2)"
+        );
+        assert_eq!(
+            predicate_to_sql(&num("blink_risk_count_num", "lte", 0.0, None)),
+            "(face_blink_risk_count <= 0)"
+        );
         assert!(predicate_to_sql(&num("focus_quality", "gte", 8.0, None))
             .contains("quantile_cont(score, 0.7)"));
         assert!(
@@ -7928,6 +8140,22 @@ mod keyword_tests {
         assert!(per_basis_sql.contains("quantile_cont(score, 0.6)"));
         assert!(per_basis_sql.contains("focus_whole_image_score IS NOT NULL"));
         assert!(per_basis_sql.contains("quantile_cont(score, 0.2)"));
+        let mut all_basis_focus = num("focus_quality", "gte", 0.0, None);
+        all_basis_focus.num = None;
+        all_basis_focus.value = Some("mode=all;human_face=7,whole_image=3".to_string());
+        let all_basis_sql = predicate_to_sql(&all_basis_focus);
+        assert!(all_basis_sql.contains(" AND "));
+        let mut one_basis_focus = num("focus_quality", "gte", 0.0, None);
+        one_basis_focus.num = None;
+        one_basis_focus.value = Some("mode=one;human_face=7,whole_image=3".to_string());
+        assert!(predicate_to_sql(&one_basis_focus).contains("= 1"));
+        let mut face_quality = num("face_quality", "gte", 0.0, None);
+        face_quality.num = None;
+        face_quality.value = Some("mode=all;best=70,lowest=40".to_string());
+        assert_eq!(
+            predicate_to_sql(&face_quality),
+            "((face_quality_best IS NOT NULL AND face_quality_best >= 0.7) AND (face_quality_min IS NOT NULL AND face_quality_min >= 0.4))"
+        );
         assert_eq!(
             predicate_to_sql(&num("focus_quality", "gte", 80.5, None)),
             "(FALSE)"
