@@ -3745,6 +3745,27 @@ fn build_filter_predicate(predicates: &[QueryPredicate], connectors: &[Connector
     format!("({})", acc)
 }
 
+/// Compose a normal Query Builder sentence with an independent gallery scope
+/// (Sources/Dates). The flat `connectors` array is intentionally left-to-right,
+/// so appending scope predicates directly would let OR clauses leak out of the
+/// selected sidebar scope. Keep the two groups parenthesized and AND them here.
+fn build_scoped_filter_predicate(
+    predicates: &[QueryPredicate],
+    connectors: &[Connector],
+    scope_predicates: &[QueryPredicate],
+    scope_connectors: &[Connector],
+) -> String {
+    let filter = build_filter_predicate(predicates, connectors);
+    let scope = build_filter_predicate(scope_predicates, scope_connectors);
+
+    match (filter.is_empty(), scope.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => filter,
+        (true, false) => scope,
+        (false, false) => format!("({}) AND ({})", filter, scope),
+    }
+}
+
 /// The Browse default row order: capture date newest-first. Used for the empty
 /// filter and for any first-subject that doesn't define its own order.
 const DEFAULT_FILTER_ORDER_BY: &str = "capture_datetime DESC NULLS LAST, created_timestamp DESC";
@@ -3839,6 +3860,92 @@ pub async fn count_query_images(
     };
 
     let where_clause = build_filter_predicate(&predicates, &connectors);
+
+    let count = execute_image_count_query(
+        conn,
+        &where_clause,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+        media_type,
+    );
+
+    if count < 0 {
+        0
+    } else {
+        count as u64
+    }
+}
+
+/// Gallery Query Builder inside the currently viewed Sources/Dates scope.
+/// Browse deliberately keeps using `query_images`; this variant exists because
+/// Gallery needs `(query sentence) AND (sidebar scope)` grouping, which the flat
+/// left-to-right connector model cannot express safely when either side has ORs.
+pub async fn query_images_scoped(
+    predicates: Vec<QueryPredicate>,
+    connectors: Vec<Connector>,
+    scope_predicates: Vec<QueryPredicate>,
+    scope_connectors: Vec<Connector>,
+    limit: u32,
+    offset: u32,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+    media_type: MediaType,
+) -> Vec<ImageRecord> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let where_clause = build_scoped_filter_predicate(
+        &predicates,
+        &connectors,
+        &scope_predicates,
+        &scope_connectors,
+    );
+    let order_by = order_by_for_filter(&predicates);
+
+    execute_image_record_query(
+        conn,
+        &where_clause,
+        order_by,
+        limit as i64,
+        offset as i64,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+        media_type,
+    )
+}
+
+/// Count counterpart for `query_images_scoped`; uses the exact same WHERE
+/// assembly so page/count parity holds.
+pub async fn count_query_images_scoped(
+    predicates: Vec<QueryPredicate>,
+    connectors: Vec<Connector>,
+    scope_predicates: Vec<QueryPredicate>,
+    scope_connectors: Vec<Connector>,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+    media_type: MediaType,
+) -> u64 {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    let where_clause = build_scoped_filter_predicate(
+        &predicates,
+        &connectors,
+        &scope_predicates,
+        &scope_connectors,
+    );
 
     let count = execute_image_count_query(
         conn,
@@ -9387,6 +9494,12 @@ mod query_builder_tests {
         p
     }
 
+    fn value_pred(kind: &str, value: &str) -> QueryPredicate {
+        let mut p = qp(kind);
+        p.value = Some(value.to_string());
+        p
+    }
+
     fn color(value: &str) -> QueryPredicate {
         let mut p = qp("color");
         p.value = Some(value.to_string());
@@ -9547,6 +9660,33 @@ mod query_builder_tests {
     #[test]
     fn empty_predicates_no_where() {
         assert_eq!(build_filter_predicate(&[], &[]), "");
+    }
+
+    #[test]
+    fn scoped_filter_keeps_query_and_sidebar_groups_separate() {
+        let query = vec![rating("gte", 4), flag("pick")];
+        let query_connectors = vec![Connector::Or];
+        let scope = vec![
+            value_pred("path_prefix", "/Photos/A/"),
+            value_pred("path_prefix", "/Photos/B/"),
+        ];
+        let scope_connectors = vec![Connector::Or];
+
+        let scoped = build_scoped_filter_predicate(
+            &query,
+            &query_connectors,
+            &scope,
+            &scope_connectors,
+        );
+
+        assert_eq!(
+            scoped,
+            format!(
+                "({}) AND ({})",
+                build_filter_predicate(&query, &query_connectors),
+                build_filter_predicate(&scope, &scope_connectors)
+            )
+        );
     }
 
     #[test]

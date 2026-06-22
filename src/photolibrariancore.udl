@@ -94,6 +94,34 @@ namespace photolibrariancore {
         MediaType media_type
     );
 
+    // Gallery Query Builder scoped by the current Sources/Dates selection.
+    // Keeps Browse on query_images while Gallery can express:
+    //   (query sentence) AND (sidebar scope)
+    // without OR clauses leaking across the flat connector model.
+    [Async]
+    sequence<ImageRecord> query_images_scoped(
+        sequence<QueryPredicate> predicates,
+        sequence<Connector> connectors,
+        sequence<QueryPredicate> scope_predicates,
+        sequence<Connector> scope_connectors,
+        u32 limit,
+        u32 offset,
+        boolean apply_duplicate_filter,
+        boolean apply_raw_jpeg_collapse,
+        MediaType media_type
+    );
+
+    [Async]
+    u64 count_query_images_scoped(
+        sequence<QueryPredicate> predicates,
+        sequence<Connector> connectors,
+        sequence<QueryPredicate> scope_predicates,
+        sequence<Connector> scope_connectors,
+        boolean apply_duplicate_filter,
+        boolean apply_raw_jpeg_collapse,
+        MediaType media_type
+    );
+
     // Browse multi-select (Session 44). query_image_ids returns the IDs of
     // every row matching the filter (⌘A "select the whole query");
     // get_images_by_ids resolves a selection (any IDs, cross-page or whole-

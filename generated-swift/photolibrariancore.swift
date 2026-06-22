@@ -3406,6 +3406,21 @@ public func countQueryImages(predicates: [QueryPredicate], connectors: [Connecto
             
         )
 }
+public func countQueryImagesScoped(predicates: [QueryPredicate], connectors: [Connector], scopePredicates: [QueryPredicate], scopeConnectors: [Connector], applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, mediaType: MediaType)async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_count_query_images_scoped(FfiConverterSequenceTypeQueryPredicate.lower(predicates),FfiConverterSequenceTypeConnector.lower(connectors),FfiConverterSequenceTypeQueryPredicate.lower(scopePredicates),FfiConverterSequenceTypeConnector.lower(scopeConnectors),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse),FfiConverterTypeMediaType_lower(mediaType)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func createAnalysisJob(jobKind: String, scopeKind: String, scopeValue: String?, algorithmVersion: String, analysisRunId: String, totalCandidateCount: UInt64)async  -> AnalysisJob?  {
     return
         try!  await uniffiRustCallAsync(
@@ -4055,6 +4070,21 @@ public func queryImages(predicates: [QueryPredicate], connectors: [Connector], l
             
         )
 }
+public func queryImagesScoped(predicates: [QueryPredicate], connectors: [Connector], scopePredicates: [QueryPredicate], scopeConnectors: [Connector], limit: UInt32, offset: UInt32, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, mediaType: MediaType)async  -> [ImageRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_query_images_scoped(FfiConverterSequenceTypeQueryPredicate.lower(predicates),FfiConverterSequenceTypeConnector.lower(connectors),FfiConverterSequenceTypeQueryPredicate.lower(scopePredicates),FfiConverterSequenceTypeConnector.lower(scopeConnectors),FfiConverterUInt32.lower(limit),FfiConverterUInt32.lower(offset),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse),FfiConverterTypeMediaType_lower(mediaType)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeImageRecord.lift,
+            errorHandler: nil
+            
+        )
+}
 public func recoverInterruptedAnalysisJobs(jobKind: String, terminalStatus: String, lastError: String?)async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
@@ -4431,6 +4461,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_count_query_images() != 13157) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_count_query_images_scoped() != 33427) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_create_analysis_job() != 35443) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4564,6 +4597,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_query_images() != 21638) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_query_images_scoped() != 46785) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_recover_interrupted_analysis_jobs() != 41065) {

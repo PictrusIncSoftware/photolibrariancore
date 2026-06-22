@@ -295,6 +295,11 @@ uint64_t uniffi_photolibrariancore_fn_func_copy_keyword_rows_for_image_pairs(Rus
 uint64_t uniffi_photolibrariancore_fn_func_count_query_images(RustBuffer predicates, RustBuffer connectors, int8_t apply_duplicate_filter, int8_t apply_raw_jpeg_collapse, RustBuffer media_type
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_COUNT_QUERY_IMAGES_SCOPED
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_COUNT_QUERY_IMAGES_SCOPED
+uint64_t uniffi_photolibrariancore_fn_func_count_query_images_scoped(RustBuffer predicates, RustBuffer connectors, RustBuffer scope_predicates, RustBuffer scope_connectors, int8_t apply_duplicate_filter, int8_t apply_raw_jpeg_collapse, RustBuffer media_type
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_CREATE_ANALYSIS_JOB
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_CREATE_ANALYSIS_JOB
 uint64_t uniffi_photolibrariancore_fn_func_create_analysis_job(RustBuffer job_kind, RustBuffer scope_kind, RustBuffer scope_value, RustBuffer algorithm_version, RustBuffer analysis_run_id, uint64_t total_candidate_count
@@ -527,6 +532,11 @@ uint64_t uniffi_photolibrariancore_fn_func_query_image_ids(RustBuffer predicates
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_QUERY_IMAGES
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_QUERY_IMAGES
 uint64_t uniffi_photolibrariancore_fn_func_query_images(RustBuffer predicates, RustBuffer connectors, uint32_t limit, uint32_t offset, int8_t apply_duplicate_filter, int8_t apply_raw_jpeg_collapse, RustBuffer media_type
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_QUERY_IMAGES_SCOPED
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_QUERY_IMAGES_SCOPED
+uint64_t uniffi_photolibrariancore_fn_func_query_images_scoped(RustBuffer predicates, RustBuffer connectors, RustBuffer scope_predicates, RustBuffer scope_connectors, uint32_t limit, uint32_t offset, int8_t apply_duplicate_filter, int8_t apply_raw_jpeg_collapse, RustBuffer media_type
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_RECOVER_INTERRUPTED_ANALYSIS_JOBS
@@ -959,6 +969,12 @@ uint16_t uniffi_photolibrariancore_checksum_func_count_query_images(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_COUNT_QUERY_IMAGES_SCOPED
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_COUNT_QUERY_IMAGES_SCOPED
+uint16_t uniffi_photolibrariancore_checksum_func_count_query_images_scoped(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_CREATE_ANALYSIS_JOB
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_CREATE_ANALYSIS_JOB
 uint16_t uniffi_photolibrariancore_checksum_func_create_analysis_job(void
@@ -1226,6 +1242,12 @@ uint16_t uniffi_photolibrariancore_checksum_func_query_image_ids(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_QUERY_IMAGES
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_QUERY_IMAGES
 uint16_t uniffi_photolibrariancore_checksum_func_query_images(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_QUERY_IMAGES_SCOPED
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_QUERY_IMAGES_SCOPED
+uint16_t uniffi_photolibrariancore_checksum_func_query_images_scoped(void
     
 );
 #endif
