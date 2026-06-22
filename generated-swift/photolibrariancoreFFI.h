@@ -487,6 +487,11 @@ uint64_t uniffi_photolibrariancore_fn_func_keyword_vocabulary(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_KEYWORD_VOCABULARY_FOR_ORIGIN
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_KEYWORD_VOCABULARY_FOR_ORIGIN
+uint64_t uniffi_photolibrariancore_fn_func_keyword_vocabulary_for_origin(RustBuffer origin
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_KEYWORDS_FOR_IMAGE
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_KEYWORDS_FOR_IMAGE
 uint64_t uniffi_photolibrariancore_fn_func_keywords_for_image(int64_t image_id
@@ -1188,6 +1193,12 @@ uint16_t uniffi_photolibrariancore_checksum_func_keyword_labels(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_KEYWORD_VOCABULARY
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_KEYWORD_VOCABULARY
 uint16_t uniffi_photolibrariancore_checksum_func_keyword_vocabulary(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_KEYWORD_VOCABULARY_FOR_ORIGIN
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_KEYWORD_VOCABULARY_FOR_ORIGIN
+uint16_t uniffi_photolibrariancore_checksum_func_keyword_vocabulary_for_origin(void
     
 );
 #endif

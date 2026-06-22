@@ -3947,6 +3947,21 @@ public func keywordVocabulary()async  -> [KeywordNode]  {
             
         )
 }
+public func keywordVocabularyForOrigin(origin: String)async  -> [KeywordNode]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_keyword_vocabulary_for_origin(FfiConverterString.lower(origin)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeKeywordNode.lift,
+            errorHandler: nil
+            
+        )
+}
 public func keywordsForImage(imageId: Int64)async  -> [KeywordRow]  {
     return
         try!  await uniffiRustCallAsync(
@@ -4574,6 +4589,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_keyword_vocabulary() != 50955) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_keyword_vocabulary_for_origin() != 1581) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_keywords_for_image() != 32244) {

@@ -248,6 +248,9 @@ namespace photolibrariancore {
     sequence<KeywordNode> keyword_vocabulary();
 
     [Async]
+    sequence<KeywordNode> keyword_vocabulary_for_origin(string origin);
+
+    [Async]
     sequence<KeywordRow> hidden_keywords_for_image(i64 image_id);
 
     // ---- Collections (the `collection` switch on the keyword row) ----

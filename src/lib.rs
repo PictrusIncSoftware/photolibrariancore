@@ -4651,26 +4651,31 @@ pub async fn keywords_for_image(image_id: i64) -> Vec<KeywordRow> {
     }
 }
 
-/// The DISTINCT (label, path) keyword vocabulary over the active view — for the
-/// assignment-panel autocomplete and (future) tree browser. Ordered by path.
-pub async fn keyword_vocabulary() -> Vec<KeywordNode> {
-    let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref() {
-        Some(c) => c,
-        None => {
-            eprintln!("Catalogue not initialized");
+fn keyword_vocabulary_origin_where(origin: &str) -> Option<&'static str> {
+    match origin {
+        "both" | "" => Some(""),
+        "user" => Some(" WHERE (origin & 1) <> 0"),
+        "auto" => Some(" WHERE (origin & 2) <> 0"),
+        _ => None,
+    }
+}
+
+fn keyword_vocabulary_impl(conn: &Connection, origin: &str) -> Vec<KeywordNode> {
+    let Some(where_clause) = keyword_vocabulary_origin_where(origin) else {
+        return Vec::new();
+    };
+    let sql = format!(
+        "SELECT DISTINCT label, path FROM keyword_visible{} ORDER BY path",
+        where_clause
+    );
+
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("keyword_vocabulary: prepare {}", e);
             return Vec::new();
         }
     };
-
-    let mut stmt =
-        match conn.prepare("SELECT DISTINCT label, path FROM keyword_visible ORDER BY path") {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("keyword_vocabulary: prepare {}", e);
-                return Vec::new();
-            }
-        };
 
     let mapped = stmt.query_map([], |row| {
         Ok(KeywordNode {
@@ -4686,6 +4691,36 @@ pub async fn keyword_vocabulary() -> Vec<KeywordNode> {
             Vec::new()
         }
     }
+}
+
+/// The DISTINCT (label, path) keyword vocabulary over the active view — for the
+/// assignment-panel autocomplete and (future) tree browser. Ordered by path.
+pub async fn keyword_vocabulary() -> Vec<KeywordNode> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    keyword_vocabulary_impl(conn, "both")
+}
+
+/// Provenance-filtered keyword vocabulary for Query Builder keyword predicates.
+/// `both` deliberately means all active keyword rows, not only origin == 3.
+pub async fn keyword_vocabulary_for_origin(origin: String) -> Vec<KeywordNode> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    keyword_vocabulary_impl(conn, origin.as_str())
 }
 
 /// Distinct VISIBLE keyword labels (case-sensitive, alphabetical) — the source for
@@ -7631,6 +7666,40 @@ mod keyword_tests {
             keyword_image_id_in_list(&[5, 9, 12]),
             Some("image_id IN (5, 9, 12)".to_string())
         );
+    }
+
+    #[test]
+    fn keyword_vocabulary_filters_by_origin() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE keyword (
+                 image_id INTEGER NOT NULL,
+                 label TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 status INTEGER NOT NULL DEFAULT 1,
+                 origin INTEGER NOT NULL DEFAULT 1,
+                 color BOOLEAN NOT NULL DEFAULT FALSE
+             );
+             CREATE VIEW keyword_visible AS SELECT * FROM keyword WHERE status = 1;
+             INSERT INTO keyword (image_id, label, path, status, origin) VALUES
+                 (1, 'manual', 'manual', 1, 1),
+                 (2, 'automatic', 'automatic', 1, 2),
+                 (3, 'shared', 'shared', 1, 3),
+                 (4, 'hidden', 'hidden', 0, 2);",
+        )
+        .expect("schema + seed");
+
+        let labels = |origin: &str| {
+            keyword_vocabulary_impl(&conn, origin)
+                .into_iter()
+                .map(|node| node.label)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(labels("both"), vec!["automatic", "manual", "shared"]);
+        assert_eq!(labels("user"), vec!["manual", "shared"]);
+        assert_eq!(labels("auto"), vec!["automatic", "shared"]);
+        assert!(labels("bogus").is_empty());
     }
 
     #[test]
