@@ -209,6 +209,36 @@ pub struct FocusAnalysisCandidate {
     pub file_size: u64,
 }
 
+/// One still-image row eligible for similar-photo grouping.
+///
+/// Similar grouping is computed in Swift because Vision owns the feature-print
+/// observations. The core supplies a narrow, ordered candidate carrier so the
+/// app does not need to lift full ImageRecord rows just to read paths.
+#[derive(Debug, Clone)]
+pub struct SimilarPhotoCandidate {
+    pub id: i64,
+    pub file_path: String,
+    pub file_size: u64,
+    pub created_timestamp: i64,
+    pub capture_datetime: Option<String>,
+    pub directory_path: Option<String>,
+}
+
+/// One durable similar-photo stack membership row.
+///
+/// The current production representation stores only group membership, not the
+/// Vision feature vector. A row exists only for photos that belong to a
+/// multi-photo group; singletons have no membership row.
+#[derive(Debug, Clone)]
+pub struct SimilarPhotoGroupMember {
+    pub image_id: i64,
+    pub group_id: i64,
+    pub representative_id: i64,
+    pub member_rank: u32,
+    pub distance_to_representative: Option<f64>,
+    pub threshold: f64,
+}
+
 /// One focus-analysis writeback row.
 ///
 /// `status` is an allow-listed token owned by the analyzer:
@@ -914,6 +944,26 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
 
         CREATE INDEX IF NOT EXISTS idx_analysis_jobs_kind_status ON analysis_jobs(job_kind, status);
         CREATE INDEX IF NOT EXISTS idx_analysis_jobs_run_id ON analysis_jobs(analysis_run_id);
+
+        -- === Similar-photo grouping (Intelligent Culling, S94) ===
+        -- Vision feature-print comparison runs in Swift, then writes only durable
+        -- group membership here. Singletons have no row. `group_id` is the
+        -- representative image id, which keeps groups stable and readable without
+        -- a separate sequence/table for v1.
+        CREATE TABLE IF NOT EXISTS similar_photo_group_member (
+            image_id INTEGER PRIMARY KEY,
+            group_id INTEGER NOT NULL,
+            representative_id INTEGER NOT NULL,
+            member_rank INTEGER NOT NULL,
+            distance_to_representative DOUBLE,
+            algorithm_version TEXT NOT NULL,
+            threshold DOUBLE NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_similar_photo_group ON similar_photo_group_member(group_id);
+        CREATE INDEX IF NOT EXISTS idx_similar_photo_rep ON similar_photo_group_member(representative_id);
+        CREATE INDEX IF NOT EXISTS idx_similar_photo_algorithm ON similar_photo_group_member(algorithm_version);
 
         -- === Keyword system (Session 45; Docs/DESIGN-Keyword-System.md) ===
         -- Hierarchical keywords in ONE table. Each applied keyword PATH is
@@ -6178,6 +6228,237 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
     updated
 }
 
+fn similar_photo_candidates_impl(
+    conn: &Connection,
+    algorithm_version: &str,
+    scoped_ids: Option<&[i64]>,
+) -> Vec<SimilarPhotoCandidate> {
+    let id_filter = match scoped_ids {
+        Some(ids) => match id_in_list(ids) {
+            Some(filter) => Some(filter),
+            None => return Vec::new(),
+        },
+        None => None,
+    };
+
+    let mut predicates = vec![
+        "is_video IS NOT TRUE".to_string(),
+        "focus_analysis_status = 'complete'".to_string(),
+        "focus_algorithm_version = ?1".to_string(),
+    ];
+    if let Some(filter) = id_filter {
+        predicates.push(format!("({})", filter));
+    }
+
+    let sql = format!(
+        "SELECT id, file_path, file_size, created_timestamp, capture_datetime, directory_path
+         FROM images
+         WHERE {}
+         ORDER BY directory_path ASC NULLS LAST,
+                  capture_datetime ASC NULLS LAST,
+                  created_timestamp ASC,
+                  id ASC",
+        predicates.join(" AND ")
+    );
+
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("similar_photo_candidates: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mapped = stmt.query_map(params![algorithm_version], |row| {
+        Ok(SimilarPhotoCandidate {
+            id: row.get(0)?,
+            file_path: row.get(1)?,
+            file_size: row.get::<_, i64>(2)? as u64,
+            created_timestamp: row.get(3)?,
+            capture_datetime: row.get(4)?,
+            directory_path: row.get(5)?,
+        })
+    });
+
+    match mapped {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            eprintln!("similar_photo_candidates: query {}", e);
+            Vec::new()
+        }
+    }
+}
+
+/// Candidate rows for similar-photo grouping across the full catalogue. Rows are
+/// limited to stills whose current Intelligent Culling pass completed for the
+/// supplied algorithm version.
+pub async fn similar_photo_candidates(algorithm_version: String) -> Vec<SimilarPhotoCandidate> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    similar_photo_candidates_impl(conn, &algorithm_version, None)
+}
+
+/// Candidate rows for similar-photo grouping intersected with an explicit image
+/// selection. Empty selection means empty queue.
+pub async fn similar_photo_candidates_for_ids(
+    ids: Vec<i64>,
+    algorithm_version: String,
+) -> Vec<SimilarPhotoCandidate> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    similar_photo_candidates_impl(conn, &algorithm_version, Some(&ids))
+}
+
+fn similar_photo_member_is_valid(member: &SimilarPhotoGroupMember) -> bool {
+    member.image_id > 0
+        && member.group_id > 0
+        && member.representative_id > 0
+        && member.threshold.is_finite()
+        && member.threshold >= 0.0
+        && member
+            .distance_to_representative
+            .map(|distance| distance.is_finite() && distance >= 0.0)
+            .unwrap_or(true)
+}
+
+fn replace_similar_photo_groups_impl(
+    conn: &Connection,
+    members: Vec<SimilarPhotoGroupMember>,
+    algorithm_version: &str,
+    scoped_ids: Option<&[i64]>,
+) -> u64 {
+    let algorithm_version = algorithm_version.trim();
+    if algorithm_version.is_empty() {
+        eprintln!("replace_similar_photo_groups: empty algorithm version");
+        return 0;
+    }
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
+        eprintln!("replace_similar_photo_groups: begin {}", e);
+        return 0;
+    }
+
+    let delete_result = match scoped_ids {
+        Some(ids) => match id_in_list(ids) {
+            Some(filter) => {
+                let sql = format!("DELETE FROM similar_photo_group_member WHERE image_id IN (SELECT id FROM images WHERE {})", filter);
+                conn.execute(&sql, [])
+            }
+            None => Ok(0),
+        },
+        None => conn.execute(
+            "DELETE FROM similar_photo_group_member WHERE algorithm_version = ?1",
+            params![algorithm_version],
+        ),
+    };
+
+    if let Err(e) = delete_result {
+        eprintln!("replace_similar_photo_groups: delete {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return 0;
+    }
+
+    let mut inserted = 0u64;
+    for member in members {
+        if !similar_photo_member_is_valid(&member) {
+            eprintln!(
+                "replace_similar_photo_groups: skipped invalid member image_id={}",
+                member.image_id
+            );
+            continue;
+        }
+
+        match conn.execute(
+            "INSERT INTO similar_photo_group_member (
+                 image_id, group_id, representative_id, member_rank,
+                 distance_to_representative, algorithm_version, threshold
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                member.image_id,
+                member.group_id,
+                member.representative_id,
+                member.member_rank as i64,
+                member.distance_to_representative,
+                algorithm_version,
+                member.threshold,
+            ],
+        ) {
+            Ok(n) => inserted += n as u64,
+            Err(e) => {
+                eprintln!(
+                    "replace_similar_photo_groups: insert image_id={} failed: {}",
+                    member.image_id, e
+                );
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
+            }
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;") {
+        eprintln!("replace_similar_photo_groups: commit {}", e);
+        return 0;
+    }
+
+    inserted
+}
+
+/// Replace all similar-photo group memberships for the supplied algorithm
+/// version. Used after whole-catalogue Intelligent Culling.
+pub async fn replace_similar_photo_groups(
+    members: Vec<SimilarPhotoGroupMember>,
+    algorithm_version: String,
+) -> u64 {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    replace_similar_photo_groups_impl(conn, members, &algorithm_version, None)
+}
+
+/// Replace similar-photo group memberships for an explicit image-id selection.
+/// Empty selection clears nothing and inserts nothing.
+pub async fn replace_similar_photo_groups_for_ids(
+    ids: Vec<i64>,
+    members: Vec<SimilarPhotoGroupMember>,
+    algorithm_version: String,
+) -> u64 {
+    if ids.is_empty() {
+        return 0;
+    }
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    replace_similar_photo_groups_impl(conn, members, &algorithm_version, Some(&ids))
+}
+
 /// Distinct collection names — labels carrying `collection = TRUE` on any row,
 /// read from the RAW `keyword` table (membership is independent of search
 /// visibility). The gallery "Select Collection" picker's autofill/dropdown —
@@ -7249,6 +7530,84 @@ mod focus_analysis_queue_tests {
             0
         );
         assert!(focus_analysis_candidates_impl(&conn, 500, "v2", "run-1", Some(&ids)).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod similar_photo_group_tests {
+    use super::*;
+    use duckdb::Connection;
+
+    fn setup() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE similar_photo_group_member (
+                image_id INTEGER PRIMARY KEY,
+                group_id INTEGER NOT NULL,
+                representative_id INTEGER NOT NULL,
+                member_rank INTEGER NOT NULL,
+                distance_to_representative DOUBLE,
+                algorithm_version TEXT NOT NULL,
+                threshold DOUBLE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO similar_photo_group_member
+                (image_id, group_id, representative_id, member_rank, distance_to_representative, algorithm_version, threshold)
+            VALUES
+                (1, 1, 1, 0, 0.0, 'old-v1', 2.35),
+                (9, 9, 9, 0, 0.0, 'other-v', 2.35);",
+        )
+        .expect("similar-photo DDL");
+        conn
+    }
+
+    #[test]
+    fn replace_similar_groups_replaces_only_target_algorithm() {
+        let conn = setup();
+        let members = vec![
+            SimilarPhotoGroupMember {
+                image_id: 2,
+                group_id: 2,
+                representative_id: 2,
+                member_rank: 0,
+                distance_to_representative: Some(0.0),
+                threshold: 2.35,
+            },
+            SimilarPhotoGroupMember {
+                image_id: 3,
+                group_id: 2,
+                representative_id: 2,
+                member_rank: 1,
+                distance_to_representative: Some(1.25),
+                threshold: 2.35,
+            },
+        ];
+
+        assert_eq!(
+            replace_similar_photo_groups_impl(&conn, members, "old-v1", None),
+            2
+        );
+
+        let rows: Vec<(i64, String)> = conn
+            .prepare(
+                "SELECT image_id, algorithm_version
+                 FROM similar_photo_group_member
+                 ORDER BY image_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+
+        assert_eq!(
+            rows,
+            vec![
+                (2, "old-v1".to_string()),
+                (3, "old-v1".to_string()),
+                (9, "other-v".to_string()),
+            ]
+        );
     }
 }
 

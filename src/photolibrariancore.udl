@@ -337,6 +337,20 @@ namespace photolibrariancore {
     [Async]
     u64 update_focus_analysis_results(sequence<FocusAnalysisResult> results);
 
+    // Similar-photo grouping (S94): Swift computes Vision feature-print groups
+    // after Intelligent Culling and persists only multi-photo memberships here.
+    [Async]
+    sequence<SimilarPhotoCandidate> similar_photo_candidates(string algorithm_version);
+
+    [Async]
+    sequence<SimilarPhotoCandidate> similar_photo_candidates_for_ids(sequence<i64> ids, string algorithm_version);
+
+    [Async]
+    u64 replace_similar_photo_groups(sequence<SimilarPhotoGroupMember> members, string algorithm_version);
+
+    [Async]
+    u64 replace_similar_photo_groups_for_ids(sequence<i64> ids, sequence<SimilarPhotoGroupMember> members, string algorithm_version);
+
     // Update the rotation angle for an image identified by file path
     // degrees: Rotation angle in degrees (0, 90, 180, or 270)
     // Returns true on success, false on failure
@@ -660,6 +674,24 @@ dictionary FocusAnalysisCandidate {
     i64 id;
     string file_path;
     u64 file_size;
+};
+
+dictionary SimilarPhotoCandidate {
+    i64 id;
+    string file_path;
+    u64 file_size;
+    i64 created_timestamp;
+    string? capture_datetime;
+    string? directory_path;
+};
+
+dictionary SimilarPhotoGroupMember {
+    i64 image_id;
+    i64 group_id;
+    i64 representative_id;
+    u32 member_rank;
+    f64? distance_to_representative;
+    f64 threshold;
 };
 
 dictionary FocusAnalysisResult {
