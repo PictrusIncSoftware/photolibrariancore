@@ -1582,15 +1582,17 @@ public struct KeywordRow: Equatable, Hashable {
     public var label: String
     public var path: String
     public var status: Int32
+    public var origin: Int32
     public var createdAt: String
     public var hiddenAt: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(label: String, path: String, status: Int32, createdAt: String, hiddenAt: String?) {
+    public init(label: String, path: String, status: Int32, origin: Int32, createdAt: String, hiddenAt: String?) {
         self.label = label
         self.path = path
         self.status = status
+        self.origin = origin
         self.createdAt = createdAt
         self.hiddenAt = hiddenAt
     }
@@ -1614,6 +1616,7 @@ public struct FfiConverterTypeKeywordRow: FfiConverterRustBuffer {
                 label: FfiConverterString.read(from: &buf), 
                 path: FfiConverterString.read(from: &buf), 
                 status: FfiConverterInt32.read(from: &buf), 
+                origin: FfiConverterInt32.read(from: &buf), 
                 createdAt: FfiConverterString.read(from: &buf), 
                 hiddenAt: FfiConverterOptionString.read(from: &buf)
         )
@@ -1623,6 +1626,7 @@ public struct FfiConverterTypeKeywordRow: FfiConverterRustBuffer {
         FfiConverterString.write(value.label, into: &buf)
         FfiConverterString.write(value.path, into: &buf)
         FfiConverterInt32.write(value.status, into: &buf)
+        FfiConverterInt32.write(value.origin, into: &buf)
         FfiConverterString.write(value.createdAt, into: &buf)
         FfiConverterOptionString.write(value.hiddenAt, into: &buf)
     }

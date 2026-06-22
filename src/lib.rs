@@ -931,6 +931,7 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             label TEXT NOT NULL,                -- this node's text (= last path segment)
             path TEXT NOT NULL,                 -- root->this node, U+001F-separated
             status INTEGER NOT NULL DEFAULT 1,  -- 1 = active, 0 = hidden (soft-delete)
+            origin INTEGER NOT NULL DEFAULT 1,  -- bitmask: 1 = user/import, 2 = auto-categorization, 3 = both
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             hidden_at TIMESTAMP,                -- set when status->0; NULL while active
             collection BOOLEAN NOT NULL DEFAULT FALSE,  -- Collections-panel membership; orthogonal to status (keyword search stays oblivious)
@@ -960,6 +961,15 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         -- them.
         ALTER TABLE keyword ADD COLUMN IF NOT EXISTS color BOOLEAN;
         UPDATE keyword SET color = FALSE WHERE color IS NULL;
+
+        -- Keyword provenance (S93): separate from `status`, which remains the
+        -- active/hidden switch. Bitmask: 1 = user/import-applied, 2 =
+        -- auto-categorization, 3 = both. Existing rows backfill user-origin;
+        -- development catalogues are normally rebuilt fresh, but this keeps the
+        -- schema reopen path total.
+        ALTER TABLE keyword ADD COLUMN IF NOT EXISTS origin INTEGER;
+        UPDATE keyword SET origin = 1 WHERE origin IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_keyword_origin ON keyword(origin);
 
         -- S70: denormalized media-type discriminator on each keyword row — a copy
         -- of images.is_video for the row it points to. is_video is immutable, so
@@ -3078,6 +3088,15 @@ fn people_count_predicate_sql(p: &QueryPredicate) -> String {
     }
 }
 
+fn keyword_origin_clause(op: Option<&str>) -> &'static str {
+    match op {
+        Some("user") => " AND (k.origin & 1) <> 0",
+        Some("auto") => " AND (k.origin & 2) <> 0",
+        Some("both") | None => "",
+        _ => "",
+    }
+}
+
 fn focus_quality_column_for_basis(basis: &str) -> Option<&'static str> {
     match basis {
         "human_face" | "face" => Some("focus_human_score"),
@@ -3507,16 +3526,18 @@ fn predicate_to_sql(p: &QueryPredicate) -> String {
         "keyword_has" => match p.value.as_deref()
         {
             Some(v) if !v.is_empty() => format!(
-                "(EXISTS (SELECT 1 FROM keyword_visible k WHERE k.image_id = images.id AND k.label = '{}'))",
-                v.replace('\'', "''")
+                "(EXISTS (SELECT 1 FROM keyword_visible k WHERE k.image_id = images.id AND k.label = '{}'{}))",
+                v.replace('\'', "''"),
+                keyword_origin_clause(p.op.as_deref())
             ),
             _ => bad(),
         },
         "keyword_not" => match p.value.as_deref()
         {
             Some(v) if !v.is_empty() => format!(
-                "(NOT EXISTS (SELECT 1 FROM keyword_visible k WHERE k.image_id = images.id AND k.label = '{}'))",
-                v.replace('\'', "''")
+                "(NOT EXISTS (SELECT 1 FROM keyword_visible k WHERE k.image_id = images.id AND k.label = '{}'{}))",
+                v.replace('\'', "''"),
+                keyword_origin_clause(p.op.as_deref())
             ),
             _ => bad(),
         },
@@ -3529,9 +3550,11 @@ fn predicate_to_sql(p: &QueryPredicate) -> String {
         // never counts color labels as keywords). NULL-tolerant for the
         // instant between a migration ALTER and its backfill.
         "keyword_none" =>
-            "(NOT EXISTS (SELECT 1 FROM keyword_visible k WHERE k.image_id = images.id \
-              AND (k.color = FALSE OR k.color IS NULL)))"
-                .to_string(),
+            format!(
+                "(NOT EXISTS (SELECT 1 FROM keyword_visible k WHERE k.image_id = images.id \
+                  AND (k.color = FALSE OR k.color IS NULL){}))",
+                keyword_origin_clause(p.op.as_deref())
+            ),
         // Sidebar multi-select scopes (S67): one predicate per selected
         // sidebar node, OR-joined by the caller — the union of the selected
         // folders/dates rides the same paged query machinery every other
@@ -4205,6 +4228,8 @@ pub async fn expand_collapse_group_ids(ids: Vec<i64>) -> Vec<i64> {
 /// it can never collide with human-typed keyword text — no escaping needed. The
 /// UI renders a visible glyph (e.g. "›") in its place.
 const KEYWORD_PATH_SEPARATOR: &str = "\u{001F}";
+const KEYWORD_ORIGIN_USER: i32 = 1;
+const KEYWORD_ORIGIN_AUTO: i32 = 2;
 
 /// A single materialized keyword row, as returned to Swift.
 #[derive(Debug, Clone)]
@@ -4212,6 +4237,7 @@ pub struct KeywordRow {
     pub label: String,
     pub path: String,
     pub status: i32,
+    pub origin: i32,
     pub created_at: String,
     pub hidden_at: Option<String>,
 }
@@ -4255,6 +4281,56 @@ fn keyword_image_id_in_list(ids: &[i64]) -> Option<String> {
     Some(format!("image_id IN ({})", joined))
 }
 
+fn merge_active_keyword_origin(
+    conn: &Connection,
+    image_id: i64,
+    path: &str,
+    origin: i32,
+) -> Result<bool, duckdb::Error> {
+    let changed = conn.execute(
+        "UPDATE keyword SET origin = (origin | ?) \
+         WHERE image_id = ? AND path = ? AND status = 1 AND (origin & ?) = 0",
+        params![origin, image_id, path, origin],
+    )?;
+    Ok(changed > 0)
+}
+
+fn insert_or_merge_active_keyword_for_image(
+    conn: &Connection,
+    image_id: i64,
+    segments: &[String],
+    origin: i32,
+) -> Result<u64, duckdb::Error> {
+    let rows = keyword_materialized_rows(segments);
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let mut changed: u64 = 0;
+    for (label, path) in rows {
+        let existing: Result<i64, _> = conn.query_row(
+            "SELECT 1 FROM keyword WHERE image_id = ? AND path = ? AND status = 1 LIMIT 1",
+            params![image_id, path],
+            |r| r.get(0),
+        );
+        if existing.is_ok() {
+            if merge_active_keyword_origin(conn, image_id, &path, origin)? {
+                changed += 1;
+            }
+            continue;
+        }
+
+        conn.execute(
+            "INSERT INTO keyword (image_id, label, path, status, origin, created_at, is_video) \
+             VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP, COALESCE((SELECT is_video FROM images WHERE id = ?), FALSE))",
+            params![image_id, label, path, origin, image_id],
+        )?;
+        changed += 1;
+    }
+
+    Ok(changed)
+}
+
 /// Assign a keyword PATH to many images. Rust materializes the ancestor chain
 /// and inserts one row per depth for each image. Blind-insert, except it skips a
 /// row byte-identical to an already-ACTIVE row for that image (so a double-apply
@@ -4287,29 +4363,12 @@ pub async fn assign_keyword_for_ids(ids: Vec<i64>, segments: Vec<String>) -> u64
 
     let mut inserted: u64 = 0;
     for id in &ids {
-        for (label, path) in &rows {
-            let existing: Result<i64, _> = conn.query_row(
-                "SELECT 1 FROM keyword WHERE image_id = ? AND path = ? AND status = 1 LIMIT 1",
-                params![id, path],
-                |r| r.get(0),
-            );
-            if existing.is_ok() {
-                continue;
-            }
-            match conn.execute(
-                // Carry the denormalized is_video from the referenced image so a video's
-                // keyword row gets the right discriminator (it was defaulting to FALSE —
-                // the S72 "is_video at the keyword-write sites" closeout).
-                "INSERT INTO keyword (image_id, label, path, status, created_at, is_video) \
-                 VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, COALESCE((SELECT is_video FROM images WHERE id = ?), FALSE))",
-                params![id, label, path, id],
-            ) {
-                Ok(_) => inserted += 1,
-                Err(e) => {
-                    eprintln!("assign_keyword_for_ids: insert failed: {}", e);
-                    let _ = conn.execute_batch("ROLLBACK;");
-                    return 0;
-                }
+        match insert_or_merge_active_keyword_for_image(conn, *id, &segments, KEYWORD_ORIGIN_USER) {
+            Ok(changed) => inserted += changed,
+            Err(e) => {
+                eprintln!("assign_keyword_for_ids: insert failed: {}", e);
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
             }
         }
     }
@@ -4425,8 +4484,8 @@ fn mirror_keyword_rows_across_pairs_impl(conn: &Connection) -> u64 {
     let mut copied: u64 = 0;
     for (kind_filter, direction_label) in DIRECTIONS {
         let sql = format!(
-            "INSERT INTO keyword (image_id, label, path, status, created_at, hidden_at, collection, color) \
-             SELECT DISTINCT dst.id, k.label, k.path, k.status, CURRENT_TIMESTAMP, k.hidden_at, k.collection, k.color \
+            "INSERT INTO keyword (image_id, label, path, status, origin, created_at, hidden_at, collection, color) \
+             SELECT DISTINCT dst.id, k.label, k.path, k.status, k.origin, CURRENT_TIMESTAMP, k.hidden_at, k.collection, k.color \
              FROM images dst \
              JOIN images src ON src.file_stem = dst.file_stem \
                             AND src.directory_path = dst.directory_path \
@@ -4505,8 +4564,8 @@ fn copy_keyword_rows_for_image_pairs_impl(
             // Carry is_video from the source keyword rows — a byte copy keeps the media
             // type, so the source image's is_video is the copy's (was defaulting to
             // FALSE) — S72 closeout.
-            "INSERT INTO keyword (image_id, label, path, status, created_at, hidden_at, collection, color, is_video) \
-             SELECT ?2, k.label, k.path, k.status, CURRENT_TIMESTAMP, k.hidden_at, k.collection, k.color, k.is_video \
+            "INSERT INTO keyword (image_id, label, path, status, origin, created_at, hidden_at, collection, color, is_video) \
+             SELECT ?2, k.label, k.path, k.status, k.origin, CURRENT_TIMESTAMP, k.hidden_at, k.collection, k.color, k.is_video \
              FROM keyword k \
              WHERE k.image_id = ?1 \
                AND NOT EXISTS (SELECT 1 FROM keyword k2 \
@@ -4562,7 +4621,7 @@ pub async fn keywords_for_image(image_id: i64) -> Vec<KeywordRow> {
     };
 
     let mut stmt = match conn.prepare(
-        "SELECT label, path, status, CAST(created_at AS VARCHAR), CAST(hidden_at AS VARCHAR) \
+        "SELECT label, path, status, origin, CAST(created_at AS VARCHAR), CAST(hidden_at AS VARCHAR) \
          FROM keyword_visible WHERE image_id = ? ORDER BY path",
     ) {
         Ok(s) => s,
@@ -4577,8 +4636,9 @@ pub async fn keywords_for_image(image_id: i64) -> Vec<KeywordRow> {
             label: row.get(0)?,
             path: row.get(1)?,
             status: row.get(2)?,
-            created_at: row.get(3)?,
-            hidden_at: row.get(4)?,
+            origin: row.get(3)?,
+            created_at: row.get(4)?,
+            hidden_at: row.get(5)?,
         })
     });
 
@@ -5720,32 +5780,13 @@ fn sanitized_focus_result(mut result: FocusAnalysisResult) -> FocusAnalysisResul
 }
 
 fn insert_active_keyword_for_image(conn: &Connection, image_id: i64, segments: &[String]) -> bool {
-    let rows = keyword_materialized_rows(segments);
-    if rows.is_empty() {
-        return true;
-    }
-
-    for (label, path) in rows {
-        let existing: Result<i64, _> = conn.query_row(
-            "SELECT 1 FROM keyword WHERE image_id = ? AND path = ? AND status = 1 LIMIT 1",
-            params![image_id, path],
-            |r| r.get(0),
-        );
-        if existing.is_ok() {
-            continue;
-        }
-
-        if let Err(e) = conn.execute(
-            "INSERT INTO keyword (image_id, label, path, status, created_at, is_video) \
-             VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, COALESCE((SELECT is_video FROM images WHERE id = ?), FALSE))",
-            params![image_id, label, path, image_id],
-        ) {
+    match insert_or_merge_active_keyword_for_image(conn, image_id, segments, KEYWORD_ORIGIN_AUTO) {
+        Ok(_) => true,
+        Err(e) => {
             eprintln!("insert_active_keyword_for_image: insert failed: {}", e);
-            return false;
+            false
         }
     }
-
-    true
 }
 
 fn focus_analysis_queue_where_clause(id_predicate: Option<&str>) -> String {
@@ -6225,9 +6266,9 @@ pub async fn add_images_to_collections(ids: Vec<i64>, labels: Vec<String>) -> u6
             // No visible row with this label → insert a flat collection row.
             match conn.execute(
                 // Carry is_video from the image (was defaulting to FALSE) — S72 closeout.
-                "INSERT INTO keyword (image_id, label, path, status, created_at, collection, is_video) \
-                 VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, TRUE, COALESCE((SELECT is_video FROM images WHERE id = ?), FALSE))",
-                params![id, label, label, id],
+                "INSERT INTO keyword (image_id, label, path, status, origin, created_at, collection, is_video) \
+                 VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP, TRUE, COALESCE((SELECT is_video FROM images WHERE id = ?), FALSE))",
+                params![id, label, label, KEYWORD_ORIGIN_USER, id],
             ) {
                 Ok(_) => changed += 1,
                 Err(e) => {
@@ -6299,9 +6340,9 @@ fn assign_color_keyword_for_ids_impl(conn: &Connection, ids: &[i64], label: &str
         // No visible row with this label → insert a flat color row.
         match conn.execute(
             // Carry is_video from the image (was defaulting to FALSE) — S72 closeout.
-            "INSERT INTO keyword (image_id, label, path, status, created_at, collection, color, is_video) \
-             VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, FALSE, TRUE, COALESCE((SELECT is_video FROM images WHERE id = ?), FALSE))",
-            params![id, trimmed, trimmed, id],
+            "INSERT INTO keyword (image_id, label, path, status, origin, created_at, collection, color, is_video) \
+             VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP, FALSE, TRUE, COALESCE((SELECT is_video FROM images WHERE id = ?), FALSE))",
+            params![id, trimmed, trimmed, KEYWORD_ORIGIN_USER, id],
         ) {
             Ok(_) => changed += 1,
             Err(e) => {
@@ -6424,7 +6465,7 @@ pub async fn hidden_keywords_for_image(image_id: i64) -> Vec<KeywordRow> {
     };
 
     let mut stmt = match conn.prepare(
-        "SELECT label, path, status, CAST(created_at AS VARCHAR), CAST(hidden_at AS VARCHAR) \
+        "SELECT label, path, status, origin, CAST(created_at AS VARCHAR), CAST(hidden_at AS VARCHAR) \
          FROM keyword WHERE image_id = ? AND status = 0 ORDER BY hidden_at DESC",
     ) {
         Ok(s) => s,
@@ -6439,8 +6480,9 @@ pub async fn hidden_keywords_for_image(image_id: i64) -> Vec<KeywordRow> {
             label: row.get(0)?,
             path: row.get(1)?,
             status: row.get(2)?,
-            created_at: row.get(3)?,
-            hidden_at: row.get(4)?,
+            origin: row.get(3)?,
+            created_at: row.get(4)?,
+            hidden_at: row.get(5)?,
         })
     });
 
@@ -6504,10 +6546,18 @@ pub async fn reparent_keyword(source_path: Vec<String>, new_parent: Vec<String>)
 
     // (1) Ensure the new-parent ancestor chain exists for every affected image.
     for (label, path) in &new_parent_rows {
-        let sql = "INSERT INTO keyword (image_id, label, path, status, created_at, is_video) \
-                   SELECT DISTINCT image_id, ?, ?, 1, CURRENT_TIMESTAMP, is_video FROM keyword \
-                   WHERE status = 1 AND (path = ? OR starts_with(path, ?)) \
-                   AND image_id NOT IN (SELECT image_id FROM keyword WHERE status = 1 AND path = ?)";
+        let sql = "INSERT INTO keyword (image_id, label, path, status, origin, created_at, is_video) \
+                   SELECT k.image_id, ?, ?, 1, \
+                          (CASE WHEN SUM(CASE WHEN (k.origin & 1) <> 0 THEN 1 ELSE 0 END) > 0 THEN 1 ELSE 0 END) + \
+                          (CASE WHEN SUM(CASE WHEN (k.origin & 2) <> 0 THEN 1 ELSE 0 END) > 0 THEN 2 ELSE 0 END), \
+                          CURRENT_TIMESTAMP, k.is_video \
+                   FROM keyword k \
+                   WHERE k.status = 1 AND (k.path = ? OR starts_with(k.path, ?)) \
+                   AND NOT EXISTS (SELECT 1 FROM keyword existing \
+                                   WHERE existing.image_id = k.image_id \
+                                     AND existing.status = 1 \
+                                     AND existing.path = ?) \
+                   GROUP BY k.image_id, k.is_video";
         if let Err(e) = conn.execute(
             sql,
             params![label, path, source_joined, source_prefix, path],
@@ -6519,8 +6569,8 @@ pub async fn reparent_keyword(source_path: Vec<String>, new_parent: Vec<String>)
     }
 
     // (2) Re-root the moved subtree (label unchanged; path = new_root || suffix).
-    let move_sql = "INSERT INTO keyword (image_id, label, path, status, created_at, is_video) \
-                    SELECT image_id, label, ? || substr(path, ?), 1, CURRENT_TIMESTAMP, is_video FROM keyword \
+    let move_sql = "INSERT INTO keyword (image_id, label, path, status, origin, created_at, is_video) \
+                    SELECT image_id, label, ? || substr(path, ?), 1, origin, CURRENT_TIMESTAMP, is_video FROM keyword \
                     WHERE status = 1 AND (path = ? OR starts_with(path, ?))";
     if let Err(e) = conn.execute(
         move_sql,
@@ -6601,10 +6651,10 @@ pub async fn rename_keyword(target_path: Vec<String>, new_label: String) -> u64 
 
     // Re-root the subtree; the root row's label becomes new_label (descendants
     // keep theirs), path re-rooted for the whole subtree.
-    let move_sql = "INSERT INTO keyword (image_id, label, path, status, created_at, is_video) \
+    let move_sql = "INSERT INTO keyword (image_id, label, path, status, origin, created_at, is_video) \
                     SELECT image_id, \
                            CASE WHEN path = ? THEN ? ELSE label END, \
-                           ? || substr(path, ?), 1, CURRENT_TIMESTAMP, is_video FROM keyword \
+                           ? || substr(path, ?), 1, origin, CURRENT_TIMESTAMP, is_video FROM keyword \
                     WHERE status = 1 AND (path = ? OR starts_with(path, ?))";
     if let Err(e) = conn.execute(
         move_sql,
@@ -7599,6 +7649,18 @@ mod keyword_tests {
             predicate_to_sql(&has),
             "(EXISTS (SELECT 1 FROM keyword_visible k WHERE k.image_id = images.id AND k.label = 'Wagner'))"
         );
+        let mut auto_has = has.clone();
+        auto_has.op = Some("auto".to_string());
+        assert_eq!(
+            predicate_to_sql(&auto_has),
+            "(EXISTS (SELECT 1 FROM keyword_visible k WHERE k.image_id = images.id AND k.label = 'Wagner' AND (k.origin & 2) <> 0))"
+        );
+        let mut user_has = has.clone();
+        user_has.op = Some("user".to_string());
+        assert_eq!(
+            predicate_to_sql(&user_has),
+            "(EXISTS (SELECT 1 FROM keyword_visible k WHERE k.image_id = images.id AND k.label = 'Wagner' AND (k.origin & 1) <> 0))"
+        );
 
         let not = QueryPredicate {
             kind: "keyword_not".to_string(),
@@ -7802,6 +7864,7 @@ mod keyword_tests {
                  label TEXT NOT NULL,
                  path TEXT NOT NULL,
                  status INTEGER NOT NULL DEFAULT 1,
+                 origin INTEGER NOT NULL DEFAULT 1,
                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                  hidden_at TIMESTAMP,
                  collection BOOLEAN NOT NULL DEFAULT FALSE,
@@ -7887,6 +7950,7 @@ mod keyword_tests {
                  label TEXT NOT NULL,
                  path TEXT NOT NULL,
                  status INTEGER NOT NULL DEFAULT 1,
+                 origin INTEGER NOT NULL DEFAULT 1,
                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                  hidden_at TIMESTAMP,
                  collection BOOLEAN NOT NULL DEFAULT FALSE,
@@ -7970,6 +8034,7 @@ mod keyword_tests {
                  label TEXT NOT NULL,
                  path TEXT NOT NULL,
                  status INTEGER NOT NULL DEFAULT 1,
+                 origin INTEGER NOT NULL DEFAULT 1,
                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                  hidden_at TIMESTAMP,
                  collection BOOLEAN NOT NULL DEFAULT FALSE,
@@ -9672,12 +9737,8 @@ mod query_builder_tests {
         ];
         let scope_connectors = vec![Connector::Or];
 
-        let scoped = build_scoped_filter_predicate(
-            &query,
-            &query_connectors,
-            &scope,
-            &scope_connectors,
-        );
+        let scoped =
+            build_scoped_filter_predicate(&query, &query_connectors, &scope, &scope_connectors);
 
         assert_eq!(
             scoped,
@@ -9855,6 +9916,7 @@ mod folder_sync_tests {
                  label TEXT NOT NULL,
                  path TEXT NOT NULL,
                  status INTEGER NOT NULL DEFAULT 1,
+                 origin INTEGER NOT NULL DEFAULT 1,
                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                  hidden_at TIMESTAMP,
                  collection BOOLEAN NOT NULL DEFAULT FALSE,

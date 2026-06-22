@@ -619,8 +619,8 @@ enum MediaType {
 //   "unflagged"         → (none)
 //   "color"             → value ("red".."purple")
 //   "no_color"          → (none)
-//   "keyword_has"       → value (the keyword label)  → EXISTS (subtree-inclusive)
-//   "keyword_not"       → value (the keyword label)  → NOT EXISTS
+//   "keyword_has"       → value (the keyword label), op? ("both"/"user"/"auto")  → EXISTS (subtree-inclusive)
+//   "keyword_not"       → value (the keyword label), op? ("both"/"user"/"auto")  → NOT EXISTS
 //   "filename_contains" → value (text)  → file_name ILIKE %text% (case-insensitive)
 //   "filename_starts"   → value (text)  → file_name ILIKE text%
 //   "filename_ends"     → value (text)  → file_name ILIKE %text
@@ -742,6 +742,7 @@ dictionary KeywordRow {
     string label;
     string path;
     i32 status;
+    i32 origin;
     string created_at;
     string? hidden_at;
 };
