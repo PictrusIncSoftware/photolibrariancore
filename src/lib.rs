@@ -222,6 +222,7 @@ pub struct SimilarPhotoCandidate {
     pub created_timestamp: i64,
     pub capture_datetime: Option<String>,
     pub directory_path: Option<String>,
+    pub camera_model: Option<String>,
 }
 
 /// One durable similar-photo stack membership row.
@@ -237,6 +238,19 @@ pub struct SimilarPhotoGroupMember {
     pub member_rank: u32,
     pub distance_to_representative: Option<f64>,
     pub threshold: f64,
+}
+
+/// Compact gallery metadata for a visible similar-photo representative.
+///
+/// `logical_count` collapses RAW/JPEG siblings with the same directory/stem;
+/// `physical_count` is the underlying row count available to a future expanded
+/// stack/deck view.
+#[derive(Debug, Clone)]
+pub struct SimilarPhotoStackSummary {
+    pub image_id: i64,
+    pub group_id: i64,
+    pub logical_count: u32,
+    pub physical_count: u32,
 }
 
 /// One focus-analysis writeback row.
@@ -1555,6 +1569,8 @@ pub async fn get_image_count(
         "",
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        false,
+        "",
         media_type,
     ) as u64
 }
@@ -1709,6 +1725,46 @@ const RAW_JPEG_COLLAPSE_PREDICATE: &str = "\
           AND j.file_stem = images.file_stem \
           AND j.directory_path = images.directory_path \
     ))";
+
+/// Similar-photo collapse is an OUTER filter, not an inner `WHERE id =
+/// representative_id` check. The durable grouping table's representative can be
+/// a RAW row; after RAW/JPEG collapse the visible gallery row may instead be
+/// the JPEG/HEIF sibling. Ranking all rows that survive the normal inner
+/// filters gives the page/count helpers one visible representative per stack
+/// without making a RAW representative erase the whole group.
+const SIMILAR_VISIBLE_ID_PROJECTION: &str = "\
+            FIRST_VALUE(id) OVER ( \
+                PARTITION BY similar_group_id \
+                ORDER BY \
+                    CASE \
+                        WHEN similar_image_kind IN ('jpeg', 'heif') THEN 0 \
+                        WHEN similar_image_kind = 'raw' THEN 1 \
+                        ELSE 2 \
+                    END, \
+                    id ASC \
+                ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING \
+            ) AS similar_visible_id";
+
+const SIMILAR_COLLAPSE_PREDICATE: &str = "(similar_group_id IS NULL OR id = similar_visible_id)";
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace("'", "''"))
+}
+
+fn similar_photo_join_clause(
+    apply_similar_photo_collapse: bool,
+    algorithm_version: &str,
+) -> String {
+    if !apply_similar_photo_collapse || algorithm_version.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "LEFT JOIN similar_photo_group_member spgm \
+             ON spgm.image_id = images.id AND spgm.algorithm_version = {}",
+            sql_string_literal(algorithm_version.trim())
+        )
+    }
+}
 
 /// Inner-WHERE predicate restricting a result set to STILLS (non-video).
 ///
@@ -1987,6 +2043,8 @@ fn execute_image_record_query(
     offset: i64,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
+    apply_similar_photo_collapse: bool,
+    similar_algorithm_version: &str,
     media_type: MediaType,
 ) -> Vec<ImageRecord> {
     // Assemble the inner WHERE from the caller-supplied predicate text
@@ -2012,37 +2070,82 @@ fn execute_image_record_query(
         format!("WHERE {}", inner_predicates.join(" AND "))
     };
 
-    // Branch on apply_duplicate_filter (decision C1). When active, wrap
-    // the projection-with-duplicate_group_id in a subquery so the outer
-    // WHERE can reference the alias. When inactive, emit the same
-    // projection at the top level — the alias is still surfaced on the
-    // returned ImageRecord (column 30) for the existing Swift filter and
-    // future Filter Builder consumers.
-    let query_sql = if apply_duplicate_filter {
+    let similar_join =
+        similar_photo_join_clause(apply_similar_photo_collapse, similar_algorithm_version);
+    let effective_similar_collapse = apply_similar_photo_collapse && !similar_join.is_empty();
+    let needs_outer_filter = apply_duplicate_filter || effective_similar_collapse;
+    let duplicate_filter = if apply_duplicate_filter {
+        Some(DUPLICATE_FILTER_PREDICATE)
+    } else {
+        None
+    };
+    let similar_filter = if effective_similar_collapse {
+        Some(SIMILAR_COLLAPSE_PREDICATE)
+    } else {
+        None
+    };
+    let outer_filters = [duplicate_filter, similar_filter]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<&str>>()
+        .join(" AND ");
+    let similar_inner_projection = if effective_similar_collapse {
+        ", spgm.group_id AS similar_group_id, image_kind AS similar_image_kind"
+    } else {
+        ""
+    };
+
+    // Branch on outer filters. Duplicate and similar-photo collapse both need
+    // projection aliases, so they share the same wrap shape. When inactive,
+    // emit the minimal top-level projection.
+    let query_sql = if needs_outer_filter {
+        let inner_select = format!(
+            r#"
+            SELECT
+                id, epoch(indexed_timestamp) as indexed_ts_epoch,
+                file_path, file_size, file_name, file_extension,
+                created_timestamp, modified_timestamp,
+                camera_make, camera_model, lens_model,
+                focal_length, aperture, shutter_speed, iso,
+                capture_datetime,
+                pixel_width, pixel_height, color_space, bit_depth,
+                gps_latitude, gps_longitude, gps_altitude,
+                copyright, creator, description,
+                rating, flag, color_label, rotation,
+                {},
+                focus_score
+                {}
+            FROM images
+            {}
+            {}
+        "#,
+            DUPLICATE_GROUP_ID_CASE, similar_inner_projection, similar_join, inner_where
+        );
+        let filtered_source = if effective_similar_collapse {
+            format!(
+                r#"
+                SELECT
+                    *,
+                    {}
+                FROM (
+                    {}
+                )
+            "#,
+                SIMILAR_VISIBLE_ID_PROJECTION, inner_select
+            )
+        } else {
+            inner_select
+        };
         format!(
             r#"
             SELECT * FROM (
-                SELECT
-                    id, epoch(indexed_timestamp) as indexed_ts_epoch,
-                    file_path, file_size, file_name, file_extension,
-                    created_timestamp, modified_timestamp,
-                    camera_make, camera_model, lens_model,
-                    focal_length, aperture, shutter_speed, iso,
-                    capture_datetime,
-                    pixel_width, pixel_height, color_space, bit_depth,
-                    gps_latitude, gps_longitude, gps_altitude,
-                    copyright, creator, description,
-                    rating, flag, color_label, rotation,
-                    {},
-                    focus_score
-                FROM images
                 {}
             )
             WHERE {}
             ORDER BY {}
             LIMIT ?1 OFFSET ?2
         "#,
-            DUPLICATE_GROUP_ID_CASE, inner_where, DUPLICATE_FILTER_PREDICATE, order_by
+            filtered_source, outer_filters, order_by
         )
     } else {
         format!(
@@ -2188,6 +2291,8 @@ fn execute_image_count_query(
     where_clause: &str,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
+    apply_similar_photo_collapse: bool,
+    similar_algorithm_version: &str,
     media_type: MediaType,
 ) -> i64 {
     let mut inner_predicates: Vec<&str> = Vec::new();
@@ -2210,25 +2315,70 @@ fn execute_image_count_query(
         format!("WHERE {}", inner_predicates.join(" AND "))
     };
 
-    // Branch on apply_duplicate_filter (decision C2). When inactive,
-    // emit the minimal COUNT form — no subquery, no window function.
-    // When active, wrap a projection carrying duplicate_group_id in a
-    // subquery so the outer WHERE can reference the alias; this matches
-    // the record helper's wrap-in-subquery shape so totals stay
-    // consistent with the paginated page contents.
-    let query_sql = if apply_duplicate_filter {
+    let similar_join =
+        similar_photo_join_clause(apply_similar_photo_collapse, similar_algorithm_version);
+    let effective_similar_collapse = apply_similar_photo_collapse && !similar_join.is_empty();
+    let needs_outer_filter = apply_duplicate_filter || effective_similar_collapse;
+    let duplicate_filter = if apply_duplicate_filter {
+        Some(DUPLICATE_FILTER_PREDICATE)
+    } else {
+        None
+    };
+    let similar_filter = if effective_similar_collapse {
+        Some(SIMILAR_COLLAPSE_PREDICATE)
+    } else {
+        None
+    };
+    let outer_filters = [duplicate_filter, similar_filter]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<&str>>()
+        .join(" AND ");
+    let similar_inner_projection = if effective_similar_collapse {
+        ", spgm.group_id AS similar_group_id, image_kind AS similar_image_kind"
+    } else {
+        ""
+    };
+
+    // Duplicate and similar-photo collapse both operate on projection aliases.
+    // Keep the COUNT shape in lockstep with `execute_image_record_query` so
+    // pages count visible representatives, not hidden member rows.
+    let query_sql = if needs_outer_filter {
+        let inner_select = format!(
+            r#"
+            SELECT
+                id,
+                {}
+                {}
+            FROM images
+            {}
+            {}
+        "#,
+            DUPLICATE_GROUP_ID_CASE, similar_inner_projection, similar_join, inner_where
+        );
+        let filtered_source = if effective_similar_collapse {
+            format!(
+                r#"
+                SELECT
+                    *,
+                    {}
+                FROM (
+                    {}
+                )
+            "#,
+                SIMILAR_VISIBLE_ID_PROJECTION, inner_select
+            )
+        } else {
+            inner_select
+        };
         format!(
             r#"
             SELECT COUNT(*) FROM (
-                SELECT
-                    id,
-                    {}
-                FROM images
                 {}
             )
             WHERE {}
         "#,
-            DUPLICATE_GROUP_ID_CASE, inner_where, DUPLICATE_FILTER_PREDICATE
+            filtered_source, outer_filters
         )
     } else {
         format!("SELECT COUNT(*) FROM images {}", inner_where)
@@ -2612,6 +2762,8 @@ pub async fn get_all_images(
         offset as i64,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        false,
+        "",
         media_type,
     )
 }
@@ -2674,6 +2826,8 @@ pub async fn get_images_sorted(
         offset as i64,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        false,
+        "",
         MediaType::StillsOnly,
     )
 }
@@ -3910,6 +4064,8 @@ pub async fn query_images(
         offset as i64,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        false,
+        "",
         media_type,
     )
 }
@@ -3939,6 +4095,85 @@ pub async fn count_query_images(
         &where_clause,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        false,
+        "",
+        media_type,
+    );
+
+    if count < 0 {
+        0
+    } else {
+        count as u64
+    }
+}
+
+/// Gallery-specific Query Builder variant that can collapse durable
+/// similar-photo stacks before pagination. Browse intentionally stays on
+/// `query_images` so its long-standing physical-row semantics do not change.
+pub async fn query_images_gallery(
+    predicates: Vec<QueryPredicate>,
+    connectors: Vec<Connector>,
+    limit: u32,
+    offset: u32,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+    apply_similar_photo_collapse: bool,
+    similar_algorithm_version: String,
+    media_type: MediaType,
+) -> Vec<ImageRecord> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let where_clause = build_filter_predicate(&predicates, &connectors);
+    let order_by = order_by_for_filter(&predicates);
+
+    execute_image_record_query(
+        conn,
+        &where_clause,
+        order_by,
+        limit as i64,
+        offset as i64,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+        apply_similar_photo_collapse,
+        &similar_algorithm_version,
+        media_type,
+    )
+}
+
+pub async fn count_query_images_gallery(
+    predicates: Vec<QueryPredicate>,
+    connectors: Vec<Connector>,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+    apply_similar_photo_collapse: bool,
+    similar_algorithm_version: String,
+    media_type: MediaType,
+) -> u64 {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    let where_clause = build_filter_predicate(&predicates, &connectors);
+
+    let count = execute_image_count_query(
+        conn,
+        &where_clause,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+        apply_similar_photo_collapse,
+        &similar_algorithm_version,
         media_type,
     );
 
@@ -3989,6 +4224,8 @@ pub async fn query_images_scoped(
         offset as i64,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        false,
+        "",
         media_type,
     )
 }
@@ -4025,6 +4262,96 @@ pub async fn count_query_images_scoped(
         &where_clause,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        false,
+        "",
+        media_type,
+    );
+
+    if count < 0 {
+        0
+    } else {
+        count as u64
+    }
+}
+
+pub async fn query_images_scoped_gallery(
+    predicates: Vec<QueryPredicate>,
+    connectors: Vec<Connector>,
+    scope_predicates: Vec<QueryPredicate>,
+    scope_connectors: Vec<Connector>,
+    limit: u32,
+    offset: u32,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+    apply_similar_photo_collapse: bool,
+    similar_algorithm_version: String,
+    media_type: MediaType,
+) -> Vec<ImageRecord> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let where_clause = build_scoped_filter_predicate(
+        &predicates,
+        &connectors,
+        &scope_predicates,
+        &scope_connectors,
+    );
+    let order_by = order_by_for_filter(&predicates);
+
+    execute_image_record_query(
+        conn,
+        &where_clause,
+        order_by,
+        limit as i64,
+        offset as i64,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+        apply_similar_photo_collapse,
+        &similar_algorithm_version,
+        media_type,
+    )
+}
+
+pub async fn count_query_images_scoped_gallery(
+    predicates: Vec<QueryPredicate>,
+    connectors: Vec<Connector>,
+    scope_predicates: Vec<QueryPredicate>,
+    scope_connectors: Vec<Connector>,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+    apply_similar_photo_collapse: bool,
+    similar_algorithm_version: String,
+    media_type: MediaType,
+) -> u64 {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    let where_clause = build_scoped_filter_predicate(
+        &predicates,
+        &connectors,
+        &scope_predicates,
+        &scope_connectors,
+    );
+
+    let count = execute_image_count_query(
+        conn,
+        &where_clause,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+        apply_similar_photo_collapse,
+        &similar_algorithm_version,
         media_type,
     );
 
@@ -6251,10 +6578,11 @@ fn similar_photo_candidates_impl(
     }
 
     let sql = format!(
-        "SELECT id, file_path, file_size, created_timestamp, capture_datetime, directory_path
+        "SELECT id, file_path, file_size, created_timestamp, capture_datetime, directory_path, camera_model
          FROM images
          WHERE {}
          ORDER BY directory_path ASC NULLS LAST,
+                  camera_model ASC NULLS LAST,
                   capture_datetime ASC NULLS LAST,
                   created_timestamp ASC,
                   id ASC",
@@ -6277,6 +6605,7 @@ fn similar_photo_candidates_impl(
             created_timestamp: row.get(3)?,
             capture_datetime: row.get(4)?,
             directory_path: row.get(5)?,
+            camera_model: row.get(6)?,
         })
     });
 
@@ -6457,6 +6786,98 @@ pub async fn replace_similar_photo_groups_for_ids(
     };
 
     replace_similar_photo_groups_impl(conn, members, &algorithm_version, Some(&ids))
+}
+
+/// Return compact stack counts for visible gallery representatives.
+///
+/// The caller passes page-visible ids. Each id is resolved to its durable
+/// similar-photo group, then counted two ways: physical image rows and logical
+/// photos where RAW/JPEG/HEIF siblings with the same directory/stem count once.
+pub async fn similar_photo_stack_summaries_for_ids(
+    ids: Vec<i64>,
+    algorithm_version: String,
+) -> Vec<SimilarPhotoStackSummary> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+
+    let algorithm_version = algorithm_version.trim().to_string();
+    if algorithm_version.is_empty() {
+        return Vec::new();
+    }
+
+    let id_filter = match id_in_list(&ids) {
+        Some(filter) => filter,
+        None => return Vec::new(),
+    };
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let sql = format!(
+        r#"
+        WITH requested AS (
+            SELECT id AS image_id
+            FROM images
+            WHERE {}
+        ),
+        requested_membership AS (
+            SELECT r.image_id, m.group_id
+            FROM requested r
+            JOIN similar_photo_group_member m
+              ON m.image_id = r.image_id
+             AND m.algorithm_version = ?1
+        )
+        SELECT
+            rm.image_id,
+            rm.group_id,
+            COUNT(DISTINCT (
+                COALESCE(i.directory_path, '') || '/' ||
+                COALESCE(i.file_stem, CAST(i.id AS VARCHAR))
+            )) AS logical_count,
+            COUNT(*) AS physical_count
+        FROM requested_membership rm
+        JOIN similar_photo_group_member gm
+          ON gm.group_id = rm.group_id
+         AND gm.algorithm_version = ?1
+        JOIN images i ON i.id = gm.image_id
+        GROUP BY rm.image_id, rm.group_id
+        "#,
+        id_filter
+    );
+
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("similar_photo_stack_summaries_for_ids: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mapped = stmt.query_map(params![algorithm_version], |row| {
+        let logical_count: i64 = row.get(2)?;
+        let physical_count: i64 = row.get(3)?;
+        Ok(SimilarPhotoStackSummary {
+            image_id: row.get(0)?,
+            group_id: row.get(1)?,
+            logical_count: logical_count.max(0) as u32,
+            physical_count: physical_count.max(0) as u32,
+        })
+    });
+
+    match mapped {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            eprintln!("similar_photo_stack_summaries_for_ids: query {}", e);
+            Vec::new()
+        }
+    }
 }
 
 /// Distinct collection names — labels carrying `collection = TRUE` on any row,
@@ -10287,11 +10708,142 @@ mod query_builder_tests {
             0,
             true,
             false,
+            false,
+            "",
             MediaType::StillsOnly,
         );
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id, 1);
+    }
+
+    #[test]
+    fn similar_collapse_picks_visible_jpeg_even_when_durable_rep_is_raw() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE images (
+                id INTEGER,
+                indexed_timestamp TIMESTAMP,
+                file_path TEXT,
+                file_size BIGINT,
+                file_name TEXT,
+                file_extension TEXT,
+                created_timestamp BIGINT,
+                modified_timestamp BIGINT,
+                camera_make TEXT,
+                camera_model TEXT,
+                lens_model TEXT,
+                focal_length DOUBLE,
+                aperture DOUBLE,
+                shutter_speed DOUBLE,
+                iso INTEGER,
+                capture_datetime TEXT,
+                pixel_width INTEGER,
+                pixel_height INTEGER,
+                color_space TEXT,
+                bit_depth INTEGER,
+                gps_latitude DOUBLE,
+                gps_longitude DOUBLE,
+                gps_altitude DOUBLE,
+                copyright TEXT,
+                creator TEXT,
+                description TEXT,
+                rating INTEGER,
+                flag TEXT,
+                color_label TEXT,
+                rotation INTEGER,
+                file_stem TEXT,
+                image_kind TEXT,
+                directory_path TEXT,
+                is_video BOOLEAN,
+                focus_score DOUBLE
+             );
+             CREATE TABLE similar_photo_group_member (
+                image_id BIGINT NOT NULL,
+                group_id BIGINT NOT NULL,
+                representative_id BIGINT NOT NULL,
+                member_rank INTEGER NOT NULL,
+                distance_to_representative DOUBLE,
+                algorithm_version TEXT NOT NULL,
+                threshold DOUBLE NOT NULL
+             );",
+        )
+        .expect("create tables");
+
+        conn.execute_batch(
+            "INSERT INTO images (
+                id, indexed_timestamp, file_path, file_size, file_name,
+                file_extension, created_timestamp, modified_timestamp,
+                camera_model, capture_datetime, pixel_width, pixel_height,
+                rotation, file_stem, image_kind, directory_path, is_video, focus_score
+             ) VALUES
+                (1, TIMESTAMP '2026-06-15 10:00:00', '/tmp/a.nef', 1000, 'a.nef',
+                 'nef', 1700000000, 1700000001, 'Z 8', '2026:06:15 10:00:00',
+                 100, 100, 0, 'a', 'raw', '/tmp', FALSE, 3.5),
+                (2, TIMESTAMP '2026-06-15 10:00:01', '/tmp/a.jpg', 900, 'a.jpg',
+                 'jpg', 1700000000, 1700000001, 'Z 8', '2026:06:15 10:00:01',
+                 100, 100, 0, 'a', 'jpeg', '/tmp', FALSE, 3.6),
+                (3, TIMESTAMP '2026-06-15 10:00:02', '/tmp/b.nef', 1000, 'b.nef',
+                 'nef', 1700000002, 1700000003, 'Z 8', '2026:06:15 10:00:02',
+                 100, 100, 0, 'b', 'raw', '/tmp', FALSE, 3.4),
+                (4, TIMESTAMP '2026-06-15 10:00:03', '/tmp/b.jpg', 900, 'b.jpg',
+                 'jpg', 1700000002, 1700000003, 'Z 8', '2026:06:15 10:00:03',
+                 100, 100, 0, 'b', 'jpeg', '/tmp', FALSE, 3.7);
+
+             INSERT INTO similar_photo_group_member VALUES
+                (1, 10, 1, 0, 0.0, 'v-test', 2.35),
+                (2, 10, 1, 1, 0.1, 'v-test', 2.35),
+                (3, 10, 1, 2, 0.2, 'v-test', 2.35),
+                (4, 10, 1, 3, 0.3, 'v-test', 2.35);",
+        )
+        .expect("insert rows");
+
+        let raw_visible_records = execute_image_record_query(
+            &conn,
+            "",
+            "id ASC",
+            10,
+            0,
+            false,
+            false,
+            true,
+            "v-test",
+            MediaType::StillsOnly,
+        );
+        assert_eq!(raw_visible_records.len(), 1);
+        assert_eq!(
+            raw_visible_records[0].id, 2,
+            "similar collapse should prefer the JPEG representative even when RAW rows are otherwise visible"
+        );
+
+        let raw_collapsed_records = execute_image_record_query(
+            &conn,
+            "",
+            "id ASC",
+            10,
+            0,
+            false,
+            true,
+            true,
+            "v-test",
+            MediaType::StillsOnly,
+        );
+        assert_eq!(raw_collapsed_records.len(), 1);
+        assert_eq!(
+            raw_collapsed_records[0].id, 2,
+            "RAW/JPEG collapse must not make a RAW durable representative erase the stack"
+        );
+
+        let count = execute_image_count_query(
+            &conn,
+            "",
+            false,
+            true,
+            true,
+            "v-test",
+            MediaType::StillsOnly,
+        );
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -10897,6 +11449,8 @@ pub async fn get_images_filtered(
         offset,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        false,
+        "",
         MediaType::StillsOnly,
     )
 }
@@ -10949,6 +11503,8 @@ pub async fn get_filtered_image_count(
         &predicate,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        false,
+        "",
         media_type,
     )
 }
@@ -10991,6 +11547,8 @@ pub async fn get_image_count_for_path_prefix(
         &predicate,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        false,
+        "",
         MediaType::StillsOnly,
     )
 }
@@ -11041,6 +11599,8 @@ pub async fn get_images_for_path_prefix(
         offset,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        false,
+        "",
         media_type,
     )
 }
@@ -11084,6 +11644,75 @@ pub async fn get_image_count_for_filters(
         &predicate,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        false,
+        "",
+        media_type,
+    )
+}
+
+pub async fn get_images_for_path_prefix_gallery(
+    limit: i64,
+    offset: i64,
+    path_prefix: String,
+    date_prefix: String,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+    apply_similar_photo_collapse: bool,
+    similar_algorithm_version: String,
+    media_type: MediaType,
+) -> Vec<ImageRecord> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let predicate = build_path_date_predicate(&path_prefix, &date_prefix);
+
+    execute_image_record_query(
+        conn,
+        &predicate,
+        "capture_datetime DESC NULLS LAST, created_timestamp DESC",
+        limit,
+        offset,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+        apply_similar_photo_collapse,
+        &similar_algorithm_version,
+        media_type,
+    )
+}
+
+pub async fn get_image_count_for_filters_gallery(
+    path_prefix: String,
+    date_prefix: String,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+    apply_similar_photo_collapse: bool,
+    similar_algorithm_version: String,
+    media_type: MediaType,
+) -> i64 {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    let predicate = build_path_date_predicate(&path_prefix, &date_prefix);
+
+    execute_image_count_query(
+        conn,
+        &predicate,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+        apply_similar_photo_collapse,
+        &similar_algorithm_version,
         media_type,
     )
 }

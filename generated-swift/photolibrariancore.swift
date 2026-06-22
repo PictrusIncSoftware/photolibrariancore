@@ -2125,16 +2125,18 @@ public struct SimilarPhotoCandidate: Equatable, Hashable {
     public var createdTimestamp: Int64
     public var captureDatetime: String?
     public var directoryPath: String?
+    public var cameraModel: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: Int64, filePath: String, fileSize: UInt64, createdTimestamp: Int64, captureDatetime: String?, directoryPath: String?) {
+    public init(id: Int64, filePath: String, fileSize: UInt64, createdTimestamp: Int64, captureDatetime: String?, directoryPath: String?, cameraModel: String?) {
         self.id = id
         self.filePath = filePath
         self.fileSize = fileSize
         self.createdTimestamp = createdTimestamp
         self.captureDatetime = captureDatetime
         self.directoryPath = directoryPath
+        self.cameraModel = cameraModel
     }
 
     
@@ -2158,7 +2160,8 @@ public struct FfiConverterTypeSimilarPhotoCandidate: FfiConverterRustBuffer {
                 fileSize: FfiConverterUInt64.read(from: &buf), 
                 createdTimestamp: FfiConverterInt64.read(from: &buf), 
                 captureDatetime: FfiConverterOptionString.read(from: &buf), 
-                directoryPath: FfiConverterOptionString.read(from: &buf)
+                directoryPath: FfiConverterOptionString.read(from: &buf), 
+                cameraModel: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -2169,6 +2172,7 @@ public struct FfiConverterTypeSimilarPhotoCandidate: FfiConverterRustBuffer {
         FfiConverterInt64.write(value.createdTimestamp, into: &buf)
         FfiConverterOptionString.write(value.captureDatetime, into: &buf)
         FfiConverterOptionString.write(value.directoryPath, into: &buf)
+        FfiConverterOptionString.write(value.cameraModel, into: &buf)
     }
 }
 
@@ -2255,6 +2259,68 @@ public func FfiConverterTypeSimilarPhotoGroupMember_lift(_ buf: RustBuffer) thro
 #endif
 public func FfiConverterTypeSimilarPhotoGroupMember_lower(_ value: SimilarPhotoGroupMember) -> RustBuffer {
     return FfiConverterTypeSimilarPhotoGroupMember.lower(value)
+}
+
+
+public struct SimilarPhotoStackSummary: Equatable, Hashable {
+    public var imageId: Int64
+    public var groupId: Int64
+    public var logicalCount: UInt32
+    public var physicalCount: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(imageId: Int64, groupId: Int64, logicalCount: UInt32, physicalCount: UInt32) {
+        self.imageId = imageId
+        self.groupId = groupId
+        self.logicalCount = logicalCount
+        self.physicalCount = physicalCount
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SimilarPhotoStackSummary: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSimilarPhotoStackSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SimilarPhotoStackSummary {
+        return
+            try SimilarPhotoStackSummary(
+                imageId: FfiConverterInt64.read(from: &buf), 
+                groupId: FfiConverterInt64.read(from: &buf), 
+                logicalCount: FfiConverterUInt32.read(from: &buf), 
+                physicalCount: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SimilarPhotoStackSummary, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.imageId, into: &buf)
+        FfiConverterInt64.write(value.groupId, into: &buf)
+        FfiConverterUInt32.write(value.logicalCount, into: &buf)
+        FfiConverterUInt32.write(value.physicalCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSimilarPhotoStackSummary_lift(_ buf: RustBuffer) throws -> SimilarPhotoStackSummary {
+    return try FfiConverterTypeSimilarPhotoStackSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSimilarPhotoStackSummary_lower(_ value: SimilarPhotoStackSummary) -> RustBuffer {
+    return FfiConverterTypeSimilarPhotoStackSummary.lower(value)
 }
 
 
@@ -3389,6 +3455,31 @@ fileprivate struct FfiConverterSequenceTypeSimilarPhotoGroupMember: FfiConverter
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeSimilarPhotoStackSummary: FfiConverterRustBuffer {
+    typealias SwiftType = [SimilarPhotoStackSummary]
+
+    public static func write(_ value: [SimilarPhotoStackSummary], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSimilarPhotoStackSummary.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SimilarPhotoStackSummary] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SimilarPhotoStackSummary]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSimilarPhotoStackSummary.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeConnector: FfiConverterRustBuffer {
     typealias SwiftType = [Connector]
 
@@ -3600,11 +3691,41 @@ public func countQueryImages(predicates: [QueryPredicate], connectors: [Connecto
             
         )
 }
+public func countQueryImagesGallery(predicates: [QueryPredicate], connectors: [Connector], applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, applySimilarPhotoCollapse: Bool, similarAlgorithmVersion: String, mediaType: MediaType)async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_count_query_images_gallery(FfiConverterSequenceTypeQueryPredicate.lower(predicates),FfiConverterSequenceTypeConnector.lower(connectors),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse),FfiConverterBool.lower(applySimilarPhotoCollapse),FfiConverterString.lower(similarAlgorithmVersion),FfiConverterTypeMediaType_lower(mediaType)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func countQueryImagesScoped(predicates: [QueryPredicate], connectors: [Connector], scopePredicates: [QueryPredicate], scopeConnectors: [Connector], applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, mediaType: MediaType)async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_photolibrariancore_fn_func_count_query_images_scoped(FfiConverterSequenceTypeQueryPredicate.lower(predicates),FfiConverterSequenceTypeConnector.lower(connectors),FfiConverterSequenceTypeQueryPredicate.lower(scopePredicates),FfiConverterSequenceTypeConnector.lower(scopeConnectors),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse),FfiConverterTypeMediaType_lower(mediaType)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+public func countQueryImagesScopedGallery(predicates: [QueryPredicate], connectors: [Connector], scopePredicates: [QueryPredicate], scopeConnectors: [Connector], applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, applySimilarPhotoCollapse: Bool, similarAlgorithmVersion: String, mediaType: MediaType)async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_count_query_images_scoped_gallery(FfiConverterSequenceTypeQueryPredicate.lower(predicates),FfiConverterSequenceTypeConnector.lower(connectors),FfiConverterSequenceTypeQueryPredicate.lower(scopePredicates),FfiConverterSequenceTypeConnector.lower(scopeConnectors),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse),FfiConverterBool.lower(applySimilarPhotoCollapse),FfiConverterString.lower(similarAlgorithmVersion),FfiConverterTypeMediaType_lower(mediaType)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
@@ -3945,6 +4066,21 @@ public func getImageCountForFilters(pathPrefix: String, datePrefix: String, appl
             
         )
 }
+public func getImageCountForFiltersGallery(pathPrefix: String, datePrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, applySimilarPhotoCollapse: Bool, similarAlgorithmVersion: String, mediaType: MediaType)async  -> Int64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_get_image_count_for_filters_gallery(FfiConverterString.lower(pathPrefix),FfiConverterString.lower(datePrefix),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse),FfiConverterBool.lower(applySimilarPhotoCollapse),FfiConverterString.lower(similarAlgorithmVersion),FfiConverterTypeMediaType_lower(mediaType)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_i64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_i64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_i64,
+            liftFunc: FfiConverterInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func getImageCountForPathPrefix(pathPrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> Int64  {
     return
         try!  await uniffiRustCallAsync(
@@ -4010,6 +4146,21 @@ public func getImagesForPathPrefix(limit: Int64, offset: Int64, pathPrefix: Stri
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_photolibrariancore_fn_func_get_images_for_path_prefix(FfiConverterInt64.lower(limit),FfiConverterInt64.lower(offset),FfiConverterString.lower(pathPrefix),FfiConverterString.lower(datePrefix),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse),FfiConverterTypeMediaType_lower(mediaType)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeImageRecord.lift,
+            errorHandler: nil
+            
+        )
+}
+public func getImagesForPathPrefixGallery(limit: Int64, offset: Int64, pathPrefix: String, datePrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, applySimilarPhotoCollapse: Bool, similarAlgorithmVersion: String, mediaType: MediaType)async  -> [ImageRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_get_images_for_path_prefix_gallery(FfiConverterInt64.lower(limit),FfiConverterInt64.lower(offset),FfiConverterString.lower(pathPrefix),FfiConverterString.lower(datePrefix),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse),FfiConverterBool.lower(applySimilarPhotoCollapse),FfiConverterString.lower(similarAlgorithmVersion),FfiConverterTypeMediaType_lower(mediaType)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
@@ -4279,11 +4430,41 @@ public func queryImages(predicates: [QueryPredicate], connectors: [Connector], l
             
         )
 }
+public func queryImagesGallery(predicates: [QueryPredicate], connectors: [Connector], limit: UInt32, offset: UInt32, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, applySimilarPhotoCollapse: Bool, similarAlgorithmVersion: String, mediaType: MediaType)async  -> [ImageRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_query_images_gallery(FfiConverterSequenceTypeQueryPredicate.lower(predicates),FfiConverterSequenceTypeConnector.lower(connectors),FfiConverterUInt32.lower(limit),FfiConverterUInt32.lower(offset),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse),FfiConverterBool.lower(applySimilarPhotoCollapse),FfiConverterString.lower(similarAlgorithmVersion),FfiConverterTypeMediaType_lower(mediaType)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeImageRecord.lift,
+            errorHandler: nil
+            
+        )
+}
 public func queryImagesScoped(predicates: [QueryPredicate], connectors: [Connector], scopePredicates: [QueryPredicate], scopeConnectors: [Connector], limit: UInt32, offset: UInt32, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, mediaType: MediaType)async  -> [ImageRecord]  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_photolibrariancore_fn_func_query_images_scoped(FfiConverterSequenceTypeQueryPredicate.lower(predicates),FfiConverterSequenceTypeConnector.lower(connectors),FfiConverterSequenceTypeQueryPredicate.lower(scopePredicates),FfiConverterSequenceTypeConnector.lower(scopeConnectors),FfiConverterUInt32.lower(limit),FfiConverterUInt32.lower(offset),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse),FfiConverterTypeMediaType_lower(mediaType)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeImageRecord.lift,
+            errorHandler: nil
+            
+        )
+}
+public func queryImagesScopedGallery(predicates: [QueryPredicate], connectors: [Connector], scopePredicates: [QueryPredicate], scopeConnectors: [Connector], limit: UInt32, offset: UInt32, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, applySimilarPhotoCollapse: Bool, similarAlgorithmVersion: String, mediaType: MediaType)async  -> [ImageRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_query_images_scoped_gallery(FfiConverterSequenceTypeQueryPredicate.lower(predicates),FfiConverterSequenceTypeConnector.lower(connectors),FfiConverterSequenceTypeQueryPredicate.lower(scopePredicates),FfiConverterSequenceTypeConnector.lower(scopeConnectors),FfiConverterUInt32.lower(limit),FfiConverterUInt32.lower(offset),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse),FfiConverterBool.lower(applySimilarPhotoCollapse),FfiConverterString.lower(similarAlgorithmVersion),FfiConverterTypeMediaType_lower(mediaType)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
@@ -4519,6 +4700,21 @@ public func similarPhotoCandidatesForIds(ids: [Int64], algorithmVersion: String)
             
         )
 }
+public func similarPhotoStackSummariesForIds(ids: [Int64], algorithmVersion: String)async  -> [SimilarPhotoStackSummary]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_similar_photo_stack_summaries_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterString.lower(algorithmVersion)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeSimilarPhotoStackSummary.lift,
+            errorHandler: nil
+            
+        )
+}
 public func updateAnalysisJobBreadcrumb(id: Int64, currentImageId: Int64?, currentFilePath: String?, timedOut: Bool)async  -> AnalysisJob?  {
     return
         try!  await uniffiRustCallAsync(
@@ -4730,7 +4926,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_count_query_images() != 13157) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_count_query_images_gallery() != 59345) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_count_query_images_scoped() != 33427) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_count_query_images_scoped_gallery() != 40882) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_create_analysis_job() != 35443) {
@@ -4799,6 +5001,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_get_image_count_for_filters() != 28842) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_get_image_count_for_filters_gallery() != 19093) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_get_image_count_for_path_prefix() != 38666) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -4812,6 +5017,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_images_for_path_prefix() != 41257) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_get_images_for_path_prefix_gallery() != 50079) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_get_images_sorted() != 8765) {
@@ -4871,7 +5079,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_query_images() != 21638) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_query_images_gallery() != 5671) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_query_images_scoped() != 46785) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_query_images_scoped_gallery() != 28562) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_recover_interrupted_analysis_jobs() != 41065) {
@@ -4917,6 +5131,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_similar_photo_candidates_for_ids() != 32232) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_similar_photo_stack_summaries_for_ids() != 43301) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_analysis_job_breadcrumb() != 10254) {

@@ -94,6 +94,30 @@ namespace photolibrariancore {
         MediaType media_type
     );
 
+    [Async]
+    sequence<ImageRecord> query_images_gallery(
+        sequence<QueryPredicate> predicates,
+        sequence<Connector> connectors,
+        u32 limit,
+        u32 offset,
+        boolean apply_duplicate_filter,
+        boolean apply_raw_jpeg_collapse,
+        boolean apply_similar_photo_collapse,
+        string similar_algorithm_version,
+        MediaType media_type
+    );
+
+    [Async]
+    u64 count_query_images_gallery(
+        sequence<QueryPredicate> predicates,
+        sequence<Connector> connectors,
+        boolean apply_duplicate_filter,
+        boolean apply_raw_jpeg_collapse,
+        boolean apply_similar_photo_collapse,
+        string similar_algorithm_version,
+        MediaType media_type
+    );
+
     // Gallery Query Builder scoped by the current Sources/Dates selection.
     // Keeps Browse on query_images while Gallery can express:
     //   (query sentence) AND (sidebar scope)
@@ -119,6 +143,34 @@ namespace photolibrariancore {
         sequence<Connector> scope_connectors,
         boolean apply_duplicate_filter,
         boolean apply_raw_jpeg_collapse,
+        MediaType media_type
+    );
+
+    [Async]
+    sequence<ImageRecord> query_images_scoped_gallery(
+        sequence<QueryPredicate> predicates,
+        sequence<Connector> connectors,
+        sequence<QueryPredicate> scope_predicates,
+        sequence<Connector> scope_connectors,
+        u32 limit,
+        u32 offset,
+        boolean apply_duplicate_filter,
+        boolean apply_raw_jpeg_collapse,
+        boolean apply_similar_photo_collapse,
+        string similar_algorithm_version,
+        MediaType media_type
+    );
+
+    [Async]
+    u64 count_query_images_scoped_gallery(
+        sequence<QueryPredicate> predicates,
+        sequence<Connector> connectors,
+        sequence<QueryPredicate> scope_predicates,
+        sequence<Connector> scope_connectors,
+        boolean apply_duplicate_filter,
+        boolean apply_raw_jpeg_collapse,
+        boolean apply_similar_photo_collapse,
+        string similar_algorithm_version,
         MediaType media_type
     );
 
@@ -346,6 +398,9 @@ namespace photolibrariancore {
     sequence<SimilarPhotoCandidate> similar_photo_candidates_for_ids(sequence<i64> ids, string algorithm_version);
 
     [Async]
+    sequence<SimilarPhotoStackSummary> similar_photo_stack_summaries_for_ids(sequence<i64> ids, string algorithm_version);
+
+    [Async]
     u64 replace_similar_photo_groups(sequence<SimilarPhotoGroupMember> members, string algorithm_version);
 
     [Async]
@@ -405,10 +460,34 @@ namespace photolibrariancore {
     [Async]
     sequence<ImageRecord> get_images_for_path_prefix(i64 limit, i64 offset, string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse, MediaType media_type);
 
+    [Async]
+    sequence<ImageRecord> get_images_for_path_prefix_gallery(
+        i64 limit,
+        i64 offset,
+        string path_prefix,
+        string date_prefix,
+        boolean apply_duplicate_filter,
+        boolean apply_raw_jpeg_collapse,
+        boolean apply_similar_photo_collapse,
+        string similar_algorithm_version,
+        MediaType media_type
+    );
+
     // Get count of images matching both path prefix and date filter
     // apply_duplicate_filter / apply_raw_jpeg_collapse: Step 4a filter booleans.
     [Async]
     i64 get_image_count_for_filters(string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse, MediaType media_type);
+
+    [Async]
+    i64 get_image_count_for_filters_gallery(
+        string path_prefix,
+        string date_prefix,
+        boolean apply_duplicate_filter,
+        boolean apply_raw_jpeg_collapse,
+        boolean apply_similar_photo_collapse,
+        string similar_algorithm_version,
+        MediaType media_type
+    );
 
     // A9 (sidebar bulk-copy enumeration foundation): return the set of
     // `file_path` values matching the gallery's current filter state via
@@ -683,6 +762,7 @@ dictionary SimilarPhotoCandidate {
     i64 created_timestamp;
     string? capture_datetime;
     string? directory_path;
+    string? camera_model;
 };
 
 dictionary SimilarPhotoGroupMember {
@@ -692,6 +772,13 @@ dictionary SimilarPhotoGroupMember {
     u32 member_rank;
     f64? distance_to_representative;
     f64 threshold;
+};
+
+dictionary SimilarPhotoStackSummary {
+    i64 image_id;
+    i64 group_id;
+    u32 logical_count;
+    u32 physical_count;
 };
 
 dictionary FocusAnalysisResult {
