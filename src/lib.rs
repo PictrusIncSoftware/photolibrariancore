@@ -6213,6 +6213,7 @@ fn insert_active_keyword_for_image(conn: &Connection, image_id: i64, segments: &
 fn focus_analysis_queue_where_clause(id_predicate: Option<&str>) -> String {
     let mut predicates = vec![
         "is_video IS NOT TRUE".to_string(),
+        RAW_JPEG_COLLAPSE_PREDICATE.to_string(),
         "(
              focus_analysis_status IS NULL
              OR focus_algorithm_version IS NULL
@@ -6234,6 +6235,31 @@ fn focus_analysis_queue_where_clause(id_predicate: Option<&str>) -> String {
     format!("WHERE {}", predicates.join(" AND "))
 }
 
+fn focus_analysis_scope_predicate(ids: &[i64]) -> Option<String> {
+    if ids.is_empty() {
+        return None;
+    }
+
+    let csv = ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    Some(format!(
+        "(id IN ({csv}) \
+          OR (image_kind IN ('raw', 'jpeg', 'heif') \
+              AND EXISTS ( \
+                  SELECT 1 FROM images selected \
+                  WHERE selected.id IN ({csv}) \
+                    AND selected.image_kind IN ('raw', 'jpeg', 'heif') \
+                    AND selected.file_stem = images.file_stem \
+                    AND selected.directory_path = images.directory_path \
+              )))",
+        csv = csv
+    ))
+}
+
 fn focus_analysis_candidates_impl(
     conn: &Connection,
     limit: u32,
@@ -6241,14 +6267,14 @@ fn focus_analysis_candidates_impl(
     analysis_run_id: &str,
     scoped_ids: Option<&[i64]>,
 ) -> Vec<FocusAnalysisCandidate> {
-    let id_filter = match scoped_ids {
-        Some(ids) => match id_in_list(ids) {
+    let scope_filter = match scoped_ids {
+        Some(ids) => match focus_analysis_scope_predicate(ids) {
             Some(filter) => Some(filter),
             None => return Vec::new(),
         },
         None => None,
     };
-    let where_clause = focus_analysis_queue_where_clause(id_filter.as_deref());
+    let where_clause = focus_analysis_queue_where_clause(scope_filter.as_deref());
     let capped_limit = limit.clamp(1, 5000) as i64;
     let sql = format!(
         "SELECT id, file_path, file_size
@@ -6292,14 +6318,14 @@ fn focus_analysis_candidate_count_impl(
     analysis_run_id: &str,
     scoped_ids: Option<&[i64]>,
 ) -> u64 {
-    let id_filter = match scoped_ids {
-        Some(ids) => match id_in_list(ids) {
+    let scope_filter = match scoped_ids {
+        Some(ids) => match focus_analysis_scope_predicate(ids) {
             Some(filter) => Some(filter),
             None => return 0,
         },
         None => None,
     };
-    let where_clause = focus_analysis_queue_where_clause(id_filter.as_deref());
+    let where_clause = focus_analysis_queue_where_clause(scope_filter.as_deref());
     let sql = format!("SELECT COUNT(*) FROM images {}", where_clause);
 
     match conn.query_row(&sql, params![algorithm_version, analysis_run_id], |row| {
@@ -6397,6 +6423,44 @@ pub async fn focus_analysis_candidate_count_for_ids(
     focus_analysis_candidate_count_impl(conn, &algorithm_version, &analysis_run_id, Some(&ids))
 }
 
+fn focus_analysis_writeback_target_ids(conn: &Connection, image_id: i64) -> Vec<i64> {
+    let mut stmt = match conn.prepare(
+        "SELECT target.id
+         FROM images source
+         JOIN images target
+           ON target.id = source.id
+           OR (
+               source.image_kind IN ('raw', 'jpeg', 'heif')
+               AND target.image_kind IN ('raw', 'jpeg', 'heif')
+               AND target.file_stem = source.file_stem
+               AND target.directory_path = source.directory_path
+           )
+         WHERE source.id = ?1
+         ORDER BY target.id",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            eprintln!("focus_analysis_writeback_target_ids: prepare {}", e);
+            return vec![image_id];
+        }
+    };
+
+    let rows = match stmt.query_map(params![image_id], |row| row.get::<_, i64>(0)) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("focus_analysis_writeback_target_ids: query {}", e);
+            return vec![image_id];
+        }
+    };
+
+    let ids = rows.filter_map(|row| row.ok()).collect::<Vec<_>>();
+    if ids.is_empty() {
+        vec![image_id]
+    } else {
+        ids
+    }
+}
+
 /// Batch writeback for focus-analysis results. Returns the number of rows updated.
 pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) -> u64 {
     if results.is_empty() {
@@ -6421,6 +6485,11 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
     for result in results {
         let result = sanitized_focus_result(result);
         let is_complete = result.status == "complete";
+        let target_ids = if is_complete {
+            focus_analysis_writeback_target_ids(conn, result.id)
+        } else {
+            vec![result.id]
+        };
 
         let score = if is_complete {
             result.focus_score
@@ -6505,7 +6574,18 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
                  face_quality_min = ?16,
                  face_eyes_open_count = ?17,
                  face_blink_risk_count = ?18
-             WHERE id = ?1",
+             WHERE id = ?1
+                OR (
+                    ?11 = 'complete'
+                    AND EXISTS (
+                        SELECT 1 FROM images source
+                        WHERE source.id = ?1
+                          AND source.image_kind IN ('raw', 'jpeg', 'heif')
+                          AND images.image_kind IN ('raw', 'jpeg', 'heif')
+                          AND source.file_stem = images.file_stem
+                          AND source.directory_path = images.directory_path
+                    )
+                )",
             params![
                 result.id,
                 score,
@@ -6539,10 +6619,16 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
                     labels.sort_by_key(|label| label.to_lowercase());
                     labels.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
 
-                    for label in labels {
-                        if !insert_active_keyword_for_image(conn, result.id, &[label]) {
-                            let _ = conn.execute_batch("ROLLBACK;");
-                            return 0;
+                    for target_id in &target_ids {
+                        for label in &labels {
+                            if !insert_active_keyword_for_image(
+                                conn,
+                                *target_id,
+                                std::slice::from_ref(label),
+                            ) {
+                                let _ = conn.execute_batch("ROLLBACK;");
+                                return 0;
+                            }
                         }
                     }
                 }
@@ -8011,22 +8097,25 @@ mod focus_analysis_queue_tests {
                  id INTEGER PRIMARY KEY,
                  file_path TEXT NOT NULL,
                  file_size BIGINT NOT NULL,
+                 image_kind VARCHAR,
+                 file_stem VARCHAR,
+                 directory_path VARCHAR,
                  is_video BOOLEAN,
                  focus_analysis_status TEXT,
                  focus_algorithm_version TEXT,
                  focus_analysis_attempt_id TEXT
              );
              INSERT INTO images (
-                 id, file_path, file_size, is_video,
+                 id, file_path, file_size, image_kind, file_stem, directory_path, is_video,
                  focus_analysis_status, focus_algorithm_version, focus_analysis_attempt_id
              ) VALUES
-                 (1, '/a/missing.jpg', 10, FALSE, NULL, NULL, NULL),
-                 (2, '/a/current-complete.jpg', 10, FALSE, 'complete', 'v2', 'old-run'),
-                 (3, '/a/stale-complete.jpg', 10, FALSE, 'complete', 'v1', 'old-run'),
-                 (4, '/a/retry-offline.jpg', 10, FALSE, 'online_only', 'v2', 'old-run'),
-                 (5, '/a/same-run-unreadable.jpg', 10, FALSE, 'unreadable', 'v2', 'run-1'),
-                 (6, '/a/retry-failed.jpg', 10, FALSE, 'failed', 'v2', NULL),
-                 (7, '/a/video.mov', 10, TRUE, NULL, NULL, NULL);",
+                 (1, '/a/missing.jpg', 10, 'jpeg', 'missing', '/a', FALSE, NULL, NULL, NULL),
+                 (2, '/a/current-complete.jpg', 10, 'jpeg', 'current-complete', '/a', FALSE, 'complete', 'v2', 'old-run'),
+                 (3, '/a/stale-complete.jpg', 10, 'jpeg', 'stale-complete', '/a', FALSE, 'complete', 'v1', 'old-run'),
+                 (4, '/a/retry-offline.jpg', 10, 'jpeg', 'retry-offline', '/a', FALSE, 'online_only', 'v2', 'old-run'),
+                 (5, '/a/same-run-unreadable.jpg', 10, 'jpeg', 'same-run-unreadable', '/a', FALSE, 'unreadable', 'v2', 'run-1'),
+                 (6, '/a/retry-failed.jpg', 10, 'jpeg', 'retry-failed', '/a', FALSE, 'failed', 'v2', NULL),
+                 (7, '/a/video.mov', 10, 'other', 'video', '/a', TRUE, NULL, NULL, NULL);",
         )
         .expect("focus queue DDL");
         conn
@@ -8097,6 +8186,44 @@ mod focus_analysis_queue_tests {
             0
         );
         assert!(focus_analysis_candidates_impl(&conn, 500, "v2", "run-1", Some(&ids)).is_empty());
+    }
+
+    #[test]
+    fn focus_queue_collapses_raw_jpeg_pairs_to_lightweight_sibling() {
+        let conn = setup();
+        conn.execute_batch(
+            "INSERT INTO images (
+                 id, file_path, file_size, image_kind, file_stem, directory_path, is_video,
+                 focus_analysis_status, focus_algorithm_version, focus_analysis_attempt_id
+             ) VALUES
+                 (8, '/a/pair.nef', 20, 'raw', 'pair', '/a', FALSE, NULL, NULL, NULL),
+                 (9, '/a/pair.jpg', 10, 'jpeg', 'pair', '/a', FALSE, NULL, NULL, NULL),
+                 (10, '/a/raw-only.nef', 20, 'raw', 'raw-only', '/a', FALSE, NULL, NULL, NULL);",
+        )
+        .expect("insert pair rows");
+
+        assert_eq!(
+            candidate_ids(focus_analysis_candidates_impl(
+                &conn,
+                500,
+                "v2",
+                "run-1",
+                None
+            )),
+            vec![1, 3, 4, 6, 9, 10]
+        );
+
+        assert_eq!(
+            candidate_ids(focus_analysis_candidates_impl(
+                &conn,
+                500,
+                "v2",
+                "run-1",
+                Some(&[8])
+            )),
+            vec![9],
+            "a selection containing only the RAW half should analyze the JPEG representative"
+        );
     }
 }
 
