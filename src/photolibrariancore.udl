@@ -413,6 +413,18 @@ namespace photolibrariancore {
     sequence<SimilarPhotoCandidate> similar_photo_candidates_for_ids(sequence<i64> ids, string algorithm_version);
 
     [Async]
+    sequence<SimilarPhotoFeatureprint> similar_photo_featureprints_for_ids(sequence<i64> ids, string algorithm_version);
+
+    [Async]
+    u64 upsert_similar_photo_featureprints(sequence<SimilarPhotoFeatureprint> entries, string algorithm_version);
+
+    [Async]
+    sequence<SimilarPhotoWorkUnit> completed_similar_photo_work_units(string algorithm_version, string scope_key);
+
+    [Async]
+    boolean mark_similar_photo_work_unit_complete(string algorithm_version, string scope_key, SimilarPhotoWorkUnit unit);
+
+    [Async]
     sequence<SimilarPhotoStackSummary> similar_photo_stack_summaries_for_ids(sequence<i64> ids, string algorithm_version);
 
     [Async]
@@ -423,6 +435,9 @@ namespace photolibrariancore {
 
     [Async]
     u64 replace_similar_photo_groups_for_ids(sequence<i64> ids, sequence<SimilarPhotoGroupMember> members, string algorithm_version);
+
+    [Async]
+    u64 upsert_similar_photo_groups_for_ids(sequence<i64> ids, sequence<SimilarPhotoGroupMember> members, string algorithm_version);
 
     // Update the rotation angle for an image identified by file path
     // degrees: Rotation angle in degrees (0, 90, 180, or 270)
@@ -783,6 +798,12 @@ dictionary SimilarPhotoCandidate {
     string? camera_model;
 };
 
+dictionary SimilarPhotoFeatureprint {
+    i64 image_id;
+    string source_stamp;
+    sequence<u8> featureprint_blob;
+};
+
 dictionary SimilarPhotoGroupMember {
     i64 image_id;
     i64 group_id;
@@ -790,6 +811,14 @@ dictionary SimilarPhotoGroupMember {
     u32 member_rank;
     f64? distance_to_representative;
     f64 threshold;
+};
+
+dictionary SimilarPhotoWorkUnit {
+    i64 unit_index;
+    i64 start_image_id;
+    i64 end_image_id;
+    i64 candidate_count;
+    i64 member_count;
 };
 
 dictionary SimilarPhotoStackSummary {

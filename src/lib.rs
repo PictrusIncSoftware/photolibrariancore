@@ -225,6 +225,13 @@ pub struct SimilarPhotoCandidate {
     pub camera_model: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SimilarPhotoFeatureprint {
+    pub image_id: i64,
+    pub source_stamp: String,
+    pub featureprint_blob: Vec<u8>,
+}
+
 /// One durable similar-photo stack membership row.
 ///
 /// The current production representation stores only group membership, not the
@@ -238,6 +245,15 @@ pub struct SimilarPhotoGroupMember {
     pub member_rank: u32,
     pub distance_to_representative: Option<f64>,
     pub threshold: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SimilarPhotoWorkUnit {
+    pub unit_index: i64,
+    pub start_image_id: i64,
+    pub end_image_id: i64,
+    pub candidate_count: i64,
+    pub member_count: i64,
 }
 
 /// Compact gallery metadata for a visible similar-photo representative.
@@ -987,6 +1003,41 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         CREATE INDEX IF NOT EXISTS idx_similar_photo_group ON similar_photo_group_member(group_id);
         CREATE INDEX IF NOT EXISTS idx_similar_photo_rep ON similar_photo_group_member(representative_id);
         CREATE INDEX IF NOT EXISTS idx_similar_photo_algorithm ON similar_photo_group_member(algorithm_version);
+
+        -- Durable Vision featureprints for resumable similar-photo grouping.
+        -- The Swift runner owns the Vision observation bytes; core stores them
+        -- by image/algorithm/source stamp so cancelled runs do not regenerate
+        -- the expensive featureprint work.
+        CREATE TABLE IF NOT EXISTS similar_photo_featureprint (
+            image_id INTEGER NOT NULL,
+            algorithm_version TEXT NOT NULL,
+            source_stamp TEXT NOT NULL,
+            featureprint_blob BLOB NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (image_id, algorithm_version)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_similar_featureprint_algorithm ON similar_photo_featureprint(algorithm_version);
+
+        -- Resumable/progressive grouping checkpoints. A unit is complete only
+        -- for the deterministic candidate boundary that wrote it; callers match
+        -- unit index plus start/end ids before skipping.
+        CREATE TABLE IF NOT EXISTS similar_photo_group_work_unit (
+            algorithm_version TEXT NOT NULL,
+            scope_key TEXT NOT NULL,
+            unit_index BIGINT NOT NULL,
+            start_image_id INTEGER NOT NULL,
+            end_image_id INTEGER NOT NULL,
+            candidate_count BIGINT NOT NULL,
+            member_count BIGINT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (algorithm_version, scope_key, unit_index)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_similar_work_unit_scope ON similar_photo_group_work_unit(algorithm_version, scope_key, status);
 
         -- === Keyword system (Session 45; Docs/DESIGN-Keyword-System.md) ===
         -- Hierarchical keywords in ONE table. Each applied keyword PATH is
@@ -6918,6 +6969,241 @@ pub async fn similar_photo_candidates_for_ids(
     similar_photo_candidates_impl(conn, &algorithm_version, Some(&ids))
 }
 
+fn similar_photo_featureprints_for_ids_impl(
+    conn: &Connection,
+    ids: &[i64],
+    algorithm_version: &str,
+) -> Vec<SimilarPhotoFeatureprint> {
+    let Some(filter) = id_in_list(ids) else {
+        return Vec::new();
+    };
+    let sql = format!(
+        "SELECT image_id, source_stamp, featureprint_blob
+         FROM similar_photo_featureprint
+         WHERE algorithm_version = ?1 AND image_id IN (SELECT id FROM images WHERE {})
+         ORDER BY image_id",
+        filter
+    );
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("similar_photo_featureprints_for_ids: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mapped = stmt.query_map(params![algorithm_version], |row| {
+        Ok(SimilarPhotoFeatureprint {
+            image_id: row.get(0)?,
+            source_stamp: row.get(1)?,
+            featureprint_blob: row.get(2)?,
+        })
+    });
+
+    match mapped {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            eprintln!("similar_photo_featureprints_for_ids: query {}", e);
+            Vec::new()
+        }
+    }
+}
+
+pub async fn similar_photo_featureprints_for_ids(
+    ids: Vec<i64>,
+    algorithm_version: String,
+) -> Vec<SimilarPhotoFeatureprint> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    similar_photo_featureprints_for_ids_impl(conn, &ids, &algorithm_version)
+}
+
+fn upsert_similar_photo_featureprints_impl(
+    conn: &Connection,
+    entries: Vec<SimilarPhotoFeatureprint>,
+    algorithm_version: &str,
+) -> u64 {
+    let algorithm_version = algorithm_version.trim();
+    if entries.is_empty() || algorithm_version.is_empty() {
+        return 0;
+    }
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
+        eprintln!("upsert_similar_photo_featureprints: begin {}", e);
+        return 0;
+    }
+
+    let mut changed = 0u64;
+    for entry in entries {
+        if entry.image_id <= 0 || entry.source_stamp.trim().is_empty() || entry.featureprint_blob.is_empty() {
+            continue;
+        }
+        match conn.execute(
+            "INSERT INTO similar_photo_featureprint (
+                 image_id, algorithm_version, source_stamp, featureprint_blob
+             )
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (image_id, algorithm_version)
+             DO UPDATE SET
+                 source_stamp = excluded.source_stamp,
+                 featureprint_blob = excluded.featureprint_blob,
+                 updated_at = now()",
+            params![
+                entry.image_id,
+                algorithm_version,
+                entry.source_stamp,
+                entry.featureprint_blob,
+            ],
+        ) {
+            Ok(n) => changed += n as u64,
+            Err(e) => {
+                eprintln!("upsert_similar_photo_featureprints: image_id={} {}", entry.image_id, e);
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
+            }
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;") {
+        eprintln!("upsert_similar_photo_featureprints: commit {}", e);
+        return 0;
+    }
+    changed
+}
+
+pub async fn upsert_similar_photo_featureprints(
+    entries: Vec<SimilarPhotoFeatureprint>,
+    algorithm_version: String,
+) -> u64 {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    upsert_similar_photo_featureprints_impl(conn, entries, &algorithm_version)
+}
+
+fn completed_similar_photo_work_units_impl(
+    conn: &Connection,
+    algorithm_version: &str,
+    scope_key: &str,
+) -> Vec<SimilarPhotoWorkUnit> {
+    let mut stmt = match conn.prepare(
+        "SELECT unit_index, start_image_id, end_image_id, candidate_count, member_count
+         FROM similar_photo_group_work_unit
+         WHERE algorithm_version = ?1 AND scope_key = ?2 AND status = 'complete'
+         ORDER BY unit_index",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("completed_similar_photo_work_units: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mapped = stmt.query_map(params![algorithm_version, scope_key], |row| {
+        Ok(SimilarPhotoWorkUnit {
+            unit_index: row.get(0)?,
+            start_image_id: row.get(1)?,
+            end_image_id: row.get(2)?,
+            candidate_count: row.get(3)?,
+            member_count: row.get(4)?,
+        })
+    });
+
+    match mapped {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            eprintln!("completed_similar_photo_work_units: query {}", e);
+            Vec::new()
+        }
+    }
+}
+
+pub async fn completed_similar_photo_work_units(
+    algorithm_version: String,
+    scope_key: String,
+) -> Vec<SimilarPhotoWorkUnit> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    completed_similar_photo_work_units_impl(conn, &algorithm_version, &scope_key)
+}
+
+fn mark_similar_photo_work_unit_complete_impl(
+    conn: &Connection,
+    algorithm_version: &str,
+    scope_key: &str,
+    unit: SimilarPhotoWorkUnit,
+) -> bool {
+    if algorithm_version.trim().is_empty() || scope_key.trim().is_empty() || unit.unit_index < 0 {
+        return false;
+    }
+    match conn.execute(
+        "INSERT INTO similar_photo_group_work_unit (
+             algorithm_version, scope_key, unit_index, start_image_id, end_image_id,
+             candidate_count, member_count, status
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'complete')
+         ON CONFLICT (algorithm_version, scope_key, unit_index)
+         DO UPDATE SET
+             start_image_id = excluded.start_image_id,
+             end_image_id = excluded.end_image_id,
+             candidate_count = excluded.candidate_count,
+             member_count = excluded.member_count,
+             status = 'complete',
+             updated_at = now()",
+        params![
+            algorithm_version,
+            scope_key,
+            unit.unit_index,
+            unit.start_image_id,
+            unit.end_image_id,
+            unit.candidate_count,
+            unit.member_count,
+        ],
+    ) {
+        Ok(n) => n > 0,
+        Err(e) => {
+            eprintln!("mark_similar_photo_work_unit_complete: {}", e);
+            false
+        }
+    }
+}
+
+pub async fn mark_similar_photo_work_unit_complete(
+    algorithm_version: String,
+    scope_key: String,
+    unit: SimilarPhotoWorkUnit,
+) -> bool {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return false;
+        }
+    };
+
+    mark_similar_photo_work_unit_complete_impl(conn, &algorithm_version, &scope_key, unit)
+}
+
 fn similar_photo_member_is_valid(member: &SimilarPhotoGroupMember) -> bool {
     member.image_id > 0
         && member.group_id > 0
@@ -7052,6 +7338,110 @@ pub async fn replace_similar_photo_groups_for_ids(
     };
 
     replace_similar_photo_groups_impl(conn, members, &algorithm_version, Some(&ids))
+}
+
+fn upsert_similar_photo_groups_for_ids_impl(
+    conn: &Connection,
+    ids: &[i64],
+    members: Vec<SimilarPhotoGroupMember>,
+    algorithm_version: &str,
+) -> u64 {
+    let algorithm_version = algorithm_version.trim();
+    if ids.is_empty() || algorithm_version.is_empty() {
+        return 0;
+    }
+    let Some(filter) = id_in_list(ids) else {
+        return 0;
+    };
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
+        eprintln!("upsert_similar_photo_groups_for_ids: begin {}", e);
+        return 0;
+    }
+
+    let delete_sql = format!(
+        "DELETE FROM similar_photo_group_member
+         WHERE algorithm_version = ?1 AND image_id IN (SELECT id FROM images WHERE {})",
+        filter
+    );
+    if let Err(e) = conn.execute(&delete_sql, params![algorithm_version]) {
+        eprintln!("upsert_similar_photo_groups_for_ids: delete {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return 0;
+    }
+
+    let mut changed = 0u64;
+    for member in members {
+        if !similar_photo_member_is_valid(&member) {
+            eprintln!(
+                "upsert_similar_photo_groups_for_ids: skipped invalid member image_id={}",
+                member.image_id
+            );
+            continue;
+        }
+        match conn.execute(
+            "INSERT INTO similar_photo_group_member (
+                 image_id, group_id, representative_id, member_rank,
+                 distance_to_representative, algorithm_version, threshold
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (image_id)
+             DO UPDATE SET
+                 group_id = excluded.group_id,
+                 representative_id = excluded.representative_id,
+                 member_rank = excluded.member_rank,
+                 distance_to_representative = excluded.distance_to_representative,
+                 algorithm_version = excluded.algorithm_version,
+                 threshold = excluded.threshold,
+                 created_at = now()",
+            params![
+                member.image_id,
+                member.group_id,
+                member.representative_id,
+                member.member_rank as i64,
+                member.distance_to_representative,
+                algorithm_version,
+                member.threshold,
+            ],
+        ) {
+            Ok(n) => changed += n as u64,
+            Err(e) => {
+                eprintln!(
+                    "upsert_similar_photo_groups_for_ids: insert image_id={} failed: {}",
+                    member.image_id, e
+                );
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
+            }
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;") {
+        eprintln!("upsert_similar_photo_groups_for_ids: commit {}", e);
+        return 0;
+    }
+
+    changed
+}
+
+/// Progressive similar-photo write for a completed work unit. Clears only the
+/// supplied unit ids, then upserts discovered memberships so partial stacks are
+/// visible while the larger grouping run continues.
+pub async fn upsert_similar_photo_groups_for_ids(
+    ids: Vec<i64>,
+    members: Vec<SimilarPhotoGroupMember>,
+    algorithm_version: String,
+) -> u64 {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    upsert_similar_photo_groups_for_ids_impl(conn, &ids, members, &algorithm_version)
 }
 
 /// Return compact stack counts for visible gallery representatives.
@@ -8418,6 +8808,28 @@ mod similar_photo_group_tests {
                 threshold DOUBLE NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE similar_photo_featureprint (
+                image_id INTEGER NOT NULL,
+                algorithm_version TEXT NOT NULL,
+                source_stamp TEXT NOT NULL,
+                featureprint_blob BLOB NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (image_id, algorithm_version)
+            );
+            CREATE TABLE similar_photo_group_work_unit (
+                algorithm_version TEXT NOT NULL,
+                scope_key TEXT NOT NULL,
+                unit_index BIGINT NOT NULL,
+                start_image_id INTEGER NOT NULL,
+                end_image_id INTEGER NOT NULL,
+                candidate_count BIGINT NOT NULL,
+                member_count BIGINT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (algorithm_version, scope_key, unit_index)
+            );
             INSERT INTO similar_photo_group_member
                 (image_id, group_id, representative_id, member_rank, distance_to_representative, algorithm_version, threshold)
             VALUES
@@ -8489,6 +8901,72 @@ mod similar_photo_group_tests {
                 (9, "other-v".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn progressive_grouping_state_upserts_featureprints_units_and_members() {
+        let conn = setup();
+        let featureprints = vec![
+            SimilarPhotoFeatureprint {
+                image_id: 1,
+                source_stamp: "stamp-a".to_string(),
+                featureprint_blob: vec![1, 2, 3],
+            },
+            SimilarPhotoFeatureprint {
+                image_id: 2,
+                source_stamp: "stamp-b".to_string(),
+                featureprint_blob: vec![4, 5, 6],
+            },
+        ];
+        assert_eq!(
+            upsert_similar_photo_featureprints_impl(&conn, featureprints, "new-v1"),
+            2
+        );
+        let cached = similar_photo_featureprints_for_ids_impl(&conn, &[1, 2, 9], "new-v1");
+        assert_eq!(cached.len(), 2);
+        assert_eq!(cached[0].featureprint_blob, vec![1, 2, 3]);
+
+        let written = upsert_similar_photo_groups_for_ids_impl(
+            &conn,
+            &[1, 2],
+            vec![
+                SimilarPhotoGroupMember {
+                    image_id: 1,
+                    group_id: 1,
+                    representative_id: 1,
+                    member_rank: 0,
+                    distance_to_representative: Some(0.0),
+                    threshold: 8.5,
+                },
+                SimilarPhotoGroupMember {
+                    image_id: 2,
+                    group_id: 1,
+                    representative_id: 1,
+                    member_rank: 1,
+                    distance_to_representative: Some(1.0),
+                    threshold: 8.5,
+                },
+            ],
+            "new-v1",
+        );
+        assert_eq!(written, 2);
+
+        let unit = SimilarPhotoWorkUnit {
+            unit_index: 0,
+            start_image_id: 1,
+            end_image_id: 2,
+            candidate_count: 2,
+            member_count: written as i64,
+        };
+        assert!(mark_similar_photo_work_unit_complete_impl(
+            &conn,
+            "new-v1",
+            "whole:test",
+            unit
+        ));
+        let units = completed_similar_photo_work_units_impl(&conn, "new-v1", "whole:test");
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].member_count, 2);
     }
 }
 

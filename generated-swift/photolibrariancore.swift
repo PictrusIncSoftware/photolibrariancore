@@ -2266,6 +2266,64 @@ public func FfiConverterTypeSimilarPhotoCandidate_lower(_ value: SimilarPhotoCan
 }
 
 
+public struct SimilarPhotoFeatureprint: Equatable, Hashable {
+    public var imageId: Int64
+    public var sourceStamp: String
+    public var featureprintBlob: [UInt8]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(imageId: Int64, sourceStamp: String, featureprintBlob: [UInt8]) {
+        self.imageId = imageId
+        self.sourceStamp = sourceStamp
+        self.featureprintBlob = featureprintBlob
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SimilarPhotoFeatureprint: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSimilarPhotoFeatureprint: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SimilarPhotoFeatureprint {
+        return
+            try SimilarPhotoFeatureprint(
+                imageId: FfiConverterInt64.read(from: &buf), 
+                sourceStamp: FfiConverterString.read(from: &buf), 
+                featureprintBlob: FfiConverterSequenceUInt8.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SimilarPhotoFeatureprint, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.imageId, into: &buf)
+        FfiConverterString.write(value.sourceStamp, into: &buf)
+        FfiConverterSequenceUInt8.write(value.featureprintBlob, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSimilarPhotoFeatureprint_lift(_ buf: RustBuffer) throws -> SimilarPhotoFeatureprint {
+    return try FfiConverterTypeSimilarPhotoFeatureprint.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSimilarPhotoFeatureprint_lower(_ value: SimilarPhotoFeatureprint) -> RustBuffer {
+    return FfiConverterTypeSimilarPhotoFeatureprint.lower(value)
+}
+
+
 public struct SimilarPhotoGroupMember: Equatable, Hashable {
     public var imageId: Int64
     public var groupId: Int64
@@ -2457,6 +2515,72 @@ public func FfiConverterTypeSimilarPhotoStackSummary_lift(_ buf: RustBuffer) thr
 #endif
 public func FfiConverterTypeSimilarPhotoStackSummary_lower(_ value: SimilarPhotoStackSummary) -> RustBuffer {
     return FfiConverterTypeSimilarPhotoStackSummary.lower(value)
+}
+
+
+public struct SimilarPhotoWorkUnit: Equatable, Hashable {
+    public var unitIndex: Int64
+    public var startImageId: Int64
+    public var endImageId: Int64
+    public var candidateCount: Int64
+    public var memberCount: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(unitIndex: Int64, startImageId: Int64, endImageId: Int64, candidateCount: Int64, memberCount: Int64) {
+        self.unitIndex = unitIndex
+        self.startImageId = startImageId
+        self.endImageId = endImageId
+        self.candidateCount = candidateCount
+        self.memberCount = memberCount
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SimilarPhotoWorkUnit: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSimilarPhotoWorkUnit: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SimilarPhotoWorkUnit {
+        return
+            try SimilarPhotoWorkUnit(
+                unitIndex: FfiConverterInt64.read(from: &buf), 
+                startImageId: FfiConverterInt64.read(from: &buf), 
+                endImageId: FfiConverterInt64.read(from: &buf), 
+                candidateCount: FfiConverterInt64.read(from: &buf), 
+                memberCount: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SimilarPhotoWorkUnit, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.unitIndex, into: &buf)
+        FfiConverterInt64.write(value.startImageId, into: &buf)
+        FfiConverterInt64.write(value.endImageId, into: &buf)
+        FfiConverterInt64.write(value.candidateCount, into: &buf)
+        FfiConverterInt64.write(value.memberCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSimilarPhotoWorkUnit_lift(_ buf: RustBuffer) throws -> SimilarPhotoWorkUnit {
+    return try FfiConverterTypeSimilarPhotoWorkUnit.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSimilarPhotoWorkUnit_lower(_ value: SimilarPhotoWorkUnit) -> RustBuffer {
+    return FfiConverterTypeSimilarPhotoWorkUnit.lower(value)
 }
 
 
@@ -3141,6 +3265,31 @@ fileprivate struct FfiConverterOptionTypeVideoDetails: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceUInt8: FfiConverterRustBuffer {
+    typealias SwiftType = [UInt8]
+
+    public static func write(_ value: [UInt8], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterUInt8.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [UInt8] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [UInt8]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterUInt8.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceInt64: FfiConverterRustBuffer {
     typealias SwiftType = [Int64]
 
@@ -3591,6 +3740,31 @@ fileprivate struct FfiConverterSequenceTypeSimilarPhotoCandidate: FfiConverterRu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeSimilarPhotoFeatureprint: FfiConverterRustBuffer {
+    typealias SwiftType = [SimilarPhotoFeatureprint]
+
+    public static func write(_ value: [SimilarPhotoFeatureprint], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSimilarPhotoFeatureprint.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SimilarPhotoFeatureprint] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SimilarPhotoFeatureprint]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSimilarPhotoFeatureprint.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeSimilarPhotoGroupMember: FfiConverterRustBuffer {
     typealias SwiftType = [SimilarPhotoGroupMember]
 
@@ -3658,6 +3832,31 @@ fileprivate struct FfiConverterSequenceTypeSimilarPhotoStackSummary: FfiConverte
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeSimilarPhotoStackSummary.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSimilarPhotoWorkUnit: FfiConverterRustBuffer {
+    typealias SwiftType = [SimilarPhotoWorkUnit]
+
+    public static func write(_ value: [SimilarPhotoWorkUnit], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSimilarPhotoWorkUnit.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SimilarPhotoWorkUnit] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SimilarPhotoWorkUnit]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSimilarPhotoWorkUnit.read(from: &buf))
         }
         return seq
     }
@@ -3843,6 +4042,21 @@ public func collectionLabels()async  -> [String]  {
             completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceString.lift,
+            errorHandler: nil
+            
+        )
+}
+public func completedSimilarPhotoWorkUnits(algorithmVersion: String, scopeKey: String)async  -> [SimilarPhotoWorkUnit]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_completed_similar_photo_work_units(FfiConverterString.lower(algorithmVersion),FfiConverterString.lower(scopeKey)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeSimilarPhotoWorkUnit.lift,
             errorHandler: nil
             
         )
@@ -4564,6 +4778,21 @@ public func loadSavedQuery(id: Int64)async  -> SavedQueryPayload?  {
             
         )
 }
+public func markSimilarPhotoWorkUnitComplete(algorithmVersion: String, scopeKey: String, unit: SimilarPhotoWorkUnit)async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_mark_similar_photo_work_unit_complete(FfiConverterString.lower(algorithmVersion),FfiConverterString.lower(scopeKey),FfiConverterTypeSimilarPhotoWorkUnit_lower(unit)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_i8,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_i8,
+            freeFunc: ffi_photolibrariancore_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
+        )
+}
 public func mergeLightroomRecords(records: [ImageMetadata])async  -> MergeChunkResult  {
     return
         try!  await uniffiRustCallAsync(
@@ -4916,6 +5145,21 @@ public func similarPhotoCandidatesForIds(ids: [Int64], algorithmVersion: String)
             
         )
 }
+public func similarPhotoFeatureprintsForIds(ids: [Int64], algorithmVersion: String)async  -> [SimilarPhotoFeatureprint]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_similar_photo_featureprints_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterString.lower(algorithmVersion)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeSimilarPhotoFeatureprint.lift,
+            errorHandler: nil
+            
+        )
+}
 public func similarPhotoStackMembersForIds(ids: [Int64], algorithmVersion: String)async  -> [SimilarPhotoStackMember]  {
     return
         try!  await uniffiRustCallAsync(
@@ -5111,6 +5355,36 @@ public func updateRatingForIds(ids: [Int64], rating: UInt32)async  -> UInt64  {
             
         )
 }
+public func upsertSimilarPhotoFeatureprints(entries: [SimilarPhotoFeatureprint], algorithmVersion: String)async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_upsert_similar_photo_featureprints(FfiConverterSequenceTypeSimilarPhotoFeatureprint.lower(entries),FfiConverterString.lower(algorithmVersion)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+public func upsertSimilarPhotoGroupsForIds(ids: [Int64], members: [SimilarPhotoGroupMember], algorithmVersion: String)async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_upsert_similar_photo_groups_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterSequenceTypeSimilarPhotoGroupMember.lower(members),FfiConverterString.lower(algorithmVersion)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 
 private enum InitializationResult {
     case ok
@@ -5149,6 +5423,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_collection_labels() != 45357) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_completed_similar_photo_work_units() != 13330) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_copy_keyword_rows_for_image_pairs() != 7187) {
@@ -5298,6 +5575,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_load_saved_query() != 5281) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_mark_similar_photo_work_unit_complete() != 42326) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_merge_lightroom_records() != 40572) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5370,6 +5650,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_similar_photo_candidates_for_ids() != 32232) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_similar_photo_featureprints_for_ids() != 50110) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_similar_photo_stack_members_for_ids() != 48770) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5407,6 +5690,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_rating_for_ids() != 35398) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_upsert_similar_photo_featureprints() != 40550) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_upsert_similar_photo_groups_for_ids() != 62406) {
         return InitializationResult.apiChecksumMismatch
     }
 
