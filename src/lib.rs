@@ -4635,6 +4635,20 @@ pub struct KeywordNode {
     pub path: String,
 }
 
+/// Settings → Keywords management row. One row per distinct keyword path,
+/// aggregated across the raw keyword table so cleanup can see collection-backed
+/// rows and hidden orphan rows that normal vocabulary reads intentionally hide.
+#[derive(Debug, Clone)]
+pub struct KeywordManagementRow {
+    pub label: String,
+    pub path: String,
+    pub origin: i32,
+    pub visible_count: i64,
+    pub hidden_count: i64,
+    pub collection_count: i64,
+    pub total_count: i64,
+}
+
 /// Materialize an ordered segment list into one (label, path) pair per ancestor
 /// depth. `["Animals","Dog","Lab"]` -> `[("Animals","Animals"),
 /// ("Dog","Animals␟Dog"), ("Lab","Animals␟Dog␟Lab")]`. Returns empty if any
@@ -5107,6 +5121,163 @@ pub async fn keyword_vocabulary_for_origin(origin: String) -> Vec<KeywordNode> {
     };
 
     keyword_vocabulary_impl(conn, origin.as_str())
+}
+
+fn keyword_management_origin_clause(origin: &str) -> Option<&'static str> {
+    match origin {
+        "both" | "" => Some(""),
+        "user" => Some("WHERE (origin & 1) <> 0"),
+        "auto" => Some("WHERE (origin & 2) <> 0"),
+        _ => None,
+    }
+}
+
+fn keyword_management_rows_impl(
+    conn: &Connection,
+    origin: &str,
+    include_collections: bool,
+    include_orphaned: bool,
+) -> Vec<KeywordManagementRow> {
+    let Some(where_clause) = keyword_management_origin_clause(origin) else {
+        return Vec::new();
+    };
+    let collection_filter = if include_collections {
+        ""
+    } else {
+        "AND collection_count = 0"
+    };
+    let orphan_filter = if include_orphaned {
+        ""
+    } else {
+        "AND NOT (visible_count = 0 AND collection_count = 0)"
+    };
+    let sql = format!(
+        "WITH scoped AS (
+             SELECT label,
+                    path,
+                    origin,
+                    status,
+                    COALESCE(collection, FALSE) AS collection
+             FROM keyword
+             {}
+         ),
+         grouped AS (
+             SELECT label,
+                    path,
+                    CAST(bit_or(origin) AS INTEGER) AS origin,
+                    SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) AS visible_count,
+                    SUM(CASE WHEN status <> 1 THEN 1 ELSE 0 END) AS hidden_count,
+                    SUM(CASE WHEN collection THEN 1 ELSE 0 END) AS collection_count,
+                    COUNT(*) AS total_count
+             FROM scoped
+             GROUP BY label, path
+         )
+         SELECT label, path, origin, visible_count, hidden_count, collection_count, total_count
+         FROM grouped
+         WHERE 1 = 1 {} {}
+         ORDER BY path",
+        where_clause, collection_filter, orphan_filter
+    );
+
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("keyword_management_rows: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mapped = stmt.query_map([], |row| {
+        Ok(KeywordManagementRow {
+            label: row.get(0)?,
+            path: row.get(1)?,
+            origin: row.get(2)?,
+            visible_count: row.get(3)?,
+            hidden_count: row.get(4)?,
+            collection_count: row.get(5)?,
+            total_count: row.get(6)?,
+        })
+    });
+
+    match mapped {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            eprintln!("keyword_management_rows: query {}", e);
+            Vec::new()
+        }
+    }
+}
+
+/// Settings → Keywords management read. Unlike keyword_vocabulary, this reads
+/// the raw keyword table so orphaned hidden rows are visible for cleanup.
+pub async fn keyword_management_rows(
+    origin: String,
+    include_collections: bool,
+    include_orphaned: bool,
+) -> Vec<KeywordManagementRow> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    keyword_management_rows_impl(conn, origin.as_str(), include_collections, include_orphaned)
+}
+
+fn delete_keyword_paths_impl(conn: &Connection, paths: &[String]) -> u64 {
+    if paths.is_empty() {
+        return 0;
+    }
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
+        eprintln!("delete_keyword_paths: begin failed: {}", e);
+        return 0;
+    }
+
+    let mut deleted: u64 = 0;
+    for path in paths {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let prefix = format!("{}{}", trimmed, KEYWORD_PATH_SEPARATOR);
+        match conn.execute(
+            "DELETE FROM keyword WHERE path = ? OR starts_with(path, ?)",
+            params![trimmed, prefix],
+        ) {
+            Ok(changed) => deleted += changed as u64,
+            Err(e) => {
+                eprintln!("delete_keyword_paths: delete failed: {}", e);
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
+            }
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;") {
+        eprintln!("delete_keyword_paths: commit failed: {}", e);
+        return 0;
+    }
+    deleted
+}
+
+/// Physically purge keyword rows for the selected path(s), including descendants.
+/// This is intentionally separate from remove_keyword_for_ids, which is the
+/// normal user-facing soft-hide operation.
+pub async fn delete_keyword_paths(paths: Vec<String>) -> u64 {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    delete_keyword_paths_impl(conn, &paths)
 }
 
 /// Distinct VISIBLE keyword labels (case-sensitive, alphabetical) — the source for
@@ -8769,6 +8940,70 @@ mod keyword_tests {
         assert_eq!(labels("user"), vec!["manual", "shared"]);
         assert_eq!(labels("auto"), vec!["automatic", "shared"]);
         assert!(labels("bogus").is_empty());
+    }
+
+    #[test]
+    fn keyword_management_rows_filter_and_delete_raw_keyword_rows() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        let sep = KEYWORD_PATH_SEPARATOR;
+        conn.execute_batch(&format!(
+            "CREATE TABLE keyword (
+                 image_id INTEGER NOT NULL,
+                 label TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 status INTEGER NOT NULL DEFAULT 1,
+                 origin INTEGER NOT NULL DEFAULT 1,
+                 collection BOOLEAN NOT NULL DEFAULT FALSE
+             );
+             INSERT INTO keyword (image_id, label, path, status, origin, collection) VALUES
+                 (1, 'Dogs', 'Animals{sep}Dogs', 1, 1, FALSE),
+                 (2, 'Dogs', 'Animals{sep}Dogs', 0, 1, FALSE),
+                 (3, 'Auto', 'Auto', 1, 2, FALSE),
+                 (4, 'Trips', 'Trips', 0, 1, TRUE),
+                 (5, 'Gone', 'Gone', 0, 2, FALSE),
+                 (6, 'Puppies', 'Animals{sep}Dogs{sep}Puppies', 1, 1, FALSE);"
+        ))
+        .expect("schema + seed");
+
+        let all = keyword_management_rows_impl(&conn, "both", true, true);
+        assert_eq!(all.len(), 5);
+
+        let dogs = all
+            .iter()
+            .find(|row| row.path == format!("Animals{sep}Dogs"))
+            .expect("dogs");
+        assert_eq!(dogs.visible_count, 1);
+        assert_eq!(dogs.hidden_count, 1);
+        assert_eq!(dogs.collection_count, 0);
+        assert_eq!(dogs.total_count, 2);
+
+        let no_collections = keyword_management_rows_impl(&conn, "both", false, true)
+            .into_iter()
+            .map(|row| row.label)
+            .collect::<Vec<_>>();
+        assert!(!no_collections.contains(&"Trips".to_string()));
+
+        let no_orphans = keyword_management_rows_impl(&conn, "both", true, false)
+            .into_iter()
+            .map(|row| row.label)
+            .collect::<Vec<_>>();
+        assert!(!no_orphans.contains(&"Gone".to_string()));
+        assert!(no_orphans.contains(&"Trips".to_string()));
+
+        let auto = keyword_management_rows_impl(&conn, "auto", true, true)
+            .into_iter()
+            .map(|row| row.label)
+            .collect::<Vec<_>>();
+        assert_eq!(auto, vec!["Auto".to_string(), "Gone".to_string()]);
+
+        let deleted = delete_keyword_paths_impl(&conn, &[format!("Animals{sep}Dogs")]);
+        assert_eq!(deleted, 3);
+        let remaining = keyword_management_rows_impl(&conn, "both", true, true)
+            .into_iter()
+            .map(|row| row.label)
+            .collect::<Vec<_>>();
+        assert!(!remaining.contains(&"Dogs".to_string()));
+        assert!(!remaining.contains(&"Puppies".to_string()));
     }
 
     #[test]

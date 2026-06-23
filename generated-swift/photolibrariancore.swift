@@ -1524,6 +1524,80 @@ public func FfiConverterTypeImageRecord_lower(_ value: ImageRecord) -> RustBuffe
 }
 
 
+public struct KeywordManagementRow: Equatable, Hashable {
+    public var label: String
+    public var path: String
+    public var origin: Int32
+    public var visibleCount: Int64
+    public var hiddenCount: Int64
+    public var collectionCount: Int64
+    public var totalCount: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(label: String, path: String, origin: Int32, visibleCount: Int64, hiddenCount: Int64, collectionCount: Int64, totalCount: Int64) {
+        self.label = label
+        self.path = path
+        self.origin = origin
+        self.visibleCount = visibleCount
+        self.hiddenCount = hiddenCount
+        self.collectionCount = collectionCount
+        self.totalCount = totalCount
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension KeywordManagementRow: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeKeywordManagementRow: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> KeywordManagementRow {
+        return
+            try KeywordManagementRow(
+                label: FfiConverterString.read(from: &buf), 
+                path: FfiConverterString.read(from: &buf), 
+                origin: FfiConverterInt32.read(from: &buf), 
+                visibleCount: FfiConverterInt64.read(from: &buf), 
+                hiddenCount: FfiConverterInt64.read(from: &buf), 
+                collectionCount: FfiConverterInt64.read(from: &buf), 
+                totalCount: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: KeywordManagementRow, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.label, into: &buf)
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterInt32.write(value.origin, into: &buf)
+        FfiConverterInt64.write(value.visibleCount, into: &buf)
+        FfiConverterInt64.write(value.hiddenCount, into: &buf)
+        FfiConverterInt64.write(value.collectionCount, into: &buf)
+        FfiConverterInt64.write(value.totalCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeKeywordManagementRow_lift(_ buf: RustBuffer) throws -> KeywordManagementRow {
+    return try FfiConverterTypeKeywordManagementRow.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeKeywordManagementRow_lower(_ value: KeywordManagementRow) -> RustBuffer {
+    return FfiConverterTypeKeywordManagementRow.lower(value)
+}
+
+
 public struct KeywordNode: Equatable, Hashable {
     public var label: String
     public var path: String
@@ -3342,6 +3416,31 @@ fileprivate struct FfiConverterSequenceTypeImageRecord: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeKeywordManagementRow: FfiConverterRustBuffer {
+    typealias SwiftType = [KeywordManagementRow]
+
+    public static func write(_ value: [KeywordManagementRow], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeKeywordManagementRow.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [KeywordManagementRow] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [KeywordManagementRow]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeKeywordManagementRow.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeKeywordNode: FfiConverterRustBuffer {
     typealias SwiftType = [KeywordNode]
 
@@ -3834,6 +3933,21 @@ public func createAnalysisJob(jobKind: String, scopeKind: String, scopeValue: St
             completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeAnalysisJob.lift,
+            errorHandler: nil
+            
+        )
+}
+public func deleteKeywordPaths(paths: [String])async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_delete_keyword_paths(FfiConverterSequenceString.lower(paths)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
             
         )
@@ -4356,6 +4470,21 @@ public func keywordLabels()async  -> [String]  {
             completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceString.lift,
+            errorHandler: nil
+            
+        )
+}
+public func keywordManagementRows(origin: String, includeCollections: Bool, includeOrphaned: Bool)async  -> [KeywordManagementRow]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_keyword_management_rows(FfiConverterString.lower(origin),FfiConverterBool.lower(includeCollections),FfiConverterBool.lower(includeOrphaned)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeKeywordManagementRow.lift,
             errorHandler: nil
             
         )
@@ -5040,6 +5169,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_create_analysis_job() != 35443) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_delete_keyword_paths() != 43024) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_delete_saved_query() != 60302) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -5146,6 +5278,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_keyword_labels() != 36384) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_keyword_management_rows() != 3409) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_keyword_vocabulary() != 50955) {

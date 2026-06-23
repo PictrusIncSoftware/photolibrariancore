@@ -302,6 +302,21 @@ namespace photolibrariancore {
     [Async]
     sequence<KeywordNode> keyword_vocabulary_for_origin(string origin);
 
+    // Settings → Keywords management. Reads the raw keyword table so hidden
+    // orphaned rows and collection-backed rows can be inspected/cleaned without
+    // changing normal keyword/query vocabulary behavior.
+    [Async]
+    sequence<KeywordManagementRow> keyword_management_rows(
+        string origin,
+        boolean include_collections,
+        boolean include_orphaned
+    );
+
+    // Physically purge keyword rows for the selected path(s), including
+    // descendants. Separate from remove_keyword_for_ids, which soft-hides.
+    [Async]
+    u64 delete_keyword_paths(sequence<string> paths);
+
     [Async]
     sequence<KeywordRow> hidden_keywords_for_image(i64 image_id);
 
@@ -884,6 +899,19 @@ dictionary KeywordRow {
 dictionary KeywordNode {
     string label;
     string path;
+};
+
+// Settings → Keywords management aggregate row. Counts are over raw keyword
+// rows, grouped by path. visible_count = status 1; hidden_count = non-visible;
+// collection_count = rows whose collection switch is on.
+dictionary KeywordManagementRow {
+    string label;
+    string path;
+    i32 origin;
+    i64 visible_count;
+    i64 hidden_count;
+    i64 collection_count;
+    i64 total_count;
 };
 
 // Lightroom import — per-chunk merge result. image_ids is aligned to the input

@@ -315,6 +315,11 @@ uint64_t uniffi_photolibrariancore_fn_func_count_query_images_scoped_gallery(Rus
 uint64_t uniffi_photolibrariancore_fn_func_create_analysis_job(RustBuffer job_kind, RustBuffer scope_kind, RustBuffer scope_value, RustBuffer algorithm_version, RustBuffer analysis_run_id, uint64_t total_candidate_count
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_DELETE_KEYWORD_PATHS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_DELETE_KEYWORD_PATHS
+uint64_t uniffi_photolibrariancore_fn_func_delete_keyword_paths(RustBuffer paths
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_DELETE_SAVED_QUERY
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_DELETE_SAVED_QUERY
 uint64_t uniffi_photolibrariancore_fn_func_delete_saved_query(int64_t id
@@ -499,6 +504,11 @@ uint64_t uniffi_photolibrariancore_fn_func_initialize_catalogue(RustBuffer catal
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_KEYWORD_LABELS
 uint64_t uniffi_photolibrariancore_fn_func_keyword_labels(void
     
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_KEYWORD_MANAGEMENT_ROWS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_KEYWORD_MANAGEMENT_ROWS
+uint64_t uniffi_photolibrariancore_fn_func_keyword_management_rows(RustBuffer origin, int8_t include_collections, int8_t include_orphaned
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_KEYWORD_VOCABULARY
@@ -1058,6 +1068,12 @@ uint16_t uniffi_photolibrariancore_checksum_func_create_analysis_job(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_DELETE_KEYWORD_PATHS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_DELETE_KEYWORD_PATHS
+uint16_t uniffi_photolibrariancore_checksum_func_delete_keyword_paths(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_DELETE_SAVED_QUERY
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_DELETE_SAVED_QUERY
 uint16_t uniffi_photolibrariancore_checksum_func_delete_saved_query(void
@@ -1271,6 +1287,12 @@ uint16_t uniffi_photolibrariancore_checksum_func_initialize_catalogue(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_KEYWORD_LABELS
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_KEYWORD_LABELS
 uint16_t uniffi_photolibrariancore_checksum_func_keyword_labels(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_KEYWORD_MANAGEMENT_ROWS
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_KEYWORD_MANAGEMENT_ROWS
+uint16_t uniffi_photolibrariancore_checksum_func_keyword_management_rows(void
     
 );
 #endif
