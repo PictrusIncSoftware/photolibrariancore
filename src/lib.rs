@@ -253,6 +253,15 @@ pub struct SimilarPhotoStackSummary {
     pub physical_count: u32,
 }
 
+/// Expanded physical membership for one or more selected visible stack rows.
+#[derive(Debug, Clone)]
+pub struct SimilarPhotoStackMember {
+    pub image_id: i64,
+    pub group_id: i64,
+    pub representative_id: i64,
+    pub member_rank: u32,
+}
+
 /// One focus-analysis writeback row.
 ///
 /// `status` is an allow-listed token owned by the analyzer:
@@ -6880,6 +6889,143 @@ pub async fn similar_photo_stack_summaries_for_ids(
     }
 }
 
+/// Return the physical similar-photo stack members represented by visible ids.
+///
+/// Input ids that are not in a stack are returned as singleton rows with
+/// `group_id == representative_id == image_id`. On errors, degrade to those
+/// singleton rows so callers still act on the visible selection.
+fn similar_photo_stack_members_for_ids_impl(
+    conn: &Connection,
+    ids: &[i64],
+    algorithm_version: &str,
+) -> Vec<SimilarPhotoStackMember> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+
+    let fallback = || {
+        ids.iter()
+            .map(|id| SimilarPhotoStackMember {
+                image_id: *id,
+                group_id: *id,
+                representative_id: *id,
+                member_rank: 0,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let algorithm_version = algorithm_version.trim().to_string();
+    if algorithm_version.is_empty() {
+        return fallback();
+    }
+
+    let id_filter = match id_in_list(&ids) {
+        Some(filter) => filter,
+        None => return Vec::new(),
+    };
+
+    let sql = format!(
+        r#"
+        WITH requested AS (
+            SELECT id AS image_id
+            FROM images
+            WHERE {}
+        ),
+        requested_membership AS (
+            SELECT r.image_id, m.group_id
+            FROM requested r
+            LEFT JOIN similar_photo_group_member m
+              ON m.image_id = r.image_id
+             AND m.algorithm_version = ?1
+        ),
+        expanded AS (
+            SELECT
+                gm.image_id,
+                gm.group_id,
+                gm.representative_id,
+                gm.member_rank
+            FROM requested_membership rm
+            JOIN similar_photo_group_member gm
+              ON gm.group_id = rm.group_id
+             AND gm.algorithm_version = ?1
+            UNION
+            SELECT
+                rm.image_id,
+                rm.image_id AS group_id,
+                rm.image_id AS representative_id,
+                0 AS member_rank
+            FROM requested_membership rm
+            WHERE rm.group_id IS NULL
+        )
+        SELECT image_id, group_id, representative_id, member_rank
+        FROM expanded
+        ORDER BY group_id, member_rank, image_id
+        "#,
+        id_filter
+    );
+
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("similar_photo_stack_members_for_ids: prepare {}", e);
+            return fallback();
+        }
+    };
+
+    let mapped = stmt.query_map(params![algorithm_version], |row| {
+        let rank: i64 = row.get(3)?;
+        Ok(SimilarPhotoStackMember {
+            image_id: row.get(0)?,
+            group_id: row.get(1)?,
+            representative_id: row.get(2)?,
+            member_rank: rank.max(0) as u32,
+        })
+    });
+
+    match mapped {
+        Ok(iter) => {
+            let members = iter.filter_map(|r| r.ok()).collect::<Vec<_>>();
+            if members.is_empty() {
+                fallback()
+            } else {
+                members
+            }
+        }
+        Err(e) => {
+            eprintln!("similar_photo_stack_members_for_ids: query {}", e);
+            fallback()
+        }
+    }
+}
+
+pub async fn similar_photo_stack_members_for_ids(
+    ids: Vec<i64>,
+    algorithm_version: String,
+) -> Vec<SimilarPhotoStackMember> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return ids
+                .iter()
+                .map(|id| SimilarPhotoStackMember {
+                    image_id: *id,
+                    group_id: *id,
+                    representative_id: *id,
+                    member_rank: 0,
+                })
+                .collect();
+        }
+    };
+
+    similar_photo_stack_members_for_ids_impl(conn, &ids, &algorithm_version)
+}
+
 /// Distinct collection names — labels carrying `collection = TRUE` on any row,
 /// read from the RAW `keyword` table (membership is independent of search
 /// visibility). The gallery "Select Collection" picker's autofill/dropdown —
@@ -7962,7 +8108,9 @@ mod similar_photo_group_tests {
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().expect("in-memory db");
         conn.execute_batch(
-            "CREATE TABLE similar_photo_group_member (
+            "CREATE TABLE images (id INTEGER PRIMARY KEY);
+            INSERT INTO images (id) VALUES (1), (2), (3), (4), (9);
+            CREATE TABLE similar_photo_group_member (
                 image_id INTEGER PRIMARY KEY,
                 group_id INTEGER NOT NULL,
                 representative_id INTEGER NOT NULL,
@@ -7976,10 +8124,24 @@ mod similar_photo_group_tests {
                 (image_id, group_id, representative_id, member_rank, distance_to_representative, algorithm_version, threshold)
             VALUES
                 (1, 1, 1, 0, 0.0, 'old-v1', 2.35),
+                (2, 2, 2, 0, 0.0, 'old-v1', 2.35),
+                (3, 2, 2, 1, 1.25, 'old-v1', 2.35),
                 (9, 9, 9, 0, 0.0, 'other-v', 2.35);",
         )
         .expect("similar-photo DDL");
         conn
+    }
+
+    #[test]
+    fn stack_members_expand_selected_groups_and_keep_singletons() {
+        let conn = setup();
+        let members = similar_photo_stack_members_for_ids_impl(&conn, &[2, 4], "old-v1");
+        let actual: Vec<(i64, i64, i64, u32)> = members
+            .into_iter()
+            .map(|m| (m.image_id, m.group_id, m.representative_id, m.member_rank))
+            .collect();
+
+        assert_eq!(actual, vec![(2, 2, 2, 0), (3, 2, 2, 1), (4, 4, 4, 0)]);
     }
 
     #[test]

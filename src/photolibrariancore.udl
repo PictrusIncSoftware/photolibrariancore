@@ -401,6 +401,9 @@ namespace photolibrariancore {
     sequence<SimilarPhotoStackSummary> similar_photo_stack_summaries_for_ids(sequence<i64> ids, string algorithm_version);
 
     [Async]
+    sequence<SimilarPhotoStackMember> similar_photo_stack_members_for_ids(sequence<i64> ids, string algorithm_version);
+
+    [Async]
     u64 replace_similar_photo_groups(sequence<SimilarPhotoGroupMember> members, string algorithm_version);
 
     [Async]
@@ -779,6 +782,13 @@ dictionary SimilarPhotoStackSummary {
     i64 group_id;
     u32 logical_count;
     u32 physical_count;
+};
+
+dictionary SimilarPhotoStackMember {
+    i64 image_id;
+    i64 group_id;
+    i64 representative_id;
+    u32 member_rank;
 };
 
 dictionary FocusAnalysisResult {
