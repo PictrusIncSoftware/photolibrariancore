@@ -306,6 +306,38 @@ pub struct FocusAnalysisResult {
     pub face_eyes_open_count: Option<i32>,
     pub face_blink_risk_count: Option<i32>,
     pub auto_keywords: Vec<String>,
+    pub face_observations: Vec<FaceObservationResult>,
+}
+
+/// One detected human face from the Vision enrichment pass.
+///
+/// These rows are scalar geometry/quality facts stored in DuckDB. Future
+/// AuraFace embeddings should live in the vector store keyed by the durable
+/// `face_observation.id`.
+#[derive(Debug, Clone)]
+pub struct FaceObservationResult {
+    pub face_index: u32,
+    pub bounding_box_x: f64,
+    pub bounding_box_y: f64,
+    pub bounding_box_width: f64,
+    pub bounding_box_height: f64,
+    pub detection_confidence: Option<f64>,
+    pub face_capture_quality: Option<f64>,
+    pub face_focus_score: Option<f64>,
+    pub left_eye_open_score: Option<f64>,
+    pub right_eye_open_score: Option<f64>,
+    pub eyes_open_score: Option<f64>,
+    pub blink_risk_score: Option<f64>,
+    pub left_eye_x: Option<f64>,
+    pub left_eye_y: Option<f64>,
+    pub right_eye_x: Option<f64>,
+    pub right_eye_y: Option<f64>,
+    pub nose_x: Option<f64>,
+    pub nose_y: Option<f64>,
+    pub mouth_left_x: Option<f64>,
+    pub mouth_left_y: Option<f64>,
+    pub mouth_right_x: Option<f64>,
+    pub mouth_right_y: Option<f64>,
 }
 
 /// Durable coordinator row for enrichment / intelligent-culling work.
@@ -937,6 +969,50 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         CREATE INDEX IF NOT EXISTS idx_face_quality_min ON images(face_quality_min);
         CREATE INDEX IF NOT EXISTS idx_face_eyes_open_count ON images(face_eyes_open_count);
         CREATE INDEX IF NOT EXISTS idx_face_blink_risk_count ON images(face_blink_risk_count);
+
+        -- === Face observations (Vision detection, pre-recognition) ===
+        -- One row per detected human face per image/algorithm version. This is
+        -- the durable scalar side of face detection: geometry, capture quality,
+        -- focus, eye-state measurements, and coarse alignment landmarks. Future
+        -- AuraFace embeddings belong in LanceDB keyed by face_observation.id.
+        CREATE SEQUENCE IF NOT EXISTS face_observation_id_seq START 1;
+
+        CREATE TABLE IF NOT EXISTS face_observation (
+            id INTEGER PRIMARY KEY DEFAULT nextval('face_observation_id_seq'),
+            image_id INTEGER NOT NULL,
+            analyzed_image_id INTEGER NOT NULL,
+            face_index INTEGER NOT NULL,
+            algorithm_version TEXT NOT NULL,
+            analysis_run_id TEXT NOT NULL,
+            bounding_box_x DOUBLE NOT NULL,
+            bounding_box_y DOUBLE NOT NULL,
+            bounding_box_width DOUBLE NOT NULL,
+            bounding_box_height DOUBLE NOT NULL,
+            detection_confidence DOUBLE,
+            face_capture_quality DOUBLE,
+            face_focus_score DOUBLE,
+            left_eye_open_score DOUBLE,
+            right_eye_open_score DOUBLE,
+            eyes_open_score DOUBLE,
+            blink_risk_score DOUBLE,
+            left_eye_x DOUBLE,
+            left_eye_y DOUBLE,
+            right_eye_x DOUBLE,
+            right_eye_y DOUBLE,
+            nose_x DOUBLE,
+            nose_y DOUBLE,
+            mouth_left_x DOUBLE,
+            mouth_left_y DOUBLE,
+            mouth_right_x DOUBLE,
+            mouth_right_y DOUBLE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (image_id, algorithm_version, face_index)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_face_observation_image ON face_observation(image_id);
+        CREATE INDEX IF NOT EXISTS idx_face_observation_analyzed_image ON face_observation(analyzed_image_id);
+        CREATE INDEX IF NOT EXISTS idx_face_observation_algorithm ON face_observation(algorithm_version);
+        CREATE INDEX IF NOT EXISTS idx_face_observation_run ON face_observation(analysis_run_id);
 
         -- === Durable analysis jobs (background intelligent culling coordinator) ===
         -- One row per user/requested enrichment run. The current focus pass uses
@@ -6371,6 +6447,55 @@ fn face_quality_is_valid(score: Option<f64>) -> bool {
     score.map(|score| score.is_finite()).unwrap_or(true)
 }
 
+fn normalized_optional_score_is_valid(score: Option<f64>) -> bool {
+    score
+        .map(|score| score.is_finite() && (-0.01..=1.01).contains(&score))
+        .unwrap_or(true)
+}
+
+fn optional_finite_is_valid(score: Option<f64>) -> bool {
+    score.map(|score| score.is_finite()).unwrap_or(true)
+}
+
+fn normalized_landmark_pair_is_valid(x: Option<f64>, y: Option<f64>) -> bool {
+    match (x, y) {
+        (Some(x), Some(y)) => {
+            x.is_finite()
+                && y.is_finite()
+                && (-0.01..=1.01).contains(&x)
+                && (-0.01..=1.01).contains(&y)
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn face_observation_is_valid(observation: &FaceObservationResult) -> bool {
+    observation.face_index <= 10_000
+        && observation.bounding_box_x.is_finite()
+        && observation.bounding_box_y.is_finite()
+        && observation.bounding_box_width.is_finite()
+        && observation.bounding_box_height.is_finite()
+        && observation.bounding_box_width > 0.0
+        && observation.bounding_box_height > 0.0
+        && observation.bounding_box_x >= -0.01
+        && observation.bounding_box_y >= -0.01
+        && observation.bounding_box_x + observation.bounding_box_width <= 1.01
+        && observation.bounding_box_y + observation.bounding_box_height <= 1.01
+        && normalized_optional_score_is_valid(observation.detection_confidence)
+        && normalized_optional_score_is_valid(observation.face_capture_quality)
+        && optional_finite_is_valid(observation.face_focus_score)
+        && optional_finite_is_valid(observation.left_eye_open_score)
+        && optional_finite_is_valid(observation.right_eye_open_score)
+        && optional_finite_is_valid(observation.eyes_open_score)
+        && normalized_optional_score_is_valid(observation.blink_risk_score)
+        && normalized_landmark_pair_is_valid(observation.left_eye_x, observation.left_eye_y)
+        && normalized_landmark_pair_is_valid(observation.right_eye_x, observation.right_eye_y)
+        && normalized_landmark_pair_is_valid(observation.nose_x, observation.nose_y)
+        && normalized_landmark_pair_is_valid(observation.mouth_left_x, observation.mouth_left_y)
+        && normalized_landmark_pair_is_valid(observation.mouth_right_x, observation.mouth_right_y)
+}
+
 fn sanitized_focus_result(mut result: FocusAnalysisResult) -> FocusAnalysisResult {
     let scores_are_valid = focus_score_is_valid(result.focus_score)
         && focus_score_is_valid(result.focus_human_score)
@@ -6417,6 +6542,19 @@ fn sanitized_focus_result(mut result: FocusAnalysisResult) -> FocusAnalysisResul
         result.face_eyes_open_count = None;
         result.face_blink_risk_count = None;
         result.auto_keywords.clear();
+        result.face_observations.clear();
+    } else {
+        let original_observation_count = result.face_observations.len();
+        result
+            .face_observations
+            .retain(|observation| face_observation_is_valid(observation));
+        if result.face_observations.len() != original_observation_count {
+            eprintln!(
+                "update_focus_analysis_results: skipped {} invalid face observation(s) for id {}",
+                original_observation_count - result.face_observations.len(),
+                result.id
+            );
+        }
     }
 
     result
@@ -6683,6 +6821,108 @@ fn focus_analysis_writeback_target_ids(conn: &Connection, image_id: i64) -> Vec<
     }
 }
 
+fn replace_face_observations_for_targets(
+    conn: &Connection,
+    result: &FocusAnalysisResult,
+    target_ids: &[i64],
+    is_complete: bool,
+) -> bool {
+    for target_id in target_ids {
+        if let Err(e) = conn.execute(
+            "DELETE FROM face_observation
+             WHERE image_id = ?1
+               AND algorithm_version = ?2",
+            params![target_id, &result.algorithm_version],
+        ) {
+            eprintln!(
+                "replace_face_observations_for_targets: delete image_id={} {}",
+                target_id, e
+            );
+            return false;
+        }
+    }
+
+    if !is_complete {
+        return true;
+    }
+
+    for target_id in target_ids {
+        for observation in &result.face_observations {
+            if let Err(e) = conn.execute(
+                "INSERT INTO face_observation (
+                     image_id,
+                     analyzed_image_id,
+                     face_index,
+                     algorithm_version,
+                     analysis_run_id,
+                     bounding_box_x,
+                     bounding_box_y,
+                     bounding_box_width,
+                     bounding_box_height,
+                     detection_confidence,
+                     face_capture_quality,
+                     face_focus_score,
+                     left_eye_open_score,
+                     right_eye_open_score,
+                     eyes_open_score,
+                     blink_risk_score,
+                     left_eye_x,
+                     left_eye_y,
+                     right_eye_x,
+                     right_eye_y,
+                     nose_x,
+                     nose_y,
+                     mouth_left_x,
+                     mouth_left_y,
+                     mouth_right_x,
+                     mouth_right_y
+                 )
+                 VALUES (
+                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+                     ?25, ?26
+                 )",
+                params![
+                    target_id,
+                    result.id,
+                    observation.face_index as i64,
+                    &result.algorithm_version,
+                    &result.analysis_run_id,
+                    observation.bounding_box_x,
+                    observation.bounding_box_y,
+                    observation.bounding_box_width,
+                    observation.bounding_box_height,
+                    observation.detection_confidence,
+                    observation.face_capture_quality,
+                    observation.face_focus_score,
+                    observation.left_eye_open_score,
+                    observation.right_eye_open_score,
+                    observation.eyes_open_score,
+                    observation.blink_risk_score,
+                    observation.left_eye_x,
+                    observation.left_eye_y,
+                    observation.right_eye_x,
+                    observation.right_eye_y,
+                    observation.nose_x,
+                    observation.nose_y,
+                    observation.mouth_left_x,
+                    observation.mouth_left_y,
+                    observation.mouth_right_x,
+                    observation.mouth_right_y,
+                ],
+            ) {
+                eprintln!(
+                    "replace_face_observations_for_targets: insert image_id={} face_index={} {}",
+                    target_id, observation.face_index, e
+                );
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
 /// Batch writeback for focus-analysis results. Returns the number of rows updated.
 pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) -> u64 {
     if results.is_empty() {
@@ -6774,7 +7014,10 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
         } else {
             None
         };
-        let basis = result.focus_basis.unwrap_or_else(|| "unknown".to_string());
+        let basis = result
+            .focus_basis
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
 
         match conn.execute(
             "UPDATE images
@@ -6831,6 +7074,18 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
         ) {
             Ok(n) => {
                 updated += n as u64;
+                if n > 0
+                    && !replace_face_observations_for_targets(
+                        conn,
+                        &result,
+                        &target_ids,
+                        is_complete,
+                    )
+                {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    return 0;
+                }
+
                 if n > 0 && is_complete {
                     let mut labels = result
                         .auto_keywords
@@ -7041,7 +7296,10 @@ fn upsert_similar_photo_featureprints_impl(
 
     let mut changed = 0u64;
     for entry in entries {
-        if entry.image_id <= 0 || entry.source_stamp.trim().is_empty() || entry.featureprint_blob.is_empty() {
+        if entry.image_id <= 0
+            || entry.source_stamp.trim().is_empty()
+            || entry.featureprint_blob.is_empty()
+        {
             continue;
         }
         match conn.execute(
@@ -7063,7 +7321,10 @@ fn upsert_similar_photo_featureprints_impl(
         ) {
             Ok(n) => changed += n as u64,
             Err(e) => {
-                eprintln!("upsert_similar_photo_featureprints: image_id={} {}", entry.image_id, e);
+                eprintln!(
+                    "upsert_similar_photo_featureprints: image_id={} {}",
+                    entry.image_id, e
+                );
                 let _ = conn.execute_batch("ROLLBACK;");
                 return 0;
             }
@@ -8647,6 +8908,171 @@ pub async fn merge_lightroom_videos(records: Vec<LightroomVideoRecord>) -> Merge
 }
 
 #[cfg(test)]
+mod face_observation_tests {
+    use super::*;
+    use duckdb::Connection;
+
+    fn setup() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE SEQUENCE face_observation_id_seq START 1;
+             CREATE TABLE face_observation (
+                 id INTEGER PRIMARY KEY DEFAULT nextval('face_observation_id_seq'),
+                 image_id INTEGER NOT NULL,
+                 analyzed_image_id INTEGER NOT NULL,
+                 face_index INTEGER NOT NULL,
+                 algorithm_version TEXT NOT NULL,
+                 analysis_run_id TEXT NOT NULL,
+                 bounding_box_x DOUBLE NOT NULL,
+                 bounding_box_y DOUBLE NOT NULL,
+                 bounding_box_width DOUBLE NOT NULL,
+                 bounding_box_height DOUBLE NOT NULL,
+                 detection_confidence DOUBLE,
+                 face_capture_quality DOUBLE,
+                 face_focus_score DOUBLE,
+                 left_eye_open_score DOUBLE,
+                 right_eye_open_score DOUBLE,
+                 eyes_open_score DOUBLE,
+                 blink_risk_score DOUBLE,
+                 left_eye_x DOUBLE,
+                 left_eye_y DOUBLE,
+                 right_eye_x DOUBLE,
+                 right_eye_y DOUBLE,
+                 nose_x DOUBLE,
+                 nose_y DOUBLE,
+                 mouth_left_x DOUBLE,
+                 mouth_left_y DOUBLE,
+                 mouth_right_x DOUBLE,
+                 mouth_right_y DOUBLE,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 UNIQUE (image_id, algorithm_version, face_index)
+             );",
+        )
+        .expect("face observation DDL");
+        conn
+    }
+
+    fn observation(face_index: u32) -> FaceObservationResult {
+        FaceObservationResult {
+            face_index,
+            bounding_box_x: 0.1,
+            bounding_box_y: 0.2,
+            bounding_box_width: 0.3,
+            bounding_box_height: 0.4,
+            detection_confidence: Some(0.9),
+            face_capture_quality: Some(0.8),
+            face_focus_score: Some(123.0),
+            left_eye_open_score: Some(0.2),
+            right_eye_open_score: Some(0.21),
+            eyes_open_score: Some(0.205),
+            blink_risk_score: Some(0.0),
+            left_eye_x: Some(0.2),
+            left_eye_y: Some(0.6),
+            right_eye_x: Some(0.4),
+            right_eye_y: Some(0.6),
+            nose_x: Some(0.3),
+            nose_y: Some(0.45),
+            mouth_left_x: Some(0.23),
+            mouth_left_y: Some(0.35),
+            mouth_right_x: Some(0.37),
+            mouth_right_y: Some(0.35),
+        }
+    }
+
+    fn result(face_observations: Vec<FaceObservationResult>) -> FocusAnalysisResult {
+        FocusAnalysisResult {
+            id: 10,
+            focus_score: Some(1.0),
+            focus_basis: Some("human_face".to_string()),
+            algorithm_version: "faces-v1".to_string(),
+            analysis_run_id: "run-1".to_string(),
+            status: "complete".to_string(),
+            focus_human_score: Some(1.0),
+            focus_animal_score: None,
+            focus_foreground_score: None,
+            focus_saliency_score: None,
+            focus_animal_pose_score: None,
+            focus_whole_image_score: Some(1.0),
+            face_count: Some(face_observations.len() as i32),
+            face_quality_best: Some(0.8),
+            face_quality_average: Some(0.8),
+            face_quality_min: Some(0.8),
+            face_eyes_open_count: Some(1),
+            face_blink_risk_count: Some(0),
+            auto_keywords: Vec::new(),
+            face_observations,
+        }
+    }
+
+    #[test]
+    fn face_observations_replace_current_algorithm_for_each_target() {
+        let conn = setup();
+        let first = result(vec![observation(0), observation(1)]);
+        assert!(replace_face_observations_for_targets(
+            &conn,
+            &first,
+            &[1, 2],
+            true
+        ));
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM face_observation", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 4);
+
+        let replacement = result(vec![observation(0)]);
+        assert!(replace_face_observations_for_targets(
+            &conn,
+            &replacement,
+            &[1, 2],
+            true
+        ));
+
+        let rows: Vec<(i64, i64, i64)> = conn
+            .prepare(
+                "SELECT image_id, analyzed_image_id, face_index
+                 FROM face_observation
+                 ORDER BY image_id, face_index",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+
+        assert_eq!(rows, vec![(1, 10, 0), (2, 10, 0)]);
+    }
+
+    #[test]
+    fn failed_result_clears_stale_face_observations() {
+        let conn = setup();
+        let complete = result(vec![observation(0)]);
+        assert!(replace_face_observations_for_targets(
+            &conn,
+            &complete,
+            &[1],
+            true
+        ));
+
+        assert!(replace_face_observations_for_targets(
+            &conn,
+            &complete,
+            &[1],
+            false
+        ));
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM face_observation", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+}
+
+#[cfg(test)]
 mod focus_analysis_queue_tests {
     use super::*;
     use duckdb::Connection;
@@ -8765,11 +9191,7 @@ mod focus_analysis_queue_tests {
 
         assert_eq!(
             candidate_ids(focus_analysis_candidates_impl(
-                &conn,
-                500,
-                "v2",
-                "run-1",
-                None
+                &conn, 500, "v2", "run-1", None
             )),
             vec![1, 3, 4, 6, 9, 10]
         );
