@@ -404,6 +404,12 @@ namespace photolibrariancore {
     [Async]
     u64 update_focus_analysis_results(sequence<FocusAnalysisResult> results);
 
+    [Async]
+    u64 face_observation_count(string algorithm_version);
+
+    [Async]
+    sequence<FaceObservationRecord> face_observations_for_image_ids(sequence<i64> ids, string algorithm_version);
+
     // Similar-photo grouping (S94): Swift computes Vision feature-print groups
     // after Intelligent Culling and persists only multi-photo memberships here.
     [Async]
@@ -881,6 +887,37 @@ dictionary FaceObservationResult {
     f64? mouth_left_y = null;
     f64? mouth_right_x = null;
     f64? mouth_right_y = null;
+};
+
+dictionary FaceObservationRecord {
+    i64 id;
+    i64 image_id;
+    i64 analyzed_image_id;
+    u32 face_index;
+    string algorithm_version;
+    string analysis_run_id;
+    f64 bounding_box_x;
+    f64 bounding_box_y;
+    f64 bounding_box_width;
+    f64 bounding_box_height;
+    f64? detection_confidence = null;
+    f64? face_capture_quality = null;
+    f64? face_focus_score = null;
+    f64? left_eye_open_score = null;
+    f64? right_eye_open_score = null;
+    f64? eyes_open_score = null;
+    f64? blink_risk_score = null;
+    f64? left_eye_x = null;
+    f64? left_eye_y = null;
+    f64? right_eye_x = null;
+    f64? right_eye_y = null;
+    f64? nose_x = null;
+    f64? nose_y = null;
+    f64? mouth_left_x = null;
+    f64? mouth_left_y = null;
+    f64? mouth_right_x = null;
+    f64? mouth_right_y = null;
+    string created_at;
 };
 
 dictionary AnalysisJob {

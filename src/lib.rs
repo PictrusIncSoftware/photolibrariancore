@@ -340,6 +340,43 @@ pub struct FaceObservationResult {
     pub mouth_right_y: Option<f64>,
 }
 
+/// Durable face-observation row read back from the catalogue.
+///
+/// This is the production read model for the `face_observation` table. Swift
+/// can use it to crop/align faces for the recognition pass and to display
+/// diagnostics without querying DuckDB directly.
+#[derive(Debug, Clone)]
+pub struct FaceObservationRecord {
+    pub id: i64,
+    pub image_id: i64,
+    pub analyzed_image_id: i64,
+    pub face_index: u32,
+    pub algorithm_version: String,
+    pub analysis_run_id: String,
+    pub bounding_box_x: f64,
+    pub bounding_box_y: f64,
+    pub bounding_box_width: f64,
+    pub bounding_box_height: f64,
+    pub detection_confidence: Option<f64>,
+    pub face_capture_quality: Option<f64>,
+    pub face_focus_score: Option<f64>,
+    pub left_eye_open_score: Option<f64>,
+    pub right_eye_open_score: Option<f64>,
+    pub eyes_open_score: Option<f64>,
+    pub blink_risk_score: Option<f64>,
+    pub left_eye_x: Option<f64>,
+    pub left_eye_y: Option<f64>,
+    pub right_eye_x: Option<f64>,
+    pub right_eye_y: Option<f64>,
+    pub nose_x: Option<f64>,
+    pub nose_y: Option<f64>,
+    pub mouth_left_x: Option<f64>,
+    pub mouth_left_y: Option<f64>,
+    pub mouth_right_x: Option<f64>,
+    pub mouth_right_y: Option<f64>,
+    pub created_at: String,
+}
+
 /// Durable coordinator row for enrichment / intelligent-culling work.
 ///
 /// The current focus analyzer still runs in Swift, but the job identity and
@@ -4794,9 +4831,9 @@ fn keyword_materialized_rows(segments: &[String]) -> Vec<(String, String)> {
     rows
 }
 
-/// `image_id IN (...)` for the keyword table — sibling of `id_in_list`, which is
-/// hard-coded to the `images.id` column. `None` on empty.
-fn keyword_image_id_in_list(ids: &[i64]) -> Option<String> {
+/// `image_id IN (...)` predicate — sibling of `id_in_list`, which is hard-coded
+/// to the `images.id` column. `None` on empty.
+fn image_id_in_list(ids: &[i64]) -> Option<String> {
     if ids.is_empty() {
         return None;
     }
@@ -4914,7 +4951,7 @@ pub async fn remove_keyword_for_ids(ids: Vec<i64>, path: String) -> u64 {
     if ids.is_empty() || path.is_empty() {
         return 0;
     }
-    let where_ids = match keyword_image_id_in_list(&ids) {
+    let where_ids = match image_id_in_list(&ids) {
         Some(w) => w,
         None => return 0,
     };
@@ -4949,7 +4986,7 @@ pub async fn restore_keyword_for_ids(ids: Vec<i64>, path: String) -> u64 {
     if ids.is_empty() || path.is_empty() {
         return 0;
     }
-    let where_ids = match keyword_image_id_in_list(&ids) {
+    let where_ids = match image_id_in_list(&ids) {
         Some(w) => w,
         None => return 0,
     };
@@ -6457,31 +6494,36 @@ fn optional_finite_is_valid(score: Option<f64>) -> bool {
     score.map(|score| score.is_finite()).unwrap_or(true)
 }
 
-fn normalized_landmark_pair_is_valid(x: Option<f64>, y: Option<f64>) -> bool {
+fn landmark_pair_is_valid(x: Option<f64>, y: Option<f64>) -> bool {
     match (x, y) {
-        (Some(x), Some(y)) => {
-            x.is_finite()
-                && y.is_finite()
-                && (-0.01..=1.01).contains(&x)
-                && (-0.01..=1.01).contains(&y)
-        }
+        (Some(x), Some(y)) => x.is_finite() && y.is_finite(),
         (None, None) => true,
         _ => false,
     }
 }
 
+fn face_bounding_box_is_valid(observation: &FaceObservationResult) -> bool {
+    if !observation.bounding_box_x.is_finite()
+        || !observation.bounding_box_y.is_finite()
+        || !observation.bounding_box_width.is_finite()
+        || !observation.bounding_box_height.is_finite()
+        || observation.bounding_box_width <= 0.0
+        || observation.bounding_box_height <= 0.0
+    {
+        return false;
+    }
+
+    let min_x = observation.bounding_box_x;
+    let min_y = observation.bounding_box_y;
+    let max_x = observation.bounding_box_x + observation.bounding_box_width;
+    let max_y = observation.bounding_box_y + observation.bounding_box_height;
+
+    max_x > 0.0 && max_y > 0.0 && min_x < 1.0 && min_y < 1.0
+}
+
 fn face_observation_is_valid(observation: &FaceObservationResult) -> bool {
     observation.face_index <= 10_000
-        && observation.bounding_box_x.is_finite()
-        && observation.bounding_box_y.is_finite()
-        && observation.bounding_box_width.is_finite()
-        && observation.bounding_box_height.is_finite()
-        && observation.bounding_box_width > 0.0
-        && observation.bounding_box_height > 0.0
-        && observation.bounding_box_x >= -0.01
-        && observation.bounding_box_y >= -0.01
-        && observation.bounding_box_x + observation.bounding_box_width <= 1.01
-        && observation.bounding_box_y + observation.bounding_box_height <= 1.01
+        && face_bounding_box_is_valid(observation)
         && normalized_optional_score_is_valid(observation.detection_confidence)
         && normalized_optional_score_is_valid(observation.face_capture_quality)
         && optional_finite_is_valid(observation.face_focus_score)
@@ -6489,11 +6531,11 @@ fn face_observation_is_valid(observation: &FaceObservationResult) -> bool {
         && optional_finite_is_valid(observation.right_eye_open_score)
         && optional_finite_is_valid(observation.eyes_open_score)
         && normalized_optional_score_is_valid(observation.blink_risk_score)
-        && normalized_landmark_pair_is_valid(observation.left_eye_x, observation.left_eye_y)
-        && normalized_landmark_pair_is_valid(observation.right_eye_x, observation.right_eye_y)
-        && normalized_landmark_pair_is_valid(observation.nose_x, observation.nose_y)
-        && normalized_landmark_pair_is_valid(observation.mouth_left_x, observation.mouth_left_y)
-        && normalized_landmark_pair_is_valid(observation.mouth_right_x, observation.mouth_right_y)
+        && landmark_pair_is_valid(observation.left_eye_x, observation.left_eye_y)
+        && landmark_pair_is_valid(observation.right_eye_x, observation.right_eye_y)
+        && landmark_pair_is_valid(observation.nose_x, observation.nose_y)
+        && landmark_pair_is_valid(observation.mouth_left_x, observation.mouth_left_y)
+        && landmark_pair_is_valid(observation.mouth_right_x, observation.mouth_right_y)
 }
 
 fn sanitized_focus_result(mut result: FocusAnalysisResult) -> FocusAnalysisResult {
@@ -7125,6 +7167,142 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
     }
 
     updated
+}
+
+/// Count durable face observations for the requested focus/enrichment algorithm
+/// version. This is intentionally scoped by version so old detection rows never
+/// leak into the current recognition/crop pipeline.
+pub async fn face_observation_count(algorithm_version: String) -> u64 {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    match conn.query_row(
+        "SELECT COUNT(*)
+         FROM face_observation
+         WHERE algorithm_version = ?1",
+        params![algorithm_version],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(count) => count.max(0) as u64,
+        Err(e) => {
+            eprintln!("face_observation_count: query {}", e);
+            0
+        }
+    }
+}
+
+/// Return durable face observations for explicit image ids and algorithm
+/// version. Empty id lists intentionally return no rows.
+pub async fn face_observations_for_image_ids(
+    ids: Vec<i64>,
+    algorithm_version: String,
+) -> Vec<FaceObservationRecord> {
+    let id_filter = match image_id_in_list(&ids) {
+        Some(filter) => filter,
+        None => return Vec::new(),
+    };
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let sql = format!(
+        "SELECT
+             id,
+             image_id,
+             analyzed_image_id,
+             face_index,
+             algorithm_version,
+             analysis_run_id,
+             bounding_box_x,
+             bounding_box_y,
+             bounding_box_width,
+             bounding_box_height,
+             detection_confidence,
+             face_capture_quality,
+             face_focus_score,
+             left_eye_open_score,
+             right_eye_open_score,
+             eyes_open_score,
+             blink_risk_score,
+             left_eye_x,
+             left_eye_y,
+             right_eye_x,
+             right_eye_y,
+             nose_x,
+             nose_y,
+             mouth_left_x,
+             mouth_left_y,
+             mouth_right_x,
+             mouth_right_y,
+             CAST(created_at AS VARCHAR)
+         FROM face_observation
+         WHERE algorithm_version = ?1
+           AND {}
+         ORDER BY image_id, face_index",
+        id_filter
+    );
+
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            eprintln!("face_observations_for_image_ids: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map(params![algorithm_version], |row| {
+        let face_index = row.get::<_, i64>(3)?;
+        Ok(FaceObservationRecord {
+            id: row.get(0)?,
+            image_id: row.get(1)?,
+            analyzed_image_id: row.get(2)?,
+            face_index: face_index.clamp(0, u32::MAX as i64) as u32,
+            algorithm_version: row.get(4)?,
+            analysis_run_id: row.get(5)?,
+            bounding_box_x: row.get(6)?,
+            bounding_box_y: row.get(7)?,
+            bounding_box_width: row.get(8)?,
+            bounding_box_height: row.get(9)?,
+            detection_confidence: row.get(10)?,
+            face_capture_quality: row.get(11)?,
+            face_focus_score: row.get(12)?,
+            left_eye_open_score: row.get(13)?,
+            right_eye_open_score: row.get(14)?,
+            eyes_open_score: row.get(15)?,
+            blink_risk_score: row.get(16)?,
+            left_eye_x: row.get(17)?,
+            left_eye_y: row.get(18)?,
+            right_eye_x: row.get(19)?,
+            right_eye_y: row.get(20)?,
+            nose_x: row.get(21)?,
+            nose_y: row.get(22)?,
+            mouth_left_x: row.get(23)?,
+            mouth_left_y: row.get(24)?,
+            mouth_right_x: row.get(25)?,
+            mouth_right_y: row.get(26)?,
+            created_at: row.get(27)?,
+        })
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("face_observations_for_image_ids: query {}", e);
+            return Vec::new();
+        }
+    };
+
+    rows.filter_map(|row| row.ok()).collect()
 }
 
 fn similar_photo_candidates_impl(
@@ -9800,10 +9978,10 @@ mod keyword_tests {
     }
 
     #[test]
-    fn keyword_image_id_in_list_assembly() {
-        assert_eq!(keyword_image_id_in_list(&[]), None);
+    fn image_id_in_list_assembly() {
+        assert_eq!(image_id_in_list(&[]), None);
         assert_eq!(
-            keyword_image_id_in_list(&[5, 9, 12]),
+            image_id_in_list(&[5, 9, 12]),
             Some("image_id IN (5, 9, 12)".to_string())
         );
     }
