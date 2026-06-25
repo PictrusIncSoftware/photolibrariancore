@@ -2744,6 +2744,84 @@ public func FfiConverterTypeParsedFilename_lower(_ value: ParsedFilename) -> Rus
 }
 
 
+public struct PersonClusterAcceptResult: Equatable, Hashable {
+    public var personId: Int64
+    public var personName: String
+    public var assignedFaceCount: UInt64
+    public var keywordImageCount: UInt64
+    public var keywordRowCount: UInt64
+    public var keywordPath: String
+    public var status: String
+    public var message: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(personId: Int64, personName: String, assignedFaceCount: UInt64, keywordImageCount: UInt64, keywordRowCount: UInt64, keywordPath: String, status: String, message: String) {
+        self.personId = personId
+        self.personName = personName
+        self.assignedFaceCount = assignedFaceCount
+        self.keywordImageCount = keywordImageCount
+        self.keywordRowCount = keywordRowCount
+        self.keywordPath = keywordPath
+        self.status = status
+        self.message = message
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PersonClusterAcceptResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePersonClusterAcceptResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PersonClusterAcceptResult {
+        return
+            try PersonClusterAcceptResult(
+                personId: FfiConverterInt64.read(from: &buf),
+                personName: FfiConverterString.read(from: &buf),
+                assignedFaceCount: FfiConverterUInt64.read(from: &buf),
+                keywordImageCount: FfiConverterUInt64.read(from: &buf),
+                keywordRowCount: FfiConverterUInt64.read(from: &buf),
+                keywordPath: FfiConverterString.read(from: &buf),
+                status: FfiConverterString.read(from: &buf),
+                message: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PersonClusterAcceptResult, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.personId, into: &buf)
+        FfiConverterString.write(value.personName, into: &buf)
+        FfiConverterUInt64.write(value.assignedFaceCount, into: &buf)
+        FfiConverterUInt64.write(value.keywordImageCount, into: &buf)
+        FfiConverterUInt64.write(value.keywordRowCount, into: &buf)
+        FfiConverterString.write(value.keywordPath, into: &buf)
+        FfiConverterString.write(value.status, into: &buf)
+        FfiConverterString.write(value.message, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePersonClusterAcceptResult_lift(_ buf: RustBuffer) throws -> PersonClusterAcceptResult {
+    return try FfiConverterTypePersonClusterAcceptResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePersonClusterAcceptResult_lower(_ value: PersonClusterAcceptResult) -> RustBuffer {
+    return FfiConverterTypePersonClusterAcceptResult.lower(value)
+}
+
+
 public struct QueryPredicate: Equatable, Hashable {
     public var kind: String
     public var day: String?
@@ -4905,6 +4983,21 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
         print("uniffiFutureContinuationCallback invalid handle")
     }
 }
+public func acceptFaceClusterAsPerson(runId: String, clusterId: Int64, personName: String)async  -> PersonClusterAcceptResult  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_accept_face_cluster_as_person(FfiConverterString.lower(runId),FfiConverterInt64.lower(clusterId),FfiConverterString.lower(personName)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypePersonClusterAcceptResult_lift,
+            errorHandler: nil
+
+        )
+}
 public func activeAnalysisJob(jobKind: String)async  -> AnalysisJob?  {
     return
         try!  await uniffiRustCallAsync(
@@ -6491,6 +6584,9 @@ private let initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_photolibrariancore_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_accept_face_cluster_as_person() != 63609) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_active_analysis_job() != 59426) {
         return InitializationResult.apiChecksumMismatch

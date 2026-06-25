@@ -464,6 +464,18 @@ pub struct FaceClusterMemberRecord {
     pub nearest_neighbor_cosine: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PersonClusterAcceptResult {
+    pub person_id: i64,
+    pub person_name: String,
+    pub assigned_face_count: u64,
+    pub keyword_image_count: u64,
+    pub keyword_row_count: u64,
+    pub keyword_path: String,
+    pub status: String,
+    pub message: String,
+}
+
 /// Durable coordinator row for enrichment / intelligent-culling work.
 ///
 /// The current focus analyzer still runs in Swift, but the job identity and
@@ -1172,6 +1184,43 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         CREATE INDEX IF NOT EXISTS idx_face_cluster_member_cluster ON face_cluster_member(run_id, cluster_id);
         CREATE INDEX IF NOT EXISTS idx_face_cluster_member_face ON face_cluster_member(face_observation_id);
         CREATE INDEX IF NOT EXISTS idx_face_cluster_run_versions ON face_cluster_run(model_version, preprocessing_version, threshold);
+
+        -- === People / face identity (production source of truth) ===
+        -- Named people are durable identities. Keywords are a search/export
+        -- projection, not the authority. Face assignments preserve the exact
+        -- face observation and the cluster/model provenance that suggested it.
+        CREATE SEQUENCE IF NOT EXISTS person_id_seq START 1;
+
+        CREATE TABLE IF NOT EXISTS person (
+            id INTEGER PRIMARY KEY DEFAULT nextval('person_id_seq'),
+            display_name TEXT NOT NULL,
+            normalized_name TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_person_normalized_name ON person(normalized_name);
+
+        CREATE TABLE IF NOT EXISTS person_face_assignment (
+            face_observation_id INTEGER PRIMARY KEY,
+            person_id INTEGER NOT NULL,
+            image_id INTEGER NOT NULL,
+            analyzed_image_id INTEGER NOT NULL,
+            face_index INTEGER NOT NULL,
+            assignment_source TEXT NOT NULL,
+            face_cluster_run_id TEXT,
+            face_cluster_id INTEGER,
+            model_version TEXT,
+            preprocessing_version TEXT,
+            threshold DOUBLE,
+            confidence_cosine DOUBLE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_person_face_assignment_person ON person_face_assignment(person_id);
+        CREATE INDEX IF NOT EXISTS idx_person_face_assignment_image ON person_face_assignment(image_id);
+        CREATE INDEX IF NOT EXISTS idx_person_face_assignment_cluster ON person_face_assignment(face_cluster_run_id, face_cluster_id);
 
         -- === Durable analysis jobs (background intelligent culling coordinator) ===
         -- One row per user/requested enrichment run. The current focus pass uses
@@ -8202,6 +8251,254 @@ pub async fn face_cluster_members(run_id: String) -> Vec<FaceClusterMemberRecord
     face_cluster_members_impl(conn, &run_id)
 }
 
+fn clean_person_display_name(name: &str) -> Option<String> {
+    let display = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if display.is_empty() || display.contains(KEYWORD_PATH_SEPARATOR) {
+        None
+    } else {
+        Some(display)
+    }
+}
+
+fn normalized_person_name(display_name: &str) -> String {
+    display_name.to_lowercase()
+}
+
+fn person_accept_error(status: &str, message: &str) -> PersonClusterAcceptResult {
+    PersonClusterAcceptResult {
+        person_id: 0,
+        person_name: String::new(),
+        assigned_face_count: 0,
+        keyword_image_count: 0,
+        keyword_row_count: 0,
+        keyword_path: String::new(),
+        status: status.to_string(),
+        message: message.to_string(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FaceClusterRunForPersonAccept {
+    model_version: String,
+    preprocessing_version: String,
+    threshold: f64,
+}
+
+fn face_cluster_run_for_person_accept(
+    conn: &Connection,
+    run_id: &str,
+) -> Option<FaceClusterRunForPersonAccept> {
+    conn.query_row(
+        "SELECT model_version, preprocessing_version, threshold
+         FROM face_cluster_run
+         WHERE run_id = ?1",
+        params![run_id],
+        |row| {
+            Ok(FaceClusterRunForPersonAccept {
+                model_version: row.get(0)?,
+                preprocessing_version: row.get(1)?,
+                threshold: row.get(2)?,
+            })
+        },
+    )
+    .ok()
+}
+
+fn face_cluster_members_for_person_accept(
+    conn: &Connection,
+    run_id: &str,
+    cluster_id: i64,
+) -> Vec<FaceClusterMemberRecord> {
+    face_cluster_members_impl(conn, run_id)
+        .into_iter()
+        .filter(|member| member.cluster_id == cluster_id)
+        .collect()
+}
+
+fn get_or_create_person_impl(
+    conn: &Connection,
+    display_name: &str,
+    normalized_name: &str,
+) -> Result<i64, duckdb::Error> {
+    if let Ok(id) = conn.query_row(
+        "SELECT id FROM person WHERE normalized_name = ?1",
+        params![normalized_name],
+        |row| row.get(0),
+    ) {
+        conn.execute(
+            "UPDATE person SET updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id],
+        )?;
+        return Ok(id);
+    }
+
+    conn.query_row(
+        "INSERT INTO person (display_name, normalized_name, created_at, updated_at)
+         VALUES (?1, ?2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+         RETURNING id",
+        params![display_name, normalized_name],
+        |row| row.get(0),
+    )
+}
+
+fn accept_face_cluster_as_person_impl(
+    conn: &Connection,
+    run_id: &str,
+    cluster_id: i64,
+    person_name: &str,
+) -> PersonClusterAcceptResult {
+    let run_id = run_id.trim();
+    if run_id.is_empty() || cluster_id <= 0 {
+        return person_accept_error("invalid", "A run id and positive cluster id are required.");
+    }
+
+    let Some(display_name) = clean_person_display_name(person_name) else {
+        return person_accept_error("invalid", "A non-empty person name is required.");
+    };
+    let normalized_name = normalized_person_name(&display_name);
+    let keyword_segments = vec!["People".to_string(), display_name.clone()];
+    let keyword_path = keyword_segments.join(KEYWORD_PATH_SEPARATOR);
+
+    let Some(run) = face_cluster_run_for_person_accept(conn, run_id) else {
+        return person_accept_error(
+            "missing_run",
+            "The selected face cluster run was not found.",
+        );
+    };
+
+    let members = face_cluster_members_for_person_accept(conn, run_id, cluster_id);
+    if members.is_empty() {
+        return person_accept_error(
+            "empty_cluster",
+            "The selected cluster has no persisted members.",
+        );
+    }
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
+        eprintln!("accept_face_cluster_as_person: begin {}", e);
+        return person_accept_error(
+            "failed",
+            "Could not start the person assignment transaction.",
+        );
+    }
+
+    let person_id = match get_or_create_person_impl(conn, &display_name, &normalized_name) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("accept_face_cluster_as_person: person {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return person_accept_error("failed", "Could not create or reuse the person row.");
+        }
+    };
+
+    let mut assigned_face_count = 0u64;
+    let mut image_ids = std::collections::BTreeSet::new();
+    let mut keyword_row_count = 0u64;
+
+    for member in &members {
+        match conn.execute(
+            "INSERT INTO person_face_assignment (
+                 face_observation_id, person_id, image_id, analyzed_image_id, face_index,
+                 assignment_source, face_cluster_run_id, face_cluster_id,
+                 model_version, preprocessing_version, threshold, confidence_cosine,
+                 created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, 'cluster_accept', ?6, ?7, ?8, ?9, ?10, ?11, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+             ON CONFLICT (face_observation_id) DO UPDATE SET
+                 person_id = excluded.person_id,
+                 image_id = excluded.image_id,
+                 analyzed_image_id = excluded.analyzed_image_id,
+                 face_index = excluded.face_index,
+                 assignment_source = excluded.assignment_source,
+                 face_cluster_run_id = excluded.face_cluster_run_id,
+                 face_cluster_id = excluded.face_cluster_id,
+                 model_version = excluded.model_version,
+                 preprocessing_version = excluded.preprocessing_version,
+                 threshold = excluded.threshold,
+                 confidence_cosine = excluded.confidence_cosine,
+                 updated_at = now()",
+            params![
+                member.face_observation_id,
+                person_id,
+                member.image_id,
+                member.analyzed_image_id,
+                member.face_index as i64,
+                run_id,
+                cluster_id,
+                run.model_version.as_str(),
+                run.preprocessing_version.as_str(),
+                run.threshold,
+                member.nearest_neighbor_cosine,
+            ],
+        ) {
+            Ok(_) => {
+                assigned_face_count += 1;
+                image_ids.insert(member.image_id);
+            }
+            Err(e) => {
+                eprintln!(
+                    "accept_face_cluster_as_person: assign face_observation_id={} {}",
+                    member.face_observation_id, e
+                );
+                let _ = conn.execute_batch("ROLLBACK;");
+                return person_accept_error("failed", "Could not persist all face assignments.");
+            }
+        }
+    }
+
+    for image_id in &image_ids {
+        match insert_or_merge_active_keyword_for_image(
+            conn,
+            *image_id,
+            &keyword_segments,
+            KEYWORD_ORIGIN_USER,
+        ) {
+            Ok(changed) => keyword_row_count += changed,
+            Err(e) => {
+                eprintln!(
+                    "accept_face_cluster_as_person: keyword image_id={} {}",
+                    image_id, e
+                );
+                let _ = conn.execute_batch("ROLLBACK;");
+                return person_accept_error("failed", "Could not mirror the People keyword.");
+            }
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;") {
+        eprintln!("accept_face_cluster_as_person: commit {}", e);
+        return person_accept_error("failed", "Could not commit the person assignment.");
+    }
+
+    PersonClusterAcceptResult {
+        person_id,
+        person_name: display_name,
+        assigned_face_count,
+        keyword_image_count: image_ids.len() as u64,
+        keyword_row_count,
+        keyword_path,
+        status: "accepted".to_string(),
+        message: "Face cluster accepted as a named person.".to_string(),
+    }
+}
+
+pub async fn accept_face_cluster_as_person(
+    run_id: String,
+    cluster_id: i64,
+    person_name: String,
+) -> PersonClusterAcceptResult {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return person_accept_error("failed", "Catalogue not initialized.");
+        }
+    };
+
+    accept_face_cluster_as_person_impl(conn, &run_id, cluster_id, &person_name)
+}
+
 fn similar_photo_candidates_impl(
     conn: &Connection,
     algorithm_version: &str,
@@ -10059,6 +10356,53 @@ mod face_cluster_tests {
                  nearest_neighbor_cosine DOUBLE,
                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                  PRIMARY KEY (run_id, face_observation_id)
+             );
+
+             CREATE TABLE images (
+                 id INTEGER PRIMARY KEY,
+                 is_video BOOLEAN NOT NULL DEFAULT FALSE
+             );
+
+             CREATE SEQUENCE keyword_id_seq START 1;
+             CREATE TABLE keyword (
+                 id INTEGER PRIMARY KEY DEFAULT nextval('keyword_id_seq'),
+                 image_id INTEGER NOT NULL,
+                 label TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 status INTEGER NOT NULL DEFAULT 1,
+                 origin INTEGER NOT NULL DEFAULT 1,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 hidden_at TIMESTAMP,
+                 collection BOOLEAN NOT NULL DEFAULT FALSE,
+                 color BOOLEAN NOT NULL DEFAULT FALSE,
+                 is_video BOOLEAN NOT NULL DEFAULT FALSE
+             );
+
+             CREATE SEQUENCE person_id_seq START 1;
+             CREATE TABLE person (
+                 id INTEGER PRIMARY KEY DEFAULT nextval('person_id_seq'),
+                 display_name TEXT NOT NULL,
+                 normalized_name TEXT NOT NULL,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+             );
+             CREATE UNIQUE INDEX idx_person_normalized_name ON person(normalized_name);
+
+             CREATE TABLE person_face_assignment (
+                 face_observation_id INTEGER PRIMARY KEY,
+                 person_id INTEGER NOT NULL,
+                 image_id INTEGER NOT NULL,
+                 analyzed_image_id INTEGER NOT NULL,
+                 face_index INTEGER NOT NULL,
+                 assignment_source TEXT NOT NULL,
+                 face_cluster_run_id TEXT,
+                 face_cluster_id INTEGER,
+                 model_version TEXT,
+                 preprocessing_version TEXT,
+                 threshold DOUBLE,
+                 confidence_cosine DOUBLE,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
              );",
         )
         .expect("schema");
@@ -10166,6 +10510,92 @@ mod face_cluster_tests {
                 .collect::<Vec<_>>(),
             vec![21, 22]
         );
+    }
+
+    #[test]
+    fn accept_face_cluster_as_person_assigns_faces_and_mirrors_people_keyword() {
+        let conn = setup();
+        assert_eq!(
+            replace_face_cluster_run_impl(
+                &conn,
+                run_record(),
+                vec![member(11, 1, 0), member(12, 1, 1)]
+            ),
+            2
+        );
+        conn.execute(
+            "INSERT INTO images (id, is_video) VALUES (111, FALSE), (112, FALSE)",
+            [],
+        )
+        .expect("images");
+
+        let result = accept_face_cluster_as_person_impl(&conn, "test-run", 1, "  James   Wagner  ");
+        assert_eq!(result.status, "accepted");
+        assert_eq!(result.person_name, "James Wagner");
+        assert_eq!(result.assigned_face_count, 2);
+        assert_eq!(result.keyword_image_count, 2);
+        assert_eq!(result.keyword_row_count, 4);
+        assert_eq!(
+            result.keyword_path,
+            ["People", "James Wagner"].join(KEYWORD_PATH_SEPARATOR)
+        );
+
+        let person_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM person WHERE normalized_name = 'james wagner'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("person count");
+        assert_eq!(person_count, 1);
+
+        let assignment_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM person_face_assignment
+                 WHERE face_cluster_run_id = 'test-run'
+                   AND face_cluster_id = 1
+                   AND model_version = 'auraface-coreml-v1'
+                   AND preprocessing_version = 'center-crop-v1'
+                   AND threshold = 0.55
+                   AND assignment_source = 'cluster_accept'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("assignment count");
+        assert_eq!(assignment_count, 2);
+
+        let keyword_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM keyword
+                 WHERE image_id IN (111, 112)
+                   AND status = 1
+                   AND origin = 1
+                   AND path IN ('People', ?1)",
+                params![["People", "James Wagner"].join(KEYWORD_PATH_SEPARATOR)],
+                |row| row.get(0),
+            )
+            .expect("keyword count");
+        assert_eq!(keyword_count, 4);
+
+        let repeated = accept_face_cluster_as_person_impl(&conn, "test-run", 1, "James Wagner");
+        assert_eq!(repeated.status, "accepted");
+        assert_eq!(repeated.person_id, result.person_id);
+        assert_eq!(repeated.keyword_row_count, 0);
+
+        let duplicate_keyword_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM keyword
+                 WHERE image_id IN (111, 112)
+                   AND status = 1
+                   AND path IN ('People', ?1)",
+                params![["People", "James Wagner"].join(KEYWORD_PATH_SEPARATOR)],
+                |row| row.get(0),
+            )
+            .expect("duplicate keyword count");
+        assert_eq!(duplicate_keyword_count, 4);
     }
 }
 
