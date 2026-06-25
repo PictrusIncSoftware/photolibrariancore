@@ -902,6 +902,166 @@ public func FfiConverterTypeDirectorySyncState_lower(_ value: DirectorySyncState
 }
 
 
+public struct FaceClusterMemberRecord: Equatable, Hashable {
+    public var runId: String
+    public var clusterId: Int64
+    public var faceObservationId: Int64
+    public var imageId: Int64
+    public var analyzedImageId: Int64
+    public var faceIndex: UInt32
+    public var memberRank: UInt32
+    public var clusterSize: UInt32
+    public var nearestNeighborFaceObservationId: Int64?
+    public var nearestNeighborCosine: Double?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(runId: String, clusterId: Int64, faceObservationId: Int64, imageId: Int64, analyzedImageId: Int64, faceIndex: UInt32, memberRank: UInt32, clusterSize: UInt32, nearestNeighborFaceObservationId: Int64? = nil, nearestNeighborCosine: Double? = nil) {
+        self.runId = runId
+        self.clusterId = clusterId
+        self.faceObservationId = faceObservationId
+        self.imageId = imageId
+        self.analyzedImageId = analyzedImageId
+        self.faceIndex = faceIndex
+        self.memberRank = memberRank
+        self.clusterSize = clusterSize
+        self.nearestNeighborFaceObservationId = nearestNeighborFaceObservationId
+        self.nearestNeighborCosine = nearestNeighborCosine
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FaceClusterMemberRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFaceClusterMemberRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FaceClusterMemberRecord {
+        return
+            try FaceClusterMemberRecord(
+                runId: FfiConverterString.read(from: &buf),
+                clusterId: FfiConverterInt64.read(from: &buf),
+                faceObservationId: FfiConverterInt64.read(from: &buf),
+                imageId: FfiConverterInt64.read(from: &buf),
+                analyzedImageId: FfiConverterInt64.read(from: &buf),
+                faceIndex: FfiConverterUInt32.read(from: &buf),
+                memberRank: FfiConverterUInt32.read(from: &buf),
+                clusterSize: FfiConverterUInt32.read(from: &buf),
+                nearestNeighborFaceObservationId: FfiConverterOptionInt64.read(from: &buf),
+                nearestNeighborCosine: FfiConverterOptionDouble.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FaceClusterMemberRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.runId, into: &buf)
+        FfiConverterInt64.write(value.clusterId, into: &buf)
+        FfiConverterInt64.write(value.faceObservationId, into: &buf)
+        FfiConverterInt64.write(value.imageId, into: &buf)
+        FfiConverterInt64.write(value.analyzedImageId, into: &buf)
+        FfiConverterUInt32.write(value.faceIndex, into: &buf)
+        FfiConverterUInt32.write(value.memberRank, into: &buf)
+        FfiConverterUInt32.write(value.clusterSize, into: &buf)
+        FfiConverterOptionInt64.write(value.nearestNeighborFaceObservationId, into: &buf)
+        FfiConverterOptionDouble.write(value.nearestNeighborCosine, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFaceClusterMemberRecord_lift(_ buf: RustBuffer) throws -> FaceClusterMemberRecord {
+    return try FfiConverterTypeFaceClusterMemberRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFaceClusterMemberRecord_lower(_ value: FaceClusterMemberRecord) -> RustBuffer {
+    return FfiConverterTypeFaceClusterMemberRecord.lower(value)
+}
+
+
+public struct FaceClusterRunRecord: Equatable, Hashable {
+    public var runId: String
+    public var faceAlgorithmVersion: String
+    public var modelVersion: String
+    public var preprocessingVersion: String
+    public var threshold: Double
+    public var clusterCount: UInt32
+    public var memberCount: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(runId: String, faceAlgorithmVersion: String, modelVersion: String, preprocessingVersion: String, threshold: Double, clusterCount: UInt32, memberCount: UInt32) {
+        self.runId = runId
+        self.faceAlgorithmVersion = faceAlgorithmVersion
+        self.modelVersion = modelVersion
+        self.preprocessingVersion = preprocessingVersion
+        self.threshold = threshold
+        self.clusterCount = clusterCount
+        self.memberCount = memberCount
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FaceClusterRunRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFaceClusterRunRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FaceClusterRunRecord {
+        return
+            try FaceClusterRunRecord(
+                runId: FfiConverterString.read(from: &buf),
+                faceAlgorithmVersion: FfiConverterString.read(from: &buf),
+                modelVersion: FfiConverterString.read(from: &buf),
+                preprocessingVersion: FfiConverterString.read(from: &buf),
+                threshold: FfiConverterDouble.read(from: &buf),
+                clusterCount: FfiConverterUInt32.read(from: &buf),
+                memberCount: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FaceClusterRunRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.runId, into: &buf)
+        FfiConverterString.write(value.faceAlgorithmVersion, into: &buf)
+        FfiConverterString.write(value.modelVersion, into: &buf)
+        FfiConverterString.write(value.preprocessingVersion, into: &buf)
+        FfiConverterDouble.write(value.threshold, into: &buf)
+        FfiConverterUInt32.write(value.clusterCount, into: &buf)
+        FfiConverterUInt32.write(value.memberCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFaceClusterRunRecord_lift(_ buf: RustBuffer) throws -> FaceClusterRunRecord {
+    return try FfiConverterTypeFaceClusterRunRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFaceClusterRunRecord_lower(_ value: FaceClusterRunRecord) -> RustBuffer {
+    return FfiConverterTypeFaceClusterRunRecord.lower(value)
+}
+
+
 public struct FaceEmbeddingNeighborRecord: Equatable, Hashable {
     public var queryFaceObservationId: Int64
     public var neighborFaceObservationId: Int64
@@ -4048,6 +4208,31 @@ fileprivate struct FfiConverterSequenceTypeDirectorySyncState: FfiConverterRustB
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFaceClusterMemberRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [FaceClusterMemberRecord]
+
+    public static func write(_ value: [FaceClusterMemberRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFaceClusterMemberRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FaceClusterMemberRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FaceClusterMemberRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFaceClusterMemberRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeFaceEmbeddingNeighborRecord: FfiConverterRustBuffer {
     typealias SwiftType = [FaceEmbeddingNeighborRecord]
 
@@ -4939,6 +5124,21 @@ public func expandCollapseGroupIds(ids: [Int64])async  -> [Int64]  {
 
         )
 }
+public func faceClusterMembers(runId: String)async  -> [FaceClusterMemberRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_face_cluster_members(FfiConverterString.lower(runId)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeFaceClusterMemberRecord.lift,
+            errorHandler: nil
+
+        )
+}
 public func faceEmbeddingCount(modelVersion: String, preprocessingVersion: String)async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
@@ -5783,6 +5983,21 @@ public func reparentKeyword(sourcePath: [String], newParent: [String])async  -> 
 
         )
 }
+public func replaceFaceClusterRun(run: FaceClusterRunRecord, members: [FaceClusterMemberRecord])async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_replace_face_cluster_run(FfiConverterTypeFaceClusterRunRecord_lower(run),FfiConverterSequenceTypeFaceClusterMemberRecord.lower(members)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+
+        )
+}
 public func replaceSimilarPhotoGroups(members: [SimilarPhotoGroupMember], algorithmVersion: String)async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
@@ -6225,6 +6440,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_expand_collapse_group_ids() != 192) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_face_cluster_members() != 8090) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_face_embedding_count() != 20632) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6397,6 +6615,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_reparent_keyword() != 9760) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_replace_face_cluster_run() != 35373) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_replace_similar_photo_groups() != 65346) {

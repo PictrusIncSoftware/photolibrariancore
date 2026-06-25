@@ -423,6 +423,12 @@ namespace photolibrariancore {
     [Async]
     sequence<FaceEmbeddingNeighborRecord> face_embedding_nearest_neighbors(string model_version, string preprocessing_version, u32 limit_per_face);
 
+    [Async]
+    u64 replace_face_cluster_run(FaceClusterRunRecord run, sequence<FaceClusterMemberRecord> members);
+
+    [Async]
+    sequence<FaceClusterMemberRecord> face_cluster_members(string run_id);
+
     // Similar-photo grouping (S94): Swift computes Vision feature-print groups
     // after Intelligent Culling and persists only multi-photo memberships here.
     [Async]
@@ -967,6 +973,29 @@ dictionary FaceEmbeddingNeighborRecord {
     u32 query_face_index;
     u32 neighbor_face_index;
     f64 cosine;
+};
+
+dictionary FaceClusterRunRecord {
+    string run_id;
+    string face_algorithm_version;
+    string model_version;
+    string preprocessing_version;
+    f64 threshold;
+    u32 cluster_count;
+    u32 member_count;
+};
+
+dictionary FaceClusterMemberRecord {
+    string run_id;
+    i64 cluster_id;
+    i64 face_observation_id;
+    i64 image_id;
+    i64 analyzed_image_id;
+    u32 face_index;
+    u32 member_rank;
+    u32 cluster_size;
+    i64? nearest_neighbor_face_observation_id = null;
+    f64? nearest_neighbor_cosine = null;
 };
 
 dictionary AnalysisJob {

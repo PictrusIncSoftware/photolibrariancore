@@ -2,8 +2,8 @@
 // DuckDB is used instead of SQLite for better analytical query performance on large image catalogues
 use arrow_array::types::Float32Type;
 use arrow_array::{
-    Array, FixedSizeListArray, Float64Array, Int64Array, RecordBatch, RecordBatchIterator, StringArray,
-    UInt32Array,
+    Array, FixedSizeListArray, Float64Array, Int64Array, RecordBatch, RecordBatchIterator,
+    StringArray, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use duckdb::{params, Connection};
@@ -425,6 +425,31 @@ pub struct FaceEmbeddingNeighborRecord {
     pub query_face_index: u32,
     pub neighbor_face_index: u32,
     pub cosine: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FaceClusterRunRecord {
+    pub run_id: String,
+    pub face_algorithm_version: String,
+    pub model_version: String,
+    pub preprocessing_version: String,
+    pub threshold: f64,
+    pub cluster_count: u32,
+    pub member_count: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct FaceClusterMemberRecord {
+    pub run_id: String,
+    pub cluster_id: i64,
+    pub face_observation_id: i64,
+    pub image_id: i64,
+    pub analyzed_image_id: i64,
+    pub face_index: u32,
+    pub member_rank: u32,
+    pub cluster_size: u32,
+    pub nearest_neighbor_face_observation_id: Option<i64>,
+    pub nearest_neighbor_cosine: Option<f64>,
 }
 
 /// Durable coordinator row for enrichment / intelligent-culling work.
@@ -1100,6 +1125,41 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         CREATE INDEX IF NOT EXISTS idx_face_observation_analyzed_image ON face_observation(analyzed_image_id);
         CREATE INDEX IF NOT EXISTS idx_face_observation_algorithm ON face_observation(algorithm_version);
         CREATE INDEX IF NOT EXISTS idx_face_observation_run ON face_observation(analysis_run_id);
+
+        -- === Face recognition cluster diagnostics (developer-only first pass) ===
+        -- AuraFace vectors live in LanceDB keyed by face_observation.id. These
+        -- DuckDB tables persist the scalar result of one clustering run so
+        -- diagnostics can prove readback before any person/naming UI exists.
+        CREATE TABLE IF NOT EXISTS face_cluster_run (
+            run_id TEXT PRIMARY KEY,
+            face_algorithm_version TEXT NOT NULL,
+            model_version TEXT NOT NULL,
+            preprocessing_version TEXT NOT NULL,
+            threshold DOUBLE NOT NULL,
+            cluster_count INTEGER NOT NULL,
+            member_count INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS face_cluster_member (
+            run_id TEXT NOT NULL,
+            cluster_id INTEGER NOT NULL,
+            face_observation_id INTEGER NOT NULL,
+            image_id INTEGER NOT NULL,
+            analyzed_image_id INTEGER NOT NULL,
+            face_index INTEGER NOT NULL,
+            member_rank INTEGER NOT NULL,
+            cluster_size INTEGER NOT NULL,
+            nearest_neighbor_face_observation_id INTEGER,
+            nearest_neighbor_cosine DOUBLE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (run_id, face_observation_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_face_cluster_member_run ON face_cluster_member(run_id);
+        CREATE INDEX IF NOT EXISTS idx_face_cluster_member_cluster ON face_cluster_member(run_id, cluster_id);
+        CREATE INDEX IF NOT EXISTS idx_face_cluster_member_face ON face_cluster_member(face_observation_id);
+        CREATE INDEX IF NOT EXISTS idx_face_cluster_run_versions ON face_cluster_run(model_version, preprocessing_version, threshold);
 
         -- === Durable analysis jobs (background intelligent culling coordinator) ===
         -- One row per user/requested enrichment run. The current focus pass uses
@@ -7398,38 +7458,30 @@ fn face_embedding_store_uri() -> Option<String> {
     let catalogue_path = CATALOGUE_PATH.lock().unwrap();
     let path = catalogue_path.as_ref()?;
     let parent = path.parent()?;
-    Some(
-        parent
-            .join("vectors.lancedb")
-            .to_string_lossy()
-            .to_string(),
-    )
+    Some(parent.join("vectors.lancedb").to_string_lossy().to_string())
 }
 
 async fn open_or_create_face_embedding_table(
     dimension: u32,
 ) -> Result<lancedb::Table, lancedb::Error> {
-    let uri = face_embedding_store_uri().ok_or_else(|| {
-        lancedb::Error::InvalidInput {
-            message: "catalogue path is not initialized".to_string(),
-        }
+    let uri = face_embedding_store_uri().ok_or_else(|| lancedb::Error::InvalidInput {
+        message: "catalogue path is not initialized".to_string(),
     })?;
 
     let db = lancedb::connect(&uri).execute().await?;
     match db.open_table(FACE_EMBEDDING_TABLE).execute().await {
         Ok(table) => Ok(table),
-        Err(_) => db
-            .create_empty_table(FACE_EMBEDDING_TABLE, face_embedding_schema(dimension))
-            .execute()
-            .await,
+        Err(_) => {
+            db.create_empty_table(FACE_EMBEDDING_TABLE, face_embedding_schema(dimension))
+                .execute()
+                .await
+        }
     }
 }
 
 async fn open_face_embedding_table() -> Result<lancedb::Table, lancedb::Error> {
-    let uri = face_embedding_store_uri().ok_or_else(|| {
-        lancedb::Error::InvalidInput {
-            message: "catalogue path is not initialized".to_string(),
-        }
+    let uri = face_embedding_store_uri().ok_or_else(|| lancedb::Error::InvalidInput {
+        message: "catalogue path is not initialized".to_string(),
     })?;
 
     let db = lancedb::connect(&uri).execute().await?;
@@ -7450,8 +7502,7 @@ fn face_embedding_batch(
 ) -> Result<
     RecordBatchIterator<std::vec::IntoIter<Result<RecordBatch, arrow_schema::ArrowError>>>,
     arrow_schema::ArrowError,
->
-{
+> {
     let schema = face_embedding_schema(dimension);
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -7494,12 +7545,14 @@ fn face_embedding_batch(
             Arc::new(Float64Array::from_iter_values(
                 records.iter().map(|record| record.embedding_l2_norm),
             )),
-            Arc::new(FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-                records.iter().map(|record| {
-                    Some(record.vector.iter().copied().map(Some).collect::<Vec<_>>())
-                }),
-                dimension as i32,
-            )),
+            Arc::new(
+                FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                    records.iter().map(|record| {
+                        Some(record.vector.iter().copied().map(Some).collect::<Vec<_>>())
+                    }),
+                    dimension as i32,
+                ),
+            ),
         ],
     )?;
 
@@ -7564,7 +7617,9 @@ async fn upsert_face_embeddings_impl(
             stored_count: 0,
             total_count,
             status: "invalid".to_string(),
-            message: "No valid face embeddings matched the first record's model/preprocessing contract.".to_string(),
+            message:
+                "No valid face embeddings matched the first record's model/preprocessing contract."
+                    .to_string(),
         };
     }
 
@@ -7711,34 +7766,48 @@ async fn stored_face_embeddings(
         let Some(face_ids) = batch
             .column_by_name("face_observation_id")
             .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
-        else { continue };
+        else {
+            continue;
+        };
         let Some(image_ids) = batch
             .column_by_name("image_id")
             .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
-        else { continue };
+        else {
+            continue;
+        };
         let Some(analyzed_ids) = batch
             .column_by_name("analyzed_image_id")
             .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
-        else { continue };
+        else {
+            continue;
+        };
         let Some(face_indices) = batch
             .column_by_name("face_index")
             .and_then(|array| array.as_any().downcast_ref::<UInt32Array>())
-        else { continue };
+        else {
+            continue;
+        };
         let Some(vectors) = batch
             .column_by_name("vector")
             .and_then(|array| array.as_any().downcast_ref::<FixedSizeListArray>())
-        else { continue };
+        else {
+            continue;
+        };
         let Some(values) = vectors
             .values()
             .as_any()
             .downcast_ref::<arrow_array::Float32Array>()
-        else { continue };
+        else {
+            continue;
+        };
 
         let dimension = vectors.value_length().max(0) as usize;
         for row in 0..batch.num_rows() {
             let start = row * dimension;
             let end = start + dimension;
-            if end > values.len() { continue }
+            if end > values.len() {
+                continue;
+            }
             records.push(StoredFaceEmbedding {
                 face_observation_id: face_ids.value(row),
                 image_id: image_ids.value(row),
@@ -7810,12 +7879,7 @@ async fn face_embedding_nearest_neighbors_impl(
             .iter()
             .enumerate()
             .filter(|(neighbor_index, _)| *neighbor_index != query_index)
-            .map(|(_, neighbor)| {
-                (
-                    neighbor,
-                    cosine_f32(&query.vector, &neighbor.vector),
-                )
-            })
+            .map(|(_, neighbor)| (neighbor, cosine_f32(&query.vector, &neighbor.vector)))
             .collect::<Vec<_>>();
         scored.sort_by(|left, right| {
             right
@@ -7848,9 +7912,222 @@ async fn face_embedding_nearest_neighbors_impl(
                     .partial_cmp(&left.cosine)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .then(left.neighbor_face_observation_id.cmp(&right.neighbor_face_observation_id))
+            .then(
+                left.neighbor_face_observation_id
+                    .cmp(&right.neighbor_face_observation_id),
+            )
     });
     neighbors
+}
+
+fn face_cluster_run_is_valid(run: &FaceClusterRunRecord) -> bool {
+    !run.run_id.trim().is_empty()
+        && !run.face_algorithm_version.trim().is_empty()
+        && !run.model_version.trim().is_empty()
+        && !run.preprocessing_version.trim().is_empty()
+        && run.threshold.is_finite()
+        && run.threshold > 0.0
+        && run.threshold <= 1.0
+}
+
+fn face_cluster_member_is_valid(member: &FaceClusterMemberRecord, run_id: &str) -> bool {
+    member.run_id == run_id
+        && member.cluster_id > 0
+        && member.face_observation_id > 0
+        && member.image_id > 0
+        && member.analyzed_image_id > 0
+        && member.cluster_size > 1
+        && member
+            .nearest_neighbor_cosine
+            .map(|value| value.is_finite())
+            .unwrap_or(true)
+}
+
+fn replace_face_cluster_run_impl(
+    conn: &Connection,
+    run: FaceClusterRunRecord,
+    members: Vec<FaceClusterMemberRecord>,
+) -> u64 {
+    if !face_cluster_run_is_valid(&run) {
+        eprintln!("replace_face_cluster_run: invalid run metadata");
+        return 0;
+    }
+
+    let run_id = run.run_id.trim().to_string();
+    let valid_members = members
+        .into_iter()
+        .filter(|member| face_cluster_member_is_valid(member, &run_id))
+        .collect::<Vec<_>>();
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
+        eprintln!("replace_face_cluster_run: begin {}", e);
+        return 0;
+    }
+
+    if let Err(e) = conn.execute(
+        "DELETE FROM face_cluster_member WHERE run_id = ?1",
+        params![run_id.as_str()],
+    ) {
+        eprintln!("replace_face_cluster_run: delete members {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return 0;
+    }
+
+    if let Err(e) = conn.execute(
+        "DELETE FROM face_cluster_run WHERE run_id = ?1",
+        params![run_id.as_str()],
+    ) {
+        eprintln!("replace_face_cluster_run: delete run {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return 0;
+    }
+
+    if let Err(e) = conn.execute(
+        "INSERT INTO face_cluster_run (
+             run_id, face_algorithm_version, model_version, preprocessing_version,
+             threshold, cluster_count, member_count
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            run_id.as_str(),
+            run.face_algorithm_version,
+            run.model_version,
+            run.preprocessing_version,
+            run.threshold,
+            run.cluster_count as i64,
+            valid_members.len() as i64,
+        ],
+    ) {
+        eprintln!("replace_face_cluster_run: insert run {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return 0;
+    }
+
+    let mut inserted = 0u64;
+    for member in valid_members {
+        match conn.execute(
+            "INSERT INTO face_cluster_member (
+                 run_id, cluster_id, face_observation_id, image_id, analyzed_image_id,
+                 face_index, member_rank, cluster_size,
+                 nearest_neighbor_face_observation_id, nearest_neighbor_cosine
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                run_id.as_str(),
+                member.cluster_id,
+                member.face_observation_id,
+                member.image_id,
+                member.analyzed_image_id,
+                member.face_index as i64,
+                member.member_rank as i64,
+                member.cluster_size as i64,
+                member.nearest_neighbor_face_observation_id,
+                member.nearest_neighbor_cosine,
+            ],
+        ) {
+            Ok(n) => inserted += n as u64,
+            Err(e) => {
+                eprintln!(
+                    "replace_face_cluster_run: insert face_observation_id={} failed: {}",
+                    member.face_observation_id, e
+                );
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
+            }
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;") {
+        eprintln!("replace_face_cluster_run: commit {}", e);
+        return 0;
+    }
+
+    inserted
+}
+
+pub async fn replace_face_cluster_run(
+    run: FaceClusterRunRecord,
+    members: Vec<FaceClusterMemberRecord>,
+) -> u64 {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    replace_face_cluster_run_impl(conn, run, members)
+}
+
+fn face_cluster_members_impl(conn: &Connection, run_id: &str) -> Vec<FaceClusterMemberRecord> {
+    let run_id = run_id.trim();
+    if run_id.is_empty() {
+        return Vec::new();
+    }
+
+    let mut stmt = match conn.prepare(
+        "SELECT
+             run_id,
+             cluster_id,
+             face_observation_id,
+             image_id,
+             analyzed_image_id,
+             face_index,
+             member_rank,
+             cluster_size,
+             nearest_neighbor_face_observation_id,
+             nearest_neighbor_cosine
+         FROM face_cluster_member
+         WHERE run_id = ?1
+         ORDER BY cluster_id, member_rank, face_observation_id",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            eprintln!("face_cluster_members: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map(params![run_id], |row| {
+        let face_index = row.get::<_, i64>(5)?;
+        let member_rank = row.get::<_, i64>(6)?;
+        let cluster_size = row.get::<_, i64>(7)?;
+        Ok(FaceClusterMemberRecord {
+            run_id: row.get(0)?,
+            cluster_id: row.get(1)?,
+            face_observation_id: row.get(2)?,
+            image_id: row.get(3)?,
+            analyzed_image_id: row.get(4)?,
+            face_index: face_index.clamp(0, u32::MAX as i64) as u32,
+            member_rank: member_rank.clamp(0, u32::MAX as i64) as u32,
+            cluster_size: cluster_size.clamp(0, u32::MAX as i64) as u32,
+            nearest_neighbor_face_observation_id: row.get(8)?,
+            nearest_neighbor_cosine: row.get(9)?,
+        })
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("face_cluster_members: query {}", e);
+            return Vec::new();
+        }
+    };
+
+    rows.filter_map(|row| row.ok()).collect()
+}
+
+pub async fn face_cluster_members(run_id: String) -> Vec<FaceClusterMemberRecord> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    face_cluster_members_impl(conn, &run_id)
 }
 
 fn similar_photo_candidates_impl(
@@ -9675,6 +9952,141 @@ mod face_embedding_tests {
             .expect("vector column");
         assert_eq!(vectors.value_length(), 3);
         assert_eq!(vectors.values().len(), 6);
+    }
+}
+
+#[cfg(test)]
+mod face_cluster_tests {
+    use super::*;
+    use duckdb::Connection;
+
+    fn setup() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE face_cluster_run (
+                 run_id TEXT PRIMARY KEY,
+                 face_algorithm_version TEXT NOT NULL,
+                 model_version TEXT NOT NULL,
+                 preprocessing_version TEXT NOT NULL,
+                 threshold DOUBLE NOT NULL,
+                 cluster_count INTEGER NOT NULL,
+                 member_count INTEGER NOT NULL,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+             );
+
+             CREATE TABLE face_cluster_member (
+                 run_id TEXT NOT NULL,
+                 cluster_id INTEGER NOT NULL,
+                 face_observation_id INTEGER NOT NULL,
+                 image_id INTEGER NOT NULL,
+                 analyzed_image_id INTEGER NOT NULL,
+                 face_index INTEGER NOT NULL,
+                 member_rank INTEGER NOT NULL,
+                 cluster_size INTEGER NOT NULL,
+                 nearest_neighbor_face_observation_id INTEGER,
+                 nearest_neighbor_cosine DOUBLE,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 PRIMARY KEY (run_id, face_observation_id)
+             );",
+        )
+        .expect("schema");
+        conn
+    }
+
+    fn run_record() -> FaceClusterRunRecord {
+        FaceClusterRunRecord {
+            run_id: "test-run".to_string(),
+            face_algorithm_version: "vision-face-v1".to_string(),
+            model_version: "auraface-coreml-v1".to_string(),
+            preprocessing_version: "center-crop-v1".to_string(),
+            threshold: 0.55,
+            cluster_count: 1,
+            member_count: 0,
+        }
+    }
+
+    fn member(
+        face_observation_id: i64,
+        cluster_id: i64,
+        member_rank: u32,
+    ) -> FaceClusterMemberRecord {
+        FaceClusterMemberRecord {
+            run_id: "test-run".to_string(),
+            cluster_id,
+            face_observation_id,
+            image_id: face_observation_id + 100,
+            analyzed_image_id: face_observation_id + 200,
+            face_index: member_rank,
+            member_rank,
+            cluster_size: 2,
+            nearest_neighbor_face_observation_id: Some(11),
+            nearest_neighbor_cosine: Some(0.76),
+        }
+    }
+
+    #[test]
+    fn replace_face_cluster_run_filters_invalid_members_and_reads_back_ordered_rows() {
+        let conn = setup();
+        let inserted = replace_face_cluster_run_impl(
+            &conn,
+            run_record(),
+            vec![
+                member(12, 1, 1),
+                FaceClusterMemberRecord {
+                    cluster_size: 1,
+                    ..member(99, 1, 2)
+                },
+                member(11, 1, 0),
+            ],
+        );
+
+        assert_eq!(inserted, 2);
+
+        let stored_member_count: i64 = conn
+            .query_row(
+                "SELECT member_count FROM face_cluster_run WHERE run_id = 'test-run'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("run member count");
+        assert_eq!(stored_member_count, 2);
+
+        let members = face_cluster_members_impl(&conn, "test-run");
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].face_observation_id, 11);
+        assert_eq!(members[1].face_observation_id, 12);
+        assert_eq!(members[0].nearest_neighbor_face_observation_id, Some(11));
+        assert_eq!(members[0].nearest_neighbor_cosine, Some(0.76));
+    }
+
+    #[test]
+    fn replace_face_cluster_run_clears_existing_members_for_same_run() {
+        let conn = setup();
+        assert_eq!(
+            replace_face_cluster_run_impl(
+                &conn,
+                run_record(),
+                vec![member(11, 1, 0), member(12, 1, 1)]
+            ),
+            2
+        );
+        assert_eq!(
+            replace_face_cluster_run_impl(
+                &conn,
+                run_record(),
+                vec![member(21, 2, 0), member(22, 2, 1)]
+            ),
+            2
+        );
+
+        let members = face_cluster_members_impl(&conn, "test-run");
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| member.face_observation_id)
+                .collect::<Vec<_>>(),
+            vec![21, 22]
+        );
     }
 }
 
