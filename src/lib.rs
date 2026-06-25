@@ -439,6 +439,18 @@ pub struct FaceClusterRunRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct FaceClusterRunSummary {
+    pub run_id: String,
+    pub face_algorithm_version: String,
+    pub model_version: String,
+    pub preprocessing_version: String,
+    pub threshold: f64,
+    pub cluster_count: u32,
+    pub member_count: u32,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct FaceClusterMemberRecord {
     pub run_id: String,
     pub cluster_id: i64,
@@ -8061,6 +8073,66 @@ pub async fn replace_face_cluster_run(
     replace_face_cluster_run_impl(conn, run, members)
 }
 
+fn face_cluster_runs_impl(conn: &Connection, limit: u32) -> Vec<FaceClusterRunSummary> {
+    let limit = i64::from(limit.clamp(1, 100));
+    let mut stmt = match conn.prepare(
+        "SELECT
+             run_id,
+             face_algorithm_version,
+             model_version,
+             preprocessing_version,
+             threshold,
+             cluster_count,
+             member_count,
+             CAST(created_at AS VARCHAR)
+         FROM face_cluster_run
+         ORDER BY created_at DESC, run_id DESC
+         LIMIT ?1",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            eprintln!("face_cluster_runs: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map(params![limit], |row| {
+        let cluster_count = row.get::<_, i64>(5)?;
+        let member_count = row.get::<_, i64>(6)?;
+        Ok(FaceClusterRunSummary {
+            run_id: row.get(0)?,
+            face_algorithm_version: row.get(1)?,
+            model_version: row.get(2)?,
+            preprocessing_version: row.get(3)?,
+            threshold: row.get(4)?,
+            cluster_count: cluster_count.clamp(0, u32::MAX as i64) as u32,
+            member_count: member_count.clamp(0, u32::MAX as i64) as u32,
+            created_at: row.get(7)?,
+        })
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("face_cluster_runs: query {}", e);
+            return Vec::new();
+        }
+    };
+
+    rows.filter_map(|row| row.ok()).collect()
+}
+
+pub async fn face_cluster_runs(limit: u32) -> Vec<FaceClusterRunSummary> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    face_cluster_runs_impl(conn, limit)
+}
+
 fn face_cluster_members_impl(conn: &Connection, run_id: &str) -> Vec<FaceClusterMemberRecord> {
     let run_id = run_id.trim();
     if run_id.is_empty() {
@@ -10057,6 +10129,13 @@ mod face_cluster_tests {
         assert_eq!(members[1].face_observation_id, 12);
         assert_eq!(members[0].nearest_neighbor_face_observation_id, Some(11));
         assert_eq!(members[0].nearest_neighbor_cosine, Some(0.76));
+
+        let runs = face_cluster_runs_impl(&conn, 10);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].run_id, "test-run");
+        assert_eq!(runs[0].threshold, 0.55);
+        assert_eq!(runs[0].cluster_count, 1);
+        assert_eq!(runs[0].member_count, 2);
     }
 
     #[test]

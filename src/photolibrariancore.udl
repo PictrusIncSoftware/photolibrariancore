@@ -427,6 +427,9 @@ namespace photolibrariancore {
     u64 replace_face_cluster_run(FaceClusterRunRecord run, sequence<FaceClusterMemberRecord> members);
 
     [Async]
+    sequence<FaceClusterRunSummary> face_cluster_runs(u32 limit);
+
+    [Async]
     sequence<FaceClusterMemberRecord> face_cluster_members(string run_id);
 
     // Similar-photo grouping (S94): Swift computes Vision feature-print groups
@@ -983,6 +986,17 @@ dictionary FaceClusterRunRecord {
     f64 threshold;
     u32 cluster_count;
     u32 member_count;
+};
+
+dictionary FaceClusterRunSummary {
+    string run_id;
+    string face_algorithm_version;
+    string model_version;
+    string preprocessing_version;
+    f64 threshold;
+    u32 cluster_count;
+    u32 member_count;
+    string created_at;
 };
 
 dictionary FaceClusterMemberRecord {
