@@ -7479,6 +7479,127 @@ pub async fn face_observations_for_image_ids(
     rows.filter_map(|row| row.ok()).collect()
 }
 
+/// Return face observations that do not yet have a LanceDB embedding for the
+/// requested model/preprocessing pair. `limit == 0` means no limit.
+pub async fn face_embedding_missing_observations(
+    algorithm_version: String,
+    model_version: String,
+    preprocessing_version: String,
+    limit: u32,
+) -> Vec<FaceObservationRecord> {
+    let embedded_ids = FACE_EMBEDDING_RUNTIME
+        .spawn(async move {
+            stored_face_embeddings(&model_version, &preprocessing_version)
+                .await
+                .into_iter()
+                .map(|record| record.face_observation_id)
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .await
+        .unwrap_or_default();
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let mut stmt = match conn.prepare(
+        "SELECT
+             id,
+             image_id,
+             analyzed_image_id,
+             face_index,
+             algorithm_version,
+             analysis_run_id,
+             bounding_box_x,
+             bounding_box_y,
+             bounding_box_width,
+             bounding_box_height,
+             detection_confidence,
+             face_capture_quality,
+             face_focus_score,
+             left_eye_open_score,
+             right_eye_open_score,
+             eyes_open_score,
+             blink_risk_score,
+             left_eye_x,
+             left_eye_y,
+             right_eye_x,
+             right_eye_y,
+             nose_x,
+             nose_y,
+             mouth_left_x,
+             mouth_left_y,
+             mouth_right_x,
+             mouth_right_y,
+             CAST(created_at AS VARCHAR)
+         FROM face_observation
+         WHERE algorithm_version = ?1
+         ORDER BY analyzed_image_id, image_id, face_index",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            eprintln!("face_embedding_missing_observations: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map(params![algorithm_version], |row| {
+        let face_index = row.get::<_, i64>(3)?;
+        Ok(FaceObservationRecord {
+            id: row.get(0)?,
+            image_id: row.get(1)?,
+            analyzed_image_id: row.get(2)?,
+            face_index: face_index.clamp(0, u32::MAX as i64) as u32,
+            algorithm_version: row.get(4)?,
+            analysis_run_id: row.get(5)?,
+            bounding_box_x: row.get(6)?,
+            bounding_box_y: row.get(7)?,
+            bounding_box_width: row.get(8)?,
+            bounding_box_height: row.get(9)?,
+            detection_confidence: row.get(10)?,
+            face_capture_quality: row.get(11)?,
+            face_focus_score: row.get(12)?,
+            left_eye_open_score: row.get(13)?,
+            right_eye_open_score: row.get(14)?,
+            eyes_open_score: row.get(15)?,
+            blink_risk_score: row.get(16)?,
+            left_eye_x: row.get(17)?,
+            left_eye_y: row.get(18)?,
+            right_eye_x: row.get(19)?,
+            right_eye_y: row.get(20)?,
+            nose_x: row.get(21)?,
+            nose_y: row.get(22)?,
+            mouth_left_x: row.get(23)?,
+            mouth_left_y: row.get(24)?,
+            mouth_right_x: row.get(25)?,
+            mouth_right_y: row.get(26)?,
+            created_at: row.get(27)?,
+        })
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("face_embedding_missing_observations: query {}", e);
+            return Vec::new();
+        }
+    };
+
+    let max_count = if limit == 0 {
+        usize::MAX
+    } else {
+        limit as usize
+    };
+
+    rows.filter_map(|row| row.ok())
+        .filter(|record| !embedded_ids.contains(&record.id))
+        .take(max_count)
+        .collect()
+}
+
 const FACE_EMBEDDING_TABLE: &str = "face_embeddings";
 
 static FACE_EMBEDDING_RUNTIME: once_cell::sync::Lazy<tokio::runtime::Runtime> =

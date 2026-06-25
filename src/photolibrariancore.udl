@@ -410,10 +410,17 @@ namespace photolibrariancore {
     [Async]
     sequence<FaceObservationRecord> face_observations_for_image_ids(sequence<i64> ids, string algorithm_version);
 
-    // Developer-only face embedding vector store (AuraFace validation path).
-    // Vectors live in LanceDB beside the catalogue, keyed by face_observation.id
-    // plus model/preprocessing versions so future alignment/model migrations can
-    // coexist or regenerate safely.
+    // Face embedding vector store. Vectors live in LanceDB beside the
+    // catalogue, keyed by face_observation.id plus model/preprocessing versions
+    // so future alignment/model migrations can coexist or regenerate safely.
+    [Async]
+    sequence<FaceObservationRecord> face_embedding_missing_observations(
+        string algorithm_version,
+        string model_version,
+        string preprocessing_version,
+        u32 limit
+    );
+
     [Async]
     FaceEmbeddingStoreResult upsert_face_embeddings(sequence<FaceEmbeddingVectorRecord> records);
 

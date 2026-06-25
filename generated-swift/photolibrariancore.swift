@@ -5365,6 +5365,21 @@ public func faceEmbeddingCount(modelVersion: String, preprocessingVersion: Strin
 
         )
 }
+public func faceEmbeddingMissingObservations(algorithmVersion: String, modelVersion: String, preprocessingVersion: String, limit: UInt32)async  -> [FaceObservationRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_face_embedding_missing_observations(FfiConverterString.lower(algorithmVersion),FfiConverterString.lower(modelVersion),FfiConverterString.lower(preprocessingVersion),FfiConverterUInt32.lower(limit)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeFaceObservationRecord.lift,
+            errorHandler: nil
+
+        )
+}
 public func faceEmbeddingNearestNeighbors(modelVersion: String, preprocessingVersion: String, limitPerFace: UInt32)async  -> [FaceEmbeddingNeighborRecord]  {
     return
         try!  await uniffiRustCallAsync(
@@ -6661,6 +6676,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_face_embedding_count() != 20632) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_face_embedding_missing_observations() != 2533) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_face_embedding_nearest_neighbors() != 49175) {
