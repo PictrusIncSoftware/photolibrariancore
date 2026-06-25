@@ -4285,6 +4285,7 @@ dependencies = [
  "arrow-array 53.4.1",
  "arrow-schema 53.4.1",
  "duckdb",
+ "futures",
  "lancedb",
  "once_cell",
  "serde",

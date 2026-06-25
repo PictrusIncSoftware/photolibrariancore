@@ -1,6 +1,14 @@
 // Import DuckDB for embedded database operations
 // DuckDB is used instead of SQLite for better analytical query performance on large image catalogues
+use arrow_array::types::Float32Type;
+use arrow_array::{
+    Array, FixedSizeListArray, Float64Array, Int64Array, RecordBatch, RecordBatchIterator, StringArray,
+    UInt32Array,
+};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use duckdb::{params, Connection};
+use futures::TryStreamExt;
+use lancedb::query::{ExecutableQuery, QueryBase};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -25,6 +33,9 @@ uniffi::include_scaffolding!("photolibrariancore");
 // Known limitation: Multiple threads will serialize on this lock. Replace with a
 // connection pool (e.g., r2d2) in a later milestone when concurrent operations are needed.
 static CATALOGUE: once_cell::sync::Lazy<Arc<Mutex<Option<Connection>>>> =
+    once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(None)));
+
+static CATALOGUE_PATH: once_cell::sync::Lazy<Arc<Mutex<Option<PathBuf>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(None)));
 
 /// Represents the metadata for a single image file
@@ -375,6 +386,45 @@ pub struct FaceObservationRecord {
     pub mouth_right_x: Option<f64>,
     pub mouth_right_y: Option<f64>,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FaceEmbeddingVectorRecord {
+    pub face_observation_id: i64,
+    pub image_id: i64,
+    pub analyzed_image_id: i64,
+    pub face_index: u32,
+    pub model_name: String,
+    pub model_version: String,
+    pub preprocessing_version: String,
+    pub input_size: u32,
+    pub color_order: String,
+    pub normalization: String,
+    pub embedding_dimension: u32,
+    pub embedding_l2_norm: f64,
+    pub vector: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FaceEmbeddingStoreResult {
+    pub requested_count: u64,
+    pub stored_count: u64,
+    pub total_count: u64,
+    pub status: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct FaceEmbeddingNeighborRecord {
+    pub query_face_observation_id: i64,
+    pub neighbor_face_observation_id: i64,
+    pub query_image_id: i64,
+    pub neighbor_image_id: i64,
+    pub query_analyzed_image_id: i64,
+    pub neighbor_analyzed_image_id: i64,
+    pub query_face_index: u32,
+    pub neighbor_face_index: u32,
+    pub cosine: f64,
 }
 
 /// Durable coordinator row for enrichment / intelligent-culling work.
@@ -1515,6 +1565,9 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
     // Mutex ensures thread-safe access when called from multiple Swift async tasks
     let mut catalogue = CATALOGUE.lock().unwrap();
     *catalogue = Some(conn);
+
+    let mut stored_path = CATALOGUE_PATH.lock().unwrap();
+    *stored_path = Some(path);
 
     true
 }
@@ -7305,6 +7358,501 @@ pub async fn face_observations_for_image_ids(
     rows.filter_map(|row| row.ok()).collect()
 }
 
+const FACE_EMBEDDING_TABLE: &str = "face_embeddings";
+
+static FACE_EMBEDDING_RUNTIME: once_cell::sync::Lazy<tokio::runtime::Runtime> =
+    once_cell::sync::Lazy::new(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("photolibrarian-face-embeddings")
+            .build()
+            .expect("create face embedding Tokio runtime")
+    });
+
+fn face_embedding_schema(dimension: u32) -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("face_observation_id", DataType::Int64, false),
+        Field::new("image_id", DataType::Int64, false),
+        Field::new("analyzed_image_id", DataType::Int64, false),
+        Field::new("face_index", DataType::UInt32, false),
+        Field::new("model_name", DataType::Utf8, false),
+        Field::new("model_version", DataType::Utf8, false),
+        Field::new("preprocessing_version", DataType::Utf8, false),
+        Field::new("input_size", DataType::UInt32, false),
+        Field::new("color_order", DataType::Utf8, false),
+        Field::new("normalization", DataType::Utf8, false),
+        Field::new("embedding_dimension", DataType::UInt32, false),
+        Field::new("embedding_l2_norm", DataType::Float64, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dimension as i32,
+            ),
+            false,
+        ),
+    ]))
+}
+
+fn face_embedding_store_uri() -> Option<String> {
+    let catalogue_path = CATALOGUE_PATH.lock().unwrap();
+    let path = catalogue_path.as_ref()?;
+    let parent = path.parent()?;
+    Some(
+        parent
+            .join("vectors.lancedb")
+            .to_string_lossy()
+            .to_string(),
+    )
+}
+
+async fn open_or_create_face_embedding_table(
+    dimension: u32,
+) -> Result<lancedb::Table, lancedb::Error> {
+    let uri = face_embedding_store_uri().ok_or_else(|| {
+        lancedb::Error::InvalidInput {
+            message: "catalogue path is not initialized".to_string(),
+        }
+    })?;
+
+    let db = lancedb::connect(&uri).execute().await?;
+    match db.open_table(FACE_EMBEDDING_TABLE).execute().await {
+        Ok(table) => Ok(table),
+        Err(_) => db
+            .create_empty_table(FACE_EMBEDDING_TABLE, face_embedding_schema(dimension))
+            .execute()
+            .await,
+    }
+}
+
+async fn open_face_embedding_table() -> Result<lancedb::Table, lancedb::Error> {
+    let uri = face_embedding_store_uri().ok_or_else(|| {
+        lancedb::Error::InvalidInput {
+            message: "catalogue path is not initialized".to_string(),
+        }
+    })?;
+
+    let db = lancedb::connect(&uri).execute().await?;
+    db.open_table(FACE_EMBEDDING_TABLE).execute().await
+}
+
+fn face_embedding_version_filter(model_version: &str, preprocessing_version: &str) -> String {
+    format!(
+        "model_version = {} AND preprocessing_version = {}",
+        sql_string_literal(model_version),
+        sql_string_literal(preprocessing_version)
+    )
+}
+
+fn face_embedding_batch(
+    records: &[FaceEmbeddingVectorRecord],
+    dimension: u32,
+) -> Result<
+    RecordBatchIterator<std::vec::IntoIter<Result<RecordBatch, arrow_schema::ArrowError>>>,
+    arrow_schema::ArrowError,
+>
+{
+    let schema = face_embedding_schema(dimension);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                records.iter().map(|record| record.face_observation_id),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                records.iter().map(|record| record.image_id),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                records.iter().map(|record| record.analyzed_image_id),
+            )),
+            Arc::new(UInt32Array::from_iter_values(
+                records.iter().map(|record| record.face_index),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                records.iter().map(|record| record.model_name.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                records.iter().map(|record| record.model_version.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                records
+                    .iter()
+                    .map(|record| record.preprocessing_version.as_str()),
+            )),
+            Arc::new(UInt32Array::from_iter_values(
+                records.iter().map(|record| record.input_size),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                records.iter().map(|record| record.color_order.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                records.iter().map(|record| record.normalization.as_str()),
+            )),
+            Arc::new(UInt32Array::from_iter_values(
+                records.iter().map(|record| record.embedding_dimension),
+            )),
+            Arc::new(Float64Array::from_iter_values(
+                records.iter().map(|record| record.embedding_l2_norm),
+            )),
+            Arc::new(FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                records.iter().map(|record| {
+                    Some(record.vector.iter().copied().map(Some).collect::<Vec<_>>())
+                }),
+                dimension as i32,
+            )),
+        ],
+    )?;
+
+    Ok(RecordBatchIterator::new(
+        vec![Ok(batch)].into_iter(),
+        schema.clone(),
+    ))
+}
+
+pub async fn upsert_face_embeddings(
+    records: Vec<FaceEmbeddingVectorRecord>,
+) -> FaceEmbeddingStoreResult {
+    match FACE_EMBEDDING_RUNTIME
+        .spawn(upsert_face_embeddings_impl(records))
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => FaceEmbeddingStoreResult {
+            requested_count: 0,
+            stored_count: 0,
+            total_count: 0,
+            status: "runtime_failed".to_string(),
+            message: format!("Face embedding runtime task failed: {}", e),
+        },
+    }
+}
+
+async fn upsert_face_embeddings_impl(
+    records: Vec<FaceEmbeddingVectorRecord>,
+) -> FaceEmbeddingStoreResult {
+    let requested_count = records.len() as u64;
+    if records.is_empty() {
+        let total_count = face_embedding_total_count().await;
+        return FaceEmbeddingStoreResult {
+            requested_count,
+            stored_count: 0,
+            total_count,
+            status: "empty".to_string(),
+            message: "No face embeddings were provided.".to_string(),
+        };
+    }
+
+    let model_version = records[0].model_version.clone();
+    let preprocessing_version = records[0].preprocessing_version.clone();
+    let dimension = records[0].embedding_dimension;
+    let valid_records = records
+        .into_iter()
+        .filter(|record| {
+            record.embedding_dimension == dimension
+                && record.model_version == model_version
+                && record.preprocessing_version == preprocessing_version
+                && record.vector.len() == dimension as usize
+                && record.vector.iter().all(|value| value.is_finite())
+                && record.embedding_l2_norm.is_finite()
+        })
+        .collect::<Vec<_>>();
+
+    if valid_records.is_empty() {
+        let total_count = face_embedding_total_count().await;
+        return FaceEmbeddingStoreResult {
+            requested_count,
+            stored_count: 0,
+            total_count,
+            status: "invalid".to_string(),
+            message: "No valid face embeddings matched the first record's model/preprocessing contract.".to_string(),
+        };
+    }
+
+    let table = match open_or_create_face_embedding_table(dimension).await {
+        Ok(table) => table,
+        Err(e) => {
+            return FaceEmbeddingStoreResult {
+                requested_count,
+                stored_count: 0,
+                total_count: 0,
+                status: "open_failed".to_string(),
+                message: format!("Failed to open LanceDB face embedding table: {}", e),
+            };
+        }
+    };
+
+    let ids = valid_records
+        .iter()
+        .map(|record| record.face_observation_id.to_string())
+        .collect::<Vec<_>>();
+    let delete_filter = format!(
+        "{} AND face_observation_id IN ({})",
+        face_embedding_version_filter(&model_version, &preprocessing_version),
+        ids.join(",")
+    );
+    if let Err(e) = table.delete(&delete_filter).await {
+        return FaceEmbeddingStoreResult {
+            requested_count,
+            stored_count: 0,
+            total_count: table.count_rows(None).await.unwrap_or(0) as u64,
+            status: "replace_failed".to_string(),
+            message: format!("Failed to replace existing face embeddings: {}", e),
+        };
+    }
+
+    let batch = match face_embedding_batch(&valid_records, dimension) {
+        Ok(batch) => batch,
+        Err(e) => {
+            return FaceEmbeddingStoreResult {
+                requested_count,
+                stored_count: 0,
+                total_count: table.count_rows(None).await.unwrap_or(0) as u64,
+                status: "batch_failed".to_string(),
+                message: format!("Failed to build Arrow batch for face embeddings: {}", e),
+            };
+        }
+    };
+
+    if let Err(e) = table.add(batch).execute().await {
+        return FaceEmbeddingStoreResult {
+            requested_count,
+            stored_count: 0,
+            total_count: table.count_rows(None).await.unwrap_or(0) as u64,
+            status: "store_failed".to_string(),
+            message: format!("Failed to store face embeddings: {}", e),
+        };
+    }
+
+    let total_count = table.count_rows(None).await.unwrap_or(0) as u64;
+    FaceEmbeddingStoreResult {
+        requested_count,
+        stored_count: valid_records.len() as u64,
+        total_count,
+        status: "stored".to_string(),
+        message: "Face embeddings stored in LanceDB.".to_string(),
+    }
+}
+
+async fn face_embedding_total_count() -> u64 {
+    match open_face_embedding_table().await {
+        Ok(table) => table.count_rows(None).await.unwrap_or(0) as u64,
+        Err(_) => 0,
+    }
+}
+
+pub async fn face_embedding_count(model_version: String, preprocessing_version: String) -> u64 {
+    FACE_EMBEDDING_RUNTIME
+        .spawn(face_embedding_count_impl(
+            model_version,
+            preprocessing_version,
+        ))
+        .await
+        .unwrap_or(0)
+}
+
+async fn face_embedding_count_impl(model_version: String, preprocessing_version: String) -> u64 {
+    let table = match open_face_embedding_table().await {
+        Ok(table) => table,
+        Err(_) => return 0,
+    };
+    let filter = face_embedding_version_filter(&model_version, &preprocessing_version);
+    table.count_rows(Some(filter)).await.unwrap_or(0) as u64
+}
+
+#[derive(Debug, Clone)]
+struct StoredFaceEmbedding {
+    face_observation_id: i64,
+    image_id: i64,
+    analyzed_image_id: i64,
+    face_index: u32,
+    vector: Vec<f32>,
+}
+
+async fn stored_face_embeddings(
+    model_version: &str,
+    preprocessing_version: &str,
+) -> Vec<StoredFaceEmbedding> {
+    let table = match open_face_embedding_table().await {
+        Ok(table) => table,
+        Err(e) => {
+            eprintln!("stored_face_embeddings: open {}", e);
+            return Vec::new();
+        }
+    };
+
+    let filter = face_embedding_version_filter(model_version, preprocessing_version);
+    let matching_count = table.count_rows(Some(filter.clone())).await.unwrap_or(0);
+    if matching_count == 0 {
+        return Vec::new();
+    }
+
+    let batches = match table
+        .query()
+        .only_if(filter)
+        .limit(matching_count as usize)
+        .execute()
+        .await
+    {
+        Ok(stream) => match stream.try_collect::<Vec<_>>().await {
+            Ok(batches) => batches,
+            Err(e) => {
+                eprintln!("stored_face_embeddings: collect {}", e);
+                return Vec::new();
+            }
+        },
+        Err(e) => {
+            eprintln!("stored_face_embeddings: query {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mut records = Vec::new();
+    for batch in batches {
+        let Some(face_ids) = batch
+            .column_by_name("face_observation_id")
+            .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+        else { continue };
+        let Some(image_ids) = batch
+            .column_by_name("image_id")
+            .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+        else { continue };
+        let Some(analyzed_ids) = batch
+            .column_by_name("analyzed_image_id")
+            .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+        else { continue };
+        let Some(face_indices) = batch
+            .column_by_name("face_index")
+            .and_then(|array| array.as_any().downcast_ref::<UInt32Array>())
+        else { continue };
+        let Some(vectors) = batch
+            .column_by_name("vector")
+            .and_then(|array| array.as_any().downcast_ref::<FixedSizeListArray>())
+        else { continue };
+        let Some(values) = vectors
+            .values()
+            .as_any()
+            .downcast_ref::<arrow_array::Float32Array>()
+        else { continue };
+
+        let dimension = vectors.value_length().max(0) as usize;
+        for row in 0..batch.num_rows() {
+            let start = row * dimension;
+            let end = start + dimension;
+            if end > values.len() { continue }
+            records.push(StoredFaceEmbedding {
+                face_observation_id: face_ids.value(row),
+                image_id: image_ids.value(row),
+                analyzed_image_id: analyzed_ids.value(row),
+                face_index: face_indices.value(row),
+                vector: (start..end).map(|index| values.value(index)).collect(),
+            });
+        }
+    }
+
+    records.sort_by(|left, right| {
+        left.face_observation_id
+            .cmp(&right.face_observation_id)
+            .then(left.image_id.cmp(&right.image_id))
+            .then(left.face_index.cmp(&right.face_index))
+    });
+    records
+}
+
+fn cosine_f32(left: &[f32], right: &[f32]) -> f64 {
+    if left.len() != right.len() || left.is_empty() {
+        return 0.0;
+    }
+
+    let mut dot = 0.0;
+    let mut left_norm = 0.0;
+    let mut right_norm = 0.0;
+    for (left_value, right_value) in left.iter().zip(right.iter()) {
+        let l = f64::from(*left_value);
+        let r = f64::from(*right_value);
+        dot += l * r;
+        left_norm += l * l;
+        right_norm += r * r;
+    }
+
+    if left_norm <= 0.0 || right_norm <= 0.0 {
+        return 0.0;
+    }
+
+    dot / (left_norm.sqrt() * right_norm.sqrt())
+}
+
+pub async fn face_embedding_nearest_neighbors(
+    model_version: String,
+    preprocessing_version: String,
+    limit_per_face: u32,
+) -> Vec<FaceEmbeddingNeighborRecord> {
+    FACE_EMBEDDING_RUNTIME
+        .spawn(face_embedding_nearest_neighbors_impl(
+            model_version,
+            preprocessing_version,
+            limit_per_face,
+        ))
+        .await
+        .unwrap_or_default()
+}
+
+async fn face_embedding_nearest_neighbors_impl(
+    model_version: String,
+    preprocessing_version: String,
+    limit_per_face: u32,
+) -> Vec<FaceEmbeddingNeighborRecord> {
+    let limit_per_face = limit_per_face.max(1) as usize;
+    let records = stored_face_embeddings(&model_version, &preprocessing_version).await;
+    let mut neighbors = Vec::new();
+
+    for (query_index, query) in records.iter().enumerate() {
+        let mut scored = records
+            .iter()
+            .enumerate()
+            .filter(|(neighbor_index, _)| *neighbor_index != query_index)
+            .map(|(_, neighbor)| {
+                (
+                    neighbor,
+                    cosine_f32(&query.vector, &neighbor.vector),
+                )
+            })
+            .collect::<Vec<_>>();
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        for (neighbor, cosine) in scored.into_iter().take(limit_per_face) {
+            neighbors.push(FaceEmbeddingNeighborRecord {
+                query_face_observation_id: query.face_observation_id,
+                neighbor_face_observation_id: neighbor.face_observation_id,
+                query_image_id: query.image_id,
+                neighbor_image_id: neighbor.image_id,
+                query_analyzed_image_id: query.analyzed_image_id,
+                neighbor_analyzed_image_id: neighbor.analyzed_image_id,
+                query_face_index: query.face_index,
+                neighbor_face_index: neighbor.face_index,
+                cosine,
+            });
+        }
+    }
+
+    neighbors.sort_by(|left, right| {
+        left.query_face_observation_id
+            .cmp(&right.query_face_observation_id)
+            .then_with(|| {
+                right
+                    .cosine
+                    .partial_cmp(&left.cosine)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then(left.neighbor_face_observation_id.cmp(&right.neighbor_face_observation_id))
+    });
+    neighbors
+}
+
 fn similar_photo_candidates_impl(
     conn: &Connection,
     algorithm_version: &str,
@@ -9083,6 +9631,51 @@ pub async fn merge_lightroom_videos(records: Vec<LightroomVideoRecord>) -> Merge
         }
     };
     merge_videos_into(conn, &records)
+}
+
+#[cfg(test)]
+mod face_embedding_tests {
+    use super::*;
+
+    fn embedding_record(face_observation_id: i64, vector: Vec<f32>) -> FaceEmbeddingVectorRecord {
+        FaceEmbeddingVectorRecord {
+            face_observation_id,
+            image_id: face_observation_id + 10,
+            analyzed_image_id: face_observation_id + 20,
+            face_index: 0,
+            model_name: "test-model".to_string(),
+            model_version: "test-version".to_string(),
+            preprocessing_version: "test-preprocessing".to_string(),
+            input_size: 112,
+            color_order: "RGB".to_string(),
+            normalization: "test-normalization".to_string(),
+            embedding_dimension: vector.len() as u32,
+            embedding_l2_norm: 1.0,
+            vector,
+        }
+    }
+
+    #[test]
+    fn face_embedding_batch_accepts_fixed_size_float_vectors() {
+        let records = vec![
+            embedding_record(1, vec![0.1, 0.2, 0.3]),
+            embedding_record(2, vec![0.4, 0.5, 0.6]),
+        ];
+
+        let batch_iterator = face_embedding_batch(&records, 3).expect("embedding batch");
+        let batches = batch_iterator
+            .collect::<Result<Vec<_>, _>>()
+            .expect("record batches");
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 2);
+        let vectors = batches[0]
+            .column_by_name("vector")
+            .and_then(|array| array.as_any().downcast_ref::<FixedSizeListArray>())
+            .expect("vector column");
+        assert_eq!(vectors.value_length(), 3);
+        assert_eq!(vectors.values().len(), 6);
+    }
 }
 
 #[cfg(test)]

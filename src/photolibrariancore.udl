@@ -410,6 +410,19 @@ namespace photolibrariancore {
     [Async]
     sequence<FaceObservationRecord> face_observations_for_image_ids(sequence<i64> ids, string algorithm_version);
 
+    // Developer-only face embedding vector store (AuraFace validation path).
+    // Vectors live in LanceDB beside the catalogue, keyed by face_observation.id
+    // plus model/preprocessing versions so future alignment/model migrations can
+    // coexist or regenerate safely.
+    [Async]
+    FaceEmbeddingStoreResult upsert_face_embeddings(sequence<FaceEmbeddingVectorRecord> records);
+
+    [Async]
+    u64 face_embedding_count(string model_version, string preprocessing_version);
+
+    [Async]
+    sequence<FaceEmbeddingNeighborRecord> face_embedding_nearest_neighbors(string model_version, string preprocessing_version, u32 limit_per_face);
+
     // Similar-photo grouping (S94): Swift computes Vision feature-print groups
     // after Intelligent Culling and persists only multi-photo memberships here.
     [Async]
@@ -918,6 +931,42 @@ dictionary FaceObservationRecord {
     f64? mouth_right_x = null;
     f64? mouth_right_y = null;
     string created_at;
+};
+
+dictionary FaceEmbeddingVectorRecord {
+    i64 face_observation_id;
+    i64 image_id;
+    i64 analyzed_image_id;
+    u32 face_index;
+    string model_name;
+    string model_version;
+    string preprocessing_version;
+    u32 input_size;
+    string color_order;
+    string normalization;
+    u32 embedding_dimension;
+    f64 embedding_l2_norm;
+    sequence<f32> vector;
+};
+
+dictionary FaceEmbeddingStoreResult {
+    u64 requested_count;
+    u64 stored_count;
+    u64 total_count;
+    string status;
+    string message;
+};
+
+dictionary FaceEmbeddingNeighborRecord {
+    i64 query_face_observation_id;
+    i64 neighbor_face_observation_id;
+    i64 query_image_id;
+    i64 neighbor_image_id;
+    i64 query_analyzed_image_id;
+    i64 neighbor_analyzed_image_id;
+    u32 query_face_index;
+    u32 neighbor_face_index;
+    f64 cosine;
 };
 
 dictionary AnalysisJob {
