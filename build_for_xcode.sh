@@ -51,6 +51,13 @@ set -e
 echo "🦀 Building photolibrariancore for Apple Silicon..."
 echo ""
 
+# Keep Rust/Cargo-built objects aligned with the Swift app target. Without this,
+# rustc and C/C++ build scripts can inherit the host SDK's newer deployment
+# version, which makes Xcode warn when linking libphotolibrariancore.a.
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.6}"
+echo "macOS deployment target: $MACOSX_DEPLOYMENT_TARGET"
+echo ""
+
 # Ensure the target is installed
 rustup target add aarch64-apple-darwin
 
