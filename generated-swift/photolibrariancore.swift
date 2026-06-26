@@ -1678,6 +1678,134 @@ public func FfiConverterTypeFaceObservationResult_lower(_ value: FaceObservation
 }
 
 
+public struct FaceRecognitionMenuState: Equatable, Hashable {
+    public var imageId: Int64
+    public var analysisStatus: String?
+    public var faceObservationCount: UInt32
+    public var indexedFaceCount: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(imageId: Int64, analysisStatus: String? = nil, faceObservationCount: UInt32, indexedFaceCount: UInt32) {
+        self.imageId = imageId
+        self.analysisStatus = analysisStatus
+        self.faceObservationCount = faceObservationCount
+        self.indexedFaceCount = indexedFaceCount
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FaceRecognitionMenuState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFaceRecognitionMenuState: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FaceRecognitionMenuState {
+        return
+            try FaceRecognitionMenuState(
+                imageId: FfiConverterInt64.read(from: &buf),
+                analysisStatus: FfiConverterOptionString.read(from: &buf),
+                faceObservationCount: FfiConverterUInt32.read(from: &buf),
+                indexedFaceCount: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FaceRecognitionMenuState, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.imageId, into: &buf)
+        FfiConverterOptionString.write(value.analysisStatus, into: &buf)
+        FfiConverterUInt32.write(value.faceObservationCount, into: &buf)
+        FfiConverterUInt32.write(value.indexedFaceCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFaceRecognitionMenuState_lift(_ buf: RustBuffer) throws -> FaceRecognitionMenuState {
+    return try FfiConverterTypeFaceRecognitionMenuState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFaceRecognitionMenuState_lower(_ value: FaceRecognitionMenuState) -> RustBuffer {
+    return FfiConverterTypeFaceRecognitionMenuState.lower(value)
+}
+
+
+public struct FaceSearchMatchRecord: Equatable, Hashable {
+    public var imageId: Int64
+    public var faceObservationId: Int64
+    public var seedFaceObservationId: Int64
+    public var faceIndex: UInt32
+    public var cosine: Double
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(imageId: Int64, faceObservationId: Int64, seedFaceObservationId: Int64, faceIndex: UInt32, cosine: Double) {
+        self.imageId = imageId
+        self.faceObservationId = faceObservationId
+        self.seedFaceObservationId = seedFaceObservationId
+        self.faceIndex = faceIndex
+        self.cosine = cosine
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FaceSearchMatchRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFaceSearchMatchRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FaceSearchMatchRecord {
+        return
+            try FaceSearchMatchRecord(
+                imageId: FfiConverterInt64.read(from: &buf),
+                faceObservationId: FfiConverterInt64.read(from: &buf),
+                seedFaceObservationId: FfiConverterInt64.read(from: &buf),
+                faceIndex: FfiConverterUInt32.read(from: &buf),
+                cosine: FfiConverterDouble.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FaceSearchMatchRecord, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.imageId, into: &buf)
+        FfiConverterInt64.write(value.faceObservationId, into: &buf)
+        FfiConverterInt64.write(value.seedFaceObservationId, into: &buf)
+        FfiConverterUInt32.write(value.faceIndex, into: &buf)
+        FfiConverterDouble.write(value.cosine, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFaceSearchMatchRecord_lift(_ buf: RustBuffer) throws -> FaceSearchMatchRecord {
+    return try FfiConverterTypeFaceSearchMatchRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFaceSearchMatchRecord_lower(_ value: FaceSearchMatchRecord) -> RustBuffer {
+    return FfiConverterTypeFaceSearchMatchRecord.lower(value)
+}
+
+
 public struct FilePathsResult: Equatable, Hashable {
     public var ok: Bool
     public var paths: [String]
@@ -4514,6 +4642,56 @@ fileprivate struct FfiConverterSequenceTypeFaceObservationResult: FfiConverterRu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFaceRecognitionMenuState: FfiConverterRustBuffer {
+    typealias SwiftType = [FaceRecognitionMenuState]
+
+    public static func write(_ value: [FaceRecognitionMenuState], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFaceRecognitionMenuState.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FaceRecognitionMenuState] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FaceRecognitionMenuState]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFaceRecognitionMenuState.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFaceSearchMatchRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [FaceSearchMatchRecord]
+
+    public static func write(_ value: [FaceSearchMatchRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFaceSearchMatchRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FaceSearchMatchRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FaceSearchMatchRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFaceSearchMatchRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeFocusAnalysisCandidate: FfiConverterRustBuffer {
     typealias SwiftType = [FocusAnalysisCandidate]
 
@@ -5395,6 +5573,21 @@ public func faceEmbeddingNearestNeighbors(modelVersion: String, preprocessingVer
 
         )
 }
+public func faceEmbeddingSearch(seedFaceObservationIds: [Int64], candidateImageIds: [Int64], modelVersion: String, preprocessingVersion: String, threshold: Double, limit: UInt32)async  -> [FaceSearchMatchRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_face_embedding_search(FfiConverterSequenceInt64.lower(seedFaceObservationIds),FfiConverterSequenceInt64.lower(candidateImageIds),FfiConverterString.lower(modelVersion),FfiConverterString.lower(preprocessingVersion),FfiConverterDouble.lower(threshold),FfiConverterUInt32.lower(limit)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeFaceSearchMatchRecord.lift,
+            errorHandler: nil
+
+        )
+}
 public func faceObservationCount(algorithmVersion: String)async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
@@ -5421,6 +5614,21 @@ public func faceObservationsForImageIds(ids: [Int64], algorithmVersion: String)a
             completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeFaceObservationRecord.lift,
+            errorHandler: nil
+
+        )
+}
+public func faceRecognitionMenuStates(ids: [Int64], algorithmVersion: String, modelVersion: String, preprocessingVersion: String)async  -> [FaceRecognitionMenuState]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_face_recognition_menu_states(FfiConverterSequenceInt64.lower(ids),FfiConverterString.lower(algorithmVersion),FfiConverterString.lower(modelVersion),FfiConverterString.lower(preprocessingVersion)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeFaceRecognitionMenuState.lift,
             errorHandler: nil
 
         )
@@ -6684,10 +6892,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_face_embedding_nearest_neighbors() != 49175) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_face_embedding_search() != 34390) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_face_observation_count() != 35248) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_face_observations_for_image_ids() != 45622) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_face_recognition_menu_states() != 45593) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_find_counterpart_image() != 51699) {

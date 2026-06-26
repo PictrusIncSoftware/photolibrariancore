@@ -406,6 +406,14 @@ pub struct FaceEmbeddingVectorRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct FaceRecognitionMenuState {
+    pub image_id: i64,
+    pub analysis_status: Option<String>,
+    pub face_observation_count: u32,
+    pub indexed_face_count: u32,
+}
+
+#[derive(Debug, Clone)]
 pub struct FaceEmbeddingStoreResult {
     pub requested_count: u64,
     pub stored_count: u64,
@@ -424,6 +432,15 @@ pub struct FaceEmbeddingNeighborRecord {
     pub neighbor_analyzed_image_id: i64,
     pub query_face_index: u32,
     pub neighbor_face_index: u32,
+    pub cosine: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FaceSearchMatchRecord {
+    pub image_id: i64,
+    pub face_observation_id: i64,
+    pub seed_face_observation_id: i64,
+    pub face_index: u32,
     pub cosine: f64,
 }
 
@@ -7479,6 +7496,111 @@ pub async fn face_observations_for_image_ids(
     rows.filter_map(|row| row.ok()).collect()
 }
 
+pub async fn face_recognition_menu_states(
+    ids: Vec<i64>,
+    algorithm_version: String,
+    model_version: String,
+    preprocessing_version: String,
+) -> Vec<FaceRecognitionMenuState> {
+    let image_table_id_filter = match id_in_list(&ids) {
+        Some(filter) => filter,
+        None => return Vec::new(),
+    };
+    let face_image_id_filter = match image_id_in_list(&ids) {
+        Some(filter) => filter,
+        None => return Vec::new(),
+    };
+
+    let embedded_ids = FACE_EMBEDDING_RUNTIME
+        .spawn(async move {
+            stored_face_embeddings(&model_version, &preprocessing_version)
+                .await
+                .into_iter()
+                .map(|record| record.face_observation_id)
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .await
+        .unwrap_or_default();
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let mut states = std::collections::HashMap::<i64, FaceRecognitionMenuState>::new();
+    let image_sql = format!(
+        "SELECT id, focus_analysis_status
+         FROM images
+         WHERE {}",
+        image_table_id_filter
+    );
+    let mut image_stmt = match conn.prepare(&image_sql) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            eprintln!("face_recognition_menu_states: image prepare {}", e);
+            return Vec::new();
+        }
+    };
+    let image_rows = match image_stmt.query_map([], |row| {
+        Ok(FaceRecognitionMenuState {
+            image_id: row.get(0)?,
+            analysis_status: row.get(1)?,
+            face_observation_count: 0,
+            indexed_face_count: 0,
+        })
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("face_recognition_menu_states: image query {}", e);
+            return Vec::new();
+        }
+    };
+    for state in image_rows.filter_map(|row| row.ok()) {
+        states.insert(state.image_id, state);
+    }
+
+    let face_sql = format!(
+        "SELECT id, image_id
+         FROM face_observation
+         WHERE algorithm_version = ?1
+           AND {}
+         ORDER BY image_id, face_index",
+        face_image_id_filter
+    );
+    let mut face_stmt = match conn.prepare(&face_sql) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            eprintln!("face_recognition_menu_states: face prepare {}", e);
+            return Vec::new();
+        }
+    };
+    let face_rows = match face_stmt.query_map(params![algorithm_version], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("face_recognition_menu_states: face query {}", e);
+            return Vec::new();
+        }
+    };
+    for (face_observation_id, image_id) in face_rows.filter_map(|row| row.ok()) {
+        if let Some(state) = states.get_mut(&image_id) {
+            state.face_observation_count = state.face_observation_count.saturating_add(1);
+            if embedded_ids.contains(&face_observation_id) {
+                state.indexed_face_count = state.indexed_face_count.saturating_add(1);
+            }
+        }
+    }
+
+    ids.into_iter()
+        .filter_map(|id| states.get(&id).cloned())
+        .collect()
+}
+
 /// Return face observations that do not yet have a LanceDB embedding for the
 /// requested model/preprocessing pair. `limit == 0` means no limit.
 pub async fn face_embedding_missing_observations(
@@ -8100,6 +8222,120 @@ async fn face_embedding_nearest_neighbors_impl(
             )
     });
     neighbors
+}
+
+pub async fn face_embedding_search(
+    seed_face_observation_ids: Vec<i64>,
+    candidate_image_ids: Vec<i64>,
+    model_version: String,
+    preprocessing_version: String,
+    threshold: f64,
+    limit: u32,
+) -> Vec<FaceSearchMatchRecord> {
+    FACE_EMBEDDING_RUNTIME
+        .spawn(face_embedding_search_impl(
+            seed_face_observation_ids,
+            candidate_image_ids,
+            model_version,
+            preprocessing_version,
+            threshold,
+            limit,
+        ))
+        .await
+        .unwrap_or_default()
+}
+
+async fn face_embedding_search_impl(
+    seed_face_observation_ids: Vec<i64>,
+    candidate_image_ids: Vec<i64>,
+    model_version: String,
+    preprocessing_version: String,
+    threshold: f64,
+    limit: u32,
+) -> Vec<FaceSearchMatchRecord> {
+    if seed_face_observation_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let records = stored_face_embeddings(&model_version, &preprocessing_version).await;
+    if records.is_empty() {
+        return Vec::new();
+    }
+
+    let seed_ids = seed_face_observation_ids
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let seeds = records
+        .iter()
+        .filter(|record| seed_ids.contains(&record.face_observation_id))
+        .collect::<Vec<_>>();
+    if seeds.is_empty() {
+        return Vec::new();
+    }
+
+    let candidate_ids = if candidate_image_ids.is_empty() {
+        None
+    } else {
+        Some(
+            candidate_image_ids
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+        )
+    };
+    let threshold = if threshold.is_finite() {
+        threshold
+    } else {
+        0.0
+    };
+
+    let mut best_by_image = std::collections::HashMap::<i64, FaceSearchMatchRecord>::new();
+    for candidate in records.iter() {
+        if let Some(candidate_ids) = &candidate_ids {
+            if !candidate_ids.contains(&candidate.image_id) {
+                continue;
+            }
+        }
+
+        for seed in seeds.iter() {
+            let cosine = cosine_f32(&seed.vector, &candidate.vector);
+            if cosine < threshold {
+                continue;
+            }
+
+            let match_record = FaceSearchMatchRecord {
+                image_id: candidate.image_id,
+                face_observation_id: candidate.face_observation_id,
+                seed_face_observation_id: seed.face_observation_id,
+                face_index: candidate.face_index,
+                cosine,
+            };
+
+            match best_by_image.get(&candidate.image_id) {
+                Some(existing)
+                    if existing.cosine > cosine
+                        || (existing.cosine == cosine
+                            && existing.face_observation_id <= candidate.face_observation_id) => {}
+                _ => {
+                    best_by_image.insert(candidate.image_id, match_record);
+                }
+            }
+        }
+    }
+
+    let mut matches = best_by_image.into_values().collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        right
+            .cosine
+            .partial_cmp(&left.cosine)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(left.image_id.cmp(&right.image_id))
+            .then(left.face_observation_id.cmp(&right.face_observation_id))
+    });
+
+    if limit > 0 {
+        matches.truncate(limit as usize);
+    }
+    matches
 }
 
 fn face_cluster_run_is_valid(run: &FaceClusterRunRecord) -> bool {

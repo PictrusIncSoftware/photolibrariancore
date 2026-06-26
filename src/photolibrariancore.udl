@@ -410,6 +410,14 @@ namespace photolibrariancore {
     [Async]
     sequence<FaceObservationRecord> face_observations_for_image_ids(sequence<i64> ids, string algorithm_version);
 
+    [Async]
+    sequence<FaceRecognitionMenuState> face_recognition_menu_states(
+        sequence<i64> ids,
+        string algorithm_version,
+        string model_version,
+        string preprocessing_version
+    );
+
     // Face embedding vector store. Vectors live in LanceDB beside the
     // catalogue, keyed by face_observation.id plus model/preprocessing versions
     // so future alignment/model migrations can coexist or regenerate safely.
@@ -429,6 +437,16 @@ namespace photolibrariancore {
 
     [Async]
     sequence<FaceEmbeddingNeighborRecord> face_embedding_nearest_neighbors(string model_version, string preprocessing_version, u32 limit_per_face);
+
+    [Async]
+    sequence<FaceSearchMatchRecord> face_embedding_search(
+        sequence<i64> seed_face_observation_ids,
+        sequence<i64> candidate_image_ids,
+        string model_version,
+        string preprocessing_version,
+        f64 threshold,
+        u32 limit
+    );
 
     [Async]
     u64 replace_face_cluster_run(FaceClusterRunRecord run, sequence<FaceClusterMemberRecord> members);
@@ -968,6 +986,13 @@ dictionary FaceEmbeddingVectorRecord {
     sequence<f32> vector;
 };
 
+dictionary FaceRecognitionMenuState {
+    i64 image_id;
+    string? analysis_status = null;
+    u32 face_observation_count;
+    u32 indexed_face_count;
+};
+
 dictionary FaceEmbeddingStoreResult {
     u64 requested_count;
     u64 stored_count;
@@ -985,6 +1010,14 @@ dictionary FaceEmbeddingNeighborRecord {
     i64 neighbor_analyzed_image_id;
     u32 query_face_index;
     u32 neighbor_face_index;
+    f64 cosine;
+};
+
+dictionary FaceSearchMatchRecord {
+    i64 image_id;
+    i64 face_observation_id;
+    i64 seed_face_observation_id;
+    u32 face_index;
     f64 cosine;
 };
 
