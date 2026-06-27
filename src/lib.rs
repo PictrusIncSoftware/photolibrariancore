@@ -4883,6 +4883,121 @@ pub async fn get_images_by_ids(ids: Vec<i64>) -> Vec<ImageRecord> {
     execute_image_record_projection_query(conn, &where_clause, false, false, MediaType::Both)
 }
 
+fn project_raw_jpeg_visible_ids_impl(
+    conn: &Connection,
+    ids: &[i64],
+    apply_raw_jpeg_collapse: bool,
+) -> Vec<i64>
+{
+    if ids.is_empty()
+    {
+        return Vec::new();
+    }
+
+    if !apply_raw_jpeg_collapse
+    {
+        return ids.to_vec();
+    }
+
+    let values = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| format!("({}, {})", *id, index))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query_sql = format!(
+        r#"
+        WITH input(id, ord) AS (VALUES {})
+        SELECT
+            input.ord,
+            COALESCE(
+                (
+                    SELECT sibling.id
+                    FROM images sibling
+                    WHERE image.image_kind = 'raw'
+                      AND sibling.image_kind IN ('jpeg', 'heif')
+                      AND sibling.file_stem = image.file_stem
+                      AND sibling.directory_path = image.directory_path
+                    ORDER BY
+                        CASE
+                            WHEN sibling.image_kind = 'jpeg' THEN 0
+                            WHEN sibling.image_kind = 'heif' THEN 1
+                            ELSE 2
+                        END,
+                        sibling.file_path ASC
+                    LIMIT 1
+                ),
+                image.id
+            ) AS visible_id
+        FROM input
+        JOIN images image ON image.id = input.id
+        ORDER BY input.ord
+    "#,
+        values
+    );
+
+    let mut stmt = match conn.prepare(&query_sql)
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            eprintln!("Failed to prepare RAW/JPEG projection query: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map([], |row| row.get::<_, i64>(1))
+    {
+        Ok(r) => r,
+        Err(e) =>
+        {
+            eprintln!("Failed to execute RAW/JPEG projection query: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mut seen = std::collections::HashSet::<i64>::new();
+    let mut projected = Vec::<i64>::new();
+    for row_result in rows
+    {
+        match row_result
+        {
+            Ok(id) =>
+            {
+                if seen.insert(id)
+                {
+                    projected.push(id);
+                }
+            }
+            Err(e) => eprintln!("Failed to read RAW/JPEG projection row: {}", e),
+        }
+    }
+
+    projected
+}
+
+/// Project an ordered image-id list through the Gallery's RAW/JPEG visibility
+/// rule. Hidden RAW hits become their visible JPEG/HEIF sibling, and duplicate
+/// projected IDs are removed while preserving the original score/order.
+pub async fn project_raw_jpeg_visible_ids(
+    ids: Vec<i64>,
+    apply_raw_jpeg_collapse: bool,
+) -> Vec<i64>
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    project_raw_jpeg_visible_ids_impl(conn, &ids, apply_raw_jpeg_collapse)
+}
+
 /// Expand a set of visible record IDs to their RAW+JPEG/HEIF collapse-group:
 /// the input IDs PLUS any hidden RAW siblings sharing `(file_stem,
 /// directory_path)`. Used when the collapse toggle is ON so an action on a
@@ -14077,6 +14192,38 @@ mod query_builder_tests {
         assert_eq!(id_in_list(&[]), None);
         assert_eq!(id_in_list(&[5]), Some("id IN (5)".to_string()));
         assert_eq!(id_in_list(&[1, 2, 3]), Some("id IN (1, 2, 3)".to_string()));
+    }
+
+    #[test]
+    fn ordered_id_projection_collapses_raw_hits_to_visible_jpeg()
+    {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE images (
+                id INTEGER,
+                file_path TEXT,
+                file_stem TEXT,
+                image_kind TEXT,
+                directory_path TEXT
+             );
+             INSERT INTO images (id, file_path, file_stem, image_kind, directory_path) VALUES
+                (1, '/photos/a.nef', 'a', 'raw', '/photos'),
+                (2, '/photos/a.jpg', 'a', 'jpeg', '/photos'),
+                (3, '/photos/b.nef', 'b', 'raw', '/photos'),
+                (4, '/photos/b.jpg', 'b', 'jpeg', '/photos'),
+                (5, '/photos/c.nef', 'c', 'raw', '/photos');",
+        )
+        .expect("seed images");
+
+        let input = vec![3, 1, 2, 4, 5];
+        assert_eq!(
+            project_raw_jpeg_visible_ids_impl(&conn, &input, false),
+            input
+        );
+        assert_eq!(
+            project_raw_jpeg_visible_ids_impl(&conn, &input, true),
+            vec![4, 2, 5]
+        );
     }
 
     #[test]

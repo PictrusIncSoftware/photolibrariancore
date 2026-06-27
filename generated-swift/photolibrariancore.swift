@@ -6222,6 +6222,21 @@ public func parseFilename(fileName: String) -> ParsedFilename  {
     )
 })
 }
+public func projectRawJpegVisibleIds(ids: [Int64], applyRawJpegCollapse: Bool)async  -> [Int64]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_project_raw_jpeg_visible_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterBool.lower(applyRawJpegCollapse)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceInt64.lift,
+            errorHandler: nil
+
+        )
+}
 public func queryImageIds(predicates: [QueryPredicate], connectors: [Connector], applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, mediaType: MediaType)async  -> [Int64]  {
     return
         try!  await uniffiRustCallAsync(
@@ -7025,6 +7040,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_parse_filename() != 30612) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_project_raw_jpeg_visible_ids() != 8495) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_query_image_ids() != 35971) {
