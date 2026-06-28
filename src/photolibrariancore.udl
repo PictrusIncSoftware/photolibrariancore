@@ -488,6 +488,15 @@ namespace photolibrariancore {
     [Async]
     PersonClusterAcceptResult assign_face_observations_to_person(sequence<i64> face_observation_ids, string person_name);
 
+    [Async]
+    PersonClusterAcceptResult assign_face_search_matches_to_person(
+        sequence<FaceSearchMatchRecord> matches,
+        string person_name,
+        string model_version,
+        string preprocessing_version,
+        f64 threshold
+    );
+
     // Similar-photo grouping (S94): Swift computes Vision feature-print groups
     // after Intelligent Culling and persists only multi-photo memberships here.
     [Async]

@@ -9369,6 +9369,190 @@ pub async fn assign_face_observations_to_person(
     assign_face_observations_to_person_impl(conn, &face_observation_ids, &person_name)
 }
 
+fn assign_face_search_matches_to_person_impl(
+    conn: &Connection,
+    matches: &[FaceSearchMatchRecord],
+    person_name: &str,
+    model_version: &str,
+    preprocessing_version: &str,
+    threshold: f64,
+) -> PersonClusterAcceptResult {
+    let Some(display_name) = clean_person_display_name(person_name) else {
+        return person_accept_error("invalid", "A non-empty person name is required.");
+    };
+    let normalized_name = normalized_person_name(&display_name);
+    let keyword_segments = vec!["People".to_string(), display_name.clone()];
+    let keyword_path = keyword_segments.join(KEYWORD_PATH_SEPARATOR);
+
+    let mut best_match_by_face_id = std::collections::BTreeMap::<i64, FaceSearchMatchRecord>::new();
+    for search_match in matches {
+        if search_match.face_observation_id <= 0 || !search_match.cosine.is_finite() {
+            continue;
+        }
+        match best_match_by_face_id.get(&search_match.face_observation_id) {
+            Some(existing) if existing.cosine >= search_match.cosine => {}
+            _ => {
+                best_match_by_face_id
+                    .insert(search_match.face_observation_id, search_match.clone());
+            }
+        }
+    }
+
+    let face_observation_ids = best_match_by_face_id.keys().copied().collect::<Vec<_>>();
+    let faces = assignable_faces_for_observation_ids(conn, &face_observation_ids);
+    if faces.is_empty() {
+        return person_accept_error(
+            "empty_selection",
+            "No persisted face observations were found for the search matches.",
+        );
+    }
+    let previous_assignments =
+        person_assignments_for_face_observations_impl(conn, &face_observation_ids);
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
+        eprintln!("assign_face_search_matches_to_person: begin {}", e);
+        return person_accept_error(
+            "failed",
+            "Could not start the face-search assignment transaction.",
+        );
+    }
+
+    let person_id = match get_or_create_person_impl(conn, &display_name, &normalized_name) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("assign_face_search_matches_to_person: person {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return person_accept_error("failed", "Could not create or reuse the person row.");
+        }
+    };
+
+    let model_version = model_version.trim();
+    let preprocessing_version = preprocessing_version.trim();
+    let threshold = threshold.is_finite().then_some(threshold);
+    let mut assigned_face_count = 0u64;
+    let mut image_ids = std::collections::BTreeSet::new();
+    let mut keyword_row_count = 0u64;
+    for face in &faces {
+        let Some(search_match) = best_match_by_face_id.get(&face.face_observation_id) else {
+            continue;
+        };
+        match conn.execute(
+            "INSERT INTO person_face_assignment (
+                 face_observation_id, person_id, image_id, analyzed_image_id, face_index,
+                 assignment_source, face_cluster_run_id, face_cluster_id,
+                 model_version, preprocessing_version, threshold, confidence_cosine,
+                 created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, 'face_search_match', NULL, NULL, ?6, ?7, ?8, ?9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+             ON CONFLICT (face_observation_id) DO UPDATE SET
+                 person_id = excluded.person_id,
+                 image_id = excluded.image_id,
+                 analyzed_image_id = excluded.analyzed_image_id,
+                 face_index = excluded.face_index,
+                 assignment_source = excluded.assignment_source,
+                 face_cluster_run_id = excluded.face_cluster_run_id,
+                 face_cluster_id = excluded.face_cluster_id,
+                 model_version = excluded.model_version,
+                 preprocessing_version = excluded.preprocessing_version,
+                 threshold = excluded.threshold,
+                 confidence_cosine = excluded.confidence_cosine,
+                 updated_at = now()",
+            params![
+                face.face_observation_id,
+                person_id,
+                face.image_id,
+                face.analyzed_image_id,
+                face.face_index as i64,
+                model_version,
+                preprocessing_version,
+                threshold,
+                search_match.cosine,
+            ],
+        ) {
+            Ok(_) => {
+                assigned_face_count += 1;
+                image_ids.insert(face.image_id);
+            }
+            Err(e) => {
+                eprintln!(
+                    "assign_face_search_matches_to_person: assign face_observation_id={} {}",
+                    face.face_observation_id, e
+                );
+                let _ = conn.execute_batch("ROLLBACK;");
+                return person_accept_error("failed", "Could not persist all face-search assignments.");
+            }
+        }
+    }
+
+    for image_id in &image_ids {
+        match insert_or_merge_active_keyword_for_image(
+            conn,
+            *image_id,
+            &keyword_segments,
+            KEYWORD_ORIGIN_FACE,
+        ) {
+            Ok(changed) => keyword_row_count += changed,
+            Err(e) => {
+                eprintln!(
+                    "assign_face_search_matches_to_person: keyword image_id={} {}",
+                    image_id, e
+                );
+                let _ = conn.execute_batch("ROLLBACK;");
+                return person_accept_error("failed", "Could not mirror the People keyword.");
+            }
+        }
+    }
+
+    if let Err(e) = remove_obsolete_face_keyword_projections(conn, &previous_assignments, person_id)
+    {
+        eprintln!("assign_face_search_matches_to_person: cleanup {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return person_accept_error("failed", "Could not clean up the previous People keyword.");
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;") {
+        eprintln!("assign_face_search_matches_to_person: commit {}", e);
+        return person_accept_error("failed", "Could not commit the face-search assignment.");
+    }
+
+    PersonClusterAcceptResult {
+        person_id,
+        person_name: display_name,
+        assigned_face_count,
+        keyword_image_count: image_ids.len() as u64,
+        keyword_row_count,
+        keyword_path,
+        status: "assigned".to_string(),
+        message: "Face-search matches assigned to a named person.".to_string(),
+    }
+}
+
+pub async fn assign_face_search_matches_to_person(
+    matches: Vec<FaceSearchMatchRecord>,
+    person_name: String,
+    model_version: String,
+    preprocessing_version: String,
+    threshold: f64,
+) -> PersonClusterAcceptResult {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return person_accept_error("failed", "Catalogue not initialized.");
+        }
+    };
+
+    assign_face_search_matches_to_person_impl(
+        conn,
+        &matches,
+        &person_name,
+        &model_version,
+        &preprocessing_version,
+        threshold,
+    )
+}
+
 fn accept_face_cluster_as_person_impl(
     conn: &Connection,
     run_id: &str,
@@ -11788,6 +11972,83 @@ mod face_cluster_tests {
             )
             .expect("Grace face keywords");
         assert_eq!(grace_keyword_count, 2);
+    }
+
+    #[test]
+    fn face_search_assignment_names_matches_and_mirrors_people_keyword() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO images (id, is_video) VALUES (501, FALSE), (502, FALSE)",
+            [],
+        )
+        .expect("images");
+        conn.execute(
+            "INSERT INTO face_observation (id, image_id, analyzed_image_id, face_index)
+             VALUES (61, 501, 501, 0), (62, 502, 502, 1)",
+            [],
+        )
+        .expect("face observations");
+
+        let result = assign_face_search_matches_to_person_impl(
+            &conn,
+            &[
+                FaceSearchMatchRecord {
+                    image_id: 501,
+                    face_observation_id: 61,
+                    seed_face_observation_id: 41,
+                    face_index: 0,
+                    cosine: 0.82,
+                },
+                FaceSearchMatchRecord {
+                    image_id: 502,
+                    face_observation_id: 62,
+                    seed_face_observation_id: 41,
+                    face_index: 1,
+                    cosine: 0.79,
+                },
+            ],
+            "Angry Girl",
+            "auraface-coreml-v1",
+            "center-crop-v1",
+            0.55,
+        );
+        assert_eq!(result.status, "assigned");
+        assert_eq!(result.person_name, "Angry Girl");
+        assert_eq!(result.assigned_face_count, 2);
+        assert_eq!(result.keyword_image_count, 2);
+        assert_eq!(result.keyword_row_count, 4);
+
+        let assignment_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM person_face_assignment
+                 WHERE assignment_source = 'face_search_match'
+                   AND model_version = 'auraface-coreml-v1'
+                   AND preprocessing_version = 'center-crop-v1'
+                   AND threshold = 0.55
+                   AND confidence_cosine >= 0.79",
+                [],
+                |row| row.get(0),
+            )
+            .expect("assignment count");
+        assert_eq!(assignment_count, 2);
+
+        let keyword_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM keyword
+                 WHERE image_id IN (501, 502)
+                   AND status = 1
+                   AND (origin & ?2) <> 0
+                   AND path IN ('People', ?1)",
+                params![
+                    ["People", "Angry Girl"].join(KEYWORD_PATH_SEPARATOR),
+                    KEYWORD_ORIGIN_FACE,
+                ],
+                |row| row.get(0),
+            )
+            .expect("keyword count");
+        assert_eq!(keyword_count, 4);
     }
 }
 

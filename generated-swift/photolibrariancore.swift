@@ -5429,6 +5429,21 @@ public func assignFaceObservationsToPerson(faceObservationIds: [Int64], personNa
 
         )
 }
+public func assignFaceSearchMatchesToPerson(matches: [FaceSearchMatchRecord], personName: String, modelVersion: String, preprocessingVersion: String, threshold: Double)async  -> PersonClusterAcceptResult  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_assign_face_search_matches_to_person(FfiConverterSequenceTypeFaceSearchMatchRecord.lower(matches),FfiConverterString.lower(personName),FfiConverterString.lower(modelVersion),FfiConverterString.lower(preprocessingVersion),FfiConverterDouble.lower(threshold)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypePersonClusterAcceptResult_lift,
+            errorHandler: nil
+
+        )
+}
 public func assignKeywordForIds(ids: [Int64], segments: [String])async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
@@ -7092,6 +7107,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_assign_face_observations_to_person() != 29864) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_assign_face_search_matches_to_person() != 42851) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_assign_keyword_for_ids() != 32359) {
