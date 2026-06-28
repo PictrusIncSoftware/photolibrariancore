@@ -493,6 +493,23 @@ pub struct PersonClusterAcceptResult {
     pub message: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct PersonSummaryRecord {
+    pub person_id: i64,
+    pub person_name: String,
+    pub assigned_face_count: u64,
+    pub image_count: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonFaceAssignmentRecord {
+    pub face_observation_id: i64,
+    pub person_id: i64,
+    pub person_name: String,
+    pub image_id: i64,
+    pub face_index: u32,
+}
+
 /// Durable coordinator row for enrichment / intelligent-culling work.
 ///
 /// The current focus analyzer still runs in Swift, but the job identity and
@@ -1356,7 +1373,7 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             label TEXT NOT NULL,                -- this node's text (= last path segment)
             path TEXT NOT NULL,                 -- root->this node, U+001F-separated
             status INTEGER NOT NULL DEFAULT 1,  -- 1 = active, 0 = hidden (soft-delete)
-            origin INTEGER NOT NULL DEFAULT 1,  -- bitmask: 1 = user/import, 2 = auto-categorization, 3 = both
+            origin INTEGER NOT NULL DEFAULT 1,  -- bitmask: 1 = user/import, 2 = auto-categorization, 4 = face/person projection
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             hidden_at TIMESTAMP,                -- set when status->0; NULL while active
             collection BOOLEAN NOT NULL DEFAULT FALSE,  -- Collections-panel membership; orthogonal to status (keyword search stays oblivious)
@@ -3660,6 +3677,7 @@ fn keyword_origin_clause(op: Option<&str>) -> &'static str {
     match op {
         Some("user") => " AND (k.origin & 1) <> 0",
         Some("auto") => " AND (k.origin & 2) <> 0",
+        Some("face") => " AND (k.origin & 4) <> 0",
         Some("both") | None => "",
         _ => "",
     }
@@ -5072,6 +5090,7 @@ pub async fn expand_collapse_group_ids(ids: Vec<i64>) -> Vec<i64> {
 const KEYWORD_PATH_SEPARATOR: &str = "\u{001F}";
 const KEYWORD_ORIGIN_USER: i32 = 1;
 const KEYWORD_ORIGIN_AUTO: i32 = 2;
+const KEYWORD_ORIGIN_FACE: i32 = 4;
 
 /// A single materialized keyword row, as returned to Swift.
 #[derive(Debug, Clone)]
@@ -5182,6 +5201,58 @@ fn insert_or_merge_active_keyword_for_image(
             params![image_id, label, path, origin, image_id],
         )?;
         changed += 1;
+    }
+
+    Ok(changed)
+}
+
+fn clear_face_keyword_origin_for_path(
+    conn: &Connection,
+    image_id: i64,
+    path: &str,
+) -> Result<u64, duckdb::Error> {
+    let clear_face_mask = !KEYWORD_ORIGIN_FACE;
+    let changed = conn.execute(
+        "UPDATE keyword SET origin = (origin & ?1)
+         WHERE image_id = ?2
+           AND path = ?3
+           AND status = 1
+           AND (origin & ?4) <> 0",
+        params![clear_face_mask, image_id, path, KEYWORD_ORIGIN_FACE],
+    )? as u64;
+
+    conn.execute(
+        "UPDATE keyword
+         SET status = 0, hidden_at = CURRENT_TIMESTAMP
+         WHERE image_id = ?1
+           AND path = ?2
+           AND status = 1
+           AND origin = 0
+           AND COALESCE(collection, FALSE) = FALSE
+           AND COALESCE(color, FALSE) = FALSE",
+        params![image_id, path],
+    )?;
+
+    Ok(changed)
+}
+
+fn remove_face_person_keyword_projection_for_image(
+    conn: &Connection,
+    image_id: i64,
+    person_name: &str,
+) -> Result<u64, duckdb::Error> {
+    let person_path = ["People", person_name].join(KEYWORD_PATH_SEPARATOR);
+    let mut changed = clear_face_keyword_origin_for_path(conn, image_id, &person_path)?;
+
+    let remaining_face_assignments: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM person_face_assignment
+         WHERE image_id = ?1",
+        params![image_id],
+        |row| row.get(0),
+    )?;
+    if remaining_face_assignments == 0 {
+        changed += clear_face_keyword_origin_for_path(conn, image_id, "People")?;
     }
 
     Ok(changed)
@@ -5512,6 +5583,7 @@ fn keyword_vocabulary_origin_where(origin: &str) -> Option<&'static str> {
         "both" | "" => Some(""),
         "user" => Some(" WHERE (origin & 1) <> 0"),
         "auto" => Some(" WHERE (origin & 2) <> 0"),
+        "face" => Some(" WHERE (origin & 4) <> 0"),
         _ => None,
     }
 }
@@ -5584,6 +5656,7 @@ fn keyword_management_origin_clause(origin: &str) -> Option<&'static str> {
         "both" | "" => Some(""),
         "user" => Some("WHERE (origin & 1) <> 0"),
         "auto" => Some("WHERE (origin & 2) <> 0"),
+        "face" => Some("WHERE (origin & 4) <> 0"),
         _ => None,
     }
 }
@@ -8900,6 +8973,402 @@ fn get_or_create_person_impl(
     )
 }
 
+#[derive(Debug, Clone)]
+struct PersonAssignableFace {
+    face_observation_id: i64,
+    image_id: i64,
+    analyzed_image_id: i64,
+    face_index: u32,
+}
+
+fn person_summaries_impl(conn: &Connection) -> Vec<PersonSummaryRecord> {
+    let mut stmt = match conn.prepare(
+        "SELECT
+             p.id,
+             p.display_name,
+             COUNT(a.face_observation_id),
+             COUNT(DISTINCT a.image_id)
+         FROM person p
+         LEFT JOIN person_face_assignment a ON a.person_id = p.id
+         GROUP BY p.id, p.display_name
+         ORDER BY lower(p.display_name), p.display_name",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            eprintln!("person_summaries: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map([], |row| {
+        let assigned_face_count = row.get::<_, i64>(2)?.max(0) as u64;
+        let image_count = row.get::<_, i64>(3)?.max(0) as u64;
+        Ok(PersonSummaryRecord {
+            person_id: row.get(0)?,
+            person_name: row.get(1)?,
+            assigned_face_count,
+            image_count,
+        })
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("person_summaries: query {}", e);
+            return Vec::new();
+        }
+    };
+
+    rows.filter_map(|row| row.ok()).collect()
+}
+
+pub async fn person_summaries() -> Vec<PersonSummaryRecord> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    person_summaries_impl(conn)
+}
+
+fn person_assignments_for_face_observations_impl(
+    conn: &Connection,
+    face_observation_ids: &[i64],
+) -> Vec<PersonFaceAssignmentRecord> {
+    if face_observation_ids.is_empty() {
+        return Vec::new();
+    }
+    let id_list = face_observation_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let sql = format!(
+        "SELECT
+             a.face_observation_id,
+             a.person_id,
+             p.display_name,
+             a.image_id,
+             a.face_index
+         FROM person_face_assignment a
+         JOIN person p ON p.id = a.person_id
+         WHERE a.face_observation_id IN ({})
+         ORDER BY a.face_observation_id",
+        id_list
+    );
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            eprintln!("person_assignments_for_face_observations: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map([], |row| {
+        let face_index = row.get::<_, i64>(4)?;
+        Ok(PersonFaceAssignmentRecord {
+            face_observation_id: row.get(0)?,
+            person_id: row.get(1)?,
+            person_name: row.get(2)?,
+            image_id: row.get(3)?,
+            face_index: face_index.clamp(0, u32::MAX as i64) as u32,
+        })
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("person_assignments_for_face_observations: query {}", e);
+            return Vec::new();
+        }
+    };
+
+    rows.filter_map(|row| row.ok()).collect()
+}
+
+pub async fn person_assignments_for_face_observations(
+    face_observation_ids: Vec<i64>,
+) -> Vec<PersonFaceAssignmentRecord> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    person_assignments_for_face_observations_impl(conn, &face_observation_ids)
+}
+
+fn remove_obsolete_face_keyword_projections(
+    conn: &Connection,
+    previous_assignments: &[PersonFaceAssignmentRecord],
+    new_person_id: i64,
+) -> Result<u64, duckdb::Error> {
+    let mut previous_people = std::collections::BTreeSet::new();
+    for assignment in previous_assignments {
+        if assignment.person_id != new_person_id {
+            previous_people.insert((
+                assignment.image_id,
+                assignment.person_id,
+                assignment.person_name.clone(),
+            ));
+        }
+    }
+
+    let mut changed = 0u64;
+    for (image_id, previous_person_id, previous_person_name) in previous_people {
+        let remaining_for_previous_person: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM person_face_assignment
+             WHERE image_id = ?1
+               AND person_id = ?2",
+            params![image_id, previous_person_id],
+            |row| row.get(0),
+        )?;
+        if remaining_for_previous_person == 0 {
+            changed += remove_face_person_keyword_projection_for_image(
+                conn,
+                image_id,
+                &previous_person_name,
+            )?;
+        }
+    }
+
+    Ok(changed)
+}
+
+fn person_face_observation_ids_impl(conn: &Connection, person_id: i64) -> Vec<i64> {
+    if person_id <= 0 {
+        return Vec::new();
+    }
+
+    let mut stmt = match conn.prepare(
+        "SELECT face_observation_id
+         FROM person_face_assignment
+         WHERE person_id = ?1
+         ORDER BY created_at, face_observation_id",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            eprintln!("person_face_observation_ids: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map(params![person_id], |row| row.get::<_, i64>(0)) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("person_face_observation_ids: query {}", e);
+            return Vec::new();
+        }
+    };
+
+    rows.filter_map(|row| row.ok()).collect()
+}
+
+pub async fn person_face_observation_ids(person_id: i64) -> Vec<i64> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    person_face_observation_ids_impl(conn, person_id)
+}
+
+fn assignable_faces_for_observation_ids(
+    conn: &Connection,
+    face_observation_ids: &[i64],
+) -> Vec<PersonAssignableFace> {
+    let id_filter = match id_in_list(face_observation_ids) {
+        Some(filter) => filter,
+        None => return Vec::new(),
+    };
+    let sql = format!(
+        "SELECT id, image_id, analyzed_image_id, face_index
+         FROM face_observation
+         WHERE {}
+         ORDER BY id",
+        id_filter
+    );
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            eprintln!("assignable_faces_for_observation_ids: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map([], |row| {
+        let face_index = row.get::<_, i64>(3)?;
+        Ok(PersonAssignableFace {
+            face_observation_id: row.get(0)?,
+            image_id: row.get(1)?,
+            analyzed_image_id: row.get(2)?,
+            face_index: face_index.clamp(0, u32::MAX as i64) as u32,
+        })
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("assignable_faces_for_observation_ids: query {}", e);
+            return Vec::new();
+        }
+    };
+
+    rows.filter_map(|row| row.ok()).collect()
+}
+
+fn assign_face_observations_to_person_impl(
+    conn: &Connection,
+    face_observation_ids: &[i64],
+    person_name: &str,
+) -> PersonClusterAcceptResult {
+    let Some(display_name) = clean_person_display_name(person_name) else {
+        return person_accept_error("invalid", "A non-empty person name is required.");
+    };
+    let normalized_name = normalized_person_name(&display_name);
+    let keyword_segments = vec!["People".to_string(), display_name.clone()];
+    let keyword_path = keyword_segments.join(KEYWORD_PATH_SEPARATOR);
+    let faces = assignable_faces_for_observation_ids(conn, face_observation_ids);
+    if faces.is_empty() {
+        return person_accept_error(
+            "empty_selection",
+            "No persisted face observations were found for the selected faces.",
+        );
+    }
+    let previous_assignments =
+        person_assignments_for_face_observations_impl(conn, face_observation_ids);
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
+        eprintln!("assign_face_observations_to_person: begin {}", e);
+        return person_accept_error(
+            "failed",
+            "Could not start the person assignment transaction.",
+        );
+    }
+
+    let person_id = match get_or_create_person_impl(conn, &display_name, &normalized_name) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("assign_face_observations_to_person: person {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return person_accept_error("failed", "Could not create or reuse the person row.");
+        }
+    };
+
+    let mut assigned_face_count = 0u64;
+    let mut image_ids = std::collections::BTreeSet::new();
+    let mut keyword_row_count = 0u64;
+    for face in &faces {
+        match conn.execute(
+            "INSERT INTO person_face_assignment (
+                 face_observation_id, person_id, image_id, analyzed_image_id, face_index,
+                 assignment_source, face_cluster_run_id, face_cluster_id,
+                 model_version, preprocessing_version, threshold, confidence_cosine,
+                 created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, 'manual_label', NULL, NULL, NULL, NULL, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+             ON CONFLICT (face_observation_id) DO UPDATE SET
+                 person_id = excluded.person_id,
+                 image_id = excluded.image_id,
+                 analyzed_image_id = excluded.analyzed_image_id,
+                 face_index = excluded.face_index,
+                 assignment_source = excluded.assignment_source,
+                 face_cluster_run_id = excluded.face_cluster_run_id,
+                 face_cluster_id = excluded.face_cluster_id,
+                 model_version = excluded.model_version,
+                 preprocessing_version = excluded.preprocessing_version,
+                 threshold = excluded.threshold,
+                 confidence_cosine = excluded.confidence_cosine,
+                 updated_at = now()",
+            params![
+                face.face_observation_id,
+                person_id,
+                face.image_id,
+                face.analyzed_image_id,
+                face.face_index as i64,
+            ],
+        ) {
+            Ok(_) => {
+                assigned_face_count += 1;
+                image_ids.insert(face.image_id);
+            }
+            Err(e) => {
+                eprintln!(
+                    "assign_face_observations_to_person: assign face_observation_id={} {}",
+                    face.face_observation_id, e
+                );
+                let _ = conn.execute_batch("ROLLBACK;");
+                return person_accept_error("failed", "Could not persist all face assignments.");
+            }
+        }
+    }
+
+    for image_id in &image_ids {
+        match insert_or_merge_active_keyword_for_image(
+            conn,
+            *image_id,
+            &keyword_segments,
+            KEYWORD_ORIGIN_FACE,
+        ) {
+            Ok(changed) => keyword_row_count += changed,
+            Err(e) => {
+                eprintln!(
+                    "assign_face_observations_to_person: keyword image_id={} {}",
+                    image_id, e
+                );
+                let _ = conn.execute_batch("ROLLBACK;");
+                return person_accept_error("failed", "Could not mirror the People keyword.");
+            }
+        }
+    }
+
+    if let Err(e) = remove_obsolete_face_keyword_projections(conn, &previous_assignments, person_id)
+    {
+        eprintln!("assign_face_observations_to_person: cleanup {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return person_accept_error("failed", "Could not clean up the previous People keyword.");
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;") {
+        eprintln!("assign_face_observations_to_person: commit {}", e);
+        return person_accept_error("failed", "Could not commit the person assignment.");
+    }
+
+    PersonClusterAcceptResult {
+        person_id,
+        person_name: display_name,
+        assigned_face_count,
+        keyword_image_count: image_ids.len() as u64,
+        keyword_row_count,
+        keyword_path,
+        status: "assigned".to_string(),
+        message: "Face observations assigned to a named person.".to_string(),
+    }
+}
+
+pub async fn assign_face_observations_to_person(
+    face_observation_ids: Vec<i64>,
+    person_name: String,
+) -> PersonClusterAcceptResult {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return person_accept_error("failed", "Catalogue not initialized.");
+        }
+    };
+
+    assign_face_observations_to_person_impl(conn, &face_observation_ids, &person_name)
+}
+
 fn accept_face_cluster_as_person_impl(
     conn: &Connection,
     run_id: &str,
@@ -8932,6 +9401,12 @@ fn accept_face_cluster_as_person_impl(
             "The selected cluster has no persisted members.",
         );
     }
+    let member_face_observation_ids = members
+        .iter()
+        .map(|member| member.face_observation_id)
+        .collect::<Vec<_>>();
+    let previous_assignments =
+        person_assignments_for_face_observations_impl(conn, &member_face_observation_ids);
 
     if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         eprintln!("accept_face_cluster_as_person: begin {}", e);
@@ -9010,7 +9485,7 @@ fn accept_face_cluster_as_person_impl(
             conn,
             *image_id,
             &keyword_segments,
-            KEYWORD_ORIGIN_USER,
+            KEYWORD_ORIGIN_FACE,
         ) {
             Ok(changed) => keyword_row_count += changed,
             Err(e) => {
@@ -9022,6 +9497,13 @@ fn accept_face_cluster_as_person_impl(
                 return person_accept_error("failed", "Could not mirror the People keyword.");
             }
         }
+    }
+
+    if let Err(e) = remove_obsolete_face_keyword_projections(conn, &previous_assignments, person_id)
+    {
+        eprintln!("accept_face_cluster_as_person: cleanup {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return person_accept_error("failed", "Could not clean up the previous People keyword.");
     }
 
     if let Err(e) = conn.execute_batch("COMMIT;") {
@@ -10922,6 +11404,13 @@ mod face_cluster_tests {
                  is_video BOOLEAN NOT NULL DEFAULT FALSE
              );
 
+             CREATE TABLE face_observation (
+                 id INTEGER PRIMARY KEY,
+                 image_id INTEGER NOT NULL,
+                 analyzed_image_id INTEGER NOT NULL,
+                 face_index INTEGER NOT NULL
+             );
+
              CREATE SEQUENCE keyword_id_seq START 1;
              CREATE TABLE keyword (
                  id INTEGER PRIMARY KEY DEFAULT nextval('keyword_id_seq'),
@@ -11130,9 +11619,12 @@ mod face_cluster_tests {
                  FROM keyword
                  WHERE image_id IN (111, 112)
                    AND status = 1
-                   AND origin = 1
+                   AND (origin & ?2) <> 0
                    AND path IN ('People', ?1)",
-                params![["People", "James Wagner"].join(KEYWORD_PATH_SEPARATOR)],
+                params![
+                    ["People", "James Wagner"].join(KEYWORD_PATH_SEPARATOR),
+                    KEYWORD_ORIGIN_FACE,
+                ],
                 |row| row.get(0),
             )
             .expect("keyword count");
@@ -11155,6 +11647,147 @@ mod face_cluster_tests {
             )
             .expect("duplicate keyword count");
         assert_eq!(duplicate_keyword_count, 4);
+    }
+
+    #[test]
+    fn direct_face_assignment_names_person_and_reads_back_identity() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO images (id, is_video) VALUES (301, FALSE), (302, FALSE)",
+            [],
+        )
+        .expect("images");
+        conn.execute(
+            "INSERT INTO face_observation (id, image_id, analyzed_image_id, face_index)
+             VALUES (41, 301, 301, 0), (42, 302, 302, 1)",
+            [],
+        )
+        .expect("face observations");
+
+        let result = assign_face_observations_to_person_impl(&conn, &[41, 42], "  Ada   Lovelace ");
+        assert_eq!(result.status, "assigned");
+        assert_eq!(result.person_name, "Ada Lovelace");
+        assert_eq!(result.assigned_face_count, 2);
+        assert_eq!(result.keyword_image_count, 2);
+        assert_eq!(result.keyword_row_count, 4);
+
+        let summaries = person_summaries_impl(&conn);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].person_name, "Ada Lovelace");
+        assert_eq!(summaries[0].assigned_face_count, 2);
+        assert_eq!(summaries[0].image_count, 2);
+
+        let assignments = person_assignments_for_face_observations_impl(&conn, &[42, 41]);
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].face_observation_id, 41);
+        assert_eq!(assignments[0].person_name, "Ada Lovelace");
+        assert_eq!(assignments[1].face_observation_id, 42);
+        assert_eq!(assignments[1].face_index, 1);
+
+        assert_eq!(
+            person_face_observation_ids_impl(&conn, summaries[0].person_id),
+            vec![41, 42]
+        );
+
+        let keyword_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM keyword
+                 WHERE image_id IN (301, 302)
+                   AND status = 1
+                   AND (origin & ?2) <> 0
+                   AND path IN ('People', ?1)",
+                params![
+                    ["People", "Ada Lovelace"].join(KEYWORD_PATH_SEPARATOR),
+                    KEYWORD_ORIGIN_FACE,
+                ],
+                |row| row.get(0),
+            )
+            .expect("keyword count");
+        assert_eq!(keyword_count, 4);
+
+        let repeat = assign_face_observations_to_person_impl(&conn, &[41], "Ada Lovelace");
+        assert_eq!(repeat.status, "assigned");
+        assert_eq!(repeat.person_id, result.person_id);
+        assert_eq!(repeat.keyword_row_count, 0);
+    }
+
+    #[test]
+    fn relabeling_face_assignment_cleans_only_face_keyword_projection() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO images (id, is_video) VALUES (401, FALSE), (402, FALSE)",
+            [],
+        )
+        .expect("images");
+        conn.execute(
+            "INSERT INTO face_observation (id, image_id, analyzed_image_id, face_index)
+             VALUES (51, 401, 401, 0), (52, 402, 402, 0)",
+            [],
+        )
+        .expect("face observations");
+
+        let ada = assign_face_observations_to_person_impl(&conn, &[51, 52], "Ada Lovelace");
+        assert_eq!(ada.status, "assigned");
+        assert_eq!(ada.keyword_row_count, 4);
+
+        let ada_segments = vec!["People".to_string(), "Ada Lovelace".to_string()];
+        let manual_merge = insert_or_merge_active_keyword_for_image(
+            &conn,
+            401,
+            &ada_segments,
+            KEYWORD_ORIGIN_USER,
+        )
+        .expect("manual keyword merge");
+        assert_eq!(manual_merge, 2);
+
+        let grace = assign_face_observations_to_person_impl(&conn, &[51, 52], "Grace Hopper");
+        assert_eq!(grace.status, "assigned");
+        assert_eq!(grace.person_name, "Grace Hopper");
+        assert_eq!(grace.keyword_row_count, 2);
+
+        let ada_path = ["People", "Ada Lovelace"].join(KEYWORD_PATH_SEPARATOR);
+        let image_401_ada_origin: i32 = conn
+            .query_row(
+                "SELECT origin
+                 FROM keyword
+                 WHERE image_id = 401
+                   AND path = ?1
+                   AND status = 1",
+                params![ada_path.as_str()],
+                |row| row.get(0),
+            )
+            .expect("manual Ada keyword remains active");
+        assert_ne!(image_401_ada_origin & KEYWORD_ORIGIN_USER, 0);
+        assert_eq!(image_401_ada_origin & KEYWORD_ORIGIN_FACE, 0);
+
+        let image_402_active_ada_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM keyword
+                 WHERE image_id = 402
+                   AND path = ?1
+                   AND status = 1",
+                params![ada_path.as_str()],
+                |row| row.get(0),
+            )
+            .expect("image 402 active Ada count");
+        assert_eq!(image_402_active_ada_count, 0);
+
+        let grace_path = ["People", "Grace Hopper"].join(KEYWORD_PATH_SEPARATOR);
+        let grace_keyword_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM keyword
+                 WHERE image_id IN (401, 402)
+                   AND path = ?1
+                   AND status = 1
+                   AND (origin & ?2) <> 0",
+                params![grace_path.as_str(), KEYWORD_ORIGIN_FACE],
+                |row| row.get(0),
+            )
+            .expect("Grace face keywords");
+        assert_eq!(grace_keyword_count, 2);
     }
 }
 
@@ -12076,7 +12709,8 @@ mod keyword_tests {
                  (1, 'manual', 'manual', 1, 1),
                  (2, 'automatic', 'automatic', 1, 2),
                  (3, 'shared', 'shared', 1, 3),
-                 (4, 'hidden', 'hidden', 0, 2);",
+                 (4, 'hidden', 'hidden', 0, 2),
+                 (5, 'face', 'face', 1, 4);",
         )
         .expect("schema + seed");
 
@@ -12087,9 +12721,13 @@ mod keyword_tests {
                 .collect::<Vec<_>>()
         };
 
-        assert_eq!(labels("both"), vec!["automatic", "manual", "shared"]);
+        assert_eq!(
+            labels("both"),
+            vec!["automatic", "face", "manual", "shared"]
+        );
         assert_eq!(labels("user"), vec!["manual", "shared"]);
         assert_eq!(labels("auto"), vec!["automatic", "shared"]);
+        assert_eq!(labels("face"), vec!["face"]);
         assert!(labels("bogus").is_empty());
     }
 
@@ -12112,12 +12750,13 @@ mod keyword_tests {
                  (3, 'Auto', 'Auto', 1, 2, FALSE),
                  (4, 'Trips', 'Trips', 0, 1, TRUE),
                  (5, 'Gone', 'Gone', 0, 2, FALSE),
-                 (6, 'Puppies', 'Animals{sep}Dogs{sep}Puppies', 1, 1, FALSE);"
+                 (6, 'Puppies', 'Animals{sep}Dogs{sep}Puppies', 1, 1, FALSE),
+                 (7, 'James', 'People{sep}James', 1, 4, FALSE);"
         ))
         .expect("schema + seed");
 
         let all = keyword_management_rows_impl(&conn, "both", true, true);
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 6);
 
         let dogs = all
             .iter()
@@ -12146,6 +12785,11 @@ mod keyword_tests {
             .map(|row| row.label)
             .collect::<Vec<_>>();
         assert_eq!(auto, vec!["Auto".to_string(), "Gone".to_string()]);
+        let face = keyword_management_rows_impl(&conn, "face", true, true)
+            .into_iter()
+            .map(|row| row.label)
+            .collect::<Vec<_>>();
+        assert_eq!(face, vec!["James".to_string()]);
 
         let deleted = delete_keyword_paths_impl(&conn, &[format!("Animals{sep}Dogs")]);
         assert_eq!(deleted, 3);
@@ -12184,6 +12828,12 @@ mod keyword_tests {
         assert_eq!(
             predicate_to_sql(&user_has),
             "(EXISTS (SELECT 1 FROM keyword_visible k WHERE k.image_id = images.id AND k.label = 'Wagner' AND (k.origin & 1) <> 0))"
+        );
+        let mut face_has = has.clone();
+        face_has.op = Some("face".to_string());
+        assert_eq!(
+            predicate_to_sql(&face_has),
+            "(EXISTS (SELECT 1 FROM keyword_visible k WHERE k.image_id = images.id AND k.label = 'Wagner' AND (k.origin & 4) <> 0))"
         );
 
         let not = QueryPredicate {

@@ -352,7 +352,7 @@ private func uniffiTraitInterfaceCallWithError<T, E>(
         callStatus.pointee.errorBuf = FfiConverterString.lower(String(describing: error))
     }
 }
-// Initial value and increment amount for handles. 
+// Initial value and increment amount for handles.
 // These ensure that SWIFT handles always have the lowest bit set
 fileprivate let UNIFFI_HANDLEMAP_INITIAL: UInt64 = 1
 fileprivate let UNIFFI_HANDLEMAP_DELTA: UInt64 = 2
@@ -651,9 +651,9 @@ public struct AnalysisJob: Equatable, Hashable {
         self.lastTimeoutAt = lastTimeoutAt
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -667,30 +667,30 @@ public struct FfiConverterTypeAnalysisJob: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AnalysisJob {
         return
             try AnalysisJob(
-                id: FfiConverterInt64.read(from: &buf), 
-                jobKind: FfiConverterString.read(from: &buf), 
-                scopeKind: FfiConverterString.read(from: &buf), 
-                scopeValue: FfiConverterOptionString.read(from: &buf), 
-                algorithmVersion: FfiConverterString.read(from: &buf), 
-                analysisRunId: FfiConverterString.read(from: &buf), 
-                status: FfiConverterString.read(from: &buf), 
-                totalCandidateCount: FfiConverterUInt64.read(from: &buf), 
-                processedCount: FfiConverterUInt64.read(from: &buf), 
-                completedCount: FfiConverterUInt64.read(from: &buf), 
-                skippedCount: FfiConverterUInt64.read(from: &buf), 
-                failedCount: FfiConverterUInt64.read(from: &buf), 
-                updatedCount: FfiConverterUInt64.read(from: &buf), 
-                cancelRequested: FfiConverterBool.read(from: &buf), 
-                createdAt: FfiConverterString.read(from: &buf), 
-                startedAt: FfiConverterOptionString.read(from: &buf), 
-                updatedAt: FfiConverterOptionString.read(from: &buf), 
-                finishedAt: FfiConverterOptionString.read(from: &buf), 
-                lastError: FfiConverterOptionString.read(from: &buf), 
-                currentImageId: FfiConverterOptionInt64.read(from: &buf), 
-                currentFilePath: FfiConverterOptionString.read(from: &buf), 
-                currentStartedAt: FfiConverterOptionString.read(from: &buf), 
-                lastTimeoutImageId: FfiConverterOptionInt64.read(from: &buf), 
-                lastTimeoutFilePath: FfiConverterOptionString.read(from: &buf), 
+                id: FfiConverterInt64.read(from: &buf),
+                jobKind: FfiConverterString.read(from: &buf),
+                scopeKind: FfiConverterString.read(from: &buf),
+                scopeValue: FfiConverterOptionString.read(from: &buf),
+                algorithmVersion: FfiConverterString.read(from: &buf),
+                analysisRunId: FfiConverterString.read(from: &buf),
+                status: FfiConverterString.read(from: &buf),
+                totalCandidateCount: FfiConverterUInt64.read(from: &buf),
+                processedCount: FfiConverterUInt64.read(from: &buf),
+                completedCount: FfiConverterUInt64.read(from: &buf),
+                skippedCount: FfiConverterUInt64.read(from: &buf),
+                failedCount: FfiConverterUInt64.read(from: &buf),
+                updatedCount: FfiConverterUInt64.read(from: &buf),
+                cancelRequested: FfiConverterBool.read(from: &buf),
+                createdAt: FfiConverterString.read(from: &buf),
+                startedAt: FfiConverterOptionString.read(from: &buf),
+                updatedAt: FfiConverterOptionString.read(from: &buf),
+                finishedAt: FfiConverterOptionString.read(from: &buf),
+                lastError: FfiConverterOptionString.read(from: &buf),
+                currentImageId: FfiConverterOptionInt64.read(from: &buf),
+                currentFilePath: FfiConverterOptionString.read(from: &buf),
+                currentStartedAt: FfiConverterOptionString.read(from: &buf),
+                lastTimeoutImageId: FfiConverterOptionInt64.read(from: &buf),
+                lastTimeoutFilePath: FfiConverterOptionString.read(from: &buf),
                 lastTimeoutAt: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -751,9 +751,9 @@ public struct CaptureDayImageCount: Equatable, Hashable {
         self.imageCount = imageCount
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -767,7 +767,7 @@ public struct FfiConverterTypeCaptureDayImageCount: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CaptureDayImageCount {
         return
             try CaptureDayImageCount(
-                day: FfiConverterString.read(from: &buf), 
+                day: FfiConverterString.read(from: &buf),
                 imageCount: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -805,9 +805,9 @@ public struct DirectoryImageCount: Equatable, Hashable {
         self.imageCount = imageCount
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -821,7 +821,7 @@ public struct FfiConverterTypeDirectoryImageCount: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DirectoryImageCount {
         return
             try DirectoryImageCount(
-                directoryPath: FfiConverterString.read(from: &buf), 
+                directoryPath: FfiConverterString.read(from: &buf),
                 imageCount: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -859,9 +859,9 @@ public struct DirectorySyncState: Equatable, Hashable {
         self.lastSyncMtime = lastSyncMtime
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -875,7 +875,7 @@ public struct FfiConverterTypeDirectorySyncState: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DirectorySyncState {
         return
             try DirectorySyncState(
-                directoryPath: FfiConverterString.read(from: &buf), 
+                directoryPath: FfiConverterString.read(from: &buf),
                 lastSyncMtime: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -929,9 +929,9 @@ public struct FaceClusterMemberRecord: Equatable, Hashable {
         self.nearestNeighborCosine = nearestNeighborCosine
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -945,15 +945,15 @@ public struct FfiConverterTypeFaceClusterMemberRecord: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FaceClusterMemberRecord {
         return
             try FaceClusterMemberRecord(
-                runId: FfiConverterString.read(from: &buf), 
-                clusterId: FfiConverterInt64.read(from: &buf), 
-                faceObservationId: FfiConverterInt64.read(from: &buf), 
-                imageId: FfiConverterInt64.read(from: &buf), 
-                analyzedImageId: FfiConverterInt64.read(from: &buf), 
-                faceIndex: FfiConverterUInt32.read(from: &buf), 
-                memberRank: FfiConverterUInt32.read(from: &buf), 
-                clusterSize: FfiConverterUInt32.read(from: &buf), 
-                nearestNeighborFaceObservationId: FfiConverterOptionInt64.read(from: &buf), 
+                runId: FfiConverterString.read(from: &buf),
+                clusterId: FfiConverterInt64.read(from: &buf),
+                faceObservationId: FfiConverterInt64.read(from: &buf),
+                imageId: FfiConverterInt64.read(from: &buf),
+                analyzedImageId: FfiConverterInt64.read(from: &buf),
+                faceIndex: FfiConverterUInt32.read(from: &buf),
+                memberRank: FfiConverterUInt32.read(from: &buf),
+                clusterSize: FfiConverterUInt32.read(from: &buf),
+                nearestNeighborFaceObservationId: FfiConverterOptionInt64.read(from: &buf),
                 nearestNeighborCosine: FfiConverterOptionDouble.read(from: &buf)
         )
     }
@@ -1009,9 +1009,9 @@ public struct FaceClusterRunRecord: Equatable, Hashable {
         self.memberCount = memberCount
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1025,12 +1025,12 @@ public struct FfiConverterTypeFaceClusterRunRecord: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FaceClusterRunRecord {
         return
             try FaceClusterRunRecord(
-                runId: FfiConverterString.read(from: &buf), 
-                faceAlgorithmVersion: FfiConverterString.read(from: &buf), 
-                modelVersion: FfiConverterString.read(from: &buf), 
-                preprocessingVersion: FfiConverterString.read(from: &buf), 
-                threshold: FfiConverterDouble.read(from: &buf), 
-                clusterCount: FfiConverterUInt32.read(from: &buf), 
+                runId: FfiConverterString.read(from: &buf),
+                faceAlgorithmVersion: FfiConverterString.read(from: &buf),
+                modelVersion: FfiConverterString.read(from: &buf),
+                preprocessingVersion: FfiConverterString.read(from: &buf),
+                threshold: FfiConverterDouble.read(from: &buf),
+                clusterCount: FfiConverterUInt32.read(from: &buf),
                 memberCount: FfiConverterUInt32.read(from: &buf)
         )
     }
@@ -1085,9 +1085,9 @@ public struct FaceClusterRunSummary: Equatable, Hashable {
         self.createdAt = createdAt
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1101,13 +1101,13 @@ public struct FfiConverterTypeFaceClusterRunSummary: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FaceClusterRunSummary {
         return
             try FaceClusterRunSummary(
-                runId: FfiConverterString.read(from: &buf), 
-                faceAlgorithmVersion: FfiConverterString.read(from: &buf), 
-                modelVersion: FfiConverterString.read(from: &buf), 
-                preprocessingVersion: FfiConverterString.read(from: &buf), 
-                threshold: FfiConverterDouble.read(from: &buf), 
-                clusterCount: FfiConverterUInt32.read(from: &buf), 
-                memberCount: FfiConverterUInt32.read(from: &buf), 
+                runId: FfiConverterString.read(from: &buf),
+                faceAlgorithmVersion: FfiConverterString.read(from: &buf),
+                modelVersion: FfiConverterString.read(from: &buf),
+                preprocessingVersion: FfiConverterString.read(from: &buf),
+                threshold: FfiConverterDouble.read(from: &buf),
+                clusterCount: FfiConverterUInt32.read(from: &buf),
+                memberCount: FfiConverterUInt32.read(from: &buf),
                 createdAt: FfiConverterString.read(from: &buf)
         )
     }
@@ -1165,9 +1165,9 @@ public struct FaceEmbeddingNeighborRecord: Equatable, Hashable {
         self.cosine = cosine
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1181,14 +1181,14 @@ public struct FfiConverterTypeFaceEmbeddingNeighborRecord: FfiConverterRustBuffe
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FaceEmbeddingNeighborRecord {
         return
             try FaceEmbeddingNeighborRecord(
-                queryFaceObservationId: FfiConverterInt64.read(from: &buf), 
-                neighborFaceObservationId: FfiConverterInt64.read(from: &buf), 
-                queryImageId: FfiConverterInt64.read(from: &buf), 
-                neighborImageId: FfiConverterInt64.read(from: &buf), 
-                queryAnalyzedImageId: FfiConverterInt64.read(from: &buf), 
-                neighborAnalyzedImageId: FfiConverterInt64.read(from: &buf), 
-                queryFaceIndex: FfiConverterUInt32.read(from: &buf), 
-                neighborFaceIndex: FfiConverterUInt32.read(from: &buf), 
+                queryFaceObservationId: FfiConverterInt64.read(from: &buf),
+                neighborFaceObservationId: FfiConverterInt64.read(from: &buf),
+                queryImageId: FfiConverterInt64.read(from: &buf),
+                neighborImageId: FfiConverterInt64.read(from: &buf),
+                queryAnalyzedImageId: FfiConverterInt64.read(from: &buf),
+                neighborAnalyzedImageId: FfiConverterInt64.read(from: &buf),
+                queryFaceIndex: FfiConverterUInt32.read(from: &buf),
+                neighborFaceIndex: FfiConverterUInt32.read(from: &buf),
                 cosine: FfiConverterDouble.read(from: &buf)
         )
     }
@@ -1239,9 +1239,9 @@ public struct FaceEmbeddingStoreResult: Equatable, Hashable {
         self.message = message
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1255,10 +1255,10 @@ public struct FfiConverterTypeFaceEmbeddingStoreResult: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FaceEmbeddingStoreResult {
         return
             try FaceEmbeddingStoreResult(
-                requestedCount: FfiConverterUInt64.read(from: &buf), 
-                storedCount: FfiConverterUInt64.read(from: &buf), 
-                totalCount: FfiConverterUInt64.read(from: &buf), 
-                status: FfiConverterString.read(from: &buf), 
+                requestedCount: FfiConverterUInt64.read(from: &buf),
+                storedCount: FfiConverterUInt64.read(from: &buf),
+                totalCount: FfiConverterUInt64.read(from: &buf),
+                status: FfiConverterString.read(from: &buf),
                 message: FfiConverterString.read(from: &buf)
         )
     }
@@ -1321,9 +1321,9 @@ public struct FaceEmbeddingVectorRecord: Equatable, Hashable {
         self.vector = vector
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1337,18 +1337,18 @@ public struct FfiConverterTypeFaceEmbeddingVectorRecord: FfiConverterRustBuffer 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FaceEmbeddingVectorRecord {
         return
             try FaceEmbeddingVectorRecord(
-                faceObservationId: FfiConverterInt64.read(from: &buf), 
-                imageId: FfiConverterInt64.read(from: &buf), 
-                analyzedImageId: FfiConverterInt64.read(from: &buf), 
-                faceIndex: FfiConverterUInt32.read(from: &buf), 
-                modelName: FfiConverterString.read(from: &buf), 
-                modelVersion: FfiConverterString.read(from: &buf), 
-                preprocessingVersion: FfiConverterString.read(from: &buf), 
-                inputSize: FfiConverterUInt32.read(from: &buf), 
-                colorOrder: FfiConverterString.read(from: &buf), 
-                normalization: FfiConverterString.read(from: &buf), 
-                embeddingDimension: FfiConverterUInt32.read(from: &buf), 
-                embeddingL2Norm: FfiConverterDouble.read(from: &buf), 
+                faceObservationId: FfiConverterInt64.read(from: &buf),
+                imageId: FfiConverterInt64.read(from: &buf),
+                analyzedImageId: FfiConverterInt64.read(from: &buf),
+                faceIndex: FfiConverterUInt32.read(from: &buf),
+                modelName: FfiConverterString.read(from: &buf),
+                modelVersion: FfiConverterString.read(from: &buf),
+                preprocessingVersion: FfiConverterString.read(from: &buf),
+                inputSize: FfiConverterUInt32.read(from: &buf),
+                colorOrder: FfiConverterString.read(from: &buf),
+                normalization: FfiConverterString.read(from: &buf),
+                embeddingDimension: FfiConverterUInt32.read(from: &buf),
+                embeddingL2Norm: FfiConverterDouble.read(from: &buf),
                 vector: FfiConverterSequenceFloat.read(from: &buf)
         )
     }
@@ -1449,9 +1449,9 @@ public struct FaceObservationRecord: Equatable, Hashable {
         self.createdAt = createdAt
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1465,33 +1465,33 @@ public struct FfiConverterTypeFaceObservationRecord: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FaceObservationRecord {
         return
             try FaceObservationRecord(
-                id: FfiConverterInt64.read(from: &buf), 
-                imageId: FfiConverterInt64.read(from: &buf), 
-                analyzedImageId: FfiConverterInt64.read(from: &buf), 
-                faceIndex: FfiConverterUInt32.read(from: &buf), 
-                algorithmVersion: FfiConverterString.read(from: &buf), 
-                analysisRunId: FfiConverterString.read(from: &buf), 
-                boundingBoxX: FfiConverterDouble.read(from: &buf), 
-                boundingBoxY: FfiConverterDouble.read(from: &buf), 
-                boundingBoxWidth: FfiConverterDouble.read(from: &buf), 
-                boundingBoxHeight: FfiConverterDouble.read(from: &buf), 
-                detectionConfidence: FfiConverterOptionDouble.read(from: &buf), 
-                faceCaptureQuality: FfiConverterOptionDouble.read(from: &buf), 
-                faceFocusScore: FfiConverterOptionDouble.read(from: &buf), 
-                leftEyeOpenScore: FfiConverterOptionDouble.read(from: &buf), 
-                rightEyeOpenScore: FfiConverterOptionDouble.read(from: &buf), 
-                eyesOpenScore: FfiConverterOptionDouble.read(from: &buf), 
-                blinkRiskScore: FfiConverterOptionDouble.read(from: &buf), 
-                leftEyeX: FfiConverterOptionDouble.read(from: &buf), 
-                leftEyeY: FfiConverterOptionDouble.read(from: &buf), 
-                rightEyeX: FfiConverterOptionDouble.read(from: &buf), 
-                rightEyeY: FfiConverterOptionDouble.read(from: &buf), 
-                noseX: FfiConverterOptionDouble.read(from: &buf), 
-                noseY: FfiConverterOptionDouble.read(from: &buf), 
-                mouthLeftX: FfiConverterOptionDouble.read(from: &buf), 
-                mouthLeftY: FfiConverterOptionDouble.read(from: &buf), 
-                mouthRightX: FfiConverterOptionDouble.read(from: &buf), 
-                mouthRightY: FfiConverterOptionDouble.read(from: &buf), 
+                id: FfiConverterInt64.read(from: &buf),
+                imageId: FfiConverterInt64.read(from: &buf),
+                analyzedImageId: FfiConverterInt64.read(from: &buf),
+                faceIndex: FfiConverterUInt32.read(from: &buf),
+                algorithmVersion: FfiConverterString.read(from: &buf),
+                analysisRunId: FfiConverterString.read(from: &buf),
+                boundingBoxX: FfiConverterDouble.read(from: &buf),
+                boundingBoxY: FfiConverterDouble.read(from: &buf),
+                boundingBoxWidth: FfiConverterDouble.read(from: &buf),
+                boundingBoxHeight: FfiConverterDouble.read(from: &buf),
+                detectionConfidence: FfiConverterOptionDouble.read(from: &buf),
+                faceCaptureQuality: FfiConverterOptionDouble.read(from: &buf),
+                faceFocusScore: FfiConverterOptionDouble.read(from: &buf),
+                leftEyeOpenScore: FfiConverterOptionDouble.read(from: &buf),
+                rightEyeOpenScore: FfiConverterOptionDouble.read(from: &buf),
+                eyesOpenScore: FfiConverterOptionDouble.read(from: &buf),
+                blinkRiskScore: FfiConverterOptionDouble.read(from: &buf),
+                leftEyeX: FfiConverterOptionDouble.read(from: &buf),
+                leftEyeY: FfiConverterOptionDouble.read(from: &buf),
+                rightEyeX: FfiConverterOptionDouble.read(from: &buf),
+                rightEyeY: FfiConverterOptionDouble.read(from: &buf),
+                noseX: FfiConverterOptionDouble.read(from: &buf),
+                noseY: FfiConverterOptionDouble.read(from: &buf),
+                mouthLeftX: FfiConverterOptionDouble.read(from: &buf),
+                mouthLeftY: FfiConverterOptionDouble.read(from: &buf),
+                mouthRightX: FfiConverterOptionDouble.read(from: &buf),
+                mouthRightY: FfiConverterOptionDouble.read(from: &buf),
                 createdAt: FfiConverterString.read(from: &buf)
         )
     }
@@ -1595,9 +1595,9 @@ public struct FaceObservationResult: Equatable, Hashable {
         self.mouthRightY = mouthRightY
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1611,27 +1611,27 @@ public struct FfiConverterTypeFaceObservationResult: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FaceObservationResult {
         return
             try FaceObservationResult(
-                faceIndex: FfiConverterUInt32.read(from: &buf), 
-                boundingBoxX: FfiConverterDouble.read(from: &buf), 
-                boundingBoxY: FfiConverterDouble.read(from: &buf), 
-                boundingBoxWidth: FfiConverterDouble.read(from: &buf), 
-                boundingBoxHeight: FfiConverterDouble.read(from: &buf), 
-                detectionConfidence: FfiConverterOptionDouble.read(from: &buf), 
-                faceCaptureQuality: FfiConverterOptionDouble.read(from: &buf), 
-                faceFocusScore: FfiConverterOptionDouble.read(from: &buf), 
-                leftEyeOpenScore: FfiConverterOptionDouble.read(from: &buf), 
-                rightEyeOpenScore: FfiConverterOptionDouble.read(from: &buf), 
-                eyesOpenScore: FfiConverterOptionDouble.read(from: &buf), 
-                blinkRiskScore: FfiConverterOptionDouble.read(from: &buf), 
-                leftEyeX: FfiConverterOptionDouble.read(from: &buf), 
-                leftEyeY: FfiConverterOptionDouble.read(from: &buf), 
-                rightEyeX: FfiConverterOptionDouble.read(from: &buf), 
-                rightEyeY: FfiConverterOptionDouble.read(from: &buf), 
-                noseX: FfiConverterOptionDouble.read(from: &buf), 
-                noseY: FfiConverterOptionDouble.read(from: &buf), 
-                mouthLeftX: FfiConverterOptionDouble.read(from: &buf), 
-                mouthLeftY: FfiConverterOptionDouble.read(from: &buf), 
-                mouthRightX: FfiConverterOptionDouble.read(from: &buf), 
+                faceIndex: FfiConverterUInt32.read(from: &buf),
+                boundingBoxX: FfiConverterDouble.read(from: &buf),
+                boundingBoxY: FfiConverterDouble.read(from: &buf),
+                boundingBoxWidth: FfiConverterDouble.read(from: &buf),
+                boundingBoxHeight: FfiConverterDouble.read(from: &buf),
+                detectionConfidence: FfiConverterOptionDouble.read(from: &buf),
+                faceCaptureQuality: FfiConverterOptionDouble.read(from: &buf),
+                faceFocusScore: FfiConverterOptionDouble.read(from: &buf),
+                leftEyeOpenScore: FfiConverterOptionDouble.read(from: &buf),
+                rightEyeOpenScore: FfiConverterOptionDouble.read(from: &buf),
+                eyesOpenScore: FfiConverterOptionDouble.read(from: &buf),
+                blinkRiskScore: FfiConverterOptionDouble.read(from: &buf),
+                leftEyeX: FfiConverterOptionDouble.read(from: &buf),
+                leftEyeY: FfiConverterOptionDouble.read(from: &buf),
+                rightEyeX: FfiConverterOptionDouble.read(from: &buf),
+                rightEyeY: FfiConverterOptionDouble.read(from: &buf),
+                noseX: FfiConverterOptionDouble.read(from: &buf),
+                noseY: FfiConverterOptionDouble.read(from: &buf),
+                mouthLeftX: FfiConverterOptionDouble.read(from: &buf),
+                mouthLeftY: FfiConverterOptionDouble.read(from: &buf),
+                mouthRightX: FfiConverterOptionDouble.read(from: &buf),
                 mouthRightY: FfiConverterOptionDouble.read(from: &buf)
         )
     }
@@ -1693,9 +1693,9 @@ public struct FaceRecognitionMenuState: Equatable, Hashable {
         self.indexedFaceCount = indexedFaceCount
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1709,9 +1709,9 @@ public struct FfiConverterTypeFaceRecognitionMenuState: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FaceRecognitionMenuState {
         return
             try FaceRecognitionMenuState(
-                imageId: FfiConverterInt64.read(from: &buf), 
-                analysisStatus: FfiConverterOptionString.read(from: &buf), 
-                faceObservationCount: FfiConverterUInt32.read(from: &buf), 
+                imageId: FfiConverterInt64.read(from: &buf),
+                analysisStatus: FfiConverterOptionString.read(from: &buf),
+                faceObservationCount: FfiConverterUInt32.read(from: &buf),
                 indexedFaceCount: FfiConverterUInt32.read(from: &buf)
         )
     }
@@ -1757,9 +1757,9 @@ public struct FaceSearchMatchRecord: Equatable, Hashable {
         self.cosine = cosine
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1773,10 +1773,10 @@ public struct FfiConverterTypeFaceSearchMatchRecord: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FaceSearchMatchRecord {
         return
             try FaceSearchMatchRecord(
-                imageId: FfiConverterInt64.read(from: &buf), 
-                faceObservationId: FfiConverterInt64.read(from: &buf), 
-                seedFaceObservationId: FfiConverterInt64.read(from: &buf), 
-                faceIndex: FfiConverterUInt32.read(from: &buf), 
+                imageId: FfiConverterInt64.read(from: &buf),
+                faceObservationId: FfiConverterInt64.read(from: &buf),
+                seedFaceObservationId: FfiConverterInt64.read(from: &buf),
+                faceIndex: FfiConverterUInt32.read(from: &buf),
                 cosine: FfiConverterDouble.read(from: &buf)
         )
     }
@@ -1819,9 +1819,9 @@ public struct FilePathsResult: Equatable, Hashable {
         self.errorMessage = errorMessage
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1835,8 +1835,8 @@ public struct FfiConverterTypeFilePathsResult: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FilePathsResult {
         return
             try FilePathsResult(
-                ok: FfiConverterBool.read(from: &buf), 
-                paths: FfiConverterSequenceString.read(from: &buf), 
+                ok: FfiConverterBool.read(from: &buf),
+                paths: FfiConverterSequenceString.read(from: &buf),
                 errorMessage: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -1877,9 +1877,9 @@ public struct FocusAnalysisCandidate: Equatable, Hashable {
         self.fileSize = fileSize
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1893,8 +1893,8 @@ public struct FfiConverterTypeFocusAnalysisCandidate: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FocusAnalysisCandidate {
         return
             try FocusAnalysisCandidate(
-                id: FfiConverterInt64.read(from: &buf), 
-                filePath: FfiConverterString.read(from: &buf), 
+                id: FfiConverterInt64.read(from: &buf),
+                filePath: FfiConverterString.read(from: &buf),
                 fileSize: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -1969,9 +1969,9 @@ public struct FocusAnalysisResult: Equatable, Hashable {
         self.faceObservations = faceObservations
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -1985,25 +1985,25 @@ public struct FfiConverterTypeFocusAnalysisResult: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FocusAnalysisResult {
         return
             try FocusAnalysisResult(
-                id: FfiConverterInt64.read(from: &buf), 
-                focusScore: FfiConverterOptionDouble.read(from: &buf), 
-                focusBasis: FfiConverterOptionString.read(from: &buf), 
-                algorithmVersion: FfiConverterString.read(from: &buf), 
-                analysisRunId: FfiConverterString.read(from: &buf), 
-                status: FfiConverterString.read(from: &buf), 
-                focusHumanScore: FfiConverterOptionDouble.read(from: &buf), 
-                focusAnimalScore: FfiConverterOptionDouble.read(from: &buf), 
-                focusForegroundScore: FfiConverterOptionDouble.read(from: &buf), 
-                focusSaliencyScore: FfiConverterOptionDouble.read(from: &buf), 
-                focusAnimalPoseScore: FfiConverterOptionDouble.read(from: &buf), 
-                focusWholeImageScore: FfiConverterOptionDouble.read(from: &buf), 
-                faceCount: FfiConverterOptionInt32.read(from: &buf), 
-                faceQualityBest: FfiConverterOptionDouble.read(from: &buf), 
-                faceQualityAverage: FfiConverterOptionDouble.read(from: &buf), 
-                faceQualityMin: FfiConverterOptionDouble.read(from: &buf), 
-                faceEyesOpenCount: FfiConverterOptionInt32.read(from: &buf), 
-                faceBlinkRiskCount: FfiConverterOptionInt32.read(from: &buf), 
-                autoKeywords: FfiConverterSequenceString.read(from: &buf), 
+                id: FfiConverterInt64.read(from: &buf),
+                focusScore: FfiConverterOptionDouble.read(from: &buf),
+                focusBasis: FfiConverterOptionString.read(from: &buf),
+                algorithmVersion: FfiConverterString.read(from: &buf),
+                analysisRunId: FfiConverterString.read(from: &buf),
+                status: FfiConverterString.read(from: &buf),
+                focusHumanScore: FfiConverterOptionDouble.read(from: &buf),
+                focusAnimalScore: FfiConverterOptionDouble.read(from: &buf),
+                focusForegroundScore: FfiConverterOptionDouble.read(from: &buf),
+                focusSaliencyScore: FfiConverterOptionDouble.read(from: &buf),
+                focusAnimalPoseScore: FfiConverterOptionDouble.read(from: &buf),
+                focusWholeImageScore: FfiConverterOptionDouble.read(from: &buf),
+                faceCount: FfiConverterOptionInt32.read(from: &buf),
+                faceQualityBest: FfiConverterOptionDouble.read(from: &buf),
+                faceQualityAverage: FfiConverterOptionDouble.read(from: &buf),
+                faceQualityMin: FfiConverterOptionDouble.read(from: &buf),
+                faceEyesOpenCount: FfiConverterOptionInt32.read(from: &buf),
+                faceBlinkRiskCount: FfiConverterOptionInt32.read(from: &buf),
+                autoKeywords: FfiConverterSequenceString.read(from: &buf),
                 faceObservations: FfiConverterSequenceTypeFaceObservationResult.read(from: &buf)
         )
     }
@@ -2147,9 +2147,9 @@ public struct ImageMetadata: Equatable, Hashable {
         self.externalSourceId = externalSourceId
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -2163,51 +2163,51 @@ public struct FfiConverterTypeImageMetadata: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ImageMetadata {
         return
             try ImageMetadata(
-                filePath: FfiConverterString.read(from: &buf), 
-                fileSize: FfiConverterUInt64.read(from: &buf), 
-                fileName: FfiConverterString.read(from: &buf), 
-                fileExtension: FfiConverterOptionString.read(from: &buf), 
-                createdTimestamp: FfiConverterInt64.read(from: &buf), 
-                modifiedTimestamp: FfiConverterInt64.read(from: &buf), 
-                cameraMake: FfiConverterOptionString.read(from: &buf), 
-                cameraModel: FfiConverterOptionString.read(from: &buf), 
-                lensModel: FfiConverterOptionString.read(from: &buf), 
-                focalLength: FfiConverterOptionDouble.read(from: &buf), 
-                aperture: FfiConverterOptionDouble.read(from: &buf), 
-                shutterSpeed: FfiConverterOptionDouble.read(from: &buf), 
-                iso: FfiConverterOptionUInt32.read(from: &buf), 
-                captureDatetime: FfiConverterOptionString.read(from: &buf), 
-                pixelWidth: FfiConverterOptionUInt32.read(from: &buf), 
-                pixelHeight: FfiConverterOptionUInt32.read(from: &buf), 
-                colorSpace: FfiConverterOptionString.read(from: &buf), 
-                bitDepth: FfiConverterOptionUInt32.read(from: &buf), 
-                gpsLatitude: FfiConverterOptionDouble.read(from: &buf), 
-                gpsLongitude: FfiConverterOptionDouble.read(from: &buf), 
-                gpsAltitude: FfiConverterOptionDouble.read(from: &buf), 
-                copyright: FfiConverterOptionString.read(from: &buf), 
-                creator: FfiConverterOptionString.read(from: &buf), 
-                description: FfiConverterOptionString.read(from: &buf), 
-                rating: FfiConverterOptionUInt8.read(from: &buf), 
-                flag: FfiConverterOptionString.read(from: &buf), 
-                colorLabel: FfiConverterOptionString.read(from: &buf), 
-                rotation: FfiConverterOptionInt32.read(from: &buf), 
-                isVideo: FfiConverterBool.read(from: &buf), 
-                durationSeconds: FfiConverterOptionDouble.read(from: &buf), 
-                frameRate: FfiConverterOptionDouble.read(from: &buf), 
-                videoKind: FfiConverterOptionString.read(from: &buf), 
-                videoCodec: FfiConverterOptionString.read(from: &buf), 
-                videoBitrate: FfiConverterOptionInt64.read(from: &buf), 
-                colorPrimaries: FfiConverterOptionString.read(from: &buf), 
-                colorTransfer: FfiConverterOptionString.read(from: &buf), 
-                colorMatrix: FfiConverterOptionString.read(from: &buf), 
-                colorRange: FfiConverterOptionString.read(from: &buf), 
-                dvProfile: FfiConverterOptionInt32.read(from: &buf), 
-                hasAudio: FfiConverterOptionBool.read(from: &buf), 
-                audioCodec: FfiConverterOptionString.read(from: &buf), 
-                audioChannels: FfiConverterOptionInt32.read(from: &buf), 
-                audioSampleRate: FfiConverterOptionInt32.read(from: &buf), 
-                audioBitrate: FfiConverterOptionInt64.read(from: &buf), 
-                livePhotoId: FfiConverterOptionString.read(from: &buf), 
+                filePath: FfiConverterString.read(from: &buf),
+                fileSize: FfiConverterUInt64.read(from: &buf),
+                fileName: FfiConverterString.read(from: &buf),
+                fileExtension: FfiConverterOptionString.read(from: &buf),
+                createdTimestamp: FfiConverterInt64.read(from: &buf),
+                modifiedTimestamp: FfiConverterInt64.read(from: &buf),
+                cameraMake: FfiConverterOptionString.read(from: &buf),
+                cameraModel: FfiConverterOptionString.read(from: &buf),
+                lensModel: FfiConverterOptionString.read(from: &buf),
+                focalLength: FfiConverterOptionDouble.read(from: &buf),
+                aperture: FfiConverterOptionDouble.read(from: &buf),
+                shutterSpeed: FfiConverterOptionDouble.read(from: &buf),
+                iso: FfiConverterOptionUInt32.read(from: &buf),
+                captureDatetime: FfiConverterOptionString.read(from: &buf),
+                pixelWidth: FfiConverterOptionUInt32.read(from: &buf),
+                pixelHeight: FfiConverterOptionUInt32.read(from: &buf),
+                colorSpace: FfiConverterOptionString.read(from: &buf),
+                bitDepth: FfiConverterOptionUInt32.read(from: &buf),
+                gpsLatitude: FfiConverterOptionDouble.read(from: &buf),
+                gpsLongitude: FfiConverterOptionDouble.read(from: &buf),
+                gpsAltitude: FfiConverterOptionDouble.read(from: &buf),
+                copyright: FfiConverterOptionString.read(from: &buf),
+                creator: FfiConverterOptionString.read(from: &buf),
+                description: FfiConverterOptionString.read(from: &buf),
+                rating: FfiConverterOptionUInt8.read(from: &buf),
+                flag: FfiConverterOptionString.read(from: &buf),
+                colorLabel: FfiConverterOptionString.read(from: &buf),
+                rotation: FfiConverterOptionInt32.read(from: &buf),
+                isVideo: FfiConverterBool.read(from: &buf),
+                durationSeconds: FfiConverterOptionDouble.read(from: &buf),
+                frameRate: FfiConverterOptionDouble.read(from: &buf),
+                videoKind: FfiConverterOptionString.read(from: &buf),
+                videoCodec: FfiConverterOptionString.read(from: &buf),
+                videoBitrate: FfiConverterOptionInt64.read(from: &buf),
+                colorPrimaries: FfiConverterOptionString.read(from: &buf),
+                colorTransfer: FfiConverterOptionString.read(from: &buf),
+                colorMatrix: FfiConverterOptionString.read(from: &buf),
+                colorRange: FfiConverterOptionString.read(from: &buf),
+                dvProfile: FfiConverterOptionInt32.read(from: &buf),
+                hasAudio: FfiConverterOptionBool.read(from: &buf),
+                audioCodec: FfiConverterOptionString.read(from: &buf),
+                audioChannels: FfiConverterOptionInt32.read(from: &buf),
+                audioSampleRate: FfiConverterOptionInt32.read(from: &buf),
+                audioBitrate: FfiConverterOptionInt64.read(from: &buf),
+                livePhotoId: FfiConverterOptionString.read(from: &buf),
                 externalSourceId: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -2347,9 +2347,9 @@ public struct ImageRecord: Equatable, Hashable {
         self.duplicateGroupId = duplicateGroupId
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -2363,36 +2363,36 @@ public struct FfiConverterTypeImageRecord: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ImageRecord {
         return
             try ImageRecord(
-                id: FfiConverterInt64.read(from: &buf), 
-                indexedTimestamp: FfiConverterString.read(from: &buf), 
-                filePath: FfiConverterString.read(from: &buf), 
-                fileSize: FfiConverterUInt64.read(from: &buf), 
-                fileName: FfiConverterString.read(from: &buf), 
-                fileExtension: FfiConverterOptionString.read(from: &buf), 
-                createdTimestamp: FfiConverterInt64.read(from: &buf), 
-                modifiedTimestamp: FfiConverterInt64.read(from: &buf), 
-                cameraMake: FfiConverterOptionString.read(from: &buf), 
-                cameraModel: FfiConverterOptionString.read(from: &buf), 
-                lensModel: FfiConverterOptionString.read(from: &buf), 
-                focalLength: FfiConverterOptionDouble.read(from: &buf), 
-                aperture: FfiConverterOptionDouble.read(from: &buf), 
-                shutterSpeed: FfiConverterOptionDouble.read(from: &buf), 
-                iso: FfiConverterOptionUInt32.read(from: &buf), 
-                captureDatetime: FfiConverterOptionString.read(from: &buf), 
-                pixelWidth: FfiConverterOptionUInt32.read(from: &buf), 
-                pixelHeight: FfiConverterOptionUInt32.read(from: &buf), 
-                colorSpace: FfiConverterOptionString.read(from: &buf), 
-                bitDepth: FfiConverterOptionUInt32.read(from: &buf), 
-                gpsLatitude: FfiConverterOptionDouble.read(from: &buf), 
-                gpsLongitude: FfiConverterOptionDouble.read(from: &buf), 
-                gpsAltitude: FfiConverterOptionDouble.read(from: &buf), 
-                copyright: FfiConverterOptionString.read(from: &buf), 
-                creator: FfiConverterOptionString.read(from: &buf), 
-                description: FfiConverterOptionString.read(from: &buf), 
-                rating: FfiConverterOptionUInt8.read(from: &buf), 
-                flag: FfiConverterOptionString.read(from: &buf), 
-                colorLabel: FfiConverterOptionString.read(from: &buf), 
-                rotation: FfiConverterInt32.read(from: &buf), 
+                id: FfiConverterInt64.read(from: &buf),
+                indexedTimestamp: FfiConverterString.read(from: &buf),
+                filePath: FfiConverterString.read(from: &buf),
+                fileSize: FfiConverterUInt64.read(from: &buf),
+                fileName: FfiConverterString.read(from: &buf),
+                fileExtension: FfiConverterOptionString.read(from: &buf),
+                createdTimestamp: FfiConverterInt64.read(from: &buf),
+                modifiedTimestamp: FfiConverterInt64.read(from: &buf),
+                cameraMake: FfiConverterOptionString.read(from: &buf),
+                cameraModel: FfiConverterOptionString.read(from: &buf),
+                lensModel: FfiConverterOptionString.read(from: &buf),
+                focalLength: FfiConverterOptionDouble.read(from: &buf),
+                aperture: FfiConverterOptionDouble.read(from: &buf),
+                shutterSpeed: FfiConverterOptionDouble.read(from: &buf),
+                iso: FfiConverterOptionUInt32.read(from: &buf),
+                captureDatetime: FfiConverterOptionString.read(from: &buf),
+                pixelWidth: FfiConverterOptionUInt32.read(from: &buf),
+                pixelHeight: FfiConverterOptionUInt32.read(from: &buf),
+                colorSpace: FfiConverterOptionString.read(from: &buf),
+                bitDepth: FfiConverterOptionUInt32.read(from: &buf),
+                gpsLatitude: FfiConverterOptionDouble.read(from: &buf),
+                gpsLongitude: FfiConverterOptionDouble.read(from: &buf),
+                gpsAltitude: FfiConverterOptionDouble.read(from: &buf),
+                copyright: FfiConverterOptionString.read(from: &buf),
+                creator: FfiConverterOptionString.read(from: &buf),
+                description: FfiConverterOptionString.read(from: &buf),
+                rating: FfiConverterOptionUInt8.read(from: &buf),
+                flag: FfiConverterOptionString.read(from: &buf),
+                colorLabel: FfiConverterOptionString.read(from: &buf),
+                rotation: FfiConverterInt32.read(from: &buf),
                 duplicateGroupId: FfiConverterOptionInt64.read(from: &buf)
         )
     }
@@ -2469,9 +2469,9 @@ public struct KeywordManagementRow: Equatable, Hashable {
         self.totalCount = totalCount
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -2485,12 +2485,12 @@ public struct FfiConverterTypeKeywordManagementRow: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> KeywordManagementRow {
         return
             try KeywordManagementRow(
-                label: FfiConverterString.read(from: &buf), 
-                path: FfiConverterString.read(from: &buf), 
-                origin: FfiConverterInt32.read(from: &buf), 
-                visibleCount: FfiConverterInt64.read(from: &buf), 
-                hiddenCount: FfiConverterInt64.read(from: &buf), 
-                collectionCount: FfiConverterInt64.read(from: &buf), 
+                label: FfiConverterString.read(from: &buf),
+                path: FfiConverterString.read(from: &buf),
+                origin: FfiConverterInt32.read(from: &buf),
+                visibleCount: FfiConverterInt64.read(from: &buf),
+                hiddenCount: FfiConverterInt64.read(from: &buf),
+                collectionCount: FfiConverterInt64.read(from: &buf),
                 totalCount: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -2533,9 +2533,9 @@ public struct KeywordNode: Equatable, Hashable {
         self.path = path
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -2549,7 +2549,7 @@ public struct FfiConverterTypeKeywordNode: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> KeywordNode {
         return
             try KeywordNode(
-                label: FfiConverterString.read(from: &buf), 
+                label: FfiConverterString.read(from: &buf),
                 path: FfiConverterString.read(from: &buf)
         )
     }
@@ -2595,9 +2595,9 @@ public struct KeywordRow: Equatable, Hashable {
         self.hiddenAt = hiddenAt
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -2611,11 +2611,11 @@ public struct FfiConverterTypeKeywordRow: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> KeywordRow {
         return
             try KeywordRow(
-                label: FfiConverterString.read(from: &buf), 
-                path: FfiConverterString.read(from: &buf), 
-                status: FfiConverterInt32.read(from: &buf), 
-                origin: FfiConverterInt32.read(from: &buf), 
-                createdAt: FfiConverterString.read(from: &buf), 
+                label: FfiConverterString.read(from: &buf),
+                path: FfiConverterString.read(from: &buf),
+                status: FfiConverterInt32.read(from: &buf),
+                origin: FfiConverterInt32.read(from: &buf),
+                createdAt: FfiConverterString.read(from: &buf),
                 hiddenAt: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -2685,9 +2685,9 @@ public struct LightroomVideoRecord: Equatable, Hashable {
         self.colorLabel = colorLabel
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -2701,21 +2701,21 @@ public struct FfiConverterTypeLightroomVideoRecord: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LightroomVideoRecord {
         return
             try LightroomVideoRecord(
-                filePath: FfiConverterString.read(from: &buf), 
-                fileSize: FfiConverterUInt64.read(from: &buf), 
-                fileName: FfiConverterString.read(from: &buf), 
-                fileExtension: FfiConverterOptionString.read(from: &buf), 
-                createdTimestamp: FfiConverterInt64.read(from: &buf), 
-                modifiedTimestamp: FfiConverterInt64.read(from: &buf), 
-                captureDatetime: FfiConverterOptionString.read(from: &buf), 
-                pixelWidth: FfiConverterOptionUInt32.read(from: &buf), 
-                pixelHeight: FfiConverterOptionUInt32.read(from: &buf), 
-                durationSeconds: FfiConverterOptionDouble.read(from: &buf), 
-                frameRate: FfiConverterOptionDouble.read(from: &buf), 
-                hasAudio: FfiConverterOptionBool.read(from: &buf), 
-                videoKind: FfiConverterOptionString.read(from: &buf), 
-                rating: FfiConverterOptionUInt8.read(from: &buf), 
-                flag: FfiConverterOptionString.read(from: &buf), 
+                filePath: FfiConverterString.read(from: &buf),
+                fileSize: FfiConverterUInt64.read(from: &buf),
+                fileName: FfiConverterString.read(from: &buf),
+                fileExtension: FfiConverterOptionString.read(from: &buf),
+                createdTimestamp: FfiConverterInt64.read(from: &buf),
+                modifiedTimestamp: FfiConverterInt64.read(from: &buf),
+                captureDatetime: FfiConverterOptionString.read(from: &buf),
+                pixelWidth: FfiConverterOptionUInt32.read(from: &buf),
+                pixelHeight: FfiConverterOptionUInt32.read(from: &buf),
+                durationSeconds: FfiConverterOptionDouble.read(from: &buf),
+                frameRate: FfiConverterOptionDouble.read(from: &buf),
+                hasAudio: FfiConverterOptionBool.read(from: &buf),
+                videoKind: FfiConverterOptionString.read(from: &buf),
+                rating: FfiConverterOptionUInt8.read(from: &buf),
+                flag: FfiConverterOptionString.read(from: &buf),
                 colorLabel: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -2769,9 +2769,9 @@ public struct MergeChunkResult: Equatable, Hashable {
         self.imageIds = imageIds
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -2785,8 +2785,8 @@ public struct FfiConverterTypeMergeChunkResult: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MergeChunkResult {
         return
             try MergeChunkResult(
-                inserted: FfiConverterUInt64.read(from: &buf), 
-                updated: FfiConverterUInt64.read(from: &buf), 
+                inserted: FfiConverterUInt64.read(from: &buf),
+                updated: FfiConverterUInt64.read(from: &buf),
                 imageIds: FfiConverterSequenceInt64.read(from: &buf)
         )
     }
@@ -2827,9 +2827,9 @@ public struct ParsedFilename: Equatable, Hashable {
         self.kind = kind
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -2843,8 +2843,8 @@ public struct FfiConverterTypeParsedFilename: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ParsedFilename {
         return
             try ParsedFilename(
-                stem: FfiConverterString.read(from: &buf), 
-                extensionLower: FfiConverterString.read(from: &buf), 
+                stem: FfiConverterString.read(from: &buf),
+                extensionLower: FfiConverterString.read(from: &buf),
                 kind: FfiConverterTypeImageKind.read(from: &buf)
         )
     }
@@ -2895,9 +2895,9 @@ public struct PersonClusterAcceptResult: Equatable, Hashable {
         self.message = message
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -2911,13 +2911,13 @@ public struct FfiConverterTypePersonClusterAcceptResult: FfiConverterRustBuffer 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PersonClusterAcceptResult {
         return
             try PersonClusterAcceptResult(
-                personId: FfiConverterInt64.read(from: &buf), 
-                personName: FfiConverterString.read(from: &buf), 
-                assignedFaceCount: FfiConverterUInt64.read(from: &buf), 
-                keywordImageCount: FfiConverterUInt64.read(from: &buf), 
-                keywordRowCount: FfiConverterUInt64.read(from: &buf), 
-                keywordPath: FfiConverterString.read(from: &buf), 
-                status: FfiConverterString.read(from: &buf), 
+                personId: FfiConverterInt64.read(from: &buf),
+                personName: FfiConverterString.read(from: &buf),
+                assignedFaceCount: FfiConverterUInt64.read(from: &buf),
+                keywordImageCount: FfiConverterUInt64.read(from: &buf),
+                keywordRowCount: FfiConverterUInt64.read(from: &buf),
+                keywordPath: FfiConverterString.read(from: &buf),
+                status: FfiConverterString.read(from: &buf),
                 message: FfiConverterString.read(from: &buf)
         )
     }
@@ -2950,6 +2950,134 @@ public func FfiConverterTypePersonClusterAcceptResult_lower(_ value: PersonClust
 }
 
 
+public struct PersonFaceAssignmentRecord: Equatable, Hashable {
+    public var faceObservationId: Int64
+    public var personId: Int64
+    public var personName: String
+    public var imageId: Int64
+    public var faceIndex: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(faceObservationId: Int64, personId: Int64, personName: String, imageId: Int64, faceIndex: UInt32) {
+        self.faceObservationId = faceObservationId
+        self.personId = personId
+        self.personName = personName
+        self.imageId = imageId
+        self.faceIndex = faceIndex
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PersonFaceAssignmentRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePersonFaceAssignmentRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PersonFaceAssignmentRecord {
+        return
+            try PersonFaceAssignmentRecord(
+                faceObservationId: FfiConverterInt64.read(from: &buf),
+                personId: FfiConverterInt64.read(from: &buf),
+                personName: FfiConverterString.read(from: &buf),
+                imageId: FfiConverterInt64.read(from: &buf),
+                faceIndex: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PersonFaceAssignmentRecord, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.faceObservationId, into: &buf)
+        FfiConverterInt64.write(value.personId, into: &buf)
+        FfiConverterString.write(value.personName, into: &buf)
+        FfiConverterInt64.write(value.imageId, into: &buf)
+        FfiConverterUInt32.write(value.faceIndex, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePersonFaceAssignmentRecord_lift(_ buf: RustBuffer) throws -> PersonFaceAssignmentRecord {
+    return try FfiConverterTypePersonFaceAssignmentRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePersonFaceAssignmentRecord_lower(_ value: PersonFaceAssignmentRecord) -> RustBuffer {
+    return FfiConverterTypePersonFaceAssignmentRecord.lower(value)
+}
+
+
+public struct PersonSummaryRecord: Equatable, Hashable {
+    public var personId: Int64
+    public var personName: String
+    public var assignedFaceCount: UInt64
+    public var imageCount: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(personId: Int64, personName: String, assignedFaceCount: UInt64, imageCount: UInt64) {
+        self.personId = personId
+        self.personName = personName
+        self.assignedFaceCount = assignedFaceCount
+        self.imageCount = imageCount
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PersonSummaryRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePersonSummaryRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PersonSummaryRecord {
+        return
+            try PersonSummaryRecord(
+                personId: FfiConverterInt64.read(from: &buf),
+                personName: FfiConverterString.read(from: &buf),
+                assignedFaceCount: FfiConverterUInt64.read(from: &buf),
+                imageCount: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PersonSummaryRecord, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.personId, into: &buf)
+        FfiConverterString.write(value.personName, into: &buf)
+        FfiConverterUInt64.write(value.assignedFaceCount, into: &buf)
+        FfiConverterUInt64.write(value.imageCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePersonSummaryRecord_lift(_ buf: RustBuffer) throws -> PersonSummaryRecord {
+    return try FfiConverterTypePersonSummaryRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePersonSummaryRecord_lower(_ value: PersonSummaryRecord) -> RustBuffer {
+    return FfiConverterTypePersonSummaryRecord.lower(value)
+}
+
+
 public struct QueryPredicate: Equatable, Hashable {
     public var kind: String
     public var day: String?
@@ -2973,9 +3101,9 @@ public struct QueryPredicate: Equatable, Hashable {
         self.numEnd = numEnd
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -2989,13 +3117,13 @@ public struct FfiConverterTypeQueryPredicate: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> QueryPredicate {
         return
             try QueryPredicate(
-                kind: FfiConverterString.read(from: &buf), 
-                day: FfiConverterOptionString.read(from: &buf), 
-                dayEnd: FfiConverterOptionString.read(from: &buf), 
-                op: FfiConverterOptionString.read(from: &buf), 
-                stars: FfiConverterOptionUInt8.read(from: &buf), 
-                value: FfiConverterOptionString.read(from: &buf), 
-                num: FfiConverterOptionDouble.read(from: &buf), 
+                kind: FfiConverterString.read(from: &buf),
+                day: FfiConverterOptionString.read(from: &buf),
+                dayEnd: FfiConverterOptionString.read(from: &buf),
+                op: FfiConverterOptionString.read(from: &buf),
+                stars: FfiConverterOptionUInt8.read(from: &buf),
+                value: FfiConverterOptionString.read(from: &buf),
+                num: FfiConverterOptionDouble.read(from: &buf),
                 numEnd: FfiConverterOptionDouble.read(from: &buf)
         )
     }
@@ -3041,9 +3169,9 @@ public struct RelocateResult: Equatable, Hashable {
         self.message = message
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -3057,8 +3185,8 @@ public struct FfiConverterTypeRelocateResult: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RelocateResult {
         return
             try RelocateResult(
-                ok: FfiConverterBool.read(from: &buf), 
-                updated: FfiConverterUInt64.read(from: &buf), 
+                ok: FfiConverterBool.read(from: &buf),
+                updated: FfiConverterUInt64.read(from: &buf),
                 message: FfiConverterString.read(from: &buf)
         )
     }
@@ -3097,9 +3225,9 @@ public struct SavedQueryInfo: Equatable, Hashable {
         self.name = name
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -3113,7 +3241,7 @@ public struct FfiConverterTypeSavedQueryInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SavedQueryInfo {
         return
             try SavedQueryInfo(
-                id: FfiConverterInt64.read(from: &buf), 
+                id: FfiConverterInt64.read(from: &buf),
                 name: FfiConverterString.read(from: &buf)
         )
     }
@@ -3151,9 +3279,9 @@ public struct SavedQueryPayload: Equatable, Hashable {
         self.connectors = connectors
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -3167,7 +3295,7 @@ public struct FfiConverterTypeSavedQueryPayload: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SavedQueryPayload {
         return
             try SavedQueryPayload(
-                predicates: FfiConverterSequenceTypeQueryPredicate.read(from: &buf), 
+                predicates: FfiConverterSequenceTypeQueryPredicate.read(from: &buf),
                 connectors: FfiConverterSequenceTypeConnector.read(from: &buf)
         )
     }
@@ -3215,9 +3343,9 @@ public struct SimilarPhotoCandidate: Equatable, Hashable {
         self.cameraModel = cameraModel
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -3231,12 +3359,12 @@ public struct FfiConverterTypeSimilarPhotoCandidate: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SimilarPhotoCandidate {
         return
             try SimilarPhotoCandidate(
-                id: FfiConverterInt64.read(from: &buf), 
-                filePath: FfiConverterString.read(from: &buf), 
-                fileSize: FfiConverterUInt64.read(from: &buf), 
-                createdTimestamp: FfiConverterInt64.read(from: &buf), 
-                captureDatetime: FfiConverterOptionString.read(from: &buf), 
-                directoryPath: FfiConverterOptionString.read(from: &buf), 
+                id: FfiConverterInt64.read(from: &buf),
+                filePath: FfiConverterString.read(from: &buf),
+                fileSize: FfiConverterUInt64.read(from: &buf),
+                createdTimestamp: FfiConverterInt64.read(from: &buf),
+                captureDatetime: FfiConverterOptionString.read(from: &buf),
+                directoryPath: FfiConverterOptionString.read(from: &buf),
                 cameraModel: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -3281,9 +3409,9 @@ public struct SimilarPhotoFeatureprint: Equatable, Hashable {
         self.featureprintBlob = featureprintBlob
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -3297,8 +3425,8 @@ public struct FfiConverterTypeSimilarPhotoFeatureprint: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SimilarPhotoFeatureprint {
         return
             try SimilarPhotoFeatureprint(
-                imageId: FfiConverterInt64.read(from: &buf), 
-                sourceStamp: FfiConverterString.read(from: &buf), 
+                imageId: FfiConverterInt64.read(from: &buf),
+                sourceStamp: FfiConverterString.read(from: &buf),
                 featureprintBlob: FfiConverterSequenceUInt8.read(from: &buf)
         )
     }
@@ -3345,9 +3473,9 @@ public struct SimilarPhotoGroupMember: Equatable, Hashable {
         self.threshold = threshold
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -3361,11 +3489,11 @@ public struct FfiConverterTypeSimilarPhotoGroupMember: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SimilarPhotoGroupMember {
         return
             try SimilarPhotoGroupMember(
-                imageId: FfiConverterInt64.read(from: &buf), 
-                groupId: FfiConverterInt64.read(from: &buf), 
-                representativeId: FfiConverterInt64.read(from: &buf), 
-                memberRank: FfiConverterUInt32.read(from: &buf), 
-                distanceToRepresentative: FfiConverterOptionDouble.read(from: &buf), 
+                imageId: FfiConverterInt64.read(from: &buf),
+                groupId: FfiConverterInt64.read(from: &buf),
+                representativeId: FfiConverterInt64.read(from: &buf),
+                memberRank: FfiConverterUInt32.read(from: &buf),
+                distanceToRepresentative: FfiConverterOptionDouble.read(from: &buf),
                 threshold: FfiConverterDouble.read(from: &buf)
         )
     }
@@ -3411,9 +3539,9 @@ public struct SimilarPhotoStackMember: Equatable, Hashable {
         self.memberRank = memberRank
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -3427,9 +3555,9 @@ public struct FfiConverterTypeSimilarPhotoStackMember: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SimilarPhotoStackMember {
         return
             try SimilarPhotoStackMember(
-                imageId: FfiConverterInt64.read(from: &buf), 
-                groupId: FfiConverterInt64.read(from: &buf), 
-                representativeId: FfiConverterInt64.read(from: &buf), 
+                imageId: FfiConverterInt64.read(from: &buf),
+                groupId: FfiConverterInt64.read(from: &buf),
+                representativeId: FfiConverterInt64.read(from: &buf),
                 memberRank: FfiConverterUInt32.read(from: &buf)
         )
     }
@@ -3473,9 +3601,9 @@ public struct SimilarPhotoStackSummary: Equatable, Hashable {
         self.physicalCount = physicalCount
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -3489,9 +3617,9 @@ public struct FfiConverterTypeSimilarPhotoStackSummary: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SimilarPhotoStackSummary {
         return
             try SimilarPhotoStackSummary(
-                imageId: FfiConverterInt64.read(from: &buf), 
-                groupId: FfiConverterInt64.read(from: &buf), 
-                logicalCount: FfiConverterUInt32.read(from: &buf), 
+                imageId: FfiConverterInt64.read(from: &buf),
+                groupId: FfiConverterInt64.read(from: &buf),
+                logicalCount: FfiConverterUInt32.read(from: &buf),
                 physicalCount: FfiConverterUInt32.read(from: &buf)
         )
     }
@@ -3537,9 +3665,9 @@ public struct SimilarPhotoWorkUnit: Equatable, Hashable {
         self.memberCount = memberCount
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -3553,10 +3681,10 @@ public struct FfiConverterTypeSimilarPhotoWorkUnit: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SimilarPhotoWorkUnit {
         return
             try SimilarPhotoWorkUnit(
-                unitIndex: FfiConverterInt64.read(from: &buf), 
-                startImageId: FfiConverterInt64.read(from: &buf), 
-                endImageId: FfiConverterInt64.read(from: &buf), 
-                candidateCount: FfiConverterInt64.read(from: &buf), 
+                unitIndex: FfiConverterInt64.read(from: &buf),
+                startImageId: FfiConverterInt64.read(from: &buf),
+                endImageId: FfiConverterInt64.read(from: &buf),
+                candidateCount: FfiConverterInt64.read(from: &buf),
                 memberCount: FfiConverterInt64.read(from: &buf)
         )
     }
@@ -3625,9 +3753,9 @@ public struct VideoDetails: Equatable, Hashable {
         self.livePhotoId = livePhotoId
     }
 
-    
 
-    
+
+
 }
 
 #if compiler(>=6)
@@ -3641,21 +3769,21 @@ public struct FfiConverterTypeVideoDetails: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VideoDetails {
         return
             try VideoDetails(
-                durationSeconds: FfiConverterOptionDouble.read(from: &buf), 
-                frameRate: FfiConverterOptionDouble.read(from: &buf), 
-                videoKind: FfiConverterOptionString.read(from: &buf), 
-                videoCodec: FfiConverterOptionString.read(from: &buf), 
-                videoBitrate: FfiConverterOptionInt64.read(from: &buf), 
-                colorPrimaries: FfiConverterOptionString.read(from: &buf), 
-                colorTransfer: FfiConverterOptionString.read(from: &buf), 
-                colorMatrix: FfiConverterOptionString.read(from: &buf), 
-                colorRange: FfiConverterOptionString.read(from: &buf), 
-                dvProfile: FfiConverterOptionInt32.read(from: &buf), 
-                hasAudio: FfiConverterOptionBool.read(from: &buf), 
-                audioCodec: FfiConverterOptionString.read(from: &buf), 
-                audioChannels: FfiConverterOptionInt32.read(from: &buf), 
-                audioSampleRate: FfiConverterOptionInt32.read(from: &buf), 
-                audioBitrate: FfiConverterOptionInt64.read(from: &buf), 
+                durationSeconds: FfiConverterOptionDouble.read(from: &buf),
+                frameRate: FfiConverterOptionDouble.read(from: &buf),
+                videoKind: FfiConverterOptionString.read(from: &buf),
+                videoCodec: FfiConverterOptionString.read(from: &buf),
+                videoBitrate: FfiConverterOptionInt64.read(from: &buf),
+                colorPrimaries: FfiConverterOptionString.read(from: &buf),
+                colorTransfer: FfiConverterOptionString.read(from: &buf),
+                colorMatrix: FfiConverterOptionString.read(from: &buf),
+                colorRange: FfiConverterOptionString.read(from: &buf),
+                dvProfile: FfiConverterOptionInt32.read(from: &buf),
+                hasAudio: FfiConverterOptionBool.read(from: &buf),
+                audioCodec: FfiConverterOptionString.read(from: &buf),
+                audioChannels: FfiConverterOptionInt32.read(from: &buf),
+                audioSampleRate: FfiConverterOptionInt32.read(from: &buf),
+                audioBitrate: FfiConverterOptionInt64.read(from: &buf),
                 livePhotoId: FfiConverterOptionString.read(from: &buf)
         )
     }
@@ -3699,7 +3827,7 @@ public func FfiConverterTypeVideoDetails_lower(_ value: VideoDetails) -> RustBuf
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
 public enum Connector: Equatable, Hashable {
-    
+
     case and
     case or
     case xor
@@ -3723,32 +3851,32 @@ public struct FfiConverterTypeConnector: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Connector {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-        
+
         case 1: return .and
-        
+
         case 2: return .or
-        
+
         case 3: return .xor
-        
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: Connector, into buf: inout [UInt8]) {
         switch value {
-        
-        
+
+
         case .and:
             writeInt(&buf, Int32(1))
-        
-        
+
+
         case .or:
             writeInt(&buf, Int32(2))
-        
-        
+
+
         case .xor:
             writeInt(&buf, Int32(3))
-        
+
         }
     }
 }
@@ -3773,7 +3901,7 @@ public func FfiConverterTypeConnector_lower(_ value: Connector) -> RustBuffer {
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
 public enum ImageKind: Equatable, Hashable {
-    
+
     case jpeg
     case raw
     case other
@@ -3802,62 +3930,62 @@ public struct FfiConverterTypeImageKind: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ImageKind {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-        
+
         case 1: return .jpeg
-        
+
         case 2: return .raw
-        
+
         case 3: return .other
-        
+
         case 4: return .heif
-        
+
         case 5: return .dng
-        
+
         case 6: return .psd
-        
+
         case 7: return .tiff
-        
+
         case 8: return .png
-        
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: ImageKind, into buf: inout [UInt8]) {
         switch value {
-        
-        
+
+
         case .jpeg:
             writeInt(&buf, Int32(1))
-        
-        
+
+
         case .raw:
             writeInt(&buf, Int32(2))
-        
-        
+
+
         case .other:
             writeInt(&buf, Int32(3))
-        
-        
+
+
         case .heif:
             writeInt(&buf, Int32(4))
-        
-        
+
+
         case .dng:
             writeInt(&buf, Int32(5))
-        
-        
+
+
         case .psd:
             writeInt(&buf, Int32(6))
-        
-        
+
+
         case .tiff:
             writeInt(&buf, Int32(7))
-        
-        
+
+
         case .png:
             writeInt(&buf, Int32(8))
-        
+
         }
     }
 }
@@ -3882,7 +4010,7 @@ public func FfiConverterTypeImageKind_lower(_ value: ImageKind) -> RustBuffer {
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
 public enum MediaType: Equatable, Hashable {
-    
+
     case stillsOnly
     case videosOnly
     case both
@@ -3906,32 +4034,32 @@ public struct FfiConverterTypeMediaType: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MediaType {
         let variant: Int32 = try readInt(&buf)
         switch variant {
-        
+
         case 1: return .stillsOnly
-        
+
         case 2: return .videosOnly
-        
+
         case 3: return .both
-        
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
     public static func write(_ value: MediaType, into buf: inout [UInt8]) {
         switch value {
-        
-        
+
+
         case .stillsOnly:
             writeInt(&buf, Int32(1))
-        
-        
+
+
         case .videosOnly:
             writeInt(&buf, Int32(2))
-        
-        
+
+
         case .both:
             writeInt(&buf, Int32(3))
-        
+
         }
     }
 }
@@ -4892,6 +5020,56 @@ fileprivate struct FfiConverterSequenceTypeLightroomVideoRecord: FfiConverterRus
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypePersonFaceAssignmentRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [PersonFaceAssignmentRecord]
+
+    public static func write(_ value: [PersonFaceAssignmentRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePersonFaceAssignmentRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PersonFaceAssignmentRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PersonFaceAssignmentRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePersonFaceAssignmentRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypePersonSummaryRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [PersonSummaryRecord]
+
+    public static func write(_ value: [PersonSummaryRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePersonSummaryRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PersonSummaryRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PersonSummaryRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePersonSummaryRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeQueryPredicate: FfiConverterRustBuffer {
     typealias SwiftType = [QueryPredicate]
 
@@ -5173,7 +5351,7 @@ public func acceptFaceClusterAsPerson(runId: String, clusterId: Int64, personNam
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypePersonClusterAcceptResult_lift,
             errorHandler: nil
-            
+
         )
 }
 public func activeAnalysisJob(jobKind: String)async  -> AnalysisJob?  {
@@ -5188,7 +5366,7 @@ public func activeAnalysisJob(jobKind: String)async  -> AnalysisJob?  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeAnalysisJob.lift,
             errorHandler: nil
-            
+
         )
 }
 public func activeAnalysisJobs()async  -> [AnalysisJob]  {
@@ -5203,7 +5381,7 @@ public func activeAnalysisJobs()async  -> [AnalysisJob]  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeAnalysisJob.lift,
             errorHandler: nil
-            
+
         )
 }
 public func addImagesToCollections(ids: [Int64], labels: [String])async  -> UInt64  {
@@ -5218,7 +5396,7 @@ public func addImagesToCollections(ids: [Int64], labels: [String])async  -> UInt
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func assignColorKeywordForIds(ids: [Int64], label: String)async  -> UInt64  {
@@ -5233,7 +5411,22 @@ public func assignColorKeywordForIds(ids: [Int64], label: String)async  -> UInt6
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
+        )
+}
+public func assignFaceObservationsToPerson(faceObservationIds: [Int64], personName: String)async  -> PersonClusterAcceptResult  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_assign_face_observations_to_person(FfiConverterSequenceInt64.lower(faceObservationIds),FfiConverterString.lower(personName)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypePersonClusterAcceptResult_lift,
+            errorHandler: nil
+
         )
 }
 public func assignKeywordForIds(ids: [Int64], segments: [String])async  -> UInt64  {
@@ -5248,7 +5441,7 @@ public func assignKeywordForIds(ids: [Int64], segments: [String])async  -> UInt6
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func captureDayImageCounts(mediaType: MediaType)async  -> [CaptureDayImageCount]  {
@@ -5263,7 +5456,7 @@ public func captureDayImageCounts(mediaType: MediaType)async  -> [CaptureDayImag
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeCaptureDayImageCount.lift,
             errorHandler: nil
-            
+
         )
 }
 public func classifyExtension(ext: String) -> ImageKind  {
@@ -5285,7 +5478,7 @@ public func collectionLabels()async  -> [String]  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceString.lift,
             errorHandler: nil
-            
+
         )
 }
 public func completedSimilarPhotoWorkUnits(algorithmVersion: String, scopeKey: String)async  -> [SimilarPhotoWorkUnit]  {
@@ -5300,7 +5493,7 @@ public func completedSimilarPhotoWorkUnits(algorithmVersion: String, scopeKey: S
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeSimilarPhotoWorkUnit.lift,
             errorHandler: nil
-            
+
         )
 }
 public func copyKeywordRowsForImagePairs(sourceIds: [Int64], destinationIds: [Int64])async  -> UInt64  {
@@ -5315,7 +5508,7 @@ public func copyKeywordRowsForImagePairs(sourceIds: [Int64], destinationIds: [In
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func countQueryImages(predicates: [QueryPredicate], connectors: [Connector], applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, mediaType: MediaType)async  -> UInt64  {
@@ -5330,7 +5523,7 @@ public func countQueryImages(predicates: [QueryPredicate], connectors: [Connecto
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func countQueryImagesGallery(predicates: [QueryPredicate], connectors: [Connector], applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, applySimilarPhotoCollapse: Bool, similarAlgorithmVersion: String, mediaType: MediaType)async  -> UInt64  {
@@ -5345,7 +5538,7 @@ public func countQueryImagesGallery(predicates: [QueryPredicate], connectors: [C
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func countQueryImagesScoped(predicates: [QueryPredicate], connectors: [Connector], scopePredicates: [QueryPredicate], scopeConnectors: [Connector], applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, mediaType: MediaType)async  -> UInt64  {
@@ -5360,7 +5553,7 @@ public func countQueryImagesScoped(predicates: [QueryPredicate], connectors: [Co
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func countQueryImagesScopedGallery(predicates: [QueryPredicate], connectors: [Connector], scopePredicates: [QueryPredicate], scopeConnectors: [Connector], applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, applySimilarPhotoCollapse: Bool, similarAlgorithmVersion: String, mediaType: MediaType)async  -> UInt64  {
@@ -5375,7 +5568,7 @@ public func countQueryImagesScopedGallery(predicates: [QueryPredicate], connecto
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func createAnalysisJob(jobKind: String, scopeKind: String, scopeValue: String?, algorithmVersion: String, analysisRunId: String, totalCandidateCount: UInt64)async  -> AnalysisJob?  {
@@ -5390,7 +5583,7 @@ public func createAnalysisJob(jobKind: String, scopeKind: String, scopeValue: St
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeAnalysisJob.lift,
             errorHandler: nil
-            
+
         )
 }
 public func deleteKeywordPaths(paths: [String])async  -> UInt64  {
@@ -5405,7 +5598,7 @@ public func deleteKeywordPaths(paths: [String])async  -> UInt64  {
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func deleteSavedQuery(id: Int64)async  -> Bool  {
@@ -5420,7 +5613,7 @@ public func deleteSavedQuery(id: Int64)async  -> Bool  {
             freeFunc: ffi_photolibrariancore_rust_future_free_i8,
             liftFunc: FfiConverterBool.lift,
             errorHandler: nil
-            
+
         )
 }
 public func directoryImageCounts(mediaType: MediaType)async  -> [DirectoryImageCount]  {
@@ -5435,7 +5628,7 @@ public func directoryImageCounts(mediaType: MediaType)async  -> [DirectoryImageC
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeDirectoryImageCount.lift,
             errorHandler: nil
-            
+
         )
 }
 public func directorySyncStates()async  -> [DirectorySyncState]  {
@@ -5450,7 +5643,7 @@ public func directorySyncStates()async  -> [DirectorySyncState]  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeDirectorySyncState.lift,
             errorHandler: nil
-            
+
         )
 }
 public func distinctImageValues(field: String)async  -> [String]  {
@@ -5465,7 +5658,7 @@ public func distinctImageValues(field: String)async  -> [String]  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceString.lift,
             errorHandler: nil
-            
+
         )
 }
 public func distinctNumericValues(field: String)async  -> [Double]  {
@@ -5480,7 +5673,7 @@ public func distinctNumericValues(field: String)async  -> [Double]  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceDouble.lift,
             errorHandler: nil
-            
+
         )
 }
 public func expandCollapseGroupIds(ids: [Int64])async  -> [Int64]  {
@@ -5495,7 +5688,7 @@ public func expandCollapseGroupIds(ids: [Int64])async  -> [Int64]  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func faceClusterMembers(runId: String)async  -> [FaceClusterMemberRecord]  {
@@ -5510,7 +5703,7 @@ public func faceClusterMembers(runId: String)async  -> [FaceClusterMemberRecord]
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeFaceClusterMemberRecord.lift,
             errorHandler: nil
-            
+
         )
 }
 public func faceClusterRuns(limit: UInt32)async  -> [FaceClusterRunSummary]  {
@@ -5525,7 +5718,7 @@ public func faceClusterRuns(limit: UInt32)async  -> [FaceClusterRunSummary]  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeFaceClusterRunSummary.lift,
             errorHandler: nil
-            
+
         )
 }
 public func faceEmbeddingCount(modelVersion: String, preprocessingVersion: String)async  -> UInt64  {
@@ -5540,7 +5733,7 @@ public func faceEmbeddingCount(modelVersion: String, preprocessingVersion: Strin
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func faceEmbeddingMissingObservations(algorithmVersion: String, modelVersion: String, preprocessingVersion: String, limit: UInt32)async  -> [FaceObservationRecord]  {
@@ -5555,7 +5748,7 @@ public func faceEmbeddingMissingObservations(algorithmVersion: String, modelVers
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeFaceObservationRecord.lift,
             errorHandler: nil
-            
+
         )
 }
 public func faceEmbeddingNearestNeighbors(modelVersion: String, preprocessingVersion: String, limitPerFace: UInt32)async  -> [FaceEmbeddingNeighborRecord]  {
@@ -5570,7 +5763,7 @@ public func faceEmbeddingNearestNeighbors(modelVersion: String, preprocessingVer
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeFaceEmbeddingNeighborRecord.lift,
             errorHandler: nil
-            
+
         )
 }
 public func faceEmbeddingSearch(seedFaceObservationIds: [Int64], candidateImageIds: [Int64], modelVersion: String, preprocessingVersion: String, threshold: Double, limit: UInt32)async  -> [FaceSearchMatchRecord]  {
@@ -5600,7 +5793,7 @@ public func faceEmbeddingSearchVector(seedVector: [Float], candidateImageIds: [I
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeFaceSearchMatchRecord.lift,
             errorHandler: nil
-            
+
         )
 }
 public func faceObservationCount(algorithmVersion: String)async  -> UInt64  {
@@ -5615,7 +5808,7 @@ public func faceObservationCount(algorithmVersion: String)async  -> UInt64  {
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func faceObservationsForImageIds(ids: [Int64], algorithmVersion: String)async  -> [FaceObservationRecord]  {
@@ -5630,7 +5823,7 @@ public func faceObservationsForImageIds(ids: [Int64], algorithmVersion: String)a
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeFaceObservationRecord.lift,
             errorHandler: nil
-            
+
         )
 }
 public func faceRecognitionMenuStates(ids: [Int64], algorithmVersion: String, modelVersion: String, preprocessingVersion: String)async  -> [FaceRecognitionMenuState]  {
@@ -5645,7 +5838,7 @@ public func faceRecognitionMenuStates(ids: [Int64], algorithmVersion: String, mo
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeFaceRecognitionMenuState.lift,
             errorHandler: nil
-            
+
         )
 }
 public func findCounterpartImage(filePath: String)async  -> ImageRecord?  {
@@ -5660,7 +5853,7 @@ public func findCounterpartImage(filePath: String)async  -> ImageRecord?  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeImageRecord.lift,
             errorHandler: nil
-            
+
         )
 }
 public func finishAnalysisJob(id: Int64, status: String, lastError: String?)async  -> AnalysisJob?  {
@@ -5675,7 +5868,7 @@ public func finishAnalysisJob(id: Int64, status: String, lastError: String?)asyn
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeAnalysisJob.lift,
             errorHandler: nil
-            
+
         )
 }
 public func focusAnalysisCandidateCount(algorithmVersion: String, analysisRunId: String)async  -> UInt64  {
@@ -5690,7 +5883,7 @@ public func focusAnalysisCandidateCount(algorithmVersion: String, analysisRunId:
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func focusAnalysisCandidateCountForIds(ids: [Int64], algorithmVersion: String, analysisRunId: String)async  -> UInt64  {
@@ -5705,7 +5898,7 @@ public func focusAnalysisCandidateCountForIds(ids: [Int64], algorithmVersion: St
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func focusAnalysisCandidates(limit: UInt32, algorithmVersion: String, analysisRunId: String)async  -> [FocusAnalysisCandidate]  {
@@ -5720,7 +5913,7 @@ public func focusAnalysisCandidates(limit: UInt32, algorithmVersion: String, ana
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeFocusAnalysisCandidate.lift,
             errorHandler: nil
-            
+
         )
 }
 public func focusAnalysisCandidatesForIds(ids: [Int64], limit: UInt32, algorithmVersion: String, analysisRunId: String)async  -> [FocusAnalysisCandidate]  {
@@ -5735,7 +5928,7 @@ public func focusAnalysisCandidatesForIds(ids: [Int64], limit: UInt32, algorithm
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeFocusAnalysisCandidate.lift,
             errorHandler: nil
-            
+
         )
 }
 public func getAllImages(limit: UInt32, offset: UInt32, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, mediaType: MediaType)async  -> [ImageRecord]  {
@@ -5750,7 +5943,7 @@ public func getAllImages(limit: UInt32, offset: UInt32, applyDuplicateFilter: Bo
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeImageRecord.lift,
             errorHandler: nil
-            
+
         )
 }
 public func getDestinationFamilyRecords(sampleFilePath: String, canonicalFileName: String)async  -> [ImageRecord]  {
@@ -5765,7 +5958,7 @@ public func getDestinationFamilyRecords(sampleFilePath: String, canonicalFileNam
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeImageRecord.lift,
             errorHandler: nil
-            
+
         )
 }
 public func getDistinctDateStrings()async  -> [String]  {
@@ -5780,7 +5973,7 @@ public func getDistinctDateStrings()async  -> [String]  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceString.lift,
             errorHandler: nil
-            
+
         )
 }
 public func getDistinctDirectoryPaths()async  -> [String]  {
@@ -5795,7 +5988,7 @@ public func getDistinctDirectoryPaths()async  -> [String]  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceString.lift,
             errorHandler: nil
-            
+
         )
 }
 public func getExternalSourceId(imageId: Int64)async  -> String?  {
@@ -5810,7 +6003,7 @@ public func getExternalSourceId(imageId: Int64)async  -> String?  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionString.lift,
             errorHandler: nil
-            
+
         )
 }
 public func getFilePathsForFilters(pathPrefix: String, datePrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, mediaType: MediaType)async  -> FilePathsResult  {
@@ -5825,7 +6018,7 @@ public func getFilePathsForFilters(pathPrefix: String, datePrefix: String, apply
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeFilePathsResult_lift,
             errorHandler: nil
-            
+
         )
 }
 public func getFilteredImageCount(datePrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, mediaType: MediaType)async  -> Int64  {
@@ -5840,7 +6033,7 @@ public func getFilteredImageCount(datePrefix: String, applyDuplicateFilter: Bool
             freeFunc: ffi_photolibrariancore_rust_future_free_i64,
             liftFunc: FfiConverterInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func getImageCount(applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, mediaType: MediaType)async  -> UInt64  {
@@ -5855,7 +6048,7 @@ public func getImageCount(applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func getImageCountForFilters(pathPrefix: String, datePrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, mediaType: MediaType)async  -> Int64  {
@@ -5870,7 +6063,7 @@ public func getImageCountForFilters(pathPrefix: String, datePrefix: String, appl
             freeFunc: ffi_photolibrariancore_rust_future_free_i64,
             liftFunc: FfiConverterInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func getImageCountForFiltersGallery(pathPrefix: String, datePrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, applySimilarPhotoCollapse: Bool, similarAlgorithmVersion: String, mediaType: MediaType)async  -> Int64  {
@@ -5885,7 +6078,7 @@ public func getImageCountForFiltersGallery(pathPrefix: String, datePrefix: Strin
             freeFunc: ffi_photolibrariancore_rust_future_free_i64,
             liftFunc: FfiConverterInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func getImageCountForPathPrefix(pathPrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> Int64  {
@@ -5900,7 +6093,7 @@ public func getImageCountForPathPrefix(pathPrefix: String, applyDuplicateFilter:
             freeFunc: ffi_photolibrariancore_rust_future_free_i64,
             liftFunc: FfiConverterInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func getImageRecordsForFilters(pathPrefix: String, datePrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, mediaType: MediaType)async  -> [ImageRecord]  {
@@ -5915,7 +6108,7 @@ public func getImageRecordsForFilters(pathPrefix: String, datePrefix: String, ap
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeImageRecord.lift,
             errorHandler: nil
-            
+
         )
 }
 public func getImagesByIds(ids: [Int64])async  -> [ImageRecord]  {
@@ -5930,7 +6123,7 @@ public func getImagesByIds(ids: [Int64])async  -> [ImageRecord]  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeImageRecord.lift,
             errorHandler: nil
-            
+
         )
 }
 public func getImagesFiltered(limit: Int64, offset: Int64, datePrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> [ImageRecord]  {
@@ -5945,7 +6138,7 @@ public func getImagesFiltered(limit: Int64, offset: Int64, datePrefix: String, a
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeImageRecord.lift,
             errorHandler: nil
-            
+
         )
 }
 public func getImagesForPathPrefix(limit: Int64, offset: Int64, pathPrefix: String, datePrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, mediaType: MediaType)async  -> [ImageRecord]  {
@@ -5960,7 +6153,7 @@ public func getImagesForPathPrefix(limit: Int64, offset: Int64, pathPrefix: Stri
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeImageRecord.lift,
             errorHandler: nil
-            
+
         )
 }
 public func getImagesForPathPrefixGallery(limit: Int64, offset: Int64, pathPrefix: String, datePrefix: String, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, applySimilarPhotoCollapse: Bool, similarAlgorithmVersion: String, mediaType: MediaType)async  -> [ImageRecord]  {
@@ -5975,7 +6168,7 @@ public func getImagesForPathPrefixGallery(limit: Int64, offset: Int64, pathPrefi
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeImageRecord.lift,
             errorHandler: nil
-            
+
         )
 }
 public func getImagesSorted(limit: UInt32, offset: UInt32, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool)async  -> [ImageRecord]  {
@@ -5990,7 +6183,7 @@ public func getImagesSorted(limit: UInt32, offset: UInt32, applyDuplicateFilter:
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeImageRecord.lift,
             errorHandler: nil
-            
+
         )
 }
 public func getJpegExtensions() -> [String]  {
@@ -6017,7 +6210,7 @@ public func getVideoDetails(imageId: Int64)async  -> VideoDetails?  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeVideoDetails.lift,
             errorHandler: nil
-            
+
         )
 }
 public func hiddenKeywordsForImage(imageId: Int64)async  -> [KeywordRow]  {
@@ -6032,7 +6225,7 @@ public func hiddenKeywordsForImage(imageId: Int64)async  -> [KeywordRow]  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeKeywordRow.lift,
             errorHandler: nil
-            
+
         )
 }
 public func ingestMetadata(metadata: [ImageMetadata])async  -> UInt32  {
@@ -6047,7 +6240,7 @@ public func ingestMetadata(metadata: [ImageMetadata])async  -> UInt32  {
             freeFunc: ffi_photolibrariancore_rust_future_free_u32,
             liftFunc: FfiConverterUInt32.lift,
             errorHandler: nil
-            
+
         )
 }
 public func initializeCatalogue(cataloguePath: String)async  -> Bool  {
@@ -6062,7 +6255,7 @@ public func initializeCatalogue(cataloguePath: String)async  -> Bool  {
             freeFunc: ffi_photolibrariancore_rust_future_free_i8,
             liftFunc: FfiConverterBool.lift,
             errorHandler: nil
-            
+
         )
 }
 public func keywordLabels()async  -> [String]  {
@@ -6077,7 +6270,7 @@ public func keywordLabels()async  -> [String]  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceString.lift,
             errorHandler: nil
-            
+
         )
 }
 public func keywordManagementRows(origin: String, includeCollections: Bool, includeOrphaned: Bool)async  -> [KeywordManagementRow]  {
@@ -6092,7 +6285,7 @@ public func keywordManagementRows(origin: String, includeCollections: Bool, incl
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeKeywordManagementRow.lift,
             errorHandler: nil
-            
+
         )
 }
 public func keywordVocabulary()async  -> [KeywordNode]  {
@@ -6107,7 +6300,7 @@ public func keywordVocabulary()async  -> [KeywordNode]  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeKeywordNode.lift,
             errorHandler: nil
-            
+
         )
 }
 public func keywordVocabularyForOrigin(origin: String)async  -> [KeywordNode]  {
@@ -6122,7 +6315,7 @@ public func keywordVocabularyForOrigin(origin: String)async  -> [KeywordNode]  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeKeywordNode.lift,
             errorHandler: nil
-            
+
         )
 }
 public func keywordsForImage(imageId: Int64)async  -> [KeywordRow]  {
@@ -6137,7 +6330,7 @@ public func keywordsForImage(imageId: Int64)async  -> [KeywordRow]  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeKeywordRow.lift,
             errorHandler: nil
-            
+
         )
 }
 public func listSavedQueries()async  -> [SavedQueryInfo]  {
@@ -6152,7 +6345,7 @@ public func listSavedQueries()async  -> [SavedQueryInfo]  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeSavedQueryInfo.lift,
             errorHandler: nil
-            
+
         )
 }
 public func loadSavedQuery(id: Int64)async  -> SavedQueryPayload?  {
@@ -6167,7 +6360,7 @@ public func loadSavedQuery(id: Int64)async  -> SavedQueryPayload?  {
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeSavedQueryPayload.lift,
             errorHandler: nil
-            
+
         )
 }
 public func markSimilarPhotoWorkUnitComplete(algorithmVersion: String, scopeKey: String, unit: SimilarPhotoWorkUnit)async  -> Bool  {
@@ -6182,7 +6375,7 @@ public func markSimilarPhotoWorkUnitComplete(algorithmVersion: String, scopeKey:
             freeFunc: ffi_photolibrariancore_rust_future_free_i8,
             liftFunc: FfiConverterBool.lift,
             errorHandler: nil
-            
+
         )
 }
 public func mergeLightroomRecords(records: [ImageMetadata])async  -> MergeChunkResult  {
@@ -6197,7 +6390,7 @@ public func mergeLightroomRecords(records: [ImageMetadata])async  -> MergeChunkR
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeMergeChunkResult_lift,
             errorHandler: nil
-            
+
         )
 }
 public func mergeLightroomVideos(records: [LightroomVideoRecord])async  -> MergeChunkResult  {
@@ -6212,7 +6405,7 @@ public func mergeLightroomVideos(records: [LightroomVideoRecord])async  -> Merge
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeMergeChunkResult_lift,
             errorHandler: nil
-            
+
         )
 }
 public func mirrorKeywordRowsAcrossPairs()async  -> UInt64  {
@@ -6227,7 +6420,7 @@ public func mirrorKeywordRowsAcrossPairs()async  -> UInt64  {
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func parseFilename(fileName: String) -> ParsedFilename  {
@@ -6236,6 +6429,51 @@ public func parseFilename(fileName: String) -> ParsedFilename  {
         FfiConverterString.lower(fileName),$0
     )
 })
+}
+public func personAssignmentsForFaceObservations(faceObservationIds: [Int64])async  -> [PersonFaceAssignmentRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_person_assignments_for_face_observations(FfiConverterSequenceInt64.lower(faceObservationIds)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypePersonFaceAssignmentRecord.lift,
+            errorHandler: nil
+
+        )
+}
+public func personFaceObservationIds(personId: Int64)async  -> [Int64]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_person_face_observation_ids(FfiConverterInt64.lower(personId)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceInt64.lift,
+            errorHandler: nil
+
+        )
+}
+public func personSummaries()async  -> [PersonSummaryRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_person_summaries(
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypePersonSummaryRecord.lift,
+            errorHandler: nil
+
+        )
 }
 public func projectRawJpegVisibleIds(ids: [Int64], applyRawJpegCollapse: Bool)async  -> [Int64]  {
     return
@@ -6264,7 +6502,7 @@ public func queryImageIds(predicates: [QueryPredicate], connectors: [Connector],
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func queryImages(predicates: [QueryPredicate], connectors: [Connector], limit: UInt32, offset: UInt32, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, mediaType: MediaType)async  -> [ImageRecord]  {
@@ -6279,7 +6517,7 @@ public func queryImages(predicates: [QueryPredicate], connectors: [Connector], l
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeImageRecord.lift,
             errorHandler: nil
-            
+
         )
 }
 public func queryImagesGallery(predicates: [QueryPredicate], connectors: [Connector], limit: UInt32, offset: UInt32, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, applySimilarPhotoCollapse: Bool, similarAlgorithmVersion: String, mediaType: MediaType)async  -> [ImageRecord]  {
@@ -6294,7 +6532,7 @@ public func queryImagesGallery(predicates: [QueryPredicate], connectors: [Connec
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeImageRecord.lift,
             errorHandler: nil
-            
+
         )
 }
 public func queryImagesScoped(predicates: [QueryPredicate], connectors: [Connector], scopePredicates: [QueryPredicate], scopeConnectors: [Connector], limit: UInt32, offset: UInt32, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, mediaType: MediaType)async  -> [ImageRecord]  {
@@ -6309,7 +6547,7 @@ public func queryImagesScoped(predicates: [QueryPredicate], connectors: [Connect
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeImageRecord.lift,
             errorHandler: nil
-            
+
         )
 }
 public func queryImagesScopedGallery(predicates: [QueryPredicate], connectors: [Connector], scopePredicates: [QueryPredicate], scopeConnectors: [Connector], limit: UInt32, offset: UInt32, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, applySimilarPhotoCollapse: Bool, similarAlgorithmVersion: String, mediaType: MediaType)async  -> [ImageRecord]  {
@@ -6324,7 +6562,7 @@ public func queryImagesScopedGallery(predicates: [QueryPredicate], connectors: [
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeImageRecord.lift,
             errorHandler: nil
-            
+
         )
 }
 public func recoverInterruptedAnalysisJobs(jobKind: String, terminalStatus: String, lastError: String?)async  -> UInt64  {
@@ -6339,7 +6577,7 @@ public func recoverInterruptedAnalysisJobs(jobKind: String, terminalStatus: Stri
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func relocateFilePathPrefix(oldPrefix: String, newPrefix: String)async  -> RelocateResult  {
@@ -6354,7 +6592,7 @@ public func relocateFilePathPrefix(oldPrefix: String, newPrefix: String)async  -
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeRelocateResult_lift,
             errorHandler: nil
-            
+
         )
 }
 public func removeImagesByIds(ids: [Int64])async  -> UInt64  {
@@ -6369,7 +6607,7 @@ public func removeImagesByIds(ids: [Int64])async  -> UInt64  {
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func removeImagesForFilters(pathPrefix: String, datePrefix: String)async  -> Int64  {
@@ -6384,7 +6622,7 @@ public func removeImagesForFilters(pathPrefix: String, datePrefix: String)async 
             freeFunc: ffi_photolibrariancore_rust_future_free_i64,
             liftFunc: FfiConverterInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func removeImagesFromCollections(ids: [Int64], labels: [String])async  -> UInt64  {
@@ -6399,7 +6637,7 @@ public func removeImagesFromCollections(ids: [Int64], labels: [String])async  ->
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func removeKeywordForIds(ids: [Int64], path: String)async  -> UInt64  {
@@ -6414,7 +6652,7 @@ public func removeKeywordForIds(ids: [Int64], path: String)async  -> UInt64  {
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func renameKeyword(targetPath: [String], newLabel: String)async  -> UInt64  {
@@ -6429,7 +6667,7 @@ public func renameKeyword(targetPath: [String], newLabel: String)async  -> UInt6
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func reparentKeyword(sourcePath: [String], newParent: [String])async  -> UInt64  {
@@ -6444,7 +6682,7 @@ public func reparentKeyword(sourcePath: [String], newParent: [String])async  -> 
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func replaceFaceClusterRun(run: FaceClusterRunRecord, members: [FaceClusterMemberRecord])async  -> UInt64  {
@@ -6459,7 +6697,7 @@ public func replaceFaceClusterRun(run: FaceClusterRunRecord, members: [FaceClust
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func replaceSimilarPhotoGroups(members: [SimilarPhotoGroupMember], algorithmVersion: String)async  -> UInt64  {
@@ -6474,7 +6712,7 @@ public func replaceSimilarPhotoGroups(members: [SimilarPhotoGroupMember], algori
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func replaceSimilarPhotoGroupsForIds(ids: [Int64], members: [SimilarPhotoGroupMember], algorithmVersion: String)async  -> UInt64  {
@@ -6489,7 +6727,7 @@ public func replaceSimilarPhotoGroupsForIds(ids: [Int64], members: [SimilarPhoto
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func requestCancelAnalysisJob(id: Int64)async  -> Bool  {
@@ -6504,7 +6742,7 @@ public func requestCancelAnalysisJob(id: Int64)async  -> Bool  {
             freeFunc: ffi_photolibrariancore_rust_future_free_i8,
             liftFunc: FfiConverterBool.lift,
             errorHandler: nil
-            
+
         )
 }
 public func restoreKeywordForIds(ids: [Int64], path: String)async  -> UInt64  {
@@ -6519,7 +6757,7 @@ public func restoreKeywordForIds(ids: [Int64], path: String)async  -> UInt64  {
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func saveQuery(name: String, predicates: [QueryPredicate], connectors: [Connector])async  -> SavedQueryInfo?  {
@@ -6534,7 +6772,7 @@ public func saveQuery(name: String, predicates: [QueryPredicate], connectors: [C
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeSavedQueryInfo.lift,
             errorHandler: nil
-            
+
         )
 }
 public func similarPhotoCandidates(algorithmVersion: String)async  -> [SimilarPhotoCandidate]  {
@@ -6549,7 +6787,7 @@ public func similarPhotoCandidates(algorithmVersion: String)async  -> [SimilarPh
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeSimilarPhotoCandidate.lift,
             errorHandler: nil
-            
+
         )
 }
 public func similarPhotoCandidatesForIds(ids: [Int64], algorithmVersion: String)async  -> [SimilarPhotoCandidate]  {
@@ -6564,7 +6802,7 @@ public func similarPhotoCandidatesForIds(ids: [Int64], algorithmVersion: String)
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeSimilarPhotoCandidate.lift,
             errorHandler: nil
-            
+
         )
 }
 public func similarPhotoFeatureprintsForIds(ids: [Int64], algorithmVersion: String)async  -> [SimilarPhotoFeatureprint]  {
@@ -6579,7 +6817,7 @@ public func similarPhotoFeatureprintsForIds(ids: [Int64], algorithmVersion: Stri
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeSimilarPhotoFeatureprint.lift,
             errorHandler: nil
-            
+
         )
 }
 public func similarPhotoStackMembersForIds(ids: [Int64], algorithmVersion: String)async  -> [SimilarPhotoStackMember]  {
@@ -6594,7 +6832,7 @@ public func similarPhotoStackMembersForIds(ids: [Int64], algorithmVersion: Strin
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeSimilarPhotoStackMember.lift,
             errorHandler: nil
-            
+
         )
 }
 public func similarPhotoStackSummariesForIds(ids: [Int64], algorithmVersion: String)async  -> [SimilarPhotoStackSummary]  {
@@ -6609,7 +6847,7 @@ public func similarPhotoStackSummariesForIds(ids: [Int64], algorithmVersion: Str
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeSimilarPhotoStackSummary.lift,
             errorHandler: nil
-            
+
         )
 }
 public func updateAnalysisJobBreadcrumb(id: Int64, currentImageId: Int64?, currentFilePath: String?, timedOut: Bool)async  -> AnalysisJob?  {
@@ -6624,7 +6862,7 @@ public func updateAnalysisJobBreadcrumb(id: Int64, currentImageId: Int64?, curre
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeAnalysisJob.lift,
             errorHandler: nil
-            
+
         )
 }
 public func updateAnalysisJobProgress(id: Int64, processedDelta: UInt64, completedDelta: UInt64, skippedDelta: UInt64, failedDelta: UInt64, updatedDelta: UInt64, totalCandidateCount: UInt64?)async  -> AnalysisJob?  {
@@ -6639,7 +6877,7 @@ public func updateAnalysisJobProgress(id: Int64, processedDelta: UInt64, complet
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeAnalysisJob.lift,
             errorHandler: nil
-            
+
         )
 }
 public func updateColorLabelForIds(ids: [Int64], colorLabel: String?)async  -> UInt64  {
@@ -6654,7 +6892,7 @@ public func updateColorLabelForIds(ids: [Int64], colorLabel: String?)async  -> U
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func updateDirectorySyncStates(states: [DirectorySyncState])async  -> UInt64  {
@@ -6669,7 +6907,7 @@ public func updateDirectorySyncStates(states: [DirectorySyncState])async  -> UIn
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func updateFlagForIds(ids: [Int64], flag: String?)async  -> UInt64  {
@@ -6684,7 +6922,7 @@ public func updateFlagForIds(ids: [Int64], flag: String?)async  -> UInt64  {
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func updateFocusAnalysisResults(results: [FocusAnalysisResult])async  -> UInt64  {
@@ -6699,7 +6937,7 @@ public func updateFocusAnalysisResults(results: [FocusAnalysisResult])async  -> 
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func updateImageColorLabel(filePath: String, colorLabel: String?)async  -> Bool  {
@@ -6714,7 +6952,7 @@ public func updateImageColorLabel(filePath: String, colorLabel: String?)async  -
             freeFunc: ffi_photolibrariancore_rust_future_free_i8,
             liftFunc: FfiConverterBool.lift,
             errorHandler: nil
-            
+
         )
 }
 public func updateImageFlag(filePath: String, flag: String?)async  -> Bool  {
@@ -6729,7 +6967,7 @@ public func updateImageFlag(filePath: String, flag: String?)async  -> Bool  {
             freeFunc: ffi_photolibrariancore_rust_future_free_i8,
             liftFunc: FfiConverterBool.lift,
             errorHandler: nil
-            
+
         )
 }
 public func updateImageRating(filePath: String, rating: UInt32)async  -> Bool  {
@@ -6744,7 +6982,7 @@ public func updateImageRating(filePath: String, rating: UInt32)async  -> Bool  {
             freeFunc: ffi_photolibrariancore_rust_future_free_i8,
             liftFunc: FfiConverterBool.lift,
             errorHandler: nil
-            
+
         )
 }
 public func updateImageRotation(filePath: String, degrees: Int32)async  -> Bool  {
@@ -6759,7 +6997,7 @@ public func updateImageRotation(filePath: String, degrees: Int32)async  -> Bool 
             freeFunc: ffi_photolibrariancore_rust_future_free_i8,
             liftFunc: FfiConverterBool.lift,
             errorHandler: nil
-            
+
         )
 }
 public func updateRatingForIds(ids: [Int64], rating: UInt32)async  -> UInt64  {
@@ -6774,7 +7012,7 @@ public func updateRatingForIds(ids: [Int64], rating: UInt32)async  -> UInt64  {
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func upsertFaceEmbeddings(records: [FaceEmbeddingVectorRecord])async  -> FaceEmbeddingStoreResult  {
@@ -6789,7 +7027,7 @@ public func upsertFaceEmbeddings(records: [FaceEmbeddingVectorRecord])async  -> 
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeFaceEmbeddingStoreResult_lift,
             errorHandler: nil
-            
+
         )
 }
 public func upsertSimilarPhotoFeatureprints(entries: [SimilarPhotoFeatureprint], algorithmVersion: String)async  -> UInt64  {
@@ -6804,7 +7042,7 @@ public func upsertSimilarPhotoFeatureprints(entries: [SimilarPhotoFeatureprint],
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 public func upsertSimilarPhotoGroupsForIds(ids: [Int64], members: [SimilarPhotoGroupMember], algorithmVersion: String)async  -> UInt64  {
@@ -6819,7 +7057,7 @@ public func upsertSimilarPhotoGroupsForIds(ids: [Int64], members: [SimilarPhotoG
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
             errorHandler: nil
-            
+
         )
 }
 
@@ -6851,6 +7089,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_assign_color_keyword_for_ids() != 11425) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_assign_face_observations_to_person() != 29864) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_assign_keyword_for_ids() != 32359) {
@@ -7058,6 +7299,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_parse_filename() != 30612) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_person_assignments_for_face_observations() != 41276) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_person_face_observation_ids() != 53319) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_person_summaries() != 22840) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_project_raw_jpeg_visible_ids() != 8495) {

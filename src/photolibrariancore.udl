@@ -476,6 +476,18 @@ namespace photolibrariancore {
     [Async]
     PersonClusterAcceptResult accept_face_cluster_as_person(string run_id, i64 cluster_id, string person_name);
 
+    [Async]
+    sequence<PersonSummaryRecord> person_summaries();
+
+    [Async]
+    sequence<PersonFaceAssignmentRecord> person_assignments_for_face_observations(sequence<i64> face_observation_ids);
+
+    [Async]
+    sequence<i64> person_face_observation_ids(i64 person_id);
+
+    [Async]
+    PersonClusterAcceptResult assign_face_observations_to_person(sequence<i64> face_observation_ids, string person_name);
+
     // Similar-photo grouping (S94): Swift computes Vision feature-print groups
     // after Intelligent Culling and persists only multi-photo memberships here.
     [Async]
@@ -1080,6 +1092,21 @@ dictionary PersonClusterAcceptResult {
     string keyword_path;
     string status;
     string message;
+};
+
+dictionary PersonSummaryRecord {
+    i64 person_id;
+    string person_name;
+    u64 assigned_face_count;
+    u64 image_count;
+};
+
+dictionary PersonFaceAssignmentRecord {
+    i64 face_observation_id;
+    i64 person_id;
+    string person_name;
+    i64 image_id;
+    u32 face_index;
 };
 
 dictionary AnalysisJob {
