@@ -455,6 +455,16 @@ namespace photolibrariancore {
     );
 
     [Async]
+    sequence<FaceSearchMatchRecord> face_embedding_search_vector(
+        sequence<f32> seed_vector,
+        sequence<i64> candidate_image_ids,
+        string model_version,
+        string preprocessing_version,
+        f64 threshold,
+        u32 limit
+    );
+
+    [Async]
     u64 replace_face_cluster_run(FaceClusterRunRecord run, sequence<FaceClusterMemberRecord> members);
 
     [Async]

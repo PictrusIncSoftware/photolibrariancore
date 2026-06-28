@@ -4887,15 +4887,12 @@ fn project_raw_jpeg_visible_ids_impl(
     conn: &Connection,
     ids: &[i64],
     apply_raw_jpeg_collapse: bool,
-) -> Vec<i64>
-{
-    if ids.is_empty()
-    {
+) -> Vec<i64> {
+    if ids.is_empty() {
         return Vec::new();
     }
 
-    if !apply_raw_jpeg_collapse
-    {
+    if !apply_raw_jpeg_collapse {
         return ids.to_vec();
     }
 
@@ -4936,21 +4933,17 @@ fn project_raw_jpeg_visible_ids_impl(
         values
     );
 
-    let mut stmt = match conn.prepare(&query_sql)
-    {
+    let mut stmt = match conn.prepare(&query_sql) {
         Ok(s) => s,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to prepare RAW/JPEG projection query: {}", e);
             return Vec::new();
         }
     };
 
-    let rows = match stmt.query_map([], |row| row.get::<_, i64>(1))
-    {
+    let rows = match stmt.query_map([], |row| row.get::<_, i64>(1)) {
         Ok(r) => r,
-        Err(e) =>
-        {
+        Err(e) => {
             eprintln!("Failed to execute RAW/JPEG projection query: {}", e);
             return Vec::new();
         }
@@ -4958,14 +4951,10 @@ fn project_raw_jpeg_visible_ids_impl(
 
     let mut seen = std::collections::HashSet::<i64>::new();
     let mut projected = Vec::<i64>::new();
-    for row_result in rows
-    {
-        match row_result
-        {
-            Ok(id) =>
-            {
-                if seen.insert(id)
-                {
+    for row_result in rows {
+        match row_result {
+            Ok(id) => {
+                if seen.insert(id) {
                     projected.push(id);
                 }
             }
@@ -4982,14 +4971,11 @@ fn project_raw_jpeg_visible_ids_impl(
 pub async fn project_raw_jpeg_visible_ids(
     ids: Vec<i64>,
     apply_raw_jpeg_collapse: bool,
-) -> Vec<i64>
-{
+) -> Vec<i64> {
     let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref()
-    {
+    let conn = match catalogue.as_ref() {
         Some(c) => c,
-        None =>
-        {
+        None => {
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
@@ -8360,6 +8346,27 @@ pub async fn face_embedding_search(
         .unwrap_or_default()
 }
 
+pub async fn face_embedding_search_vector(
+    seed_vector: Vec<f32>,
+    candidate_image_ids: Vec<i64>,
+    model_version: String,
+    preprocessing_version: String,
+    threshold: f64,
+    limit: u32,
+) -> Vec<FaceSearchMatchRecord> {
+    FACE_EMBEDDING_RUNTIME
+        .spawn(face_embedding_search_vector_impl(
+            seed_vector,
+            candidate_image_ids,
+            model_version,
+            preprocessing_version,
+            threshold,
+            limit,
+        ))
+        .await
+        .unwrap_or_default()
+}
+
 async fn face_embedding_search_impl(
     seed_face_observation_ids: Vec<i64>,
     candidate_image_ids: Vec<i64>,
@@ -8433,6 +8440,86 @@ async fn face_embedding_search_impl(
                 _ => {
                     best_by_image.insert(candidate.image_id, match_record);
                 }
+            }
+        }
+    }
+
+    let mut matches = best_by_image.into_values().collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        right
+            .cosine
+            .partial_cmp(&left.cosine)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(left.image_id.cmp(&right.image_id))
+            .then(left.face_observation_id.cmp(&right.face_observation_id))
+    });
+
+    if limit > 0 {
+        matches.truncate(limit as usize);
+    }
+    matches
+}
+
+async fn face_embedding_search_vector_impl(
+    seed_vector: Vec<f32>,
+    candidate_image_ids: Vec<i64>,
+    model_version: String,
+    preprocessing_version: String,
+    threshold: f64,
+    limit: u32,
+) -> Vec<FaceSearchMatchRecord> {
+    if seed_vector.is_empty() || !seed_vector.iter().all(|value| value.is_finite()) {
+        return Vec::new();
+    }
+
+    let records = stored_face_embeddings(&model_version, &preprocessing_version).await;
+    if records.is_empty() {
+        return Vec::new();
+    }
+
+    let candidate_ids = if candidate_image_ids.is_empty() {
+        None
+    } else {
+        Some(
+            candidate_image_ids
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+        )
+    };
+    let threshold = if threshold.is_finite() {
+        threshold
+    } else {
+        0.0
+    };
+
+    let mut best_by_image = std::collections::HashMap::<i64, FaceSearchMatchRecord>::new();
+    for candidate in records.iter() {
+        if let Some(candidate_ids) = &candidate_ids {
+            if !candidate_ids.contains(&candidate.image_id) {
+                continue;
+            }
+        }
+
+        let cosine = cosine_f32(&seed_vector, &candidate.vector);
+        if cosine < threshold {
+            continue;
+        }
+
+        let match_record = FaceSearchMatchRecord {
+            image_id: candidate.image_id,
+            face_observation_id: candidate.face_observation_id,
+            seed_face_observation_id: 0,
+            face_index: candidate.face_index,
+            cosine,
+        };
+
+        match best_by_image.get(&candidate.image_id) {
+            Some(existing)
+                if existing.cosine > cosine
+                    || (existing.cosine == cosine
+                        && existing.face_observation_id <= candidate.face_observation_id) => {}
+            _ => {
+                best_by_image.insert(candidate.image_id, match_record);
             }
         }
     }
@@ -14195,8 +14282,7 @@ mod query_builder_tests {
     }
 
     #[test]
-    fn ordered_id_projection_collapses_raw_hits_to_visible_jpeg()
-    {
+    fn ordered_id_projection_collapses_raw_hits_to_visible_jpeg() {
         let conn = Connection::open_in_memory().expect("in-memory db");
         conn.execute_batch(
             "CREATE TABLE images (

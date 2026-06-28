@@ -5585,6 +5585,21 @@ public func faceEmbeddingSearch(seedFaceObservationIds: [Int64], candidateImageI
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeFaceSearchMatchRecord.lift,
             errorHandler: nil
+
+        )
+}
+public func faceEmbeddingSearchVector(seedVector: [Float], candidateImageIds: [Int64], modelVersion: String, preprocessingVersion: String, threshold: Double, limit: UInt32)async  -> [FaceSearchMatchRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_face_embedding_search_vector(FfiConverterSequenceFloat.lower(seedVector),FfiConverterSequenceInt64.lower(candidateImageIds),FfiConverterString.lower(modelVersion),FfiConverterString.lower(preprocessingVersion),FfiConverterDouble.lower(threshold),FfiConverterUInt32.lower(limit)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeFaceSearchMatchRecord.lift,
+            errorHandler: nil
             
         )
 }
@@ -6908,6 +6923,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_face_embedding_search() != 34390) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_face_embedding_search_vector() != 46484) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_face_observation_count() != 35248) {

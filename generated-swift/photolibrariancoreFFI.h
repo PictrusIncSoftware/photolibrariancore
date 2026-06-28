@@ -391,6 +391,11 @@ uint64_t uniffi_photolibrariancore_fn_func_face_embedding_nearest_neighbors(Rust
 uint64_t uniffi_photolibrariancore_fn_func_face_embedding_search(RustBuffer seed_face_observation_ids, RustBuffer candidate_image_ids, RustBuffer model_version, RustBuffer preprocessing_version, double threshold, uint32_t limit
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_FACE_EMBEDDING_SEARCH_VECTOR
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_FACE_EMBEDDING_SEARCH_VECTOR
+uint64_t uniffi_photolibrariancore_fn_func_face_embedding_search_vector(RustBuffer seed_vector, RustBuffer candidate_image_ids, RustBuffer model_version, RustBuffer preprocessing_version, double threshold, uint32_t limit
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_FACE_OBSERVATION_COUNT
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_FN_FUNC_FACE_OBSERVATION_COUNT
 uint64_t uniffi_photolibrariancore_fn_func_face_observation_count(RustBuffer algorithm_version
@@ -1248,6 +1253,12 @@ uint16_t uniffi_photolibrariancore_checksum_func_face_embedding_search(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_FACE_EMBEDDING_SEARCH_VECTOR
+#define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_FACE_EMBEDDING_SEARCH_VECTOR
+uint16_t uniffi_photolibrariancore_checksum_func_face_embedding_search_vector(void
+
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_FACE_OBSERVATION_COUNT
 #define UNIFFI_FFIDEF_UNIFFI_PHOTOLIBRARIANCORE_CHECKSUM_FUNC_FACE_OBSERVATION_COUNT
 uint16_t uniffi_photolibrariancore_checksum_func_face_observation_count(void
@@ -1752,4 +1763,3 @@ uint32_t ffi_photolibrariancore_uniffi_contract_version(void
     
 );
 #endif
-
