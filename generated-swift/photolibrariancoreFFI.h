@@ -1808,4 +1808,3 @@ uint32_t ffi_photolibrariancore_uniffi_contract_version(void
 
 );
 #endif
-
