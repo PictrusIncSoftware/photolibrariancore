@@ -510,6 +510,24 @@ pub struct PersonFaceAssignmentRecord {
     pub face_index: u32,
 }
 
+/// One representative face per named person — the assigned face observation
+/// with the highest stored capture quality that is actually croppable
+/// (usable bbox + a source path for the analyzed image). Feeds the keyword
+/// dropdown's face-recognition view (person name + face crop). A person whose
+/// faces are all uncroppable is simply absent; the UI shows the name alone.
+#[derive(Debug, Clone)]
+pub struct PersonRepresentativeFaceRecord {
+    pub person_id: i64,
+    pub person_name: String,
+    pub face_observation_id: i64,
+    pub analyzed_image_id: i64,
+    pub analyzed_file_path: String,
+    pub bounding_box_x: f64,
+    pub bounding_box_y: f64,
+    pub bounding_box_width: f64,
+    pub bounding_box_height: f64,
+}
+
 /// Durable coordinator row for enrichment / intelligent-culling work.
 ///
 /// The current focus analyzer still runs in Swift, but the job identity and
@@ -9033,6 +9051,80 @@ pub async fn person_summaries() -> Vec<PersonSummaryRecord> {
     person_summaries_impl(conn)
 }
 
+fn person_representative_faces_impl(conn: &Connection) -> Vec<PersonRepresentativeFaceRecord> {
+    let mut stmt = match conn.prepare(
+        "SELECT person_id, person_name, face_observation_id, analyzed_image_id,
+                analyzed_file_path,
+                bounding_box_x, bounding_box_y, bounding_box_width, bounding_box_height
+         FROM (
+             SELECT
+                 p.id AS person_id,
+                 p.display_name AS person_name,
+                 f.id AS face_observation_id,
+                 f.analyzed_image_id AS analyzed_image_id,
+                 i.file_path AS analyzed_file_path,
+                 f.bounding_box_x, f.bounding_box_y,
+                 f.bounding_box_width, f.bounding_box_height,
+                 ROW_NUMBER() OVER (
+                     PARTITION BY p.id
+                     ORDER BY f.face_capture_quality DESC NULLS LAST, f.id
+                 ) AS quality_rank
+             FROM person p
+             JOIN person_face_assignment a ON a.person_id = p.id
+             JOIN face_observation f ON f.id = a.face_observation_id
+             JOIN images i ON i.id = f.analyzed_image_id
+             WHERE i.file_path IS NOT NULL
+               AND f.bounding_box_width IS NOT NULL
+               AND f.bounding_box_height IS NOT NULL
+               AND f.bounding_box_width > 0
+               AND f.bounding_box_height > 0
+         )
+         WHERE quality_rank = 1
+         ORDER BY lower(person_name), person_name",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            eprintln!("person_representative_faces: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let rows = match stmt.query_map([], |row| {
+        Ok(PersonRepresentativeFaceRecord {
+            person_id: row.get(0)?,
+            person_name: row.get(1)?,
+            face_observation_id: row.get(2)?,
+            analyzed_image_id: row.get(3)?,
+            analyzed_file_path: row.get(4)?,
+            bounding_box_x: row.get(5)?,
+            bounding_box_y: row.get(6)?,
+            bounding_box_width: row.get(7)?,
+            bounding_box_height: row.get(8)?,
+        })
+    }) {
+        Ok(rows) => rows,
+        Err(e) => {
+            eprintln!("person_representative_faces: query {}", e);
+            return Vec::new();
+        }
+    };
+
+    rows.filter_map(|row| row.ok()).collect()
+}
+
+pub async fn person_representative_faces() -> Vec<PersonRepresentativeFaceRecord> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    person_representative_faces_impl(conn)
+}
+
 fn person_assignments_for_face_observations_impl(
     conn: &Connection,
     face_observation_ids: &[i64],
@@ -11585,6 +11677,7 @@ mod face_cluster_tests {
 
              CREATE TABLE images (
                  id INTEGER PRIMARY KEY,
+                 file_path TEXT,
                  is_video BOOLEAN NOT NULL DEFAULT FALSE
              );
 
@@ -11592,7 +11685,12 @@ mod face_cluster_tests {
                  id INTEGER PRIMARY KEY,
                  image_id INTEGER NOT NULL,
                  analyzed_image_id INTEGER NOT NULL,
-                 face_index INTEGER NOT NULL
+                 face_index INTEGER NOT NULL,
+                 face_capture_quality DOUBLE,
+                 bounding_box_x DOUBLE,
+                 bounding_box_y DOUBLE,
+                 bounding_box_width DOUBLE,
+                 bounding_box_height DOUBLE
              );
 
              CREATE SEQUENCE keyword_id_seq START 1;
@@ -11894,6 +11992,53 @@ mod face_cluster_tests {
         assert_eq!(repeat.status, "assigned");
         assert_eq!(repeat.person_id, result.person_id);
         assert_eq!(repeat.keyword_row_count, 0);
+    }
+
+    #[test]
+    fn person_representative_faces_pick_best_croppable_face_per_person() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO images (id, file_path, is_video) VALUES
+                 (501, '/t/a.jpg', FALSE),
+                 (502, '/t/b.jpg', FALSE),
+                 (503, '/t/c.jpg', FALSE)",
+            [],
+        )
+        .expect("images");
+        // Person A: face 61 (quality 0.4) vs face 62 (quality 0.9) → 62 wins.
+        // Person B: face 63 has the TOP quality but NO bbox (uncroppable) →
+        //           face 64 (quality 0.2, croppable) wins.
+        // Person C: face 65 has no bbox at all → absent from the list.
+        conn.execute(
+            "INSERT INTO face_observation
+                 (id, image_id, analyzed_image_id, face_index, face_capture_quality,
+                  bounding_box_x, bounding_box_y, bounding_box_width, bounding_box_height)
+             VALUES
+                 (61, 501, 501, 0, 0.4, 0.1, 0.1, 0.2, 0.2),
+                 (62, 502, 502, 0, 0.9, 0.3, 0.3, 0.25, 0.25),
+                 (63, 503, 503, 0, 0.95, NULL, NULL, NULL, NULL),
+                 (64, 501, 501, 1, 0.2, 0.5, 0.5, 0.15, 0.15),
+                 (65, 502, 502, 1, 0.7, NULL, NULL, NULL, NULL)",
+            [],
+        )
+        .expect("face observations");
+
+        assign_face_observations_to_person_impl(&conn, &[61, 62], "Ada");
+        assign_face_observations_to_person_impl(&conn, &[63, 64], "Ben");
+        assign_face_observations_to_person_impl(&conn, &[65], "Cleo");
+
+        let representatives = person_representative_faces_impl(&conn);
+        assert_eq!(representatives.len(), 2);
+
+        assert_eq!(representatives[0].person_name, "Ada");
+        assert_eq!(representatives[0].face_observation_id, 62);
+        assert_eq!(representatives[0].analyzed_image_id, 502);
+        assert_eq!(representatives[0].analyzed_file_path, "/t/b.jpg");
+        assert!((representatives[0].bounding_box_width - 0.25).abs() < 1e-9);
+
+        assert_eq!(representatives[1].person_name, "Ben");
+        assert_eq!(representatives[1].face_observation_id, 64);
+        assert_eq!(representatives[1].analyzed_file_path, "/t/a.jpg");
     }
 
     #[test]

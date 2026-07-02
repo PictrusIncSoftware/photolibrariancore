@@ -479,6 +479,12 @@ namespace photolibrariancore {
     [Async]
     sequence<PersonSummaryRecord> person_summaries();
 
+    // One best-quality croppable face per named person (feeds the keyword
+    // dropdown's face-recognition view). A person whose faces are all
+    // uncroppable is absent from the list.
+    [Async]
+    sequence<PersonRepresentativeFaceRecord> person_representative_faces();
+
     [Async]
     sequence<PersonFaceAssignmentRecord> person_assignments_for_face_observations(sequence<i64> face_observation_ids);
 
@@ -1116,6 +1122,18 @@ dictionary PersonFaceAssignmentRecord {
     string person_name;
     i64 image_id;
     u32 face_index;
+};
+
+dictionary PersonRepresentativeFaceRecord {
+    i64 person_id;
+    string person_name;
+    i64 face_observation_id;
+    i64 analyzed_image_id;
+    string analyzed_file_path;
+    double bounding_box_x;
+    double bounding_box_y;
+    double bounding_box_width;
+    double bounding_box_height;
 };
 
 dictionary AnalysisJob {
