@@ -188,6 +188,20 @@ namespace photolibrariancore {
         MediaType media_type
     );
 
+    // Browse ⌘A with "Collapse similar photos" on: the same id projection with
+    // the gallery's similar-stack visible-representative filter, so the
+    // whole-query selection matches the collapsed table exactly.
+    [Async]
+    sequence<i64> query_image_ids_gallery(
+        sequence<QueryPredicate> predicates,
+        sequence<Connector> connectors,
+        boolean apply_duplicate_filter,
+        boolean apply_raw_jpeg_collapse,
+        boolean apply_similar_photo_collapse,
+        string similar_algorithm_version,
+        MediaType media_type
+    );
+
     [Async]
     sequence<ImageRecord> get_images_by_ids(sequence<i64> ids);
 

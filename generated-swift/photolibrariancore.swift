@@ -6642,6 +6642,21 @@ public func queryImageIds(predicates: [QueryPredicate], connectors: [Connector],
             
         )
 }
+public func queryImageIdsGallery(predicates: [QueryPredicate], connectors: [Connector], applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, applySimilarPhotoCollapse: Bool, similarAlgorithmVersion: String, mediaType: MediaType)async  -> [Int64]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_query_image_ids_gallery(FfiConverterSequenceTypeQueryPredicate.lower(predicates),FfiConverterSequenceTypeConnector.lower(connectors),FfiConverterBool.lower(applyDuplicateFilter),FfiConverterBool.lower(applyRawJpegCollapse),FfiConverterBool.lower(applySimilarPhotoCollapse),FfiConverterString.lower(similarAlgorithmVersion),FfiConverterTypeMediaType_lower(mediaType)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func queryImages(predicates: [QueryPredicate], connectors: [Connector], limit: UInt32, offset: UInt32, applyDuplicateFilter: Bool, applyRawJpegCollapse: Bool, mediaType: MediaType)async  -> [ImageRecord]  {
     return
         try!  await uniffiRustCallAsync(
@@ -7457,6 +7472,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_query_image_ids() != 35971) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_query_image_ids_gallery() != 19699) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_query_images() != 21638) {

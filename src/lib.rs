@@ -4796,6 +4796,8 @@ fn execute_id_projection_query(
     where_clause: &str,
     apply_duplicate_filter: bool,
     apply_raw_jpeg_collapse: bool,
+    apply_similar_photo_collapse: bool,
+    similar_algorithm_version: &str,
     media_type: MediaType,
 ) -> Vec<i64> {
     let mut inner_predicates: Vec<&str> = Vec::new();
@@ -4818,19 +4820,75 @@ fn execute_id_projection_query(
         format!("WHERE {}", inner_predicates.join(" AND "))
     };
 
-    let query_sql = if apply_duplicate_filter {
+    // Similar-photo collapse mirrors execute_image_record_query exactly: an
+    // OUTER visible-representative filter over the rows that survive the inner
+    // predicates, so the id set matches the collapsed page contents.
+    let similar_join =
+        similar_photo_join_clause(apply_similar_photo_collapse, similar_algorithm_version);
+    let effective_similar_collapse = apply_similar_photo_collapse && !similar_join.is_empty();
+    let needs_outer_filter = apply_duplicate_filter || effective_similar_collapse;
+
+    let query_sql = if needs_outer_filter {
+        let duplicate_filter = if apply_duplicate_filter {
+            Some(DUPLICATE_FILTER_PREDICATE)
+        } else {
+            None
+        };
+        let similar_filter = if effective_similar_collapse {
+            Some(SIMILAR_COLLAPSE_PREDICATE)
+        } else {
+            None
+        };
+        let outer_filters = [duplicate_filter, similar_filter]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<&str>>()
+            .join(" AND ");
+        let duplicate_projection = if apply_duplicate_filter {
+            format!(", {}", DUPLICATE_GROUP_ID_CASE)
+        } else {
+            String::new()
+        };
+        let similar_inner_projection = if effective_similar_collapse {
+            ", spgm.group_id AS similar_group_id, image_kind AS similar_image_kind"
+        } else {
+            ""
+        };
+        let inner_select = format!(
+            r#"
+            SELECT
+                id
+                {}
+                {}
+            FROM images
+            {}
+            {}
+        "#,
+            duplicate_projection, similar_inner_projection, similar_join, inner_where
+        );
+        let filtered_source = if effective_similar_collapse {
+            format!(
+                r#"
+                SELECT
+                    *,
+                    {}
+                FROM (
+                    {}
+                )
+            "#,
+                SIMILAR_VISIBLE_ID_PROJECTION, inner_select
+            )
+        } else {
+            inner_select
+        };
         format!(
             r#"
             SELECT id FROM (
-                SELECT
-                    id,
-                    {}
-                FROM images
                 {}
             )
             WHERE {}
         "#,
-            DUPLICATE_GROUP_ID_CASE, inner_where, DUPLICATE_FILTER_PREDICATE
+            filtered_source, outer_filters
         )
     } else {
         format!("SELECT id FROM images {}", inner_where)
@@ -4889,6 +4947,43 @@ pub async fn query_image_ids(
         &where_clause,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
+        false,
+        "",
+        media_type,
+    )
+}
+
+/// Browse ⌘A when "Collapse similar photos" is on: the id projection with the
+/// same OUTER similar-stack visible-representative filter the gallery page
+/// queries use, so the whole-query selection is EXACTLY the visible rows.
+/// Browse's plain `query_image_ids` stays byte-identical for the collapse-off
+/// path.
+pub async fn query_image_ids_gallery(
+    predicates: Vec<QueryPredicate>,
+    connectors: Vec<Connector>,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+    apply_similar_photo_collapse: bool,
+    similar_algorithm_version: String,
+    media_type: MediaType,
+) -> Vec<i64> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    let where_clause = build_filter_predicate(&predicates, &connectors);
+    execute_id_projection_query(
+        conn,
+        &where_clause,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+        apply_similar_photo_collapse,
+        &similar_algorithm_version,
         media_type,
     )
 }
@@ -15606,6 +15701,35 @@ mod query_builder_tests {
             MediaType::StillsOnly,
         );
         assert_eq!(count, 1);
+
+        // Browse ⌘A parity (query_image_ids_gallery's engine): the id
+        // projection with similar collapse must return exactly the visible
+        // representative — matching the record/count helpers above.
+        let collapsed_ids = execute_id_projection_query(
+            &conn,
+            "",
+            false,
+            true,
+            true,
+            "v-test",
+            MediaType::StillsOnly,
+        );
+        assert_eq!(collapsed_ids, vec![2]);
+
+        // Collapse off (the pinned false/"" path) still selects every
+        // physical row that survives the inner filters — byte-identical to
+        // the pre-gallery projection.
+        let mut uncollapsed_ids = execute_id_projection_query(
+            &conn,
+            "",
+            false,
+            false,
+            false,
+            "",
+            MediaType::StillsOnly,
+        );
+        uncollapsed_ids.sort_unstable();
+        assert_eq!(uncollapsed_ids, vec![1, 2, 3, 4]);
     }
 
     #[test]
