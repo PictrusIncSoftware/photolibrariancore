@@ -422,6 +422,56 @@ pub struct FaceEmbeddingStoreResult {
     pub message: String,
 }
 
+// === Backup / Restore (S111; Docs/DESIGN-Backup-Restore.md) ===
+
+/// Catalogue counts for the backup manifest — one FFI call gathers the
+/// facts the Settings backup list shows before any restore is committed.
+#[derive(Debug, Clone)]
+pub struct BackupCounts {
+    pub image_count: u64,
+    pub video_count: u64,
+    pub keyword_row_count: u64,
+    pub person_count: u64,
+    pub face_observation_count: u64,
+    pub face_embedding_count: u64,
+}
+
+/// Pre-merge census for the additive restore's confirmation / batch-prompt
+/// dialog. `backup_readable = false` means the backup catalogue could not
+/// be attached (nothing was changed).
+#[derive(Debug, Clone)]
+pub struct MergeCounts {
+    pub backup_readable: bool,
+    pub new_image_count: u64,
+    pub colliding_image_count: u64,
+}
+
+/// Collision policy for the additive restore. Identity is `file_path`;
+/// the winner takes the WHOLE record (metadata columns AND child rows) —
+/// never a field blend. The "ask" setting resolves to one of these two in
+/// the app's batch prompt before the merge FFI is called.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeCollisionPolicy {
+    CurrentWins,
+    BackupWins,
+}
+
+/// What the additive restore actually did, for the app's summary alert.
+#[derive(Debug, Clone)]
+pub struct MergeSummary {
+    pub succeeded: bool,
+    pub message: String,
+    pub images_added: u64,
+    pub images_replaced: u64,
+    pub images_kept_current: u64,
+    pub keyword_rows_added: u64,
+    pub persons_added: u64,
+    pub face_observations_added: u64,
+    pub face_embeddings_copied: u64,
+    pub stack_members_added: u64,
+    pub saved_queries_added: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct FaceEmbeddingNeighborRecord {
     pub query_face_observation_id: i64,
@@ -911,14 +961,47 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         }
     }
 
+    // Open the database and run the full schema/migration pass. The body
+    // lives in open_and_migrate_catalogue (S111, backup/restore) so the
+    // additive-restore path can bring an unzipped BACKUP catalogue file up
+    // to the current schema through the exact same code, without touching
+    // the global connection.
+    let conn = match open_and_migrate_catalogue(&path) {
+        Some(c) => c,
+        None => return false,
+    };
+
+    // Store the connection in the global state
+    // This connection will be reused by all subsequent catalogue operations
+    // Mutex ensures thread-safe access when called from multiple Swift async tasks
+    let mut catalogue = CATALOGUE.lock().unwrap();
+    *catalogue = Some(conn);
+
+    let mut stored_path = CATALOGUE_PATH.lock().unwrap();
+    *stored_path = Some(path);
+
+    true
+}
+
+/// Open a catalogue database file and run the FULL schema-creation +
+/// migration pass on it (CREATE TABLE IF NOT EXISTS + ALTER ... IF NOT
+/// EXISTS + backfills + CHECKPOINT), returning the open connection.
+///
+/// Extracted from initialize_catalogue (S111, backup/restore) so the
+/// additive restore can migrate an unzipped BACKUP catalogue to the current
+/// schema before ATTACHing it read-only — the merge SQL then never reasons
+/// about historical schemas. This helper NEVER touches the CATALOGUE /
+/// CATALOGUE_PATH globals; initialize_catalogue is the only caller that
+/// stores its result there.
+fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
     // Open or create the database
     // DuckDB's bundled feature ensures the database engine is statically linked
     // (no system library dependency — required for App Store sandboxing)
-    let conn = match Connection::open(&path) {
+    let conn = match Connection::open(path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to open catalogue database: {}", e);
-            return false;
+            return None;
         }
     };
 
@@ -1553,7 +1636,7 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
     // execute_batch is used instead of execute because we're running multiple statements
     if let Err(e) = conn.execute_batch(schema) {
         eprintln!("Failed to create catalogue schema: {}", e);
-        return false;
+        return None;
     }
 
     // EXPERIMENT 4: Verify the actual schema that was created
@@ -1597,7 +1680,7 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
     // are skipped.
     if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         eprintln!("[migration] Failed to begin transaction: {}", e);
-        return false;
+        return None;
     }
 
     // Step 1: backfill file_stem and image_kind.
@@ -1717,7 +1800,7 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
 
     if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("[migration] Failed to commit migration transaction: {}", e);
-        return false;
+        return None;
     }
 
     // DuckDB 1.2.2 can fail WAL replay when a pending ALTER TABLE ADD COLUMN is
@@ -1729,20 +1812,11 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
             "[migration] Failed to checkpoint catalogue after schema migration: {}",
             e
         );
-        return false;
+        return None;
     }
     // --- End backfill migration --------------------------------------------
 
-    // Store the connection in the global state
-    // This connection will be reused by all subsequent catalogue operations
-    // Mutex ensures thread-safe access when called from multiple Swift async tasks
-    let mut catalogue = CATALOGUE.lock().unwrap();
-    *catalogue = Some(conn);
-
-    let mut stored_path = CATALOGUE_PATH.lock().unwrap();
-    *stored_path = Some(path);
-
-    true
+    Some(conn)
 }
 
 /// Ingest a batch of image metadata records into the catalogue
@@ -11691,6 +11765,907 @@ pub async fn merge_lightroom_videos(records: Vec<LightroomVideoRecord>) -> Merge
     merge_videos_into(conn, &records)
 }
 
+// ============================================================================
+// === Backup / Restore (S111; Docs/DESIGN-Backup-Restore.md) =================
+// ============================================================================
+//
+// Backup is Swift-owned (whole files into a zip); the core contributes:
+//   - checkpoint_catalogue()            fold the WAL into catalogue.db before copy
+//   - backup_manifest_counts()          the manifest facts
+//   - count_merge_candidates()          the additive restore's pre-merge census
+//   - merge_catalogue_from_backup()     the additive merge itself
+//
+// The merge ATTACHes the (already unzipped, freshly migrated) backup
+// catalogue READ_ONLY beside the live one and works in INSERT ... SELECT
+// with an old-id -> new-id map held in TEMPORARY tables — never
+// entry-by-entry round trips. DuckDB writes stay serial (the single global
+// connection lock is held for the whole SQL phase). LanceDB face vectors
+// are then copied under the NEW face-observation ids — never re-embedded.
+
+/// Fold the WAL into catalogue.db (`CHECKPOINT;`) so a quiescent file copy
+/// captures one clean database file. The same statement the migration path
+/// already runs at startup.
+pub async fn checkpoint_catalogue() -> bool {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("checkpoint_catalogue: catalogue not initialized");
+            return false;
+        }
+    };
+    match conn.execute_batch("CHECKPOINT;") {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("checkpoint_catalogue: {}", e);
+            false
+        }
+    }
+}
+
+/// Catalogue counts for the backup manifest. The DuckDB counts run under
+/// the global lock; the LanceDB total hops to the embedding runtime AFTER
+/// the lock is released.
+pub async fn backup_manifest_counts() -> BackupCounts {
+    let (image_count, video_count, keyword_row_count, person_count, face_observation_count) = {
+        let catalogue = CATALOGUE.lock().unwrap();
+        match catalogue.as_ref() {
+            Some(conn) => {
+                let one = |sql: &str| -> u64 {
+                    conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+                        .unwrap_or(0)
+                        .max(0) as u64
+                };
+                (
+                    one("SELECT COUNT(*) FROM images WHERE is_video IS NOT TRUE"),
+                    one("SELECT COUNT(*) FROM images WHERE is_video IS TRUE"),
+                    one("SELECT COUNT(*) FROM keyword"),
+                    one("SELECT COUNT(*) FROM person"),
+                    one("SELECT COUNT(*) FROM face_observation"),
+                )
+            }
+            None => (0, 0, 0, 0, 0),
+        }
+    };
+    let face_embedding_count = FACE_EMBEDDING_RUNTIME
+        .spawn(face_embedding_total_count())
+        .await
+        .unwrap_or(0);
+    BackupCounts {
+        image_count,
+        video_count,
+        keyword_row_count,
+        person_count,
+        face_observation_count,
+        face_embedding_count,
+    }
+}
+
+/// Pre-merge census: how many backup photos are NEW to the live catalogue
+/// and how many COLLIDE (same file_path). Drives the confirmation dialog
+/// and the "ask me" batch prompt before merge_catalogue_from_backup runs.
+pub async fn count_merge_candidates(backup_db_path: String) -> MergeCounts {
+    let unreadable = MergeCounts {
+        backup_readable: false,
+        new_image_count: 0,
+        colliding_image_count: 0,
+    };
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("count_merge_candidates: catalogue not initialized");
+            return unreadable;
+        }
+    };
+    count_merge_candidates_impl(conn, &backup_db_path)
+}
+
+fn count_merge_candidates_impl(conn: &Connection, backup_db_path: &str) -> MergeCounts {
+    let unreadable = MergeCounts {
+        backup_readable: false,
+        new_image_count: 0,
+        colliding_image_count: 0,
+    };
+
+    // Best-effort cleanup of a stale attach from an interrupted earlier run,
+    // then attach read-only. Every historical schema has images.file_path,
+    // so the census needs no migration of the backup file.
+    let _ = conn.execute_batch("DETACH plbackup;");
+    if let Err(e) = conn.execute_batch(&format!(
+        "ATTACH {} AS plbackup (READ_ONLY);",
+        sql_string_literal(backup_db_path)
+    )) {
+        eprintln!("count_merge_candidates: attach failed: {}", e);
+        return unreadable;
+    }
+
+    let new_count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM plbackup.images b \
+             WHERE NOT EXISTS (SELECT 1 FROM images i WHERE i.file_path = b.file_path)",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(-1);
+    let colliding_count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM plbackup.images b \
+             WHERE EXISTS (SELECT 1 FROM images i WHERE i.file_path = b.file_path)",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(-1);
+
+    let _ = conn.execute_batch("DETACH plbackup;");
+
+    if new_count < 0 || colliding_count < 0 {
+        return unreadable;
+    }
+    MergeCounts {
+        backup_readable: true,
+        new_image_count: new_count as u64,
+        colliding_image_count: colliding_count as u64,
+    }
+}
+
+/// One merged face observation: the old backup id, its new live id, and the
+/// live identity fields the copied LanceDB vector row must carry.
+#[derive(Debug, Clone)]
+struct MergedFaceRef {
+    old_id: i64,
+    new_id: i64,
+    image_id: i64,
+    analyzed_image_id: i64,
+    face_index: u32,
+}
+
+/// The additive restore's merge. `backup_db_path` is the catalogue.db the
+/// app unzipped to a temp directory; `backup_vectors_path` is the unzipped
+/// vectors.lancedb directory (may be absent — faces then stay unindexed
+/// until the next index build heals them). See DESIGN-Backup-Restore.md §7.
+pub async fn merge_catalogue_from_backup(
+    backup_db_path: String,
+    backup_vectors_path: String,
+    policy: MergeCollisionPolicy,
+) -> MergeSummary {
+    let fail = |message: String| MergeSummary {
+        succeeded: false,
+        message,
+        images_added: 0,
+        images_replaced: 0,
+        images_kept_current: 0,
+        keyword_rows_added: 0,
+        persons_added: 0,
+        face_observations_added: 0,
+        face_embeddings_copied: 0,
+        stack_members_added: 0,
+        saved_queries_added: 0,
+    };
+
+    // Step 1: bring the backup file up to the CURRENT schema through the
+    // exact code every launch runs (open_and_migrate_catalogue never touches
+    // the global connection). The merge SQL below then never reasons about
+    // historical schemas. The connection is dropped before the read-only
+    // attach.
+    {
+        let migrated = open_and_migrate_catalogue(std::path::Path::new(&backup_db_path));
+        match migrated {
+            Some(conn) => drop(conn),
+            None => {
+                return fail(
+                    "The backup catalogue could not be opened or migrated.".to_string(),
+                )
+            }
+        }
+    }
+
+    // Step 2: the SQL merge, under the global connection lock (DuckDB writes
+    // stay serial; concurrent read FFIs simply queue on the mutex).
+    let (summary, merged_faces, replaced_live_face_ids) = {
+        let catalogue = CATALOGUE.lock().unwrap();
+        let conn = match catalogue.as_ref() {
+            Some(c) => c,
+            None => return fail("Catalogue not initialized.".to_string()),
+        };
+        match merge_catalogue_sql(conn, &backup_db_path, policy) {
+            Ok(parts) => parts,
+            Err(message) => return fail(message),
+        }
+    };
+
+    // Step 3: copy the LanceDB face vectors under the NEW face-observation
+    // ids (outside the DuckDB lock, on the embedding runtime). A failure
+    // here is non-fatal by design: the observations exist, so the next
+    // Build Face Recognition Index heals the gap.
+    let mut summary = summary;
+    summary.face_embeddings_copied = FACE_EMBEDDING_RUNTIME
+        .spawn(copy_face_embeddings_for_merge(
+            backup_vectors_path,
+            merged_faces,
+            replaced_live_face_ids,
+        ))
+        .await
+        .unwrap_or(0);
+    summary
+}
+
+/// Column names of `database.main.table` in declaration order, via
+/// duckdb_columns() (the system function initialize_catalogue already
+/// leans on for schema introspection).
+fn table_columns(conn: &Connection, database: &str, table: &str) -> Result<Vec<String>, String> {
+    let sql = format!(
+        "SELECT column_name FROM duckdb_columns() \
+         WHERE database_name = {} AND schema_name = 'main' AND table_name = {} \
+         ORDER BY column_index",
+        sql_string_literal(database),
+        sql_string_literal(table)
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("column introspection prepare failed: {}", e))?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("column introspection failed: {}", e))?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        return Err(format!(
+            "no columns found for {}.main.{}",
+            database, table
+        ));
+    }
+    Ok(names)
+}
+
+/// The live catalogue's database name (attached-database-qualified
+/// introspection needs it; for a file `catalogue.db` this is "catalogue").
+fn current_database_name(conn: &Connection) -> Result<String, String> {
+    conn.query_row("SELECT current_database()", [], |row| {
+        row.get::<_, String>(0)
+    })
+    .map_err(|e| format!("current_database() failed: {}", e))
+}
+
+/// Shared columns of one table across the live and backup catalogues, in
+/// the live table's declaration order. Both sides just ran the same
+/// migration so the sets are normally identical — the intersection is
+/// drift-proofing, not a feature.
+fn shared_table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
+    let live_db = current_database_name(conn)?;
+    let live_cols = table_columns(conn, &live_db, table)?;
+    let backup_cols = table_columns(conn, "plbackup", table)?;
+    let backup_set: std::collections::HashSet<&str> =
+        backup_cols.iter().map(|s| s.as_str()).collect();
+    Ok(live_cols
+        .into_iter()
+        .filter(|name| backup_set.contains(name.as_str()))
+        .collect())
+}
+
+fn changed_count(result: Result<usize, duckdb::Error>, what: &str) -> Result<u64, String> {
+    result
+        .map(|n| n as u64)
+        .map_err(|e| format!("{} failed: {}", what, e))
+}
+
+/// The SQL half of the additive merge. Attaches, builds the id maps, moves
+/// every merging table in dependency order inside ONE transaction, and
+/// returns the summary plus what the vector copy needs. Temp tables and the
+/// attach are cleaned up on every path.
+fn merge_catalogue_sql(
+    conn: &Connection,
+    backup_db_path: &str,
+    policy: MergeCollisionPolicy,
+) -> Result<(MergeSummary, Vec<MergedFaceRef>, Vec<i64>), String> {
+    let _ = conn.execute_batch("DETACH plbackup;");
+    conn.execute_batch(&format!(
+        "ATTACH {} AS plbackup (READ_ONLY);",
+        sql_string_literal(backup_db_path)
+    ))
+    .map_err(|e| format!("Could not attach the backup catalogue: {}", e))?;
+
+    let result = merge_catalogue_sql_inner(conn, policy);
+
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    let _ = conn.execute_batch(
+        "DROP TABLE IF EXISTS plmerge_map; \
+         DROP TABLE IF EXISTS plface_obs_map; \
+         DROP TABLE IF EXISTS plperson_map; \
+         DROP TABLE IF EXISTS plquery_map; \
+         DROP TABLE IF EXISTS plstack_copy;",
+    );
+    let _ = conn.execute_batch("DETACH plbackup;");
+    result
+}
+
+fn merge_catalogue_sql_inner(
+    conn: &Connection,
+    policy: MergeCollisionPolicy,
+) -> Result<(MergeSummary, Vec<MergedFaceRef>, Vec<i64>), String> {
+    let backup_wins = policy == MergeCollisionPolicy::BackupWins;
+    // Which map rows' CHILD data copies: new images always; collisions only
+    // under backup-wins (current-wins means the backup contributes NOTHING
+    // for that photo — the whole-record rule).
+    let copy_pred = if backup_wins { "TRUE" } else { "m.is_new" };
+
+    // Stale temp tables from an interrupted earlier merge would corrupt the
+    // maps — clear them before starting.
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS plmerge_map; \
+         DROP TABLE IF EXISTS plface_obs_map; \
+         DROP TABLE IF EXISTS plperson_map; \
+         DROP TABLE IF EXISTS plquery_map; \
+         DROP TABLE IF EXISTS plstack_copy;",
+    )
+    .map_err(|e| format!("temp-table cleanup failed: {}", e))?;
+
+    // Column lists BEFORE the transaction: shared columns (live ∩ backup) in
+    // live declaration order, so a future column added on only one side can
+    // never break the copy.
+    let image_cols = shared_table_columns(conn, "images")?;
+    let image_copy_cols: Vec<&String> =
+        image_cols.iter().filter(|c| c.as_str() != "id").collect();
+    let image_update_cols: Vec<&String> = image_cols
+        .iter()
+        .filter(|c| c.as_str() != "id" && c.as_str() != "file_path")
+        .collect();
+    let keyword_cols = shared_table_columns(conn, "keyword")?;
+    let keyword_copy_cols: Vec<&String> = keyword_cols
+        .iter()
+        .filter(|c| c.as_str() != "id" && c.as_str() != "image_id")
+        .collect();
+    let face_cols = shared_table_columns(conn, "face_observation")?;
+    let face_copy_cols: Vec<&String> = face_cols
+        .iter()
+        .filter(|c| {
+            c.as_str() != "id" && c.as_str() != "image_id" && c.as_str() != "analyzed_image_id"
+        })
+        .collect();
+
+    conn.execute_batch("BEGIN TRANSACTION;")
+        .map_err(|e| format!("BEGIN failed: {}", e))?;
+
+    // --- The image id map: every backup image gets exactly one row.
+    // New paths draw fresh ids from the live sequence; collisions map to
+    // the existing live id (child references like analyzed_image_id resolve
+    // through the map regardless of policy).
+    conn.execute_batch(
+        "CREATE TEMPORARY TABLE plmerge_map AS \
+         SELECT b.id AS old_id, nextval('images_id_seq') AS new_id, TRUE AS is_new \
+         FROM plbackup.images b \
+         WHERE NOT EXISTS (SELECT 1 FROM images i WHERE i.file_path = b.file_path);",
+    )
+    .map_err(|e| format!("merge map (new rows) failed: {}", e))?;
+    conn.execute_batch(
+        "INSERT INTO plmerge_map \
+         SELECT b.id, i.id, FALSE \
+         FROM plbackup.images b JOIN images i ON i.file_path = b.file_path;",
+    )
+    .map_err(|e| format!("merge map (collisions) failed: {}", e))?;
+
+    let colliding_count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM plmerge_map WHERE NOT is_new",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| format!("collision count failed: {}", e))? as u64;
+
+    // --- Backup-wins pre-work: capture the live face-observation ids being
+    // replaced (their LanceDB vectors are deleted after commit), then remove
+    // the collided photos' live child rows — the whole-record swap.
+    let mut replaced_live_face_ids: Vec<i64> = Vec::new();
+    let mut images_replaced = 0u64;
+    if backup_wins && colliding_count > 0 {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id FROM face_observation \
+                 WHERE image_id IN (SELECT new_id FROM plmerge_map WHERE NOT is_new)",
+            )
+            .map_err(|e| format!("replaced-face census prepare failed: {}", e))?;
+        replaced_live_face_ids = stmt
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(|e| format!("replaced-face census failed: {}", e))?
+            .filter_map(Result::ok)
+            .collect();
+        drop(stmt);
+
+        conn.execute_batch(
+            "DELETE FROM person_face_assignment WHERE face_observation_id IN \
+                 (SELECT id FROM face_observation WHERE image_id IN \
+                     (SELECT new_id FROM plmerge_map WHERE NOT is_new)); \
+             DELETE FROM face_observation WHERE image_id IN \
+                 (SELECT new_id FROM plmerge_map WHERE NOT is_new); \
+             DELETE FROM keyword WHERE image_id IN \
+                 (SELECT new_id FROM plmerge_map WHERE NOT is_new); \
+             DELETE FROM similar_photo_group_member WHERE image_id IN \
+                 (SELECT new_id FROM plmerge_map WHERE NOT is_new);",
+        )
+        .map_err(|e| format!("backup-wins child cleanup failed: {}", e))?;
+
+        // Metadata columns update in place from the backup row.
+        let set_clause = image_update_cols
+            .iter()
+            .map(|c| format!("{} = b.{}", c, c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        images_replaced = changed_count(
+            conn.execute(
+                &format!(
+                    "UPDATE images SET {} \
+                     FROM plbackup.images b JOIN plmerge_map m ON m.old_id = b.id \
+                     WHERE NOT m.is_new AND images.id = m.new_id",
+                    set_clause
+                ),
+                [],
+            ),
+            "backup-wins image update",
+        )?;
+    }
+
+    // --- New images copy with their mapped ids.
+    let insert_cols = image_copy_cols
+        .iter()
+        .map(|c| c.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let select_cols = image_copy_cols
+        .iter()
+        .map(|c| format!("b.{}", c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let images_added = changed_count(
+        conn.execute(
+            &format!(
+                "INSERT INTO images (id, {}) \
+                 SELECT m.new_id, {} \
+                 FROM plbackup.images b JOIN plmerge_map m ON m.old_id = b.id \
+                 WHERE m.is_new",
+                insert_cols, select_cols
+            ),
+            [],
+        ),
+        "image copy",
+    )?;
+
+    // --- Keywords ride the map (label/path/status/origin/collection/color/
+    // is_video all carried; keyword.id defaults from its own sequence).
+    let kw_insert = keyword_copy_cols
+        .iter()
+        .map(|c| c.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let kw_select = keyword_copy_cols
+        .iter()
+        .map(|c| format!("k.{}", c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let keyword_rows_added = changed_count(
+        conn.execute(
+            &format!(
+                "INSERT INTO keyword (image_id, {}) \
+                 SELECT m.new_id, {} \
+                 FROM plbackup.keyword k JOIN plmerge_map m ON m.old_id = k.image_id \
+                 WHERE {}",
+                kw_insert, kw_select, copy_pred
+            ),
+            [],
+        ),
+        "keyword copy",
+    )?;
+
+    // --- People: match by normalized_name (existing person reused), then
+    // copy the rest. All backup persons copy — one with no merged faces is
+    // harmless and its People/<Name> keyword rows may have ridden along.
+    conn.execute_batch(
+        "CREATE TEMPORARY TABLE plperson_map AS \
+         SELECT bp.id AS old_id, lp.id AS new_id, FALSE AS is_new \
+         FROM plbackup.person bp JOIN person lp ON lp.normalized_name = bp.normalized_name;",
+    )
+    .map_err(|e| format!("person map (matches) failed: {}", e))?;
+    conn.execute_batch(
+        "INSERT INTO plperson_map \
+         SELECT bp.id, nextval('person_id_seq'), TRUE \
+         FROM plbackup.person bp \
+         WHERE NOT EXISTS \
+             (SELECT 1 FROM person lp WHERE lp.normalized_name = bp.normalized_name);",
+    )
+    .map_err(|e| format!("person map (new rows) failed: {}", e))?;
+    let persons_added = changed_count(
+        conn.execute(
+            "INSERT INTO person (id, display_name, normalized_name, created_at, updated_at) \
+             SELECT pm.new_id, bp.display_name, bp.normalized_name, bp.created_at, bp.updated_at \
+             FROM plbackup.person bp JOIN plperson_map pm ON pm.old_id = bp.id \
+             WHERE pm.is_new",
+            [],
+        ),
+        "person copy",
+    )?;
+
+    // --- Face observations: fresh ids, image references through the map.
+    // analyzed_image_id falls back to the image itself if the backup row
+    // referenced an image that no longer exists in the backup catalogue.
+    conn.execute_batch(&format!(
+        "CREATE TEMPORARY TABLE plface_obs_map AS \
+         SELECT f.id AS old_id, nextval('face_observation_id_seq') AS new_id \
+         FROM plbackup.face_observation f JOIN plmerge_map m ON m.old_id = f.image_id \
+         WHERE {};",
+        copy_pred
+    ))
+    .map_err(|e| format!("face-observation map failed: {}", e))?;
+
+    let face_insert = face_copy_cols
+        .iter()
+        .map(|c| c.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let face_select = face_copy_cols
+        .iter()
+        .map(|c| format!("f.{}", c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let face_observations_added = changed_count(
+        conn.execute(
+            &format!(
+                "INSERT INTO face_observation (id, image_id, analyzed_image_id, {}) \
+                 SELECT fm.new_id, mi.new_id, COALESCE(ma.new_id, mi.new_id), {} \
+                 FROM plbackup.face_observation f \
+                 JOIN plface_obs_map fm ON fm.old_id = f.id \
+                 JOIN plmerge_map mi ON mi.old_id = f.image_id \
+                 LEFT JOIN plmerge_map ma ON ma.old_id = f.analyzed_image_id",
+                face_insert, face_select
+            ),
+            [],
+        ),
+        "face-observation copy",
+    )?;
+
+    // --- Person-face assignments follow the copied observations.
+    conn.execute(
+        "INSERT INTO person_face_assignment \
+             (face_observation_id, person_id, image_id, analyzed_image_id, face_index, \
+              assignment_source, face_cluster_run_id, face_cluster_id, model_version, \
+              preprocessing_version, threshold, confidence_cosine, created_at, updated_at) \
+         SELECT fm.new_id, pm.new_id, mi.new_id, COALESCE(ma.new_id, mi.new_id), a.face_index, \
+                a.assignment_source, a.face_cluster_run_id, a.face_cluster_id, a.model_version, \
+                a.preprocessing_version, a.threshold, a.confidence_cosine, a.created_at, a.updated_at \
+         FROM plbackup.person_face_assignment a \
+         JOIN plface_obs_map fm ON fm.old_id = a.face_observation_id \
+         JOIN plperson_map pm ON pm.old_id = a.person_id \
+         JOIN plmerge_map mi ON mi.old_id = a.image_id \
+         LEFT JOIN plmerge_map ma ON ma.old_id = a.analyzed_image_id",
+        [],
+    )
+    .map_err(|e| format!("person-face assignment copy failed: {}", e))?;
+
+    // --- Similar-photo stacks: memberships copy only for images that came
+    // from the backup in this merge; a group reduced below 2 members drops;
+    // the new group id / representative is the lowest member id (the S94
+    // convention).
+    conn.execute_batch(&format!(
+        "CREATE TEMPORARY TABLE plstack_copy AS \
+         SELECT m.new_id AS image_id, s.group_id AS old_group, s.member_rank, \
+                s.distance_to_representative, s.algorithm_version, s.threshold, s.created_at \
+         FROM plbackup.similar_photo_group_member s \
+         JOIN plmerge_map m ON m.old_id = s.image_id \
+         WHERE {};",
+        copy_pred
+    ))
+    .map_err(|e| format!("stack staging failed: {}", e))?;
+    conn.execute_batch(
+        "DELETE FROM plstack_copy WHERE old_group IN \
+             (SELECT old_group FROM plstack_copy GROUP BY old_group HAVING COUNT(*) < 2);",
+    )
+    .map_err(|e| format!("stack subset rule failed: {}", e))?;
+    let stack_members_added = changed_count(
+        conn.execute(
+            "INSERT INTO similar_photo_group_member \
+                 (image_id, group_id, representative_id, member_rank, \
+                  distance_to_representative, algorithm_version, threshold, created_at) \
+             SELECT sc.image_id, g.new_group, g.new_group, sc.member_rank, \
+                    sc.distance_to_representative, sc.algorithm_version, sc.threshold, sc.created_at \
+             FROM plstack_copy sc \
+             JOIN (SELECT old_group, MIN(image_id) AS new_group \
+                   FROM plstack_copy GROUP BY old_group) g \
+               ON g.old_group = sc.old_group",
+            [],
+        ),
+        "stack copy",
+    )?;
+
+    // --- Saved queries: the S66 skip-if-name-exists rule.
+    conn.execute_batch(
+        "CREATE TEMPORARY TABLE plquery_map AS \
+         SELECT bq.id AS old_id, nextval('saved_query_id_seq') AS new_id \
+         FROM plbackup.saved_query bq \
+         WHERE NOT EXISTS (SELECT 1 FROM saved_query s WHERE s.name = bq.name);",
+    )
+    .map_err(|e| format!("saved-query map failed: {}", e))?;
+    let saved_queries_added = changed_count(
+        conn.execute(
+            "INSERT INTO saved_query (id, name, created_at) \
+             SELECT qm.new_id, bq.name, bq.created_at \
+             FROM plbackup.saved_query bq JOIN plquery_map qm ON qm.old_id = bq.id",
+            [],
+        ),
+        "saved-query copy",
+    )?;
+    conn.execute(
+        "INSERT INTO saved_query_criterion \
+             (query_id, position, connector, kind, op, value, day, day_end, stars, num, num_end) \
+         SELECT qm.new_id, c.position, c.connector, c.kind, c.op, c.value, c.day, c.day_end, \
+                c.stars, c.num, c.num_end \
+         FROM plbackup.saved_query_criterion c JOIN plquery_map qm ON qm.old_id = c.query_id",
+        [],
+    )
+    .map_err(|e| format!("saved-query criterion copy failed: {}", e))?;
+
+    // --- What the vector copy needs: old id -> new id plus the LIVE
+    // identity fields the copied vector rows must carry.
+    let mut stmt = conn
+        .prepare(
+            "SELECT fm.old_id, fm.new_id, f.image_id, f.analyzed_image_id, f.face_index \
+             FROM plface_obs_map fm JOIN face_observation f ON f.id = fm.new_id",
+        )
+        .map_err(|e| format!("merged-face readback prepare failed: {}", e))?;
+    let merged_faces = stmt
+        .query_map([], |row| {
+            Ok(MergedFaceRef {
+                old_id: row.get::<_, i64>(0)?,
+                new_id: row.get::<_, i64>(1)?,
+                image_id: row.get::<_, i64>(2)?,
+                analyzed_image_id: row.get::<_, i64>(3)?,
+                face_index: row.get::<_, i64>(4)?.max(0) as u32,
+            })
+        })
+        .map_err(|e| format!("merged-face readback failed: {}", e))?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    drop(stmt);
+
+    conn.execute_batch("COMMIT;")
+        .map_err(|e| format!("COMMIT failed: {}", e))?;
+
+    // Keep the WAL folded after a large write burst (the same hygiene the
+    // startup migration applies).
+    if let Err(e) = conn.execute_batch("CHECKPOINT;") {
+        eprintln!("merge_catalogue_sql: post-merge checkpoint failed: {}", e);
+    }
+
+    let images_kept_current = if backup_wins { 0 } else { colliding_count };
+    let summary = MergeSummary {
+        succeeded: true,
+        message: "Merge complete.".to_string(),
+        images_added,
+        images_replaced,
+        images_kept_current,
+        keyword_rows_added,
+        persons_added,
+        face_observations_added,
+        face_embeddings_copied: 0,
+        stack_members_added,
+        saved_queries_added,
+    };
+    Ok((summary, merged_faces, replaced_live_face_ids))
+}
+
+/// Copy face-embedding vectors from the backup's LanceDB store into the
+/// live one under the NEW face-observation ids, and delete the vectors of
+/// live observations a backup-wins merge replaced. Runs on the embedding
+/// runtime. Missing store / missing rows are non-fatal (the index builder
+/// heals unindexed faces); returns the number of vectors copied.
+async fn copy_face_embeddings_for_merge(
+    backup_vectors_path: String,
+    merged_faces: Vec<MergedFaceRef>,
+    replaced_live_face_ids: Vec<i64>,
+) -> u64 {
+    // Replaced observations are gone from DuckDB — their vectors must not
+    // linger as neighbor-slot pollution in the live store.
+    if !replaced_live_face_ids.is_empty() {
+        if let Ok(table) = open_face_embedding_table().await {
+            for chunk in replaced_live_face_ids.chunks(500) {
+                let filter = format!(
+                    "face_observation_id IN ({})",
+                    chunk
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                if let Err(e) = table.delete(&filter).await {
+                    eprintln!("merge vector cleanup: delete failed: {}", e);
+                }
+            }
+        }
+    }
+
+    if merged_faces.is_empty() {
+        return 0;
+    }
+
+    let db = match lancedb::connect(&backup_vectors_path).execute().await {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("merge vector copy: backup store connect failed: {}", e);
+            return 0;
+        }
+    };
+    let table = match db.open_table(FACE_EMBEDDING_TABLE).execute().await {
+        Ok(table) => table,
+        Err(_) => {
+            eprintln!(
+                "merge vector copy: backup has no {} table — merged faces stay unindexed until the next index build",
+                FACE_EMBEDDING_TABLE
+            );
+            return 0;
+        }
+    };
+
+    let refs_by_old_id: std::collections::HashMap<i64, &MergedFaceRef> =
+        merged_faces.iter().map(|r| (r.old_id, r)).collect();
+
+    // Re-keyed records grouped by (model, preprocessing, dimension) —
+    // upsert_face_embeddings_impl enforces one contract per call.
+    let mut grouped: std::collections::HashMap<(String, String, u32), Vec<FaceEmbeddingVectorRecord>> =
+        std::collections::HashMap::new();
+
+    for chunk in merged_faces.chunks(500) {
+        let filter = format!(
+            "face_observation_id IN ({})",
+            chunk
+                .iter()
+                .map(|r| r.old_id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let matching = table.count_rows(Some(filter.clone())).await.unwrap_or(0);
+        if matching == 0 {
+            continue;
+        }
+        let batches = match table
+            .query()
+            .only_if(filter)
+            .limit(matching as usize)
+            .execute()
+            .await
+        {
+            Ok(stream) => match stream.try_collect::<Vec<_>>().await {
+                Ok(batches) => batches,
+                Err(e) => {
+                    eprintln!("merge vector copy: collect failed: {}", e);
+                    continue;
+                }
+            },
+            Err(e) => {
+                eprintln!("merge vector copy: query failed: {}", e);
+                continue;
+            }
+        };
+
+        for batch in batches {
+            let Some(face_ids) = batch
+                .column_by_name("face_observation_id")
+                .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+            else {
+                continue;
+            };
+            let Some(model_names) = batch
+                .column_by_name("model_name")
+                .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+            else {
+                continue;
+            };
+            let Some(model_versions) = batch
+                .column_by_name("model_version")
+                .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+            else {
+                continue;
+            };
+            let Some(preprocessing_versions) = batch
+                .column_by_name("preprocessing_version")
+                .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+            else {
+                continue;
+            };
+            let Some(input_sizes) = batch
+                .column_by_name("input_size")
+                .and_then(|array| array.as_any().downcast_ref::<UInt32Array>())
+            else {
+                continue;
+            };
+            let Some(color_orders) = batch
+                .column_by_name("color_order")
+                .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+            else {
+                continue;
+            };
+            let Some(normalizations) = batch
+                .column_by_name("normalization")
+                .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+            else {
+                continue;
+            };
+            let Some(dimensions) = batch
+                .column_by_name("embedding_dimension")
+                .and_then(|array| array.as_any().downcast_ref::<UInt32Array>())
+            else {
+                continue;
+            };
+            let Some(l2_norms) = batch
+                .column_by_name("embedding_l2_norm")
+                .and_then(|array| array.as_any().downcast_ref::<Float64Array>())
+            else {
+                continue;
+            };
+            let Some(vectors) = batch
+                .column_by_name("vector")
+                .and_then(|array| array.as_any().downcast_ref::<FixedSizeListArray>())
+            else {
+                continue;
+            };
+            let Some(values) = vectors
+                .values()
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+            else {
+                continue;
+            };
+
+            let dimension = vectors.value_length().max(0) as usize;
+            for row in 0..batch.num_rows() {
+                let Some(face_ref) = refs_by_old_id.get(&face_ids.value(row)) else {
+                    continue;
+                };
+                let start = row * dimension;
+                let end = start + dimension;
+                if end > values.len() {
+                    continue;
+                }
+                let record = FaceEmbeddingVectorRecord {
+                    face_observation_id: face_ref.new_id,
+                    image_id: face_ref.image_id,
+                    analyzed_image_id: face_ref.analyzed_image_id,
+                    face_index: face_ref.face_index,
+                    model_name: model_names.value(row).to_string(),
+                    model_version: model_versions.value(row).to_string(),
+                    preprocessing_version: preprocessing_versions.value(row).to_string(),
+                    input_size: input_sizes.value(row),
+                    color_order: color_orders.value(row).to_string(),
+                    normalization: normalizations.value(row).to_string(),
+                    embedding_dimension: dimensions.value(row),
+                    embedding_l2_norm: l2_norms.value(row),
+                    vector: (start..end).map(|index| values.value(index)).collect(),
+                };
+                grouped
+                    .entry((
+                        record.model_version.clone(),
+                        record.preprocessing_version.clone(),
+                        record.embedding_dimension,
+                    ))
+                    .or_default()
+                    .push(record);
+            }
+        }
+    }
+
+    let mut copied = 0u64;
+    for (_, records) in grouped {
+        let result = upsert_face_embeddings_impl(records).await;
+        if result.status == "stored" {
+            copied += result.stored_count;
+        } else {
+            eprintln!(
+                "merge vector copy: upsert {}: {}",
+                result.status, result.message
+            );
+        }
+    }
+    copied
+}
+
 #[cfg(test)]
 mod face_embedding_tests {
     use super::*;
@@ -17534,4 +18509,349 @@ pub async fn get_external_source_id(image_id: i64) -> Option<String> {
     )
     .ok()
     .flatten()
+}
+
+#[cfg(test)]
+mod backup_restore_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A fresh REAL catalogue file in the temp dir, built through the exact
+    /// open_and_migrate_catalogue path production uses (so the merge SQL is
+    /// tested against the true schema, not a hand-rolled fixture).
+    fn fresh_catalogue(tag: &str) -> (std::path::PathBuf, Connection) {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "plcore-backup-test-{}-{}-{}.db",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+        let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+        (path, conn)
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+    }
+
+    fn insert_image(conn: &Connection, file_path: &str, rating: i64) -> i64 {
+        conn.execute(
+            "INSERT INTO images (file_path, file_size, file_name, created_timestamp, \
+             modified_timestamp, rating) VALUES (?1, 100, ?2, 0, 0, ?3)",
+            params![
+                file_path,
+                file_path.rsplit('/').next().unwrap_or(file_path),
+                rating
+            ],
+        )
+        .expect("insert image");
+        conn.query_row(
+            "SELECT id FROM images WHERE file_path = ?1",
+            params![file_path],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("image id")
+    }
+
+    fn insert_keyword(conn: &Connection, image_id: i64, label: &str) {
+        conn.execute(
+            "INSERT INTO keyword (image_id, label, path) VALUES (?1, ?2, ?2)",
+            params![image_id, label],
+        )
+        .expect("insert keyword");
+    }
+
+    fn insert_face(conn: &Connection, image_id: i64, face_index: i64) -> i64 {
+        conn.execute(
+            "INSERT INTO face_observation (image_id, analyzed_image_id, face_index, \
+             algorithm_version, analysis_run_id, bounding_box_x, bounding_box_y, \
+             bounding_box_width, bounding_box_height) \
+             VALUES (?1, ?1, ?2, 'test-v1', 'test-run', 0.1, 0.1, 0.5, 0.5)",
+            params![image_id, face_index],
+        )
+        .expect("insert face observation");
+        conn.query_row(
+            "SELECT id FROM face_observation WHERE image_id = ?1 AND face_index = ?2",
+            params![image_id, face_index],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("face id")
+    }
+
+    fn insert_person_with_face(conn: &Connection, name: &str, face_id: i64, image_id: i64) {
+        conn.execute(
+            "INSERT INTO person (display_name, normalized_name) VALUES (?1, LOWER(?1))",
+            params![name],
+        )
+        .expect("insert person");
+        let person_id = conn
+            .query_row(
+                "SELECT id FROM person WHERE normalized_name = LOWER(?1)",
+                params![name],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("person id");
+        conn.execute(
+            "INSERT INTO person_face_assignment (face_observation_id, person_id, image_id, \
+             analyzed_image_id, face_index, assignment_source) \
+             VALUES (?1, ?2, ?3, ?3, 0, 'test')",
+            params![face_id, person_id, image_id],
+        )
+        .expect("insert assignment");
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap()
+    }
+
+    #[test]
+    fn count_merge_candidates_censuses_new_and_colliding() {
+        let (live_path, live) = fresh_catalogue("census-live");
+        let (backup_path, backup) = fresh_catalogue("census-backup");
+
+        insert_image(&live, "/photos/shared.jpg", 2);
+        insert_image(&backup, "/photos/shared.jpg", 4);
+        insert_image(&backup, "/photos/only-in-backup.jpg", 5);
+        drop(backup);
+
+        let counts =
+            count_merge_candidates_impl(&live, backup_path.to_string_lossy().as_ref());
+        assert!(counts.backup_readable);
+        assert_eq!(counts.new_image_count, 1);
+        assert_eq!(counts.colliding_image_count, 1);
+
+        cleanup(&live_path);
+        cleanup(&backup_path);
+    }
+
+    #[test]
+    fn merge_current_wins_adds_new_and_keeps_collided_untouched() {
+        let (live_path, live) = fresh_catalogue("cw-live");
+        let (backup_path, backup) = fresh_catalogue("cw-backup");
+
+        // Live: the shared photo, rated 2, with its own keyword.
+        let live_shared = insert_image(&live, "/photos/shared.jpg", 2);
+        insert_keyword(&live, live_shared, "livekw");
+
+        // Backup: the shared photo rated 4 with a different keyword, plus a
+        // new photo carrying a keyword, a named face, and a saved query.
+        let b_shared = insert_image(&backup, "/photos/shared.jpg", 4);
+        insert_keyword(&backup, b_shared, "bakkw");
+        let b_new = insert_image(&backup, "/photos/new.jpg", 5);
+        insert_keyword(&backup, b_new, "newkw");
+        let b_face = insert_face(&backup, b_new, 0);
+        insert_person_with_face(&backup, "James", b_face, b_new);
+        backup
+            .execute_batch(
+                "INSERT INTO saved_query (name) VALUES ('Trip'); \
+                 INSERT INTO saved_query_criterion (query_id, position, kind) \
+                 SELECT id, 1, 'rating_gte' FROM saved_query WHERE name = 'Trip';",
+            )
+            .expect("saved query fixture");
+        drop(backup);
+
+        let (summary, merged_faces, replaced) = merge_catalogue_sql(
+            &live,
+            backup_path.to_string_lossy().as_ref(),
+            MergeCollisionPolicy::CurrentWins,
+        )
+        .expect("merge");
+
+        assert_eq!(summary.images_added, 1);
+        assert_eq!(summary.images_kept_current, 1);
+        assert_eq!(summary.images_replaced, 0);
+        assert_eq!(summary.persons_added, 1);
+        assert_eq!(summary.face_observations_added, 1);
+        assert_eq!(summary.saved_queries_added, 1);
+        assert!(replaced.is_empty());
+
+        // The collided photo is untouched — rating AND keywords.
+        let shared_rating = count(
+            &live,
+            "SELECT rating FROM images WHERE file_path = '/photos/shared.jpg'",
+        );
+        assert_eq!(shared_rating, 2);
+        assert_eq!(
+            count(&live, "SELECT COUNT(*) FROM keyword WHERE label = 'bakkw'"),
+            0
+        );
+        assert_eq!(
+            count(&live, "SELECT COUNT(*) FROM keyword WHERE label = 'livekw'"),
+            1
+        );
+
+        // The new photo arrived with its keyword, face, and named person,
+        // all re-keyed to LIVE ids.
+        let new_id = count(
+            &live,
+            "SELECT id FROM images WHERE file_path = '/photos/new.jpg'",
+        );
+        assert_eq!(
+            count(&live, "SELECT COUNT(*) FROM keyword WHERE label = 'newkw'"),
+            1
+        );
+        let face_image = count(&live, "SELECT image_id FROM face_observation LIMIT 1");
+        assert_eq!(face_image, new_id);
+        assert_eq!(merged_faces.len(), 1);
+        assert_eq!(merged_faces[0].image_id, new_id);
+        assert_eq!(
+            count(
+                &live,
+                "SELECT COUNT(*) FROM person_face_assignment a \
+                 JOIN person p ON p.id = a.person_id WHERE p.display_name = 'James'"
+            ),
+            1
+        );
+
+        // Saved-query criteria followed the copied query.
+        assert_eq!(
+            count(
+                &live,
+                "SELECT COUNT(*) FROM saved_query_criterion c \
+                 JOIN saved_query q ON q.id = c.query_id WHERE q.name = 'Trip'"
+            ),
+            1
+        );
+
+        // A second identical merge is a no-op: everything now collides and
+        // current wins; the saved query skips by name.
+        let (second, _, _) = merge_catalogue_sql(
+            &live,
+            backup_path.to_string_lossy().as_ref(),
+            MergeCollisionPolicy::CurrentWins,
+        )
+        .expect("second merge");
+        assert_eq!(second.images_added, 0);
+        assert_eq!(second.images_kept_current, 2);
+        assert_eq!(second.saved_queries_added, 0);
+        assert_eq!(second.face_observations_added, 0);
+
+        cleanup(&live_path);
+        cleanup(&backup_path);
+    }
+
+    #[test]
+    fn merge_backup_wins_swaps_the_whole_record() {
+        let (live_path, live) = fresh_catalogue("bw-live");
+        let (backup_path, backup) = fresh_catalogue("bw-backup");
+
+        let live_shared = insert_image(&live, "/photos/shared.jpg", 2);
+        insert_keyword(&live, live_shared, "livekw");
+        let live_face = insert_face(&live, live_shared, 0);
+
+        let b_shared = insert_image(&backup, "/photos/shared.jpg", 4);
+        insert_keyword(&backup, b_shared, "bakkw");
+        let b_face = insert_face(&backup, b_shared, 0);
+        insert_person_with_face(&backup, "Janice", b_face, b_shared);
+        drop(backup);
+
+        let (summary, merged_faces, replaced) = merge_catalogue_sql(
+            &live,
+            backup_path.to_string_lossy().as_ref(),
+            MergeCollisionPolicy::BackupWins,
+        )
+        .expect("merge");
+
+        assert_eq!(summary.images_added, 0);
+        assert_eq!(summary.images_replaced, 1);
+        assert_eq!(summary.images_kept_current, 0);
+        assert_eq!(replaced, vec![live_face]);
+
+        // Whole-record swap: rating from the backup, live keyword gone,
+        // backup keyword present, face observation replaced and re-keyed to
+        // the LIVE image id.
+        assert_eq!(
+            count(
+                &live,
+                "SELECT rating FROM images WHERE file_path = '/photos/shared.jpg'"
+            ),
+            4
+        );
+        assert_eq!(
+            count(&live, "SELECT COUNT(*) FROM keyword WHERE label = 'livekw'"),
+            0
+        );
+        assert_eq!(
+            count(&live, "SELECT COUNT(*) FROM keyword WHERE label = 'bakkw'"),
+            1
+        );
+        assert_eq!(
+            count(&live, "SELECT COUNT(*) FROM face_observation"),
+            1
+        );
+        assert_eq!(merged_faces.len(), 1);
+        assert_eq!(merged_faces[0].image_id, live_shared);
+        assert_ne!(merged_faces[0].new_id, live_face);
+        assert_eq!(
+            count(
+                &live,
+                "SELECT COUNT(*) FROM person_face_assignment a \
+                 JOIN person p ON p.id = a.person_id WHERE p.display_name = 'Janice'"
+            ),
+            1
+        );
+
+        cleanup(&live_path);
+        cleanup(&backup_path);
+    }
+
+    #[test]
+    fn merge_drops_stack_groups_reduced_below_two_members() {
+        let (live_path, live) = fresh_catalogue("stack-live");
+        let (backup_path, backup) = fresh_catalogue("stack-backup");
+
+        // Live already has one member of the backup's 2-photo stack.
+        insert_image(&live, "/photos/a.jpg", 0);
+
+        let b_a = insert_image(&backup, "/photos/a.jpg", 0);
+        let b_b = insert_image(&backup, "/photos/b.jpg", 0);
+        let b_c = insert_image(&backup, "/photos/c.jpg", 0);
+        let b_d = insert_image(&backup, "/photos/d.jpg", 0);
+        // Stack 1: a + b (a collides under current-wins -> reduced to 1 -> drops).
+        // Stack 2: c + d (both new -> survives, re-keyed).
+        backup
+            .execute(
+                "INSERT INTO similar_photo_group_member \
+                 (image_id, group_id, representative_id, member_rank, algorithm_version, threshold) \
+                 VALUES (?1, ?1, ?1, 0, 'similar-v4', 7.0), (?2, ?1, ?1, 1, 'similar-v4', 7.0), \
+                        (?3, ?3, ?3, 0, 'similar-v4', 7.0), (?4, ?3, ?3, 1, 'similar-v4', 7.0)",
+                params![b_a, b_b, b_c, b_d],
+            )
+            .expect("stack fixture");
+        drop(backup);
+
+        let (summary, _, _) = merge_catalogue_sql(
+            &live,
+            backup_path.to_string_lossy().as_ref(),
+            MergeCollisionPolicy::CurrentWins,
+        )
+        .expect("merge");
+
+        // Only the c+d stack survives, both members re-keyed, representative
+        // = lowest live member id.
+        assert_eq!(summary.stack_members_added, 2);
+        let member_count = count(&live, "SELECT COUNT(*) FROM similar_photo_group_member");
+        assert_eq!(member_count, 2);
+        let distinct_groups = count(
+            &live,
+            "SELECT COUNT(DISTINCT group_id) FROM similar_photo_group_member",
+        );
+        assert_eq!(distinct_groups, 1);
+        let rep_is_min = count(
+            &live,
+            "SELECT COUNT(*) FROM similar_photo_group_member s \
+             WHERE s.group_id = (SELECT MIN(image_id) FROM similar_photo_group_member) \
+               AND s.representative_id = s.group_id",
+        );
+        assert_eq!(rep_is_min, 2);
+
+        cleanup(&live_path);
+        cleanup(&backup_path);
+    }
 }

@@ -801,6 +801,33 @@ namespace photolibrariancore {
     // malformed/missing extensions.
     // file_name: a filename without directory components (no slashes).
     ParsedFilename parse_filename(string file_name);
+
+    // === Backup / Restore (S111; Docs/DESIGN-Backup-Restore.md) ===
+
+    // Fold the WAL into catalogue.db (CHECKPOINT) so a quiescent file copy
+    // captures one clean database file. Run immediately before the backup
+    // zip streams the appdata directory.
+    [Async]
+    boolean checkpoint_catalogue();
+
+    // Catalogue counts for the backup manifest (the Settings backup list
+    // shows these before any restore is committed).
+    [Async]
+    BackupCounts backup_manifest_counts();
+
+    // Pre-merge census for the additive restore: how many backup photos are
+    // new vs. colliding (same file_path). Drives the confirmation dialog and
+    // the "ask me" batch prompt. Read-only on both catalogues.
+    [Async]
+    MergeCounts count_merge_candidates(string backup_db_path);
+
+    // The additive restore. backup_db_path is the unzipped backup
+    // catalogue.db (it is MIGRATED in place to the current schema first);
+    // backup_vectors_path is the unzipped vectors.lancedb directory. The
+    // collision winner takes the WHOLE record; LanceDB face vectors are
+    // copied under the new face-observation ids, never re-embedded.
+    [Async]
+    MergeSummary merge_catalogue_from_backup(string backup_db_path, string backup_vectors_path, MergeCollisionPolicy policy);
 };
 
 // Image classification categories for JPEG+RAW pair handling.
@@ -1472,4 +1499,50 @@ dictionary RelocateResult {
     boolean ok;
     u64 updated;
     string message;
+};
+
+// === Backup / Restore (S111; Docs/DESIGN-Backup-Restore.md) ===
+
+// Catalogue counts for the backup manifest.
+dictionary BackupCounts {
+    u64 image_count;
+    u64 video_count;
+    u64 keyword_row_count;
+    u64 person_count;
+    u64 face_observation_count;
+    u64 face_embedding_count;
+};
+
+// Pre-merge census for the additive restore's confirmation / batch prompt.
+// backup_readable = false means the backup catalogue could not be attached
+// (nothing was changed).
+dictionary MergeCounts {
+    boolean backup_readable;
+    u64 new_image_count;
+    u64 colliding_image_count;
+};
+
+// Additive-restore collision policy. Identity is file_path; the winner
+// takes the WHOLE record (metadata columns AND child rows). The app's
+// "ask me" setting resolves to one of these two in the batch prompt before
+// the merge FFI is called. Variant order mirrors the Rust enum (UniFFI
+// maps by position).
+enum MergeCollisionPolicy {
+    "CurrentWins",
+    "BackupWins",
+};
+
+// What the additive restore actually did, for the app's summary alert.
+dictionary MergeSummary {
+    boolean succeeded;
+    string message;
+    u64 images_added;
+    u64 images_replaced;
+    u64 images_kept_current;
+    u64 keyword_rows_added;
+    u64 persons_added;
+    u64 face_observations_added;
+    u64 face_embeddings_copied;
+    u64 stack_members_added;
+    u64 saved_queries_added;
 };

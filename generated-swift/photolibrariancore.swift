@@ -740,6 +740,76 @@ public func FfiConverterTypeAnalysisJob_lower(_ value: AnalysisJob) -> RustBuffe
 }
 
 
+public struct BackupCounts: Equatable, Hashable {
+    public var imageCount: UInt64
+    public var videoCount: UInt64
+    public var keywordRowCount: UInt64
+    public var personCount: UInt64
+    public var faceObservationCount: UInt64
+    public var faceEmbeddingCount: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(imageCount: UInt64, videoCount: UInt64, keywordRowCount: UInt64, personCount: UInt64, faceObservationCount: UInt64, faceEmbeddingCount: UInt64) {
+        self.imageCount = imageCount
+        self.videoCount = videoCount
+        self.keywordRowCount = keywordRowCount
+        self.personCount = personCount
+        self.faceObservationCount = faceObservationCount
+        self.faceEmbeddingCount = faceEmbeddingCount
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension BackupCounts: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBackupCounts: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BackupCounts {
+        return
+            try BackupCounts(
+                imageCount: FfiConverterUInt64.read(from: &buf), 
+                videoCount: FfiConverterUInt64.read(from: &buf), 
+                keywordRowCount: FfiConverterUInt64.read(from: &buf), 
+                personCount: FfiConverterUInt64.read(from: &buf), 
+                faceObservationCount: FfiConverterUInt64.read(from: &buf), 
+                faceEmbeddingCount: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: BackupCounts, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.imageCount, into: &buf)
+        FfiConverterUInt64.write(value.videoCount, into: &buf)
+        FfiConverterUInt64.write(value.keywordRowCount, into: &buf)
+        FfiConverterUInt64.write(value.personCount, into: &buf)
+        FfiConverterUInt64.write(value.faceObservationCount, into: &buf)
+        FfiConverterUInt64.write(value.faceEmbeddingCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBackupCounts_lift(_ buf: RustBuffer) throws -> BackupCounts {
+    return try FfiConverterTypeBackupCounts.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBackupCounts_lower(_ value: BackupCounts) -> RustBuffer {
+    return FfiConverterTypeBackupCounts.lower(value)
+}
+
+
 public struct CaptureDayImageCount: Equatable, Hashable {
     public var day: String
     public var imageCount: Int64
@@ -2814,6 +2884,154 @@ public func FfiConverterTypeMergeChunkResult_lower(_ value: MergeChunkResult) ->
 }
 
 
+public struct MergeCounts: Equatable, Hashable {
+    public var backupReadable: Bool
+    public var newImageCount: UInt64
+    public var collidingImageCount: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(backupReadable: Bool, newImageCount: UInt64, collidingImageCount: UInt64) {
+        self.backupReadable = backupReadable
+        self.newImageCount = newImageCount
+        self.collidingImageCount = collidingImageCount
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MergeCounts: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMergeCounts: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MergeCounts {
+        return
+            try MergeCounts(
+                backupReadable: FfiConverterBool.read(from: &buf), 
+                newImageCount: FfiConverterUInt64.read(from: &buf), 
+                collidingImageCount: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MergeCounts, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.backupReadable, into: &buf)
+        FfiConverterUInt64.write(value.newImageCount, into: &buf)
+        FfiConverterUInt64.write(value.collidingImageCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMergeCounts_lift(_ buf: RustBuffer) throws -> MergeCounts {
+    return try FfiConverterTypeMergeCounts.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMergeCounts_lower(_ value: MergeCounts) -> RustBuffer {
+    return FfiConverterTypeMergeCounts.lower(value)
+}
+
+
+public struct MergeSummary: Equatable, Hashable {
+    public var succeeded: Bool
+    public var message: String
+    public var imagesAdded: UInt64
+    public var imagesReplaced: UInt64
+    public var imagesKeptCurrent: UInt64
+    public var keywordRowsAdded: UInt64
+    public var personsAdded: UInt64
+    public var faceObservationsAdded: UInt64
+    public var faceEmbeddingsCopied: UInt64
+    public var stackMembersAdded: UInt64
+    public var savedQueriesAdded: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(succeeded: Bool, message: String, imagesAdded: UInt64, imagesReplaced: UInt64, imagesKeptCurrent: UInt64, keywordRowsAdded: UInt64, personsAdded: UInt64, faceObservationsAdded: UInt64, faceEmbeddingsCopied: UInt64, stackMembersAdded: UInt64, savedQueriesAdded: UInt64) {
+        self.succeeded = succeeded
+        self.message = message
+        self.imagesAdded = imagesAdded
+        self.imagesReplaced = imagesReplaced
+        self.imagesKeptCurrent = imagesKeptCurrent
+        self.keywordRowsAdded = keywordRowsAdded
+        self.personsAdded = personsAdded
+        self.faceObservationsAdded = faceObservationsAdded
+        self.faceEmbeddingsCopied = faceEmbeddingsCopied
+        self.stackMembersAdded = stackMembersAdded
+        self.savedQueriesAdded = savedQueriesAdded
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension MergeSummary: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMergeSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MergeSummary {
+        return
+            try MergeSummary(
+                succeeded: FfiConverterBool.read(from: &buf), 
+                message: FfiConverterString.read(from: &buf), 
+                imagesAdded: FfiConverterUInt64.read(from: &buf), 
+                imagesReplaced: FfiConverterUInt64.read(from: &buf), 
+                imagesKeptCurrent: FfiConverterUInt64.read(from: &buf), 
+                keywordRowsAdded: FfiConverterUInt64.read(from: &buf), 
+                personsAdded: FfiConverterUInt64.read(from: &buf), 
+                faceObservationsAdded: FfiConverterUInt64.read(from: &buf), 
+                faceEmbeddingsCopied: FfiConverterUInt64.read(from: &buf), 
+                stackMembersAdded: FfiConverterUInt64.read(from: &buf), 
+                savedQueriesAdded: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MergeSummary, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.succeeded, into: &buf)
+        FfiConverterString.write(value.message, into: &buf)
+        FfiConverterUInt64.write(value.imagesAdded, into: &buf)
+        FfiConverterUInt64.write(value.imagesReplaced, into: &buf)
+        FfiConverterUInt64.write(value.imagesKeptCurrent, into: &buf)
+        FfiConverterUInt64.write(value.keywordRowsAdded, into: &buf)
+        FfiConverterUInt64.write(value.personsAdded, into: &buf)
+        FfiConverterUInt64.write(value.faceObservationsAdded, into: &buf)
+        FfiConverterUInt64.write(value.faceEmbeddingsCopied, into: &buf)
+        FfiConverterUInt64.write(value.stackMembersAdded, into: &buf)
+        FfiConverterUInt64.write(value.savedQueriesAdded, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMergeSummary_lift(_ buf: RustBuffer) throws -> MergeSummary {
+    return try FfiConverterTypeMergeSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMergeSummary_lower(_ value: MergeSummary) -> RustBuffer {
+    return FfiConverterTypeMergeSummary.lower(value)
+}
+
+
 public struct ParsedFilename: Equatable, Hashable {
     public var stem: String
     public var extensionLower: String
@@ -4159,6 +4377,73 @@ public func FfiConverterTypeMediaType_lift(_ buf: RustBuffer) throws -> MediaTyp
 #endif
 public func FfiConverterTypeMediaType_lower(_ value: MediaType) -> RustBuffer {
     return FfiConverterTypeMediaType.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum MergeCollisionPolicy: Equatable, Hashable {
+    
+    case currentWins
+    case backupWins
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MergeCollisionPolicy: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMergeCollisionPolicy: FfiConverterRustBuffer {
+    typealias SwiftType = MergeCollisionPolicy
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MergeCollisionPolicy {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .currentWins
+        
+        case 2: return .backupWins
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MergeCollisionPolicy, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .currentWins:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .backupWins:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMergeCollisionPolicy_lift(_ buf: RustBuffer) throws -> MergeCollisionPolicy {
+    return try FfiConverterTypeMergeCollisionPolicy.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMergeCollisionPolicy_lower(_ value: MergeCollisionPolicy) -> RustBuffer {
+    return FfiConverterTypeMergeCollisionPolicy.lower(value)
 }
 
 
@@ -5566,6 +5851,21 @@ public func assignKeywordForIds(ids: [Int64], segments: [String])async  -> UInt6
             
         )
 }
+public func backupManifestCounts()async  -> BackupCounts  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_backup_manifest_counts(
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeBackupCounts_lift,
+            errorHandler: nil
+            
+        )
+}
 public func captureDayImageCounts(mediaType: MediaType)async  -> [CaptureDayImageCount]  {
     return
         try!  await uniffiRustCallAsync(
@@ -5577,6 +5877,21 @@ public func captureDayImageCounts(mediaType: MediaType)async  -> [CaptureDayImag
             completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeCaptureDayImageCount.lift,
+            errorHandler: nil
+            
+        )
+}
+public func checkpointCatalogue()async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_checkpoint_catalogue(
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_i8,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_i8,
+            freeFunc: ffi_photolibrariancore_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
             errorHandler: nil
             
         )
@@ -5629,6 +5944,21 @@ public func copyKeywordRowsForImagePairs(sourceIds: [Int64], destinationIds: [In
             completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+public func countMergeCandidates(backupDbPath: String)async  -> MergeCounts  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_count_merge_candidates(FfiConverterString.lower(backupDbPath)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeMergeCounts_lift,
             errorHandler: nil
             
         )
@@ -6500,6 +6830,21 @@ public func markSimilarPhotoWorkUnitComplete(algorithmVersion: String, scopeKey:
             
         )
 }
+public func mergeCatalogueFromBackup(backupDbPath: String, backupVectorsPath: String, policy: MergeCollisionPolicy)async  -> MergeSummary  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_merge_catalogue_from_backup(FfiConverterString.lower(backupDbPath),FfiConverterString.lower(backupVectorsPath),FfiConverterTypeMergeCollisionPolicy_lower(policy)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeMergeSummary_lift,
+            errorHandler: nil
+            
+        )
+}
 public func mergeLightroomRecords(records: [ImageMetadata])async  -> MergeChunkResult  {
     return
         try!  await uniffiRustCallAsync(
@@ -7252,7 +7597,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_assign_keyword_for_ids() != 32359) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_backup_manifest_counts() != 10660) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_capture_day_image_counts() != 23825) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_checkpoint_catalogue() != 46221) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_classify_extension() != 38346) {
@@ -7265,6 +7616,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_copy_keyword_rows_for_image_pairs() != 7187) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_count_merge_candidates() != 53480) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_count_query_images() != 13157) {
@@ -7442,6 +7796,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_mark_similar_photo_work_unit_complete() != 42326) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_merge_catalogue_from_backup() != 59516) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_merge_lightroom_records() != 40572) {
