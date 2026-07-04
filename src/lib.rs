@@ -612,6 +612,49 @@ pub struct AnalysisJob {
     pub last_timeout_at: Option<String>,
 }
 
+/// One Operation Log run (S113; Docs/DESIGN-Operation-Log.md): a durable
+/// record of what one operation did — kind, outcome, and the headline
+/// counters. Successes are carried here as counts; only noteworthy events
+/// (skips, failures, losses) get per-row `OperationLogEntryRecord`s.
+/// `entry_count` is derived at read time for the viewer's runs list.
+#[derive(Debug, Clone)]
+pub struct OperationLogRun {
+    pub id: i64,
+    pub kind: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub outcome: Option<String>,
+    pub total_count: u64,
+    pub succeeded_count: u64,
+    pub skipped_count: u64,
+    pub failed_count: u64,
+    pub summary: Option<String>,
+    pub entry_count: u64,
+}
+
+/// One noteworthy Operation Log event as stored — a skip, failure, or loss
+/// with its stable reason token and human-readable message.
+#[derive(Debug, Clone)]
+pub struct OperationLogEntryRecord {
+    pub id: i64,
+    pub run_id: i64,
+    pub severity: String,
+    pub file_path: Option<String>,
+    pub reason_code: String,
+    pub message: String,
+    pub created_at: String,
+}
+
+/// The write-side carrier for one Operation Log event. Batched per phase
+/// through `append_operation_log_entries` — never one FFI call per row.
+#[derive(Debug, Clone)]
+pub struct OperationLogEntryInput {
+    pub severity: String,
+    pub file_path: Option<String>,
+    pub reason_code: String,
+    pub message: String,
+}
+
 /// Recognized RAW image file extensions
 ///
 /// Compile-time list of file extensions (lowercase, no leading dot) that
@@ -1402,6 +1445,41 @@ fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
 
         CREATE INDEX IF NOT EXISTS idx_analysis_jobs_kind_status ON analysis_jobs(job_kind, status);
         CREATE INDEX IF NOT EXISTS idx_analysis_jobs_run_id ON analysis_jobs(analysis_run_id);
+
+        -- === Operation Log (S113; Docs/DESIGN-Operation-Log.md) ===
+        -- Durable per-run operation records + noteworthy events (skips,
+        -- failures, losses) on the analysis_jobs precedent. Write-always,
+        -- filter-at-view; successes are carried by the run counters, not
+        -- per-row entries. Brand-new tables = CREATE-time DDL only, so the
+        -- S62 ALTER-with-DEFAULT WAL hazard never arises.
+        CREATE SEQUENCE IF NOT EXISTS operation_log_id_seq START 1;
+        CREATE SEQUENCE IF NOT EXISTS operation_log_entry_id_seq START 1;
+
+        CREATE TABLE IF NOT EXISTS operation_log (
+            id INTEGER PRIMARY KEY DEFAULT nextval('operation_log_id_seq'),
+            kind TEXT NOT NULL,              -- scan / lr_import / apple_import / sync / copy / zip / materialize / backup / restore / lr_export
+            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            finished_at TIMESTAMP,
+            outcome TEXT,                    -- NULL while running; completed / cancelled / failed
+            total_count BIGINT NOT NULL,
+            succeeded_count BIGINT NOT NULL,
+            skipped_count BIGINT NOT NULL,
+            failed_count BIGINT NOT NULL,
+            summary TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS operation_log_entry (
+            id INTEGER PRIMARY KEY DEFAULT nextval('operation_log_entry_id_seq'),
+            run_id INTEGER NOT NULL,
+            severity TEXT NOT NULL,          -- info / warning / error
+            file_path TEXT,
+            reason_code TEXT NOT NULL,       -- stable token, e.g. unreadable / copy_failed
+            message TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_operation_log_entry_run ON operation_log_entry(run_id);
+        CREATE INDEX IF NOT EXISTS idx_operation_log_entry_run_severity ON operation_log_entry(run_id, severity);
 
         -- === Similar-photo grouping (Intelligent Culling, S94) ===
         -- Vision feature-print comparison runs in Swift, then writes only durable
@@ -7001,6 +7079,401 @@ pub async fn recover_interrupted_analysis_jobs(
     };
 
     recover_interrupted_analysis_jobs_impl(conn, &job_kind, &terminal_status, last_error)
+}
+
+// ==========================================================================
+// Operation Log (S113; Docs/DESIGN-Operation-Log.md)
+//
+// Write rules (doctrine): write always, filter at view time; noteworthy-only
+// entries (skips/failures/losses — successes ride the run counters); batched
+// per phase; SUPPLEMENTARY — a log-write failure eprintlns and returns a
+// benign value, it never fails the operation it describes (hence no Result
+// surfaces here).
+// ==========================================================================
+
+/// The recognized run kinds. Unknown kinds are still stored (forward
+/// compatibility beats rejection for a supportability log), but they must
+/// pass the same lowercase-token shape check as analysis-job kinds.
+fn operation_log_kind_is_valid(kind: &str) -> bool {
+    analysis_job_token_is_valid(kind)
+}
+
+/// Coerce severity to the three-token vocabulary. Forgiving by design — a
+/// malformed severity must not cost us the entry (supplementary doctrine).
+fn normalized_operation_log_severity(severity: &str) -> &'static str {
+    match severity.trim() {
+        "error" => "error",
+        "warning" => "warning",
+        _ => "info",
+    }
+}
+
+fn row_to_operation_log_run(row: &duckdb::Row) -> Result<OperationLogRun, duckdb::Error> {
+    Ok(OperationLogRun {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        started_at: row.get(2)?,
+        finished_at: row.get(3)?,
+        outcome: row.get(4)?,
+        total_count: i64_to_u64_floor(row.get(5)?),
+        succeeded_count: i64_to_u64_floor(row.get(6)?),
+        skipped_count: i64_to_u64_floor(row.get(7)?),
+        failed_count: i64_to_u64_floor(row.get(8)?),
+        summary: row.get(9)?,
+        entry_count: i64_to_u64_floor(row.get(10)?),
+    })
+}
+
+const OPERATION_LOG_RUN_SELECT_COLUMNS: &str = "\
+    ol.id, ol.kind, CAST(ol.started_at AS VARCHAR), CAST(ol.finished_at AS VARCHAR), \
+    ol.outcome, ol.total_count, ol.succeeded_count, ol.skipped_count, ol.failed_count, \
+    ol.summary, \
+    (SELECT COUNT(*) FROM operation_log_entry ole WHERE ole.run_id = ol.id)";
+
+fn begin_operation_log_impl(conn: &Connection, kind: &str) -> Option<i64> {
+    let kind = kind.trim();
+    if !operation_log_kind_is_valid(kind) {
+        eprintln!("begin_operation_log: invalid kind token: {:?}", kind);
+        return None;
+    }
+
+    // INSERT … RETURNING keeps begin to one round trip; the sequence default
+    // supplies the id and started_at defaults to CURRENT_TIMESTAMP.
+    match conn.query_row(
+        "INSERT INTO operation_log (kind, total_count, succeeded_count, skipped_count, failed_count)
+         VALUES (?1, 0, 0, 0, 0)
+         RETURNING id",
+        params![kind],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            eprintln!("begin_operation_log: insert failed: {}", e);
+            None
+        }
+    }
+}
+
+fn finish_operation_log_impl(
+    conn: &Connection,
+    id: i64,
+    outcome: &str,
+    total_count: u64,
+    succeeded_count: u64,
+    skipped_count: u64,
+    failed_count: u64,
+    summary: Option<String>,
+) -> bool {
+    // Outcome is a closed vocabulary; anything else records as 'failed' so a
+    // caller bug can't leave a run looking successful.
+    let outcome = match outcome.trim() {
+        "completed" => "completed",
+        "cancelled" => "cancelled",
+        _ => "failed",
+    };
+
+    let updated = conn.execute(
+        "UPDATE operation_log
+         SET finished_at = CURRENT_TIMESTAMP,
+             outcome = ?2,
+             total_count = ?3,
+             succeeded_count = ?4,
+             skipped_count = ?5,
+             failed_count = ?6,
+             summary = ?7
+         WHERE id = ?1",
+        params![
+            id,
+            outcome,
+            u64_to_i64_clamped(total_count),
+            u64_to_i64_clamped(succeeded_count),
+            u64_to_i64_clamped(skipped_count),
+            u64_to_i64_clamped(failed_count),
+            summary
+        ],
+    );
+
+    match updated {
+        Ok(count) => count > 0,
+        Err(e) => {
+            eprintln!("finish_operation_log: update failed: {}", e);
+            false
+        }
+    }
+}
+
+fn append_operation_log_entries_impl(
+    conn: &Connection,
+    run_id: i64,
+    entries: &[OperationLogEntryInput],
+) -> u64 {
+    if entries.is_empty() {
+        return 0;
+    }
+
+    // One transaction per batch — the write-rules doctrine says batched per
+    // phase, and a phase's entries land or fail together.
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
+        eprintln!("append_operation_log_entries: begin failed: {}", e);
+        return 0;
+    }
+
+    let mut stmt = match conn.prepare(
+        "INSERT INTO operation_log_entry (run_id, severity, file_path, reason_code, message)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            eprintln!("append_operation_log_entries: prepare failed: {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return 0;
+        }
+    };
+
+    let mut appended: u64 = 0;
+    for entry in entries {
+        let severity = normalized_operation_log_severity(&entry.severity);
+        let reason = entry.reason_code.trim();
+        let reason = if reason.is_empty() { "unspecified" } else { reason };
+        match stmt.execute(params![
+            run_id,
+            severity,
+            entry.file_path,
+            reason,
+            entry.message
+        ]) {
+            Ok(_) => appended += 1,
+            Err(e) => {
+                eprintln!("append_operation_log_entries: insert failed: {}", e);
+                drop(stmt);
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
+            }
+        }
+    }
+    drop(stmt);
+
+    if let Err(e) = conn.execute_batch("COMMIT;") {
+        eprintln!("append_operation_log_entries: commit failed: {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return 0;
+    }
+
+    appended
+}
+
+fn list_operation_logs_impl(conn: &Connection, limit: u32) -> Vec<OperationLogRun> {
+    let sql = format!(
+        "SELECT {}
+         FROM operation_log ol
+         ORDER BY ol.id DESC
+         LIMIT ?1",
+        OPERATION_LOG_RUN_SELECT_COLUMNS
+    );
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            eprintln!("list_operation_logs: prepare failed: {}", e);
+            return Vec::new();
+        }
+    };
+
+    match stmt.query_map(params![limit.max(1)], row_to_operation_log_run) {
+        Ok(iter) => iter.filter_map(|run| run.ok()).collect(),
+        Err(e) => {
+            eprintln!("list_operation_logs: query failed: {}", e);
+            Vec::new()
+        }
+    }
+}
+
+fn operation_log_entries_impl(
+    conn: &Connection,
+    run_id: i64,
+    severity_filter: Option<String>,
+    limit: u32,
+    offset: u32,
+) -> Vec<OperationLogEntryRecord> {
+    // The severity filter is view-time narrowing (write always, filter at
+    // view). NULL/empty = no filter; anything else must be one of the three
+    // stored tokens or the filter matches nothing — honest over forgiving on
+    // the READ side, because a typo'd filter silently widened would show a
+    // support reader more than they asked for.
+    let severity = severity_filter
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let sql = "SELECT id, run_id, severity, file_path, reason_code, message, \
+                      CAST(created_at AS VARCHAR)
+               FROM operation_log_entry
+               WHERE run_id = ?1 AND (?2 IS NULL OR severity = ?2)
+               ORDER BY id
+               LIMIT ?3 OFFSET ?4";
+
+    let mut stmt = match conn.prepare(sql) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            eprintln!("operation_log_entries: prepare failed: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mapped = stmt.query_map(params![run_id, severity, limit.max(1), offset], |row| {
+        Ok(OperationLogEntryRecord {
+            id: row.get(0)?,
+            run_id: row.get(1)?,
+            severity: row.get(2)?,
+            file_path: row.get(3)?,
+            reason_code: row.get(4)?,
+            message: row.get(5)?,
+            created_at: row.get(6)?,
+        })
+    });
+
+    match mapped {
+        Ok(iter) => iter.filter_map(|entry| entry.ok()).collect(),
+        Err(e) => {
+            eprintln!("operation_log_entries: query failed: {}", e);
+            Vec::new()
+        }
+    }
+}
+
+fn clear_operation_log_impl(conn: &Connection) -> bool {
+    // Entries first, then runs, one transaction — Clear History empties both
+    // tables together or not at all.
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
+        eprintln!("clear_operation_log: begin failed: {}", e);
+        return false;
+    }
+    if let Err(e) = conn.execute("DELETE FROM operation_log_entry", []) {
+        eprintln!("clear_operation_log: entry delete failed: {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return false;
+    }
+    if let Err(e) = conn.execute("DELETE FROM operation_log", []) {
+        eprintln!("clear_operation_log: run delete failed: {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return false;
+    }
+    if let Err(e) = conn.execute_batch("COMMIT;") {
+        eprintln!("clear_operation_log: commit failed: {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return false;
+    }
+    true
+}
+
+/// Open one Operation Log run and return its id (None = log unavailable —
+/// the caller proceeds without logging, per the supplementary doctrine).
+pub async fn begin_operation_log(kind: String) -> Option<i64> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("begin_operation_log: catalogue not initialized");
+            return None;
+        }
+    };
+
+    begin_operation_log_impl(conn, &kind)
+}
+
+/// Close a run with its outcome, final counters, and short summary.
+pub async fn finish_operation_log(
+    id: i64,
+    outcome: String,
+    total_count: u64,
+    succeeded_count: u64,
+    skipped_count: u64,
+    failed_count: u64,
+    summary: Option<String>,
+) -> bool {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("finish_operation_log: catalogue not initialized");
+            return false;
+        }
+    };
+
+    finish_operation_log_impl(
+        conn,
+        id,
+        &outcome,
+        total_count,
+        succeeded_count,
+        skipped_count,
+        failed_count,
+        summary,
+    )
+}
+
+/// Append one phase's noteworthy events as a single batch. Returns the
+/// appended count (0 = the batch failed; the host operation continues).
+pub async fn append_operation_log_entries(
+    run_id: i64,
+    entries: Vec<OperationLogEntryInput>,
+) -> u64 {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("append_operation_log_entries: catalogue not initialized");
+            return 0;
+        }
+    };
+
+    append_operation_log_entries_impl(conn, run_id, &entries)
+}
+
+/// Newest-first runs list for the View ▸ Logging window.
+pub async fn list_operation_logs(limit: u32) -> Vec<OperationLogRun> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("list_operation_logs: catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    list_operation_logs_impl(conn, limit)
+}
+
+/// One run's entries, paged (S57 — never one giant lift) with an optional
+/// severity filter.
+pub async fn operation_log_entries(
+    run_id: i64,
+    severity_filter: Option<String>,
+    limit: u32,
+    offset: u32,
+) -> Vec<OperationLogEntryRecord> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("operation_log_entries: catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    operation_log_entries_impl(conn, run_id, severity_filter, limit, offset)
+}
+
+/// Clear History — empties both tables (the v1 retention story).
+pub async fn clear_operation_log() -> bool {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("clear_operation_log: catalogue not initialized");
+            return false;
+        }
+    };
+
+    clear_operation_log_impl(conn)
 }
 
 fn is_valid_focus_status(status: &str) -> bool {
@@ -13749,6 +14222,160 @@ mod similar_photo_group_tests {
         let units = completed_similar_photo_work_units_impl(&conn, "new-v1", "whole:test");
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].member_count, 2);
+    }
+}
+
+#[cfg(test)]
+mod operation_log_tests {
+    use super::*;
+    use duckdb::Connection;
+
+    fn setup() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE SEQUENCE operation_log_id_seq START 1;
+             CREATE SEQUENCE operation_log_entry_id_seq START 1;
+             CREATE TABLE operation_log (
+                 id INTEGER PRIMARY KEY DEFAULT nextval('operation_log_id_seq'),
+                 kind TEXT NOT NULL,
+                 started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 finished_at TIMESTAMP,
+                 outcome TEXT,
+                 total_count BIGINT NOT NULL,
+                 succeeded_count BIGINT NOT NULL,
+                 skipped_count BIGINT NOT NULL,
+                 failed_count BIGINT NOT NULL,
+                 summary TEXT
+             );
+             CREATE TABLE operation_log_entry (
+                 id INTEGER PRIMARY KEY DEFAULT nextval('operation_log_entry_id_seq'),
+                 run_id INTEGER NOT NULL,
+                 severity TEXT NOT NULL,
+                 file_path TEXT,
+                 reason_code TEXT NOT NULL,
+                 message TEXT NOT NULL,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+             );",
+        )
+        .expect("operation log DDL");
+        conn
+    }
+
+    fn entry(severity: &str, path: Option<&str>, reason: &str, message: &str) -> OperationLogEntryInput {
+        OperationLogEntryInput {
+            severity: severity.to_string(),
+            file_path: path.map(|p| p.to_string()),
+            reason_code: reason.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn begin_creates_open_run_and_list_reads_it_back() {
+        let conn = setup();
+        let id = begin_operation_log_impl(&conn, "scan").expect("run id");
+        assert!(id >= 1);
+
+        // Invalid kind tokens are refused (shape check, not vocabulary).
+        assert!(begin_operation_log_impl(&conn, "Not A Token").is_none());
+        assert!(begin_operation_log_impl(&conn, "").is_none());
+
+        let runs = list_operation_logs_impl(&conn, 10);
+        assert_eq!(runs.len(), 1);
+        let run = &runs[0];
+        assert_eq!(run.id, id);
+        assert_eq!(run.kind, "scan");
+        assert!(run.outcome.is_none(), "open run has no outcome yet");
+        assert!(run.finished_at.is_none());
+        assert_eq!(run.entry_count, 0);
+    }
+
+    #[test]
+    fn append_batches_normalize_and_read_back_paged_and_filtered() {
+        let conn = setup();
+        let id = begin_operation_log_impl(&conn, "copy").expect("run id");
+
+        let appended = append_operation_log_entries_impl(
+            &conn,
+            id,
+            &[
+                entry("error", Some("/a/one.nef"), "copy_failed", "destination error"),
+                entry("warning", Some("/a/two.jpg"), "online_only", "cloud placeholder skipped"),
+                entry("bogus", None, "  ", "severity and reason both normalize"),
+            ],
+        );
+        assert_eq!(appended, 3);
+
+        // Empty batch is a free no-op.
+        assert_eq!(append_operation_log_entries_impl(&conn, id, &[]), 0);
+
+        let all = operation_log_entries_impl(&conn, id, None, 100, 0);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].severity, "error");
+        assert_eq!(all[0].file_path.as_deref(), Some("/a/one.nef"));
+        assert_eq!(all[2].severity, "info", "unknown severity coerces to info");
+        assert_eq!(all[2].reason_code, "unspecified", "blank reason normalizes");
+
+        // Severity filter narrows; paging honors limit/offset in id order.
+        let errors = operation_log_entries_impl(&conn, id, Some("error".to_string()), 100, 0);
+        assert_eq!(errors.len(), 1);
+        let page2 = operation_log_entries_impl(&conn, id, None, 1, 1);
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].file_path.as_deref(), Some("/a/two.jpg"));
+
+        let runs = list_operation_logs_impl(&conn, 10);
+        assert_eq!(runs[0].entry_count, 3);
+    }
+
+    #[test]
+    fn finish_records_outcome_counts_and_coerces_unknown_outcome_to_failed() {
+        let conn = setup();
+        let id = begin_operation_log_impl(&conn, "lr_import").expect("run id");
+
+        assert!(finish_operation_log_impl(
+            &conn, id, "completed", 100, 90, 7, 3,
+            Some("90 imported · 7 skipped · 3 failed".to_string())
+        ));
+
+        let run = &list_operation_logs_impl(&conn, 10)[0];
+        assert_eq!(run.outcome.as_deref(), Some("completed"));
+        assert!(run.finished_at.is_some());
+        assert_eq!(run.total_count, 100);
+        assert_eq!(run.succeeded_count, 90);
+        assert_eq!(run.skipped_count, 7);
+        assert_eq!(run.failed_count, 3);
+        assert_eq!(run.summary.as_deref(), Some("90 imported · 7 skipped · 3 failed"));
+
+        // A caller bug can't leave a run looking successful.
+        let second = begin_operation_log_impl(&conn, "zip").expect("run id");
+        assert!(finish_operation_log_impl(&conn, second, "exploded", 1, 0, 0, 1, None));
+        let newest = &list_operation_logs_impl(&conn, 10)[0];
+        assert_eq!(newest.id, second);
+        assert_eq!(newest.outcome.as_deref(), Some("failed"));
+
+        // Finishing a nonexistent run reports false, never errors.
+        assert!(!finish_operation_log_impl(&conn, 9999, "completed", 0, 0, 0, 0, None));
+    }
+
+    #[test]
+    fn clear_empties_both_tables_and_logging_resumes_after() {
+        let conn = setup();
+        let id = begin_operation_log_impl(&conn, "scan").expect("run id");
+        append_operation_log_entries_impl(
+            &conn,
+            id,
+            &[entry("error", Some("/x.tif"), "unreadable", "could not be read")],
+        );
+        assert!(finish_operation_log_impl(&conn, id, "completed", 1, 0, 0, 1, None));
+
+        assert!(clear_operation_log_impl(&conn));
+        assert!(list_operation_logs_impl(&conn, 10).is_empty());
+        assert!(operation_log_entries_impl(&conn, id, None, 10, 0).is_empty());
+
+        // History cleared ≠ logging disabled — the next run logs normally.
+        let next = begin_operation_log_impl(&conn, "copy").expect("run id");
+        assert!(next > id, "sequence keeps advancing after clear");
+        assert_eq!(list_operation_logs_impl(&conn, 10).len(), 1);
     }
 }
 

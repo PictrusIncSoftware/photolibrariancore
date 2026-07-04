@@ -3032,6 +3032,232 @@ public func FfiConverterTypeMergeSummary_lower(_ value: MergeSummary) -> RustBuf
 }
 
 
+public struct OperationLogEntryInput: Equatable, Hashable {
+    public var severity: String
+    public var filePath: String?
+    public var reasonCode: String
+    public var message: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(severity: String, filePath: String?, reasonCode: String, message: String) {
+        self.severity = severity
+        self.filePath = filePath
+        self.reasonCode = reasonCode
+        self.message = message
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension OperationLogEntryInput: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOperationLogEntryInput: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OperationLogEntryInput {
+        return
+            try OperationLogEntryInput(
+                severity: FfiConverterString.read(from: &buf), 
+                filePath: FfiConverterOptionString.read(from: &buf), 
+                reasonCode: FfiConverterString.read(from: &buf), 
+                message: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OperationLogEntryInput, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.severity, into: &buf)
+        FfiConverterOptionString.write(value.filePath, into: &buf)
+        FfiConverterString.write(value.reasonCode, into: &buf)
+        FfiConverterString.write(value.message, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOperationLogEntryInput_lift(_ buf: RustBuffer) throws -> OperationLogEntryInput {
+    return try FfiConverterTypeOperationLogEntryInput.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOperationLogEntryInput_lower(_ value: OperationLogEntryInput) -> RustBuffer {
+    return FfiConverterTypeOperationLogEntryInput.lower(value)
+}
+
+
+public struct OperationLogEntryRecord: Equatable, Hashable {
+    public var id: Int64
+    public var runId: Int64
+    public var severity: String
+    public var filePath: String?
+    public var reasonCode: String
+    public var message: String
+    public var createdAt: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: Int64, runId: Int64, severity: String, filePath: String?, reasonCode: String, message: String, createdAt: String) {
+        self.id = id
+        self.runId = runId
+        self.severity = severity
+        self.filePath = filePath
+        self.reasonCode = reasonCode
+        self.message = message
+        self.createdAt = createdAt
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension OperationLogEntryRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOperationLogEntryRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OperationLogEntryRecord {
+        return
+            try OperationLogEntryRecord(
+                id: FfiConverterInt64.read(from: &buf), 
+                runId: FfiConverterInt64.read(from: &buf), 
+                severity: FfiConverterString.read(from: &buf), 
+                filePath: FfiConverterOptionString.read(from: &buf), 
+                reasonCode: FfiConverterString.read(from: &buf), 
+                message: FfiConverterString.read(from: &buf), 
+                createdAt: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OperationLogEntryRecord, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.id, into: &buf)
+        FfiConverterInt64.write(value.runId, into: &buf)
+        FfiConverterString.write(value.severity, into: &buf)
+        FfiConverterOptionString.write(value.filePath, into: &buf)
+        FfiConverterString.write(value.reasonCode, into: &buf)
+        FfiConverterString.write(value.message, into: &buf)
+        FfiConverterString.write(value.createdAt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOperationLogEntryRecord_lift(_ buf: RustBuffer) throws -> OperationLogEntryRecord {
+    return try FfiConverterTypeOperationLogEntryRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOperationLogEntryRecord_lower(_ value: OperationLogEntryRecord) -> RustBuffer {
+    return FfiConverterTypeOperationLogEntryRecord.lower(value)
+}
+
+
+public struct OperationLogRun: Equatable, Hashable {
+    public var id: Int64
+    public var kind: String
+    public var startedAt: String
+    public var finishedAt: String?
+    public var outcome: String?
+    public var totalCount: UInt64
+    public var succeededCount: UInt64
+    public var skippedCount: UInt64
+    public var failedCount: UInt64
+    public var summary: String?
+    public var entryCount: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: Int64, kind: String, startedAt: String, finishedAt: String?, outcome: String?, totalCount: UInt64, succeededCount: UInt64, skippedCount: UInt64, failedCount: UInt64, summary: String?, entryCount: UInt64) {
+        self.id = id
+        self.kind = kind
+        self.startedAt = startedAt
+        self.finishedAt = finishedAt
+        self.outcome = outcome
+        self.totalCount = totalCount
+        self.succeededCount = succeededCount
+        self.skippedCount = skippedCount
+        self.failedCount = failedCount
+        self.summary = summary
+        self.entryCount = entryCount
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension OperationLogRun: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOperationLogRun: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OperationLogRun {
+        return
+            try OperationLogRun(
+                id: FfiConverterInt64.read(from: &buf), 
+                kind: FfiConverterString.read(from: &buf), 
+                startedAt: FfiConverterString.read(from: &buf), 
+                finishedAt: FfiConverterOptionString.read(from: &buf), 
+                outcome: FfiConverterOptionString.read(from: &buf), 
+                totalCount: FfiConverterUInt64.read(from: &buf), 
+                succeededCount: FfiConverterUInt64.read(from: &buf), 
+                skippedCount: FfiConverterUInt64.read(from: &buf), 
+                failedCount: FfiConverterUInt64.read(from: &buf), 
+                summary: FfiConverterOptionString.read(from: &buf), 
+                entryCount: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OperationLogRun, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.id, into: &buf)
+        FfiConverterString.write(value.kind, into: &buf)
+        FfiConverterString.write(value.startedAt, into: &buf)
+        FfiConverterOptionString.write(value.finishedAt, into: &buf)
+        FfiConverterOptionString.write(value.outcome, into: &buf)
+        FfiConverterUInt64.write(value.totalCount, into: &buf)
+        FfiConverterUInt64.write(value.succeededCount, into: &buf)
+        FfiConverterUInt64.write(value.skippedCount, into: &buf)
+        FfiConverterUInt64.write(value.failedCount, into: &buf)
+        FfiConverterOptionString.write(value.summary, into: &buf)
+        FfiConverterUInt64.write(value.entryCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOperationLogRun_lift(_ buf: RustBuffer) throws -> OperationLogRun {
+    return try FfiConverterTypeOperationLogRun.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOperationLogRun_lower(_ value: OperationLogRun) -> RustBuffer {
+    return FfiConverterTypeOperationLogRun.lower(value)
+}
+
+
 public struct ParsedFilename: Equatable, Hashable {
     public var stem: String
     public var extensionLower: String
@@ -5387,6 +5613,81 @@ fileprivate struct FfiConverterSequenceTypeLightroomVideoRecord: FfiConverterRus
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeOperationLogEntryInput: FfiConverterRustBuffer {
+    typealias SwiftType = [OperationLogEntryInput]
+
+    public static func write(_ value: [OperationLogEntryInput], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeOperationLogEntryInput.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [OperationLogEntryInput] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [OperationLogEntryInput]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeOperationLogEntryInput.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeOperationLogEntryRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [OperationLogEntryRecord]
+
+    public static func write(_ value: [OperationLogEntryRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeOperationLogEntryRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [OperationLogEntryRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [OperationLogEntryRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeOperationLogEntryRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeOperationLogRun: FfiConverterRustBuffer {
+    typealias SwiftType = [OperationLogRun]
+
+    public static func write(_ value: [OperationLogRun], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeOperationLogRun.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [OperationLogRun] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [OperationLogRun]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeOperationLogRun.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypePersonFaceAssignmentRecord: FfiConverterRustBuffer {
     typealias SwiftType = [PersonFaceAssignmentRecord]
 
@@ -5791,6 +6092,21 @@ public func addImagesToCollections(ids: [Int64], labels: [String])async  -> UInt
             
         )
 }
+public func appendOperationLogEntries(runId: Int64, entries: [OperationLogEntryInput])async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_append_operation_log_entries(FfiConverterInt64.lower(runId),FfiConverterSequenceTypeOperationLogEntryInput.lower(entries)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func assignColorKeywordForIds(ids: [Int64], label: String)async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
@@ -5866,6 +6182,21 @@ public func backupManifestCounts()async  -> BackupCounts  {
             
         )
 }
+public func beginOperationLog(kind: String)async  -> Int64?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_begin_operation_log(FfiConverterString.lower(kind)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func captureDayImageCounts(mediaType: MediaType)async  -> [CaptureDayImageCount]  {
     return
         try!  await uniffiRustCallAsync(
@@ -5902,6 +6233,21 @@ public func classifyExtension(ext: String) -> ImageKind  {
         FfiConverterString.lower(ext),$0
     )
 })
+}
+public func clearOperationLog()async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_clear_operation_log(
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_i8,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_i8,
+            freeFunc: ffi_photolibrariancore_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
+        )
 }
 public func collectionLabels()async  -> [String]  {
     return
@@ -6319,6 +6665,21 @@ public func finishAnalysisJob(id: Int64, status: String, lastError: String?)asyn
             completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeAnalysisJob.lift,
+            errorHandler: nil
+            
+        )
+}
+public func finishOperationLog(id: Int64, outcome: String, totalCount: UInt64, succeededCount: UInt64, skippedCount: UInt64, failedCount: UInt64, summary: String?)async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_finish_operation_log(FfiConverterInt64.lower(id),FfiConverterString.lower(outcome),FfiConverterUInt64.lower(totalCount),FfiConverterUInt64.lower(succeededCount),FfiConverterUInt64.lower(skippedCount),FfiConverterUInt64.lower(failedCount),FfiConverterOptionString.lower(summary)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_i8,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_i8,
+            freeFunc: ffi_photolibrariancore_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
             errorHandler: nil
             
         )
@@ -6785,6 +7146,21 @@ public func keywordsForImage(imageId: Int64)async  -> [KeywordRow]  {
             
         )
 }
+public func listOperationLogs(limit: UInt32)async  -> [OperationLogRun]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_list_operation_logs(FfiConverterUInt32.lower(limit)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeOperationLogRun.lift,
+            errorHandler: nil
+            
+        )
+}
 public func listSavedQueries()async  -> [SavedQueryInfo]  {
     return
         try!  await uniffiRustCallAsync(
@@ -6886,6 +7262,21 @@ public func mirrorKeywordRowsAcrossPairs()async  -> UInt64  {
             completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+public func operationLogEntries(runId: Int64, severityFilter: String?, limit: UInt32, offset: UInt32)async  -> [OperationLogEntryRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_operation_log_entries(FfiConverterInt64.lower(runId),FfiConverterOptionString.lower(severityFilter),FfiConverterUInt32.lower(limit),FfiConverterUInt32.lower(offset)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeOperationLogEntryRecord.lift,
             errorHandler: nil
             
         )
@@ -7585,6 +7976,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_add_images_to_collections() != 9062) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_append_operation_log_entries() != 46105) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_assign_color_keyword_for_ids() != 11425) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7600,6 +7994,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_backup_manifest_counts() != 10660) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_begin_operation_log() != 46419) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_capture_day_image_counts() != 23825) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7607,6 +8004,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_classify_extension() != 38346) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_clear_operation_log() != 61181) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_collection_labels() != 45357) {
@@ -7691,6 +8091,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_finish_analysis_job() != 40102) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_finish_operation_log() != 54284) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_focus_analysis_candidate_count() != 30371) {
@@ -7789,6 +8192,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_keywords_for_image() != 32244) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_list_operation_logs() != 64580) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_list_saved_queries() != 23588) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7808,6 +8214,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_mirror_keyword_rows_across_pairs() != 28156) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_operation_log_entries() != 11141) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_parse_filename() != 30612) {

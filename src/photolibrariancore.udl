@@ -278,6 +278,41 @@ namespace photolibrariancore {
         string? last_error
     );
 
+    // ---- Operation Log (S113; Docs/DESIGN-Operation-Log.md) ----
+    // Durable per-run operation records + noteworthy events. Write always,
+    // filter at view; entries batched per phase; supplementary — a log
+    // failure returns a benign value and never fails the host operation.
+    [Async]
+    i64? begin_operation_log(string kind);
+
+    [Async]
+    boolean finish_operation_log(
+        i64 id,
+        string outcome,
+        u64 total_count,
+        u64 succeeded_count,
+        u64 skipped_count,
+        u64 failed_count,
+        string? summary
+    );
+
+    [Async]
+    u64 append_operation_log_entries(i64 run_id, sequence<OperationLogEntryInput> entries);
+
+    [Async]
+    sequence<OperationLogRun> list_operation_logs(u32 limit);
+
+    [Async]
+    sequence<OperationLogEntryRecord> operation_log_entries(
+        i64 run_id,
+        string? severity_filter,
+        u32 limit,
+        u32 offset
+    );
+
+    [Async]
+    boolean clear_operation_log();
+
     // ---- Keyword system (Session 45; Docs/DESIGN-Keyword-System.md) ----
     // Hierarchical keywords in a single `keyword` table. assign materializes a
     // path's ancestor chain (one row per level) for each image; remove/restore
@@ -1203,6 +1238,41 @@ dictionary AnalysisJob {
     i64? last_timeout_image_id;
     string? last_timeout_file_path;
     string? last_timeout_at;
+};
+
+// One Operation Log run (S113; Docs/DESIGN-Operation-Log.md) — kind, outcome,
+// headline counters, and the derived entry_count for the runs list.
+dictionary OperationLogRun {
+    i64 id;
+    string kind;
+    string started_at;
+    string? finished_at;
+    string? outcome;
+    u64 total_count;
+    u64 succeeded_count;
+    u64 skipped_count;
+    u64 failed_count;
+    string? summary;
+    u64 entry_count;
+};
+
+// One stored noteworthy event (skip / failure / loss) for a run.
+dictionary OperationLogEntryRecord {
+    i64 id;
+    i64 run_id;
+    string severity;
+    string? file_path;
+    string reason_code;
+    string message;
+    string created_at;
+};
+
+// The write-side carrier — batched through append_operation_log_entries.
+dictionary OperationLogEntryInput {
+    string severity;
+    string? file_path;
+    string reason_code;
+    string message;
 };
 
 // One directory's OWN image tally (S65, Sources sidebar) — directory_path is
