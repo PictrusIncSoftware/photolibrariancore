@@ -4442,7 +4442,7 @@ fn predicate_to_sql(p: &QueryPredicate) -> String {
         },
         // Lens "contains" — free text, case-INDEPENDENT (ILIKE), wildcard-
         // escaped so a literal %/_ matches itself. No autofill by design:
-        // the user types a fragment, not an existing value (Richard, S63).
+        // the user types a fragment, not an existing value (Paige, S63).
         "lens_contains" => match p.value.as_deref()
         {
             Some(v) if !v.is_empty() => lens_ilike_atom(&format!("%{}%", escape_for_ilike(v))),
@@ -6152,7 +6152,7 @@ fn connector_from_text(s: &str) -> Connector {
     }
 }
 
-/// Save a Find in Gallery sentence under `name`. Collision policy (Richard's
+/// Save a Find in Gallery sentence under `name`. Collision policy (Paige's
 /// rule, S63): an existing name gains a numeric suffix — "Dogs" → "Dogs-01" →
 /// "Dogs-02" … — never a replace, never a prompt. The suffixing lives HERE so
 /// there is exactly one source of truth for it (and it runs under the

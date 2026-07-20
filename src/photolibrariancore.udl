@@ -410,7 +410,7 @@ namespace photolibrariancore {
 
     // ---- Saved Queries (Session 63; Docs/DESIGN-Saved-Queries.md) ----
     // save_query: write the sentence down under `name`; a colliding name gains
-    //   a -01/-02 suffix (never replace, never prompt — Richard's rule). The
+    //   a -01/-02 suffix (never replace, never prompt — Paige's rule). The
     //   returned header carries the FINAL name. Null = invalid input/failure.
     // load_saved_query: rows -> the same (predicates, connectors) arrays
     //   query_images consumes. Null = unknown id.
