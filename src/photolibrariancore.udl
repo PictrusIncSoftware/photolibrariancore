@@ -572,6 +572,30 @@ namespace photolibrariancore {
     [Async]
     boolean mark_similar_photo_work_unit_complete(string algorithm_version, string scope_key, SimilarPhotoWorkUnit unit);
 
+    // ---- Item 7a/7b (DESIGN-Pipeline-Scale-Hardening §§1-2) ----
+    // Content-keyed grouping checkpoints (supersede the positional work-unit
+    // pair above — those stay for existing catalogues, never read again) +
+    // the incremental-checkpoint neighborhood query (the ±radius sort-order
+    // window around every eligible still with no featureprint yet).
+    [Async]
+    sequence<SimilarPhotoUnitCheckpoint> completed_similar_photo_unit_checkpoints(string algorithm_version);
+
+    [Async]
+    boolean mark_similar_photo_unit_checkpoint(string algorithm_version, SimilarPhotoUnitCheckpoint checkpoint);
+
+    [Async]
+    u64 prune_similar_photo_unit_checkpoints(string keep_algorithm_version);
+
+    [Async]
+    sequence<SimilarPhotoCandidate> similar_photo_candidates_missing_neighborhood(string focus_algorithm_version, string similar_algorithm_version, u32 radius);
+
+    // Item 7c — the one-time canonical-face-embedding migration: re-keys
+    // person_face_assignment to canonical face rows FIRST, then deletes the
+    // pair-twin vectors from LanceDB. The Swift one-shot flag sets only when
+    // vector_delete_failed is false.
+    [Async]
+    CanonicalizeFaceEmbeddingsResult canonicalize_face_embeddings();
+
     [Async]
     sequence<SimilarPhotoStackSummary> similar_photo_stack_summaries_for_ids(sequence<i64> ids, string algorithm_version);
 
@@ -994,6 +1018,25 @@ dictionary SimilarPhotoWorkUnit {
     i64 end_image_id;
     i64 candidate_count;
     i64 member_count;
+};
+
+// Item 7a — one content-keyed grouping checkpoint. unit_key = the Swift
+// runner's SHA-256 over the unit's expanded candidate window; start/end and
+// anchor_count are diagnostics only, the key alone decides a skip.
+dictionary SimilarPhotoUnitCheckpoint {
+    string unit_key;
+    i64 start_image_id;
+    i64 end_image_id;
+    i64 anchor_count;
+    i64 member_count;
+};
+
+// Item 7c — the one-time canonical-face-embedding migration's receipt.
+dictionary CanonicalizeFaceEmbeddingsResult {
+    u64 reassigned;
+    u64 duplicates_removed;
+    u64 vectors_deleted;
+    boolean vector_delete_failed;
 };
 
 dictionary SimilarPhotoStackSummary {

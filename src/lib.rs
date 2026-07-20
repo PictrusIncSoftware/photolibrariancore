@@ -267,6 +267,29 @@ pub struct SimilarPhotoWorkUnit {
     pub member_count: i64,
 }
 
+/// One content-keyed grouping checkpoint (item 7a). `unit_key` is the Swift
+/// runner's SHA-256 over the unit's expanded candidate window; start/end and
+/// anchor_count are diagnostics only — the key alone decides a skip.
+#[derive(Debug, Clone)]
+pub struct SimilarPhotoUnitCheckpoint {
+    pub unit_key: String,
+    pub start_image_id: i64,
+    pub end_image_id: i64,
+    pub anchor_count: i64,
+    pub member_count: i64,
+}
+
+/// Result of the one-time canonical-face-embedding migration (item 7c).
+/// `vector_delete_failed` gates the Swift one-shot flag — a partial LanceDB
+/// failure retries at the next index build.
+#[derive(Debug, Clone)]
+pub struct CanonicalizeFaceEmbeddingsResult {
+    pub reassigned: u64,
+    pub duplicates_removed: u64,
+    pub vectors_deleted: u64,
+    pub vector_delete_failed: bool,
+}
+
 /// Compact gallery metadata for a visible similar-photo representative.
 ///
 /// `logical_count` collapses RAW/JPEG siblings with the same directory/stem;
@@ -1535,6 +1558,23 @@ fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_similar_work_unit_scope ON similar_photo_group_work_unit(algorithm_version, scope_key, status);
+
+        -- Content-keyed grouping checkpoints (item 7a; DESIGN-Pipeline-Scale-
+        -- Hardening §1). Supersedes similar_photo_group_work_unit above
+        -- (kept for existing catalogues, never read again). unit_key = the
+        -- runner's SHA-256 over the unit's expanded candidate window, so a
+        -- row survives corpus changes elsewhere; row-exists = complete; no
+        -- scope_key (a content key cannot false-match across scopes).
+        CREATE TABLE IF NOT EXISTS similar_photo_unit_checkpoint (
+            algorithm_version TEXT NOT NULL,
+            unit_key TEXT NOT NULL,
+            start_image_id INTEGER NOT NULL,
+            end_image_id INTEGER NOT NULL,
+            anchor_count BIGINT NOT NULL,
+            member_count BIGINT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (algorithm_version, unit_key)
+        );
 
         -- === Keyword system (Session 45; Docs/DESIGN-Keyword-System.md) ===
         -- Hierarchical keywords in ONE table. Each applied keyword PATH is
@@ -5460,9 +5500,17 @@ fn insert_or_merge_active_keyword_for_image(
             continue;
         }
 
+        // The LIMIT 1 is LOAD-BEARING (S124): DuckDB 1.2.2's in-transaction
+        // scan can return BOTH versions of a row UPDATED earlier in the SAME
+        // transaction — observed live when the culling chunk's focus UPDATE
+        // (pair fan-out) preceded this insert, turning the scalar subquery
+        // into "more than one row" and rolling back the whole chunk forever.
+        // is_video is immutable, so both versions always agree and LIMIT 1
+        // is semantically free. Same bound applied at all three
+        // `SELECT is_video FROM images` subquery sites.
         conn.execute(
             "INSERT INTO keyword (image_id, label, path, status, origin, created_at, is_video) \
-             VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP, COALESCE((SELECT is_video FROM images WHERE id = ?), FALSE))",
+             VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP, COALESCE((SELECT is_video FROM images WHERE id = ? LIMIT 1), FALSE))",
             params![image_id, label, path, origin, image_id],
         )?;
         changed += 1;
@@ -7631,7 +7679,12 @@ fn insert_active_keyword_for_image(conn: &Connection, image_id: i64, segments: &
     match insert_or_merge_active_keyword_for_image(conn, image_id, segments, KEYWORD_ORIGIN_AUTO) {
         Ok(_) => true,
         Err(e) => {
-            eprintln!("insert_active_keyword_for_image: insert failed: {}", e);
+            // S124 — name the exact victim: the culling chunk rollback was
+            // untraceable without the failing (image, label) pair.
+            eprintln!(
+                "insert_active_keyword_for_image: insert failed for image_id={} segments={:?}: {}",
+                image_id, segments, e
+            );
             false
         }
     }
@@ -8345,12 +8398,18 @@ pub async fn face_recognition_menu_states(
         None => return Vec::new(),
     };
 
-    let embedded_ids = FACE_EMBEDDING_RUNTIME
+    // Item 7c: only CANONICAL rows (image_id == analyzed_image_id) carry
+    // LanceDB vectors, but the per-image menu still counts BOTH pair halves'
+    // face_observation rows — so "indexed" is decided by the physical-face
+    // identity (analyzed_image_id, face_index), which every stored embedding
+    // carries. Without this, every paired photo would read .indexIncomplete
+    // forever once twin vectors stop existing.
+    let embedded_pairs = FACE_EMBEDDING_RUNTIME
         .spawn(async move {
             stored_face_embeddings(&model_version, &preprocessing_version)
                 .await
                 .into_iter()
-                .map(|record| record.face_observation_id)
+                .map(|record| (record.analyzed_image_id, record.face_index))
                 .collect::<std::collections::HashSet<_>>()
         })
         .await
@@ -8398,7 +8457,7 @@ pub async fn face_recognition_menu_states(
     }
 
     let face_sql = format!(
-        "SELECT id, image_id
+        "SELECT image_id, analyzed_image_id, face_index
          FROM face_observation
          WHERE algorithm_version = ?1
            AND {}
@@ -8413,7 +8472,11 @@ pub async fn face_recognition_menu_states(
         }
     };
     let face_rows = match face_stmt.query_map(params![algorithm_version], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
     }) {
         Ok(rows) => rows,
         Err(e) => {
@@ -8421,10 +8484,10 @@ pub async fn face_recognition_menu_states(
             return Vec::new();
         }
     };
-    for (face_observation_id, image_id) in face_rows.filter_map(|row| row.ok()) {
+    for (image_id, analyzed_image_id, face_index) in face_rows.filter_map(|row| row.ok()) {
         if let Some(state) = states.get_mut(&image_id) {
             state.face_observation_count = state.face_observation_count.saturating_add(1);
-            if embedded_ids.contains(&face_observation_id) {
+            if embedded_pairs.contains(&(analyzed_image_id, face_index as u32)) {
                 state.indexed_face_count = state.indexed_face_count.saturating_add(1);
             }
         }
@@ -8495,7 +8558,13 @@ pub async fn face_embedding_missing_observations(
              CAST(created_at AS VARCHAR)
          FROM face_observation
          WHERE algorithm_version = ?1
+           AND image_id = analyzed_image_id
          ORDER BY analyzed_image_id, image_id, face_index",
+        // Item 7c: embed only the CANONICAL row per physical face — the pair
+        // fan-out writes one row per RAW/JPEG half sharing (analyzed_image_id,
+        // face_index), and both halves' crops come from the SAME analyzed
+        // image's thumbnail, so twin embeddings were pure duplication (~2x
+        // LanceDB size + embed time on a paired catalogue).
     ) {
         Ok(stmt) => stmt,
         Err(e) => {
@@ -9100,6 +9169,53 @@ pub async fn face_embedding_search_vector(
         .unwrap_or_default()
 }
 
+/// Item 7c — resolve seed face_observation ids to their physical-face
+/// identity pairs (analyzed_image_id, face_index). Canonical-only embedding
+/// means a seed id can be a pair-TWIN row (a clicked JPEG half, or an old
+/// assignment) whose own id has no stored vector; the pair identity — which
+/// every StoredFaceEmbedding carries — reaches the canonical vector at this
+/// ONE chokepoint, healing every seed path at once.
+fn face_observation_pairs_for_ids(
+    ids: &std::collections::HashSet<i64>,
+) -> std::collections::HashSet<(i64, u32)> {
+    let id_vec: Vec<i64> = ids.iter().copied().collect();
+    let Some(filter) = id_in_list(&id_vec) else {
+        return std::collections::HashSet::new();
+    };
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return std::collections::HashSet::new();
+        }
+    };
+    let sql = format!(
+        "SELECT analyzed_image_id, face_index FROM face_observation WHERE {}",
+        filter
+    );
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("face_observation_pairs_for_ids: prepare {}", e);
+            return std::collections::HashSet::new();
+        }
+    };
+    let mapped = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    });
+    match mapped {
+        Ok(iter) => iter
+            .filter_map(|r| r.ok())
+            .map(|(analyzed, face_index)| (analyzed, face_index.clamp(0, u32::MAX as i64) as u32))
+            .collect(),
+        Err(e) => {
+            eprintln!("face_observation_pairs_for_ids: query {}", e);
+            std::collections::HashSet::new()
+        }
+    }
+}
+
 async fn face_embedding_search_impl(
     seed_face_observation_ids: Vec<i64>,
     candidate_image_ids: Vec<i64>,
@@ -9120,9 +9236,15 @@ async fn face_embedding_search_impl(
     let seed_ids = seed_face_observation_ids
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
+    // Item 7c: seeds resolve by direct id OR by physical-face pair, so a
+    // twin seed id still reaches its canonical vector.
+    let seed_pairs = face_observation_pairs_for_ids(&seed_ids);
     let seeds = records
         .iter()
-        .filter(|record| seed_ids.contains(&record.face_observation_id))
+        .filter(|record| {
+            seed_ids.contains(&record.face_observation_id)
+                || seed_pairs.contains(&(record.analyzed_image_id, record.face_index))
+        })
         .collect::<Vec<_>>();
     if seeds.is_empty() {
         return Vec::new();
@@ -9924,12 +10046,26 @@ fn assignable_faces_for_observation_ids(
         Some(filter) => filter,
         None => return Vec::new(),
     };
+    // Item 7c: redirect every requested row to its CANONICAL sibling (same
+    // physical face — shared analyzed_image_id + face_index + version — with
+    // image_id == analyzed_image_id) so person_face_assignment rows are
+    // canonical by construction. Fallback (COALESCE) keeps the requested row
+    // when no canonical sibling exists; two twins of the same physical face
+    // resolve to ONE row (deduped below).
     let sql = format!(
-        "SELECT id, image_id, analyzed_image_id, face_index
-         FROM face_observation
+        "SELECT COALESCE(canonical.id, requested.id),
+                COALESCE(canonical.image_id, requested.image_id),
+                COALESCE(canonical.analyzed_image_id, requested.analyzed_image_id),
+                COALESCE(canonical.face_index, requested.face_index)
+         FROM face_observation requested
+         LEFT JOIN face_observation canonical
+           ON canonical.analyzed_image_id = requested.analyzed_image_id
+          AND canonical.face_index = requested.face_index
+          AND canonical.algorithm_version = requested.algorithm_version
+          AND canonical.image_id = canonical.analyzed_image_id
          WHERE {}
-         ORDER BY id",
-        id_filter
+         ORDER BY 1",
+        id_filter.replace("id IN", "requested.id IN")
     );
     let mut stmt = match conn.prepare(&sql) {
         Ok(stmt) => stmt,
@@ -9955,7 +10091,199 @@ fn assignable_faces_for_observation_ids(
         }
     };
 
-    rows.filter_map(|row| row.ok()).collect()
+    let mut seen = std::collections::HashSet::<i64>::new();
+    rows.filter_map(|row| row.ok())
+        .filter(|face| seen.insert(face.face_observation_id))
+        .collect()
+}
+
+// ---- One-time canonical-face-embedding migration (item 7c; DESIGN §3) ----
+//
+// Order is load-bearing: person_face_assignment rows are re-keyed to their
+// canonical face_observation siblings FIRST (one DuckDB transaction, committed),
+// and only THEN are the twin vectors deleted from LanceDB — identity data is
+// never left pointing at vectors that no longer exist. The LanceDB half is
+// the proven merge-cleanup shape (chunked IN-filters on the embedding
+// runtime, errors non-fatal but reported); the Swift caller sets its one-shot
+// flag only when `vector_delete_failed` is false, so a partial delete retries
+// at the next index build (leftover twin vectors are benign in the interim —
+// every read seam is pair-based).
+
+/// Returns (reassigned, duplicates_removed, ok). Twin assignments whose
+/// canonical sibling already carries an assignment are DELETED (canonical
+/// wins — same physical face); the rest are re-keyed to the canonical row.
+fn canonicalize_face_assignments_impl(conn: &Connection) -> (u64, u64, bool) {
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
+        eprintln!("canonicalize_face_assignments: begin {}", e);
+        return (0, 0, false);
+    }
+
+    let rollback = |conn: &Connection| {
+        let _ = conn.execute_batch("ROLLBACK;");
+    };
+
+    // rk orders multiple twin assignments resolving to the SAME canonical row
+    // (a RAW+JPEG+HEIF triple has two twins): the lowest old id survives.
+    if let Err(e) = conn.execute_batch(
+        "CREATE TEMP TABLE plcanon_map AS
+         SELECT a.face_observation_id AS old_id,
+                c.id AS new_id,
+                c.image_id AS new_image_id,
+                c.analyzed_image_id AS new_analyzed_id,
+                ROW_NUMBER() OVER (PARTITION BY c.id ORDER BY a.face_observation_id) AS rk,
+                EXISTS (
+                    SELECT 1 FROM person_face_assignment e
+                    WHERE e.face_observation_id = c.id
+                ) AS canonical_taken
+         FROM person_face_assignment a
+         JOIN face_observation t
+           ON t.id = a.face_observation_id AND t.image_id <> t.analyzed_image_id
+         JOIN face_observation c
+           ON c.analyzed_image_id = t.analyzed_image_id
+          AND c.face_index = t.face_index
+          AND c.algorithm_version = t.algorithm_version
+          AND c.image_id = c.analyzed_image_id;",
+    ) {
+        eprintln!("canonicalize_face_assignments: map {}", e);
+        rollback(conn);
+        return (0, 0, false);
+    }
+
+    let duplicates_removed = match conn.execute(
+        "DELETE FROM person_face_assignment
+         WHERE face_observation_id IN (
+             SELECT old_id FROM plcanon_map WHERE canonical_taken OR rk > 1
+         )",
+        [],
+    ) {
+        Ok(n) => n as u64,
+        Err(e) => {
+            eprintln!("canonicalize_face_assignments: dedupe {}", e);
+            rollback(conn);
+            let _ = conn.execute_batch("DROP TABLE IF EXISTS plcanon_map;");
+            return (0, 0, false);
+        }
+    };
+
+    let reassigned = match conn.execute(
+        "UPDATE person_face_assignment
+         SET face_observation_id = m.new_id,
+             image_id = m.new_image_id,
+             analyzed_image_id = m.new_analyzed_id,
+             updated_at = now()
+         FROM plcanon_map m
+         WHERE person_face_assignment.face_observation_id = m.old_id
+           AND NOT m.canonical_taken AND m.rk = 1",
+        [],
+    ) {
+        Ok(n) => n as u64,
+        Err(e) => {
+            eprintln!("canonicalize_face_assignments: re-key {}", e);
+            rollback(conn);
+            let _ = conn.execute_batch("DROP TABLE IF EXISTS plcanon_map;");
+            return (0, 0, false);
+        }
+    };
+
+    if let Err(e) = conn.execute_batch("DROP TABLE IF EXISTS plcanon_map; COMMIT;") {
+        eprintln!("canonicalize_face_assignments: commit {}", e);
+        rollback(conn);
+        return (0, 0, false);
+    }
+
+    (reassigned, duplicates_removed, true)
+}
+
+/// Delete the twin rows' vectors from LanceDB. An unopenable table is treated
+/// as "no vector store yet" (fresh catalogue / index never built) — success
+/// with zero deletions; only a failing delete CALL flags a retry.
+async fn delete_noncanonical_face_vectors(doomed: Vec<i64>) -> (u64, bool) {
+    if doomed.is_empty() {
+        return (0, false);
+    }
+    let table = match open_face_embedding_table().await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "canonicalize_face_embeddings: open table ({}) — treating as empty store",
+                e
+            );
+            return (0, false);
+        }
+    };
+    let mut failed = false;
+    for chunk in doomed.chunks(500) {
+        let filter = format!(
+            "face_observation_id IN ({})",
+            chunk
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        if let Err(e) = table.delete(&filter).await {
+            eprintln!("canonicalize_face_embeddings: vector delete failed: {}", e);
+            failed = true;
+        }
+    }
+    (if failed { 0 } else { doomed.len() as u64 }, failed)
+}
+
+pub async fn canonicalize_face_embeddings() -> CanonicalizeFaceEmbeddingsResult {
+    // Phase 1 — the DuckDB re-key, under the catalogue lock (sync, committed
+    // before any vector is touched). The doomed-id census rides the same lock.
+    let (reassigned, duplicates_removed, doomed, db_ok) = {
+        let catalogue = CATALOGUE.lock().unwrap();
+        let conn = match catalogue.as_ref() {
+            Some(c) => c,
+            None => {
+                eprintln!("Catalogue not initialized");
+                return CanonicalizeFaceEmbeddingsResult {
+                    reassigned: 0,
+                    duplicates_removed: 0,
+                    vectors_deleted: 0,
+                    vector_delete_failed: true,
+                };
+            }
+        };
+        let (reassigned, duplicates_removed, ok) = canonicalize_face_assignments_impl(conn);
+        let doomed = if ok {
+            let mut ids = Vec::new();
+            if let Ok(mut stmt) = conn
+                .prepare("SELECT id FROM face_observation WHERE image_id <> analyzed_image_id")
+            {
+                if let Ok(rows) = stmt.query_map([], |row| row.get::<_, i64>(0)) {
+                    ids = rows.filter_map(|r| r.ok()).collect();
+                }
+            }
+            ids
+        } else {
+            Vec::new()
+        };
+        (reassigned, duplicates_removed, doomed, ok)
+    };
+
+    if !db_ok {
+        return CanonicalizeFaceEmbeddingsResult {
+            reassigned,
+            duplicates_removed,
+            vectors_deleted: 0,
+            vector_delete_failed: true,
+        };
+    }
+
+    // Phase 2 — the LanceDB delete on the embedding runtime, lock released.
+    let (vectors_deleted, vector_delete_failed) = FACE_EMBEDDING_RUNTIME
+        .spawn(delete_noncanonical_face_vectors(doomed))
+        .await
+        .unwrap_or((0, true));
+
+    CanonicalizeFaceEmbeddingsResult {
+        reassigned,
+        duplicates_removed,
+        vectors_deleted,
+        vector_delete_failed,
+    }
 }
 
 fn assign_face_observations_to_person_impl(
@@ -10796,6 +11124,249 @@ pub async fn mark_similar_photo_work_unit_complete(
     mark_similar_photo_work_unit_complete_impl(conn, &algorithm_version, &scope_key, unit)
 }
 
+// ---- Content-keyed grouping checkpoints (item 7a; DESIGN-Pipeline-Scale-Hardening §1) ----
+//
+// Supersedes the positional similar_photo_group_work_unit machinery above
+// (kept for existing catalogues; never read again). Identity is the SHA-256
+// of the unit's expanded candidate window, computed by the Swift runner —
+// identical window content produces identical grouping output, so a stored
+// key is safe to skip no matter what changed elsewhere in the corpus.
+// Row-exists = complete (only 'complete' was ever written to the old table's
+// status column, so the new one drops it). scope_key is gone too: a content
+// key can never false-match across scopes.
+
+fn completed_similar_photo_unit_checkpoints_impl(
+    conn: &Connection,
+    algorithm_version: &str,
+) -> Vec<SimilarPhotoUnitCheckpoint> {
+    let mut stmt = match conn.prepare(
+        "SELECT unit_key, start_image_id, end_image_id, anchor_count, member_count
+         FROM similar_photo_unit_checkpoint
+         WHERE algorithm_version = ?1
+         ORDER BY unit_key",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("completed_similar_photo_unit_checkpoints: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mapped = stmt.query_map(params![algorithm_version], |row| {
+        Ok(SimilarPhotoUnitCheckpoint {
+            unit_key: row.get(0)?,
+            start_image_id: row.get(1)?,
+            end_image_id: row.get(2)?,
+            anchor_count: row.get(3)?,
+            member_count: row.get(4)?,
+        })
+    });
+
+    match mapped {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            eprintln!("completed_similar_photo_unit_checkpoints: query {}", e);
+            Vec::new()
+        }
+    }
+}
+
+pub async fn completed_similar_photo_unit_checkpoints(
+    algorithm_version: String,
+) -> Vec<SimilarPhotoUnitCheckpoint> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    completed_similar_photo_unit_checkpoints_impl(conn, &algorithm_version)
+}
+
+fn mark_similar_photo_unit_checkpoint_impl(
+    conn: &Connection,
+    algorithm_version: &str,
+    checkpoint: SimilarPhotoUnitCheckpoint,
+) -> bool {
+    if algorithm_version.trim().is_empty() || checkpoint.unit_key.trim().is_empty() {
+        return false;
+    }
+    match conn.execute(
+        "INSERT INTO similar_photo_unit_checkpoint (
+             algorithm_version, unit_key, start_image_id, end_image_id,
+             anchor_count, member_count
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT (algorithm_version, unit_key)
+         DO UPDATE SET
+             start_image_id = excluded.start_image_id,
+             end_image_id = excluded.end_image_id,
+             anchor_count = excluded.anchor_count,
+             member_count = excluded.member_count",
+        params![
+            algorithm_version,
+            checkpoint.unit_key,
+            checkpoint.start_image_id,
+            checkpoint.end_image_id,
+            checkpoint.anchor_count,
+            checkpoint.member_count,
+        ],
+    ) {
+        Ok(n) => n > 0,
+        Err(e) => {
+            eprintln!("mark_similar_photo_unit_checkpoint: {}", e);
+            false
+        }
+    }
+}
+
+pub async fn mark_similar_photo_unit_checkpoint(
+    algorithm_version: String,
+    checkpoint: SimilarPhotoUnitCheckpoint,
+) -> bool {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return false;
+        }
+    };
+
+    mark_similar_photo_unit_checkpoint_impl(conn, &algorithm_version, checkpoint)
+}
+
+/// Delete every checkpoint row NOT belonging to the supplied version — the
+/// hygiene the old work-unit table never had. Called once at grouping-pass
+/// start; a version bump self-cleans instead of accumulating dead rows.
+fn prune_similar_photo_unit_checkpoints_impl(conn: &Connection, keep_algorithm_version: &str) -> u64 {
+    match conn.execute(
+        "DELETE FROM similar_photo_unit_checkpoint WHERE algorithm_version <> ?1",
+        params![keep_algorithm_version],
+    ) {
+        Ok(n) => n as u64,
+        Err(e) => {
+            eprintln!("prune_similar_photo_unit_checkpoints: {}", e);
+            0
+        }
+    }
+}
+
+pub async fn prune_similar_photo_unit_checkpoints(keep_algorithm_version: String) -> u64 {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+
+    prune_similar_photo_unit_checkpoints_impl(conn, &keep_algorithm_version)
+}
+
+// ---- Incremental checkpoint neighborhood (item 7b; DESIGN §2) ----
+//
+// The mid-culling progressive checkpoint no longer walks the whole corpus:
+// its candidate list is the ±radius sort-order neighborhood of every
+// eligible still that has NO durable featureprint yet for the similar
+// version — exactly "new since the last grouping pass", derived by
+// anti-join (robust across restarts; no in-memory ledger to lose). The
+// ranking is the SAME deterministic ORDER BY as similar_photo_candidates,
+// so grouping over the neighborhood is locally identical to grouping over
+// the corpus; the post-culling whole pass stays the correctness backstop.
+
+fn similar_photo_candidates_missing_neighborhood_impl(
+    conn: &Connection,
+    focus_algorithm_version: &str,
+    similar_algorithm_version: &str,
+    radius: i64,
+) -> Vec<SimilarPhotoCandidate> {
+    let mut stmt = match conn.prepare(
+        "WITH ranked AS (
+             SELECT id, file_path, file_size, created_timestamp, capture_datetime,
+                    directory_path, camera_model,
+                    ROW_NUMBER() OVER (
+                        ORDER BY directory_path ASC NULLS LAST,
+                                 camera_model ASC NULLS LAST,
+                                 capture_datetime ASC NULLS LAST,
+                                 created_timestamp ASC,
+                                 id ASC
+                    ) AS rn
+             FROM images
+             WHERE is_video IS NOT TRUE
+               AND focus_analysis_status = 'complete'
+               AND focus_algorithm_version = ?1
+         ),
+         missing AS (
+             SELECT r.rn
+             FROM ranked r
+             LEFT JOIN similar_photo_featureprint fp
+               ON fp.image_id = r.id AND fp.algorithm_version = ?2
+             WHERE fp.image_id IS NULL
+         )
+         SELECT DISTINCT id, file_path, file_size, created_timestamp, capture_datetime,
+                         directory_path, camera_model, ranked.rn
+         FROM ranked
+         JOIN missing m ON ranked.rn BETWEEN m.rn - ?3 AND m.rn + ?3
+         ORDER BY ranked.rn",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("similar_photo_candidates_missing_neighborhood: prepare {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mapped = stmt.query_map(
+        params![focus_algorithm_version, similar_algorithm_version, radius],
+        |row| {
+            Ok(SimilarPhotoCandidate {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                file_size: row.get::<_, i64>(2)? as u64,
+                created_timestamp: row.get(3)?,
+                capture_datetime: row.get(4)?,
+                directory_path: row.get(5)?,
+                camera_model: row.get(6)?,
+            })
+        },
+    );
+
+    match mapped {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            eprintln!("similar_photo_candidates_missing_neighborhood: query {}", e);
+            Vec::new()
+        }
+    }
+}
+
+pub async fn similar_photo_candidates_missing_neighborhood(
+    focus_algorithm_version: String,
+    similar_algorithm_version: String,
+    radius: u32,
+) -> Vec<SimilarPhotoCandidate> {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    similar_photo_candidates_missing_neighborhood_impl(
+        conn,
+        &focus_algorithm_version,
+        &similar_algorithm_version,
+        radius as i64,
+    )
+}
+
 fn similar_photo_member_is_valid(member: &SimilarPhotoGroupMember) -> bool {
     member.image_id > 0
         && member.group_id > 0
@@ -11389,7 +11960,7 @@ pub async fn add_images_to_collections(ids: Vec<i64>, labels: Vec<String>) -> u6
             match conn.execute(
                 // Carry is_video from the image (was defaulting to FALSE) — S72 closeout.
                 "INSERT INTO keyword (image_id, label, path, status, origin, created_at, collection, is_video) \
-                 VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP, TRUE, COALESCE((SELECT is_video FROM images WHERE id = ?), FALSE))",
+                 VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP, TRUE, COALESCE((SELECT is_video FROM images WHERE id = ? LIMIT 1), FALSE))",
                 params![id, label, label, KEYWORD_ORIGIN_USER, id],
             ) {
                 Ok(_) => changed += 1,
@@ -11463,7 +12034,7 @@ fn assign_color_keyword_for_ids_impl(conn: &Connection, ids: &[i64], label: &str
         match conn.execute(
             // Carry is_video from the image (was defaulting to FALSE) — S72 closeout.
             "INSERT INTO keyword (image_id, label, path, status, origin, created_at, collection, color, is_video) \
-             VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP, FALSE, TRUE, COALESCE((SELECT is_video FROM images WHERE id = ?), FALSE))",
+             VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP, FALSE, TRUE, COALESCE((SELECT is_video FROM images WHERE id = ? LIMIT 1), FALSE))",
             params![id, trimmed, trimmed, KEYWORD_ORIGIN_USER, id],
         ) {
             Ok(_) => changed += 1,
@@ -13229,6 +13800,10 @@ mod face_cluster_tests {
                  image_id INTEGER NOT NULL,
                  analyzed_image_id INTEGER NOT NULL,
                  face_index INTEGER NOT NULL,
+                 -- Item 7c: the canonical-redirect join binds on this column,
+                 -- so the fixture carries it like production (one shared
+                 -- default keeps the module's column-list INSERTs untouched).
+                 algorithm_version TEXT NOT NULL DEFAULT 'v',
                  face_capture_quality DOUBLE,
                  bounding_box_x DOUBLE,
                  bounding_box_y DOUBLE,
@@ -19480,5 +20055,275 @@ mod backup_restore_tests {
 
         cleanup(&live_path);
         cleanup(&backup_path);
+    }
+}
+
+#[cfg(test)]
+mod pipeline_scale_hardening_tests {
+    use super::*;
+    use duckdb::Connection;
+
+    fn checkpoint_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE similar_photo_unit_checkpoint (
+                 algorithm_version TEXT NOT NULL,
+                 unit_key TEXT NOT NULL,
+                 start_image_id INTEGER NOT NULL,
+                 end_image_id INTEGER NOT NULL,
+                 anchor_count BIGINT NOT NULL,
+                 member_count BIGINT NOT NULL,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 PRIMARY KEY (algorithm_version, unit_key)
+             );",
+        )
+        .expect("schema");
+        conn
+    }
+
+    fn checkpoint(key: &str, members: i64) -> SimilarPhotoUnitCheckpoint {
+        SimilarPhotoUnitCheckpoint {
+            unit_key: key.to_string(),
+            start_image_id: 1,
+            end_image_id: 200,
+            anchor_count: 200,
+            member_count: members,
+        }
+    }
+
+    #[test]
+    fn unit_checkpoint_roundtrip_upsert_and_prune() {
+        let conn = checkpoint_conn();
+
+        assert!(mark_similar_photo_unit_checkpoint_impl(&conn, "v4", checkpoint("abc", 7)));
+        assert!(mark_similar_photo_unit_checkpoint_impl(&conn, "v4", checkpoint("def", 3)));
+        assert!(mark_similar_photo_unit_checkpoint_impl(&conn, "v5", checkpoint("abc", 9)));
+        // Blank inputs refused.
+        assert!(!mark_similar_photo_unit_checkpoint_impl(&conn, " ", checkpoint("x", 0)));
+        assert!(!mark_similar_photo_unit_checkpoint_impl(&conn, "v4", checkpoint(" ", 0)));
+
+        // Upsert overwrites in place (same PK pair).
+        assert!(mark_similar_photo_unit_checkpoint_impl(&conn, "v4", checkpoint("abc", 11)));
+        let rows = completed_similar_photo_unit_checkpoints_impl(&conn, "v4");
+        assert_eq!(rows.len(), 2);
+        let abc = rows.iter().find(|r| r.unit_key == "abc").expect("abc row");
+        assert_eq!(abc.member_count, 11);
+
+        // Prune keeps only the supplied version.
+        assert_eq!(prune_similar_photo_unit_checkpoints_impl(&conn, "v4"), 1);
+        assert_eq!(completed_similar_photo_unit_checkpoints_impl(&conn, "v5").len(), 0);
+        assert_eq!(completed_similar_photo_unit_checkpoints_impl(&conn, "v4").len(), 2);
+    }
+
+    fn neighborhood_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE images (
+                 id INTEGER PRIMARY KEY,
+                 file_path TEXT NOT NULL,
+                 file_size BIGINT NOT NULL,
+                 created_timestamp BIGINT NOT NULL,
+                 capture_datetime TEXT,
+                 directory_path TEXT,
+                 camera_model TEXT,
+                 is_video BOOLEAN,
+                 focus_analysis_status TEXT,
+                 focus_algorithm_version TEXT
+             );
+             CREATE TABLE similar_photo_featureprint (
+                 image_id INTEGER NOT NULL,
+                 algorithm_version TEXT NOT NULL,
+                 source_stamp TEXT NOT NULL,
+                 featureprint_blob BLOB NOT NULL,
+                 PRIMARY KEY (image_id, algorithm_version)
+             );",
+        )
+        .expect("schema");
+        conn
+    }
+
+    #[test]
+    fn missing_neighborhood_returns_radius_window_only() {
+        let conn = neighborhood_conn();
+        // Ten eligible stills; identical sort fields except id, so the
+        // deterministic ORDER BY ranks them 1..=10 by id.
+        for id in 1..=10 {
+            conn.execute(
+                "INSERT INTO images VALUES (?1, ?2, 100, ?1, NULL, '/d', 'cam', FALSE, 'complete', 'v7')",
+                params![id, format!("/d/f{}.jpg", id)],
+            )
+            .expect("image row");
+        }
+        // Featureprints exist for everything EXCEPT ids 5 and 6.
+        for id in [1i64, 2, 3, 4, 7, 8, 9, 10] {
+            conn.execute(
+                "INSERT INTO similar_photo_featureprint VALUES (?1, 'v4', 's', 'b')",
+                params![id],
+            )
+            .expect("fp row");
+        }
+
+        let hood = similar_photo_candidates_missing_neighborhood_impl(&conn, "v7", "v4", 2);
+        let ids: Vec<i64> = hood.iter().map(|c| c.id).collect();
+        // Missing ranks 5,6 with radius 2 cover ranks 3..=8 — nothing else.
+        assert_eq!(ids, vec![3, 4, 5, 6, 7, 8]);
+
+        // Wrong focus version = no eligible corpus at all.
+        assert!(similar_photo_candidates_missing_neighborhood_impl(&conn, "v6", "v4", 2).is_empty());
+
+        // Fully featureprinted corpus = empty neighborhood (nothing new).
+        for id in [5i64, 6] {
+            conn.execute(
+                "INSERT INTO similar_photo_featureprint VALUES (?1, 'v4', 's', 'b')",
+                params![id],
+            )
+            .expect("fp row");
+        }
+        assert!(similar_photo_candidates_missing_neighborhood_impl(&conn, "v7", "v4", 2).is_empty());
+    }
+
+    fn face_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE face_observation (
+                 id INTEGER PRIMARY KEY,
+                 image_id INTEGER NOT NULL,
+                 analyzed_image_id INTEGER NOT NULL,
+                 face_index INTEGER NOT NULL,
+                 algorithm_version TEXT NOT NULL
+             );
+             CREATE TABLE person_face_assignment (
+                 face_observation_id INTEGER PRIMARY KEY,
+                 person_id INTEGER NOT NULL,
+                 image_id INTEGER NOT NULL,
+                 analyzed_image_id INTEGER NOT NULL,
+                 face_index INTEGER NOT NULL,
+                 assignment_source TEXT NOT NULL,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+             );",
+        )
+        .expect("schema");
+        conn
+    }
+
+    #[test]
+    fn canonicalize_rekeys_twin_and_dedupes_against_canonical() {
+        let conn = face_conn();
+        // Pair A: canonical row 1 (image 10 analyzed 10), twin row 2 (image 11).
+        // Only the TWIN is assigned -> re-key to row 1.
+        conn.execute_batch(
+            "INSERT INTO face_observation VALUES (1, 10, 10, 0, 'v7');
+             INSERT INTO face_observation VALUES (2, 11, 10, 0, 'v7');
+             INSERT INTO person_face_assignment VALUES (2, 1, 11, 10, 0, 'manual_label', now(), now());
+             -- Pair B: canonical row 3 AND twin row 4 both assigned -> twin deleted.
+             INSERT INTO face_observation VALUES (3, 20, 20, 0, 'v7');
+             INSERT INTO face_observation VALUES (4, 21, 20, 0, 'v7');
+             INSERT INTO person_face_assignment VALUES (3, 1, 20, 20, 0, 'manual_label', now(), now());
+             INSERT INTO person_face_assignment VALUES (4, 1, 21, 20, 0, 'manual_label', now(), now());",
+        )
+        .expect("rows");
+
+        let (reassigned, duplicates_removed, ok) = canonicalize_face_assignments_impl(&conn);
+        assert!(ok);
+        assert_eq!(reassigned, 1);
+        assert_eq!(duplicates_removed, 1);
+
+        let mut stmt = conn
+            .prepare("SELECT face_observation_id, image_id FROM person_face_assignment ORDER BY face_observation_id")
+            .expect("prepare");
+        let rows: Vec<(i64, i64)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query")
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(rows, vec![(1, 10), (3, 20)]);
+
+        // Idempotent: a second run finds nothing to do.
+        let (r2, d2, ok2) = canonicalize_face_assignments_impl(&conn);
+        assert!(ok2);
+        assert_eq!((r2, d2), (0, 0));
+    }
+
+    #[test]
+    fn assignable_faces_redirect_to_canonical_and_dedupe() {
+        let conn = face_conn();
+        conn.execute_batch(
+            "INSERT INTO face_observation VALUES (1, 10, 10, 0, 'v7');   -- canonical
+             INSERT INTO face_observation VALUES (2, 11, 10, 0, 'v7');   -- twin of 1
+             INSERT INTO face_observation VALUES (5, 30, 31, 2, 'v7');   -- twin with NO canonical sibling",
+        )
+        .expect("rows");
+
+        // A twin id redirects to its canonical sibling.
+        let redirected = assignable_faces_for_observation_ids(&conn, &[2]);
+        assert_eq!(redirected.len(), 1);
+        assert_eq!(redirected[0].face_observation_id, 1);
+        assert_eq!(redirected[0].image_id, 10);
+
+        // Twin + canonical of the SAME physical face dedupe to one row.
+        let deduped = assignable_faces_for_observation_ids(&conn, &[1, 2]);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].face_observation_id, 1);
+
+        // No canonical sibling -> the requested row survives as-is.
+        let fallback = assignable_faces_for_observation_ids(&conn, &[5]);
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].face_observation_id, 5);
+    }
+}
+
+#[cfg(test)]
+mod live_repro_tests {
+    use super::*;
+
+    /// S124 diagnostic — reproduce the culling chunk's keyword-insert failure
+    /// against a COPY of the real catalogue, through the BUNDLED DuckDB
+    /// (1.2.2), not the newer CLI. Skips silently unless PLDIAG_REPRO_DB is
+    /// set. Rolls back everything it does.
+    #[test]
+    fn repro_keyword_insert_on_real_catalogue() {
+        let Ok(path) = std::env::var("PLDIAG_REPRO_DB") else {
+            return;
+        };
+        let conn = Connection::open(&path).expect("open catalogue copy");
+        conn.execute_batch("BEGIN TRANSACTION;").expect("begin");
+        let label = std::env::var("PLDIAG_REPRO_LABEL").unwrap_or_else(|_| "dog".to_string());
+        // Replicate the chunk's REAL sequence: the focus UPDATE (which touches
+        // this image AND its pair sibling via the OR clause) runs in the same
+        // transaction BEFORE the keyword insert whose scalar subquery reads
+        // one of the just-updated rows.
+        let updated = conn
+            .execute(
+                "UPDATE images
+                 SET focus_score = 50.0,
+                     focus_algorithm_version = 'multi-subject-laplacian-v7',
+                     focus_analysis_status = 'complete',
+                     focus_analysis_attempt_id = 'repro-attempt',
+                     focus_scored_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1
+                    OR (
+                        EXISTS (
+                            SELECT 1 FROM images source
+                            WHERE source.id = ?1
+                              AND source.image_kind IN ('raw', 'jpeg', 'heif')
+                              AND images.image_kind IN ('raw', 'jpeg', 'heif')
+                              AND source.file_stem = images.file_stem
+                              AND source.directory_path = images.directory_path
+                        )
+                    )",
+                params![189188_i64],
+            )
+            .expect("focus update");
+        eprintln!("repro focus update touched {} rows", updated);
+        let result = insert_or_merge_active_keyword_for_image(
+            &conn,
+            189188,
+            &[label],
+            KEYWORD_ORIGIN_AUTO,
+        );
+        eprintln!("repro insert_or_merge result: {:?}", result);
+        let _ = conn.execute_batch("ROLLBACK;");
+        assert!(result.is_ok(), "reproduced: {:?}", result);
     }
 }
