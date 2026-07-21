@@ -2180,6 +2180,72 @@ public func FfiConverterTypeFocusAnalysisResult_lower(_ value: FocusAnalysisResu
 }
 
 
+public struct FocusAnalysisWritebackResult: Equatable, Hashable {
+    public var updated: UInt64
+    public var failureStage: String?
+    public var failedReason: String?
+    public var sourceImageId: Int64?
+    public var targetImageId: Int64?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(updated: UInt64, failureStage: String?, failedReason: String?, sourceImageId: Int64?, targetImageId: Int64?) {
+        self.updated = updated
+        self.failureStage = failureStage
+        self.failedReason = failedReason
+        self.sourceImageId = sourceImageId
+        self.targetImageId = targetImageId
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FocusAnalysisWritebackResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFocusAnalysisWritebackResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FocusAnalysisWritebackResult {
+        return
+            try FocusAnalysisWritebackResult(
+                updated: FfiConverterUInt64.read(from: &buf),
+                failureStage: FfiConverterOptionString.read(from: &buf),
+                failedReason: FfiConverterOptionString.read(from: &buf),
+                sourceImageId: FfiConverterOptionInt64.read(from: &buf),
+                targetImageId: FfiConverterOptionInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FocusAnalysisWritebackResult, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.updated, into: &buf)
+        FfiConverterOptionString.write(value.failureStage, into: &buf)
+        FfiConverterOptionString.write(value.failedReason, into: &buf)
+        FfiConverterOptionInt64.write(value.sourceImageId, into: &buf)
+        FfiConverterOptionInt64.write(value.targetImageId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFocusAnalysisWritebackResult_lift(_ buf: RustBuffer) throws -> FocusAnalysisWritebackResult {
+    return try FfiConverterTypeFocusAnalysisWritebackResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFocusAnalysisWritebackResult_lower(_ value: FocusAnalysisWritebackResult) -> RustBuffer {
+    return FfiConverterTypeFocusAnalysisWritebackResult.lower(value)
+}
+
+
 public struct ImageMetadata: Equatable, Hashable {
     public var filePath: String
     public var fileSize: UInt64
@@ -8065,17 +8131,17 @@ public func updateFlagForIds(ids: [Int64], flag: String?)async  -> UInt64  {
             
         )
 }
-public func updateFocusAnalysisResults(results: [FocusAnalysisResult])async  -> UInt64  {
+public func updateFocusAnalysisResults(results: [FocusAnalysisResult])async  -> FocusAnalysisWritebackResult  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_photolibrariancore_fn_func_update_focus_analysis_results(FfiConverterSequenceTypeFocusAnalysisResult.lower(results)
                 )
             },
-            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
-            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
-            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
-            liftFunc: FfiConverterUInt64.lift,
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeFocusAnalysisWritebackResult_lift,
             errorHandler: nil
             
         )
@@ -8594,7 +8660,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_update_flag_for_ids() != 57492) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_photolibrariancore_checksum_func_update_focus_analysis_results() != 3614) {
+    if (uniffi_photolibrariancore_checksum_func_update_focus_analysis_results() != 18700) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_image_color_label() != 55337) {

@@ -457,7 +457,7 @@ namespace photolibrariancore {
     u64 focus_analysis_candidate_count_for_ids(sequence<i64> ids, string algorithm_version, string analysis_run_id);
 
     [Async]
-    u64 update_focus_analysis_results(sequence<FocusAnalysisResult> results);
+    FocusAnalysisWritebackResult update_focus_analysis_results(sequence<FocusAnalysisResult> results);
 
     [Async]
     u64 face_observation_count(string algorithm_version);
@@ -1074,6 +1074,14 @@ dictionary FocusAnalysisResult {
     i32? face_blink_risk_count = null;
     sequence<string> auto_keywords;
     sequence<FaceObservationResult> face_observations;
+};
+
+dictionary FocusAnalysisWritebackResult {
+    u64 updated;
+    string? failure_stage;
+    string? failed_reason;
+    i64? source_image_id;
+    i64? target_image_id;
 };
 
 dictionary FaceObservationResult {

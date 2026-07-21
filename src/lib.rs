@@ -343,6 +343,22 @@ pub struct FocusAnalysisResult {
     pub face_observations: Vec<FaceObservationResult>,
 }
 
+/// Receipt for one transactional focus-analysis writeback chunk.
+///
+/// `failure_stage` is a stable machine-readable token. `failed_reason` keeps
+/// the full helper/statement context and the underlying DuckDB error for the
+/// analysis job and Operation Log flight recorders. A failed transaction
+/// always reports `updated == 0`, even if statements ran before rollback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FocusAnalysisWritebackResult
+{
+    pub updated: u64,
+    pub failure_stage: Option<String>,
+    pub failed_reason: Option<String>,
+    pub source_image_id: Option<i64>,
+    pub target_image_id: Option<i64>,
+}
+
 /// One detected human face from the Vision enrichment pass.
 ///
 /// These rows are scalar geometry/quality facts stored in DuckDB. Future
@@ -5512,7 +5528,7 @@ fn insert_or_merge_active_keyword_for_image(
     image_id: i64,
     segments: &[String],
     origin: i32,
-) -> Result<u64, duckdb::Error> {
+) -> Result<u64, String> {
     let rows = keyword_materialized_rows(segments);
     if rows.is_empty() {
         return Ok(0);
@@ -5520,16 +5536,30 @@ fn insert_or_merge_active_keyword_for_image(
 
     let mut changed: u64 = 0;
     for (label, path) in rows {
-        let existing: Result<i64, _> = conn.query_row(
+        let existing: Result<i64, duckdb::Error> = conn.query_row(
             "SELECT 1 FROM keyword WHERE image_id = ? AND path = ? AND status = 1 LIMIT 1",
             params![image_id, path],
             |r| r.get(0),
         );
-        if existing.is_ok() {
-            if merge_active_keyword_origin(conn, image_id, &path, origin)? {
-                changed += 1;
+        match existing {
+            Ok(_) => {
+                if merge_active_keyword_origin(conn, image_id, &path, origin).map_err(|e| {
+                    format!(
+                        "insert_or_merge_active_keyword_for_image: UPDATE keyword origin failed for image_id={} path={:?}: {}",
+                        image_id, path, e
+                    )
+                })? {
+                    changed += 1;
+                }
+                continue;
             }
-            continue;
+            Err(duckdb::Error::QueryReturnedNoRows) => {}
+            Err(e) => {
+                return Err(format!(
+                    "insert_or_merge_active_keyword_for_image: keyword existence SELECT failed for image_id={} path={:?}: {}",
+                    image_id, path, e
+                ));
+            }
         }
 
         // The LIMIT 1 is LOAD-BEARING (S124): DuckDB 1.2.2's in-transaction
@@ -5544,7 +5574,13 @@ fn insert_or_merge_active_keyword_for_image(
             "INSERT INTO keyword (image_id, label, path, status, origin, created_at, is_video) \
              VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP, COALESCE((SELECT is_video FROM images WHERE id = ? LIMIT 1), FALSE))",
             params![image_id, label, path, origin, image_id],
-        )?;
+        )
+        .map_err(|e| {
+            format!(
+                "insert_or_merge_active_keyword_for_image: INSERT keyword failed for image_id={} label={:?} path={:?}: {}",
+                image_id, label, path, e
+            )
+        })?;
         changed += 1;
     }
 
@@ -7716,19 +7752,13 @@ fn sanitized_focus_result(mut result: FocusAnalysisResult) -> FocusAnalysisResul
     result
 }
 
-fn insert_active_keyword_for_image(conn: &Connection, image_id: i64, segments: &[String]) -> bool {
-    match insert_or_merge_active_keyword_for_image(conn, image_id, segments, KEYWORD_ORIGIN_AUTO) {
-        Ok(_) => true,
-        Err(e) => {
-            // S124 — name the exact victim: the culling chunk rollback was
-            // untraceable without the failing (image, label) pair.
-            eprintln!(
-                "insert_active_keyword_for_image: insert failed for image_id={} segments={:?}: {}",
-                image_id, segments, e
-            );
-            false
-        }
-    }
+fn insert_active_keyword_for_image(
+    conn: &Connection,
+    image_id: i64,
+    segments: &[String],
+) -> Result<u64, String>
+{
+    insert_or_merge_active_keyword_for_image(conn, image_id, segments, KEYWORD_ORIGIN_AUTO)
 }
 
 fn focus_analysis_queue_where_clause(id_predicate: Option<&str>) -> String {
@@ -7944,6 +7974,75 @@ pub async fn focus_analysis_candidate_count_for_ids(
     focus_analysis_candidate_count_impl(conn, &algorithm_version, &analysis_run_id, Some(&ids))
 }
 
+const FOCUS_WRITEBACK_STAGE_CATALOGUE: &str = "catalogue";
+const FOCUS_WRITEBACK_STAGE_PLANNING: &str = "planning";
+const FOCUS_WRITEBACK_STAGE_BEGIN: &str = "begin";
+const FOCUS_WRITEBACK_STAGE_APPLY: &str = "apply";
+const FOCUS_WRITEBACK_STAGE_COMMIT: &str = "commit";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FocusAnalysisWritebackFailure
+{
+    stage: &'static str,
+    reason: String,
+    source_image_id: Option<i64>,
+    target_image_id: Option<i64>,
+}
+
+impl FocusAnalysisWritebackFailure
+{
+    fn new(
+        stage: &'static str,
+        reason: String,
+        source_image_id: Option<i64>,
+        target_image_id: Option<i64>,
+    ) -> Self
+    {
+        Self {
+            stage,
+            reason,
+            source_image_id,
+            target_image_id,
+        }
+    }
+
+    fn into_result(self) -> FocusAnalysisWritebackResult
+    {
+        FocusAnalysisWritebackResult {
+            updated: 0,
+            failure_stage: Some(self.stage.to_string()),
+            failed_reason: Some(self.reason),
+            source_image_id: self.source_image_id,
+            target_image_id: self.target_image_id,
+        }
+    }
+}
+
+fn successful_focus_analysis_writeback(updated: u64) -> FocusAnalysisWritebackResult
+{
+    FocusAnalysisWritebackResult {
+        updated,
+        failure_stage: None,
+        failed_reason: None,
+        source_image_id: None,
+        target_image_id: None,
+    }
+}
+
+fn rollback_focus_analysis_failure(
+    conn: &Connection,
+    mut failure: FocusAnalysisWritebackFailure,
+) -> FocusAnalysisWritebackFailure
+{
+    if let Err(rollback_error) = conn.execute_batch("ROLLBACK;") {
+        failure.reason = format!(
+            "{}; update_focus_analysis_results: ROLLBACK failed: {}",
+            failure.reason, rollback_error
+        );
+    }
+    failure
+}
+
 fn focus_analysis_writeback_target_ids(
     conn: &Connection,
     image_id: i64,
@@ -7981,14 +8080,19 @@ fn focus_analysis_writeback_target_ids(
         )
         .map_err(|e| {
             format!(
-                "target planning for image {} prepare failed: {}",
+                "focus_analysis_writeback_target_ids: prepare target SELECT failed for source_image_id={}: {}",
                 image_id, e
             )
         })?;
 
     let rows = stmt
         .query_map(params![image_id], |row| row.get::<_, i64>(0))
-        .map_err(|e| format!("target planning for image {} query failed: {}", image_id, e))?;
+        .map_err(|e| {
+            format!(
+                "focus_analysis_writeback_target_ids: execute target SELECT failed for source_image_id={}: {}",
+                image_id, e
+            )
+        })?;
 
     // Keep this defensive de-dup even though `id` is unique. DuckDB 1.2.2 can
     // expose multiple transactional versions of a row to a scan; writeback
@@ -7997,14 +8101,19 @@ fn focus_analysis_writeback_target_ids(
     let mut ids = Vec::new();
     for row in rows {
         ids.push(
-            row.map_err(|e| format!("target planning for image {} row failed: {}", image_id, e))?,
+            row.map_err(|e| {
+                format!(
+                    "focus_analysis_writeback_target_ids: read target SELECT row failed for source_image_id={}: {}",
+                    image_id, e
+                )
+            })?,
         );
     }
     ids.sort_unstable();
     ids.dedup();
     if ids.is_empty() {
         return Err(format!(
-            "target planning found no catalogue row for image {}",
+            "focus_analysis_writeback_target_ids: target SELECT found no catalogue row for source_image_id={}",
             image_id
         ));
     }
@@ -8026,7 +8135,8 @@ struct FocusAnalysisWritebackPlan {
 fn plan_focus_analysis_writebacks(
     conn: &Connection,
     results: Vec<FocusAnalysisResult>,
-) -> Result<Vec<FocusAnalysisWritebackPlan>, String> {
+) -> Result<Vec<FocusAnalysisWritebackPlan>, FocusAnalysisWritebackFailure>
+{
     let results = results
         .into_iter()
         .map(sanitized_focus_result)
@@ -8037,9 +8147,14 @@ fn plan_focus_analysis_writebacks(
     let mut source_ids = std::collections::HashSet::<i64>::new();
     for result in &results {
         if !source_ids.insert(result.id) {
-            return Err(format!(
-                "writeback chunk contains duplicate result id {}",
-                result.id
+            return Err(FocusAnalysisWritebackFailure::new(
+                FOCUS_WRITEBACK_STAGE_PLANNING,
+                format!(
+                    "plan_focus_analysis_writebacks: writeback chunk contains duplicate source_image_id={}",
+                    result.id
+                ),
+                Some(result.id),
+                None,
             ));
         }
     }
@@ -8050,7 +8165,14 @@ fn plan_focus_analysis_writebacks(
         .into_iter()
         .map(|result| {
             let mut target_ids = if result.status == "complete" {
-                focus_analysis_writeback_target_ids(conn, result.id)?
+                focus_analysis_writeback_target_ids(conn, result.id).map_err(|reason| {
+                    FocusAnalysisWritebackFailure::new(
+                        FOCUS_WRITEBACK_STAGE_PLANNING,
+                        reason,
+                        Some(result.id),
+                        None,
+                    )
+                })?
             } else {
                 vec![result.id]
             };
@@ -8073,7 +8195,8 @@ fn replace_face_observations_for_targets(
     result: &FocusAnalysisResult,
     target_ids: &[i64],
     is_complete: bool,
-) -> bool {
+) -> Result<(), FocusAnalysisWritebackFailure>
+{
     for target_id in target_ids {
         if let Err(e) = conn.execute(
             "DELETE FROM face_observation
@@ -8081,16 +8204,20 @@ fn replace_face_observations_for_targets(
                AND algorithm_version = ?2",
             params![target_id, &result.algorithm_version],
         ) {
-            eprintln!(
-                "replace_face_observations_for_targets: delete image_id={} {}",
-                target_id, e
-            );
-            return false;
+            return Err(FocusAnalysisWritebackFailure::new(
+                FOCUS_WRITEBACK_STAGE_APPLY,
+                format!(
+                    "replace_face_observations_for_targets: DELETE face_observation failed for source_image_id={} target_image_id={} algorithm_version={:?}: {}",
+                    result.id, target_id, result.algorithm_version, e
+                ),
+                Some(result.id),
+                Some(*target_id),
+            ));
         }
     }
 
     if !is_complete {
-        return true;
+        return Ok(());
     }
 
     for target_id in target_ids {
@@ -8158,16 +8285,20 @@ fn replace_face_observations_for_targets(
                     observation.mouth_right_y,
                 ],
             ) {
-                eprintln!(
-                    "replace_face_observations_for_targets: insert image_id={} face_index={} {}",
-                    target_id, observation.face_index, e
-                );
-                return false;
+                return Err(FocusAnalysisWritebackFailure::new(
+                    FOCUS_WRITEBACK_STAGE_APPLY,
+                    format!(
+                        "replace_face_observations_for_targets: INSERT face_observation failed for source_image_id={} target_image_id={} face_index={}: {}",
+                        result.id, target_id, observation.face_index, e
+                    ),
+                    Some(result.id),
+                    Some(*target_id),
+                ));
             }
         }
     }
 
-    true
+    Ok(())
 }
 
 fn update_focus_analysis_target(
@@ -8289,7 +8420,8 @@ fn update_focus_analysis_target(
 fn write_focus_analysis_plans_in_transaction(
     conn: &Connection,
     plans: &[FocusAnalysisWritebackPlan],
-) -> Result<u64, String> {
+) -> Result<u64, FocusAnalysisWritebackFailure>
+{
     let mut updated = 0u64;
 
     for plan in plans {
@@ -8300,15 +8432,25 @@ fn write_focus_analysis_plans_in_transaction(
         for target_id in &plan.target_ids {
             let row_count =
                 update_focus_analysis_target(conn, result, *target_id).map_err(|e| {
-                    format!(
-                        "row {} target {} update failed: {}",
-                        result.id, target_id, e
+                    FocusAnalysisWritebackFailure::new(
+                        FOCUS_WRITEBACK_STAGE_APPLY,
+                        format!(
+                            "update_focus_analysis_target: UPDATE images failed for source_image_id={} target_image_id={}: {}",
+                            result.id, target_id, e
+                        ),
+                        Some(result.id),
+                        Some(*target_id),
                     )
                 })?;
             if row_count != 1 {
-                return Err(format!(
-                    "row {} target {} violated one-target/one-row invariant: updated {} rows",
-                    result.id, target_id, row_count
+                return Err(FocusAnalysisWritebackFailure::new(
+                    FOCUS_WRITEBACK_STAGE_APPLY,
+                    format!(
+                        "update_focus_analysis_target: UPDATE images violated one-target/one-row invariant for source_image_id={} target_image_id={}: updated {} rows",
+                        result.id, target_id, row_count
+                    ),
+                    Some(result.id),
+                    Some(*target_id),
                 ));
             }
             updated += 1;
@@ -8319,12 +8461,7 @@ fn write_focus_analysis_plans_in_transaction(
             continue;
         }
 
-        if !replace_face_observations_for_targets(conn, result, &updated_target_ids, is_complete) {
-            return Err(format!(
-                "row {} face-observation replacement failed",
-                result.id
-            ));
-        }
+        replace_face_observations_for_targets(conn, result, &updated_target_ids, is_complete)?;
 
         if is_complete {
             let mut labels = result
@@ -8338,14 +8475,19 @@ fn write_focus_analysis_plans_in_transaction(
 
             for target_id in &updated_target_ids {
                 for label in &labels {
-                    if !insert_active_keyword_for_image(
+                    if let Err(e) = insert_active_keyword_for_image(
                         conn,
                         *target_id,
                         std::slice::from_ref(label),
                     ) {
-                        return Err(format!(
-                            "row {} target {} auto-keyword insert failed for {:?}",
-                            result.id, target_id, label
+                        return Err(FocusAnalysisWritebackFailure::new(
+                            FOCUS_WRITEBACK_STAGE_APPLY,
+                            format!(
+                                "insert_active_keyword_for_image: keyword upsert failed for source_image_id={} target_image_id={} label={:?}: {}",
+                                result.id, target_id, label, e
+                            ),
+                            Some(result.id),
+                            Some(*target_id),
                         ));
                     }
                 }
@@ -8356,20 +8498,14 @@ fn write_focus_analysis_plans_in_transaction(
     Ok(updated)
 }
 
-/// Batch writeback for focus-analysis results. Returns the number of rows updated.
-pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) -> u64 {
+fn update_focus_analysis_results_impl(
+    conn: &Connection,
+    results: Vec<FocusAnalysisResult>,
+) -> FocusAnalysisWritebackResult
+{
     if results.is_empty() {
-        return 0;
+        return successful_focus_analysis_writeback(0);
     }
-
-    let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref() {
-        Some(c) => c,
-        None => {
-            eprintln!("Catalogue not initialized");
-            return 0;
-        }
-    };
 
     // Planning must stay before BEGIN: the bundled DuckDB 1.2.2 can expose
     // both versions of a row when a transaction re-scans `images` after an
@@ -8377,33 +8513,84 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
     // the transaction completes.
     let plans = match plan_focus_analysis_writebacks(conn, results) {
         Ok(plans) => plans,
-        Err(e) => {
-            eprintln!("update_focus_analysis_results: planning failed: {}", e);
-            return 0;
+        Err(failure) => {
+            eprintln!(
+                "update_focus_analysis_results: {} failure: {}",
+                failure.stage, failure.reason
+            );
+            return failure.into_result();
         }
     };
 
     if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
-        eprintln!("update_focus_analysis_results: begin {}", e);
-        return 0;
+        let failure = FocusAnalysisWritebackFailure::new(
+            FOCUS_WRITEBACK_STAGE_BEGIN,
+            format!(
+                "update_focus_analysis_results: BEGIN TRANSACTION failed: {}",
+                e
+            ),
+            None,
+            None,
+        );
+        eprintln!("{}", failure.reason);
+        return failure.into_result();
     }
 
     let updated = match write_focus_analysis_plans_in_transaction(conn, &plans) {
         Ok(updated) => updated,
-        Err(e) => {
-            eprintln!("update_focus_analysis_results: {}", e);
-            let _ = conn.execute_batch("ROLLBACK;");
-            return 0;
+        Err(failure) => {
+            let failure = rollback_focus_analysis_failure(conn, failure);
+            eprintln!(
+                "update_focus_analysis_results: {} failure: {}",
+                failure.stage, failure.reason
+            );
+            return failure.into_result();
         }
     };
 
     if let Err(e) = conn.execute_batch("COMMIT;") {
-        eprintln!("update_focus_analysis_results: commit {}", e);
-        let _ = conn.execute_batch("ROLLBACK;");
-        return 0;
+        let failure = FocusAnalysisWritebackFailure::new(
+            FOCUS_WRITEBACK_STAGE_COMMIT,
+            format!("update_focus_analysis_results: COMMIT failed: {}", e),
+            None,
+            None,
+        );
+        let failure = rollback_focus_analysis_failure(conn, failure);
+        eprintln!("{}", failure.reason);
+        return failure.into_result();
     }
 
-    updated
+    successful_focus_analysis_writeback(updated)
+}
+
+/// Batch writeback for focus-analysis results. The returned receipt separates
+/// a successful zero-row no-op from catalogue/transaction failure and carries
+/// the exact failing helper/statement across UniFFI.
+pub async fn update_focus_analysis_results(
+    results: Vec<FocusAnalysisResult>,
+) -> FocusAnalysisWritebackResult
+{
+    if results.is_empty() {
+        return successful_focus_analysis_writeback(0);
+    }
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            let failure = FocusAnalysisWritebackFailure::new(
+                FOCUS_WRITEBACK_STAGE_CATALOGUE,
+                "update_focus_analysis_results: catalogue unavailable: catalogue not initialized"
+                    .to_string(),
+                None,
+                None,
+            );
+            eprintln!("{}", failure.reason);
+            return failure.into_result();
+        }
+    };
+
+    update_focus_analysis_results_impl(conn, results)
 }
 
 /// Count durable face observations for the requested focus/enrichment algorithm
@@ -14580,7 +14767,8 @@ mod face_observation_tests {
             &first,
             &[1, 2],
             true
-        ));
+        )
+        .is_ok());
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM face_observation", [], |row| {
@@ -14595,7 +14783,8 @@ mod face_observation_tests {
             &replacement,
             &[1, 2],
             true
-        ));
+        )
+        .is_ok());
 
         let rows: Vec<(i64, i64, i64)> = conn
             .prepare(
@@ -14621,14 +14810,16 @@ mod face_observation_tests {
             &complete,
             &[1],
             true
-        ));
+        )
+        .is_ok());
 
         assert!(replace_face_observations_for_targets(
             &conn,
             &complete,
             &[1],
             false
-        ));
+        )
+        .is_ok());
 
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM face_observation", [], |row| {
@@ -14940,6 +15131,93 @@ mod focus_analysis_writeback_tests {
             )
             .unwrap();
         assert_eq!(face_count, 2);
+    }
+
+    #[test]
+    fn structured_writeback_receipt_distinguishes_success_from_empty_no_op()
+    {
+        let conn = setup();
+
+        let empty = update_focus_analysis_results_impl(&conn, Vec::new());
+        assert_eq!(empty, successful_focus_analysis_writeback(0));
+
+        let receipt = update_focus_analysis_results_impl(&conn, vec![result(40, 73.0)]);
+        assert_eq!(receipt, successful_focus_analysis_writeback(1));
+
+        let score: f64 = conn
+            .query_row(
+                "SELECT focus_score FROM images WHERE id = 40",
+                [],
+                |row| row.get(0),
+            )
+            .expect("committed focus score");
+        assert_eq!(score, 73.0);
+    }
+
+    #[test]
+    fn structured_writeback_receipt_preserves_keyword_error_and_rolls_back()
+    {
+        let conn = setup();
+        let mut with_keyword = result(40, 73.0);
+        with_keyword.auto_keywords = vec!["adult".to_string()];
+
+        let receipt = update_focus_analysis_results_impl(&conn, vec![with_keyword]);
+
+        assert_eq!(receipt.updated, 0);
+        assert_eq!(receipt.failure_stage.as_deref(), Some("apply"));
+        assert_eq!(receipt.source_image_id, Some(40));
+        assert_eq!(receipt.target_image_id, Some(40));
+        let reason = receipt.failed_reason.expect("keyword failure detail");
+        assert!(reason.contains("insert_active_keyword_for_image"));
+        assert!(reason.contains("keyword upsert"));
+        assert!(reason.contains("keyword existence SELECT"));
+        assert!(reason.contains("source_image_id=40"));
+        assert!(reason.contains("target_image_id=40"));
+        assert!(reason.contains("adult"));
+        assert!(reason.contains("keyword"));
+
+        let score: Option<f64> = conn
+            .query_row(
+                "SELECT focus_score FROM images WHERE id = 40",
+                [],
+                |row| row.get(0),
+            )
+            .expect("rolled-back focus score");
+        assert_eq!(score, None);
+        let face_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM face_observation", [], |row| row.get(0))
+            .expect("rolled-back face count");
+        assert_eq!(face_count, 0);
+    }
+
+    #[test]
+    fn structured_writeback_receipt_preserves_face_statement_error()
+    {
+        let conn = setup();
+        conn.execute_batch("DROP TABLE face_observation;")
+            .expect("drop face table to force apply failure");
+
+        let receipt = update_focus_analysis_results_impl(&conn, vec![result(20, 41.0)]);
+
+        assert_eq!(receipt.updated, 0);
+        assert_eq!(receipt.failure_stage.as_deref(), Some("apply"));
+        assert_eq!(receipt.source_image_id, Some(20));
+        assert_eq!(receipt.target_image_id, Some(20));
+        let reason = receipt.failed_reason.expect("face failure detail");
+        assert!(reason.contains("replace_face_observations_for_targets"));
+        assert!(reason.contains("DELETE face_observation"));
+        assert!(reason.contains("source_image_id=20"));
+        assert!(reason.contains("target_image_id=20"));
+        assert!(reason.contains("face_observation"));
+
+        let score: Option<f64> = conn
+            .query_row(
+                "SELECT focus_score FROM images WHERE id = 20",
+                [],
+                |row| row.get(0),
+            )
+            .expect("rolled-back focus score");
+        assert_eq!(score, None);
     }
 }
 
