@@ -1308,6 +1308,10 @@ dictionary OperationLogEntryRecord {
     string reason_code;
     string message;
     string created_at;
+    // S125 file facts (cloud-safe stat metadata; dates are ISO-8601 TEXT).
+    i64? file_byte_size;
+    string? file_created_at;
+    string? file_modified_at;
 };
 
 // The write-side carrier — batched through append_operation_log_entries.
@@ -1316,6 +1320,11 @@ dictionary OperationLogEntryInput {
     string? file_path;
     string reason_code;
     string message;
+    // S125 file facts — appended LAST with `= null` so existing construction
+    // sites are untouched; filled at the Swift append seam via a cloud-safe stat.
+    i64? file_byte_size = null;
+    string? file_created_at = null;
+    string? file_modified_at = null;
 };
 
 // One directory's OWN image tally (S65, Sources sidebar) — directory_path is

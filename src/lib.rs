@@ -666,6 +666,16 @@ pub struct OperationLogEntryRecord {
     pub reason_code: String,
     pub message: String,
     pub created_at: String,
+    // File facts captured at write time (S125) so a support reader can find
+    // and identify the file straight from the entry — location (file_path
+    // above) plus size and dates. All cloud-SAFE stat-level metadata (never a
+    // byte read, so an online-only placeholder is never materialized to log
+    // it). Nullable: entries written before S125, or files that couldn't be
+    // stat'd, carry NULLs. Dates are stored as TEXT (ISO-8601) — see
+    // OperationLogEntryInput.
+    pub file_byte_size: Option<i64>,
+    pub file_created_at: Option<String>,
+    pub file_modified_at: Option<String>,
 }
 
 /// The write-side carrier for one Operation Log event. Batched per phase
@@ -676,6 +686,15 @@ pub struct OperationLogEntryInput {
     pub file_path: Option<String>,
     pub reason_code: String,
     pub message: String,
+    // S125 file facts (see OperationLogEntryRecord). Appended LAST with `= null`
+    // UDL defaults so existing construction sites are untouched. Filled once at
+    // the Swift append seam via a cloud-safe stat; a writer that has no file (or
+    // an un-stat'able one) simply leaves them None. Dates are ISO-8601 TEXT
+    // (stored verbatim — DuckDB never parses them; the viewer formats for
+    // display), size is the file's logical byte length.
+    pub file_byte_size: Option<i64>,
+    pub file_created_at: Option<String>,
+    pub file_modified_at: Option<String>,
 }
 
 /// Recognized RAW image file extensions
@@ -1498,8 +1517,21 @@ fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
             file_path TEXT,
             reason_code TEXT NOT NULL,       -- stable token, e.g. unreadable / copy_failed
             message TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            -- S125 file facts (cloud-safe stat metadata captured at write time so
+            -- a support reader can find AND identify the file). Nullable, NO
+            -- default (S62 WAL-replay rule); dates are ISO-8601 TEXT.
+            file_byte_size BIGINT,
+            file_created_at TEXT,
+            file_modified_at TEXT
         );
+
+        -- Pre-S125 catalogues gain the three file-fact columns here. No default
+        -- (the S62 ALTER-with-DEFAULT wedge), so no backfill: rows written before
+        -- S125 keep NULL facts and are still actionable via their stored path.
+        ALTER TABLE operation_log_entry ADD COLUMN IF NOT EXISTS file_byte_size BIGINT;
+        ALTER TABLE operation_log_entry ADD COLUMN IF NOT EXISTS file_created_at TEXT;
+        ALTER TABLE operation_log_entry ADD COLUMN IF NOT EXISTS file_modified_at TEXT;
 
         CREATE INDEX IF NOT EXISTS idx_operation_log_entry_run ON operation_log_entry(run_id);
         CREATE INDEX IF NOT EXISTS idx_operation_log_entry_run_severity ON operation_log_entry(run_id, severity);
@@ -7267,8 +7299,10 @@ fn append_operation_log_entries_impl(
     }
 
     let mut stmt = match conn.prepare(
-        "INSERT INTO operation_log_entry (run_id, severity, file_path, reason_code, message)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO operation_log_entry \
+         (run_id, severity, file_path, reason_code, message, \
+          file_byte_size, file_created_at, file_modified_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     ) {
         Ok(stmt) => stmt,
         Err(e) => {
@@ -7288,7 +7322,10 @@ fn append_operation_log_entries_impl(
             severity,
             entry.file_path,
             reason,
-            entry.message
+            entry.message,
+            entry.file_byte_size,
+            entry.file_created_at,
+            entry.file_modified_at
         ]) {
             Ok(_) => appended += 1,
             Err(e) => {
@@ -7352,7 +7389,8 @@ fn operation_log_entries_impl(
         .filter(|value| !value.is_empty());
 
     let sql = "SELECT id, run_id, severity, file_path, reason_code, message, \
-                      CAST(created_at AS VARCHAR)
+                      CAST(created_at AS VARCHAR), \
+                      file_byte_size, file_created_at, file_modified_at
                FROM operation_log_entry
                WHERE run_id = ?1 AND (?2 IS NULL OR severity = ?2)
                ORDER BY id
@@ -7375,6 +7413,9 @@ fn operation_log_entries_impl(
             reason_code: row.get(4)?,
             message: row.get(5)?,
             created_at: row.get(6)?,
+            file_byte_size: row.get(7)?,
+            file_created_at: row.get(8)?,
+            file_modified_at: row.get(9)?,
         })
     });
 
@@ -14829,7 +14870,10 @@ mod operation_log_tests {
                  file_path TEXT,
                  reason_code TEXT NOT NULL,
                  message TEXT NOT NULL,
-                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 file_byte_size BIGINT,
+                 file_created_at TEXT,
+                 file_modified_at TEXT
              );",
         )
         .expect("operation log DDL");
@@ -14842,6 +14886,9 @@ mod operation_log_tests {
             file_path: path.map(|p| p.to_string()),
             reason_code: reason.to_string(),
             message: message.to_string(),
+            file_byte_size: None,
+            file_created_at: None,
+            file_modified_at: None,
         }
     }
 
@@ -14900,6 +14947,43 @@ mod operation_log_tests {
 
         let runs = list_operation_logs_impl(&conn, 10);
         assert_eq!(runs[0].entry_count, 3);
+    }
+
+    #[test]
+    fn append_carries_file_facts_round_trip_and_defaults_to_null() {
+        // S125: the file facts (size + ISO-8601 dates) captured at the Swift
+        // append seam must round-trip verbatim, and an entry written without
+        // them (the pre-S125 shape / an un-stat'able file) reads back NULL.
+        let conn = setup();
+        let id = begin_operation_log_impl(&conn, "scan").expect("run id");
+
+        let with_facts = OperationLogEntryInput {
+            severity: "warning".to_string(),
+            file_path: Some("/vol/RawFiles/RSW_3968.NEF".to_string()),
+            reason_code: "online_only".to_string(),
+            message: "cloud placeholder skipped".to_string(),
+            file_byte_size: Some(59_352_399),
+            file_created_at: Some("2025-10-27T13:14:00-04:00".to_string()),
+            file_modified_at: Some("2025-10-27T13:14:00-04:00".to_string()),
+        };
+        // `entry(...)` leaves all three facts None — the no-facts path.
+        let without_facts = entry("error", Some("/vol/x.nef"), "unreadable", "no facts");
+
+        assert_eq!(
+            append_operation_log_entries_impl(&conn, id, &[with_facts, without_facts]),
+            2
+        );
+
+        let all = operation_log_entries_impl(&conn, id, None, 100, 0);
+        assert_eq!(all.len(), 2);
+
+        assert_eq!(all[0].file_byte_size, Some(59_352_399));
+        assert_eq!(all[0].file_created_at.as_deref(), Some("2025-10-27T13:14:00-04:00"));
+        assert_eq!(all[0].file_modified_at.as_deref(), Some("2025-10-27T13:14:00-04:00"));
+
+        assert_eq!(all[1].file_byte_size, None);
+        assert!(all[1].file_created_at.is_none());
+        assert!(all[1].file_modified_at.is_none());
     }
 
     #[test]

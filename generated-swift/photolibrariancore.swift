@@ -3099,14 +3099,20 @@ public struct OperationLogEntryInput: Equatable, Hashable {
     public var filePath: String?
     public var reasonCode: String
     public var message: String
+    public var fileByteSize: Int64?
+    public var fileCreatedAt: String?
+    public var fileModifiedAt: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(severity: String, filePath: String?, reasonCode: String, message: String) {
+    public init(severity: String, filePath: String?, reasonCode: String, message: String, fileByteSize: Int64? = nil, fileCreatedAt: String? = nil, fileModifiedAt: String? = nil) {
         self.severity = severity
         self.filePath = filePath
         self.reasonCode = reasonCode
         self.message = message
+        self.fileByteSize = fileByteSize
+        self.fileCreatedAt = fileCreatedAt
+        self.fileModifiedAt = fileModifiedAt
     }
 
     
@@ -3128,7 +3134,10 @@ public struct FfiConverterTypeOperationLogEntryInput: FfiConverterRustBuffer {
                 severity: FfiConverterString.read(from: &buf), 
                 filePath: FfiConverterOptionString.read(from: &buf), 
                 reasonCode: FfiConverterString.read(from: &buf), 
-                message: FfiConverterString.read(from: &buf)
+                message: FfiConverterString.read(from: &buf), 
+                fileByteSize: FfiConverterOptionInt64.read(from: &buf), 
+                fileCreatedAt: FfiConverterOptionString.read(from: &buf), 
+                fileModifiedAt: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -3137,6 +3146,9 @@ public struct FfiConverterTypeOperationLogEntryInput: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.filePath, into: &buf)
         FfiConverterString.write(value.reasonCode, into: &buf)
         FfiConverterString.write(value.message, into: &buf)
+        FfiConverterOptionInt64.write(value.fileByteSize, into: &buf)
+        FfiConverterOptionString.write(value.fileCreatedAt, into: &buf)
+        FfiConverterOptionString.write(value.fileModifiedAt, into: &buf)
     }
 }
 
@@ -3164,10 +3176,13 @@ public struct OperationLogEntryRecord: Equatable, Hashable {
     public var reasonCode: String
     public var message: String
     public var createdAt: String
+    public var fileByteSize: Int64?
+    public var fileCreatedAt: String?
+    public var fileModifiedAt: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(id: Int64, runId: Int64, severity: String, filePath: String?, reasonCode: String, message: String, createdAt: String) {
+    public init(id: Int64, runId: Int64, severity: String, filePath: String?, reasonCode: String, message: String, createdAt: String, fileByteSize: Int64?, fileCreatedAt: String?, fileModifiedAt: String?) {
         self.id = id
         self.runId = runId
         self.severity = severity
@@ -3175,6 +3190,9 @@ public struct OperationLogEntryRecord: Equatable, Hashable {
         self.reasonCode = reasonCode
         self.message = message
         self.createdAt = createdAt
+        self.fileByteSize = fileByteSize
+        self.fileCreatedAt = fileCreatedAt
+        self.fileModifiedAt = fileModifiedAt
     }
 
     
@@ -3199,7 +3217,10 @@ public struct FfiConverterTypeOperationLogEntryRecord: FfiConverterRustBuffer {
                 filePath: FfiConverterOptionString.read(from: &buf), 
                 reasonCode: FfiConverterString.read(from: &buf), 
                 message: FfiConverterString.read(from: &buf), 
-                createdAt: FfiConverterString.read(from: &buf)
+                createdAt: FfiConverterString.read(from: &buf), 
+                fileByteSize: FfiConverterOptionInt64.read(from: &buf), 
+                fileCreatedAt: FfiConverterOptionString.read(from: &buf), 
+                fileModifiedAt: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -3211,6 +3232,9 @@ public struct FfiConverterTypeOperationLogEntryRecord: FfiConverterRustBuffer {
         FfiConverterString.write(value.reasonCode, into: &buf)
         FfiConverterString.write(value.message, into: &buf)
         FfiConverterString.write(value.createdAt, into: &buf)
+        FfiConverterOptionInt64.write(value.fileByteSize, into: &buf)
+        FfiConverterOptionString.write(value.fileCreatedAt, into: &buf)
+        FfiConverterOptionString.write(value.fileModifiedAt, into: &buf)
     }
 }
 
