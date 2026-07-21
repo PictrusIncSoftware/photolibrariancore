@@ -7944,42 +7944,128 @@ pub async fn focus_analysis_candidate_count_for_ids(
     focus_analysis_candidate_count_impl(conn, &algorithm_version, &analysis_run_id, Some(&ids))
 }
 
-fn focus_analysis_writeback_target_ids(conn: &Connection, image_id: i64) -> Vec<i64> {
-    let mut stmt = match conn.prepare(
-        "SELECT target.id
+fn focus_analysis_writeback_target_ids(
+    conn: &Connection,
+    image_id: i64,
+) -> Result<Vec<i64>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT target.id
          FROM images source
          JOIN images target
            ON target.id = source.id
            OR (
-               source.image_kind IN ('raw', 'jpeg', 'heif')
-               AND target.image_kind IN ('raw', 'jpeg', 'heif')
+               source.image_kind IN ('jpeg', 'heif')
+               AND target.image_kind = 'raw'
                AND target.file_stem = source.file_stem
                AND target.directory_path = source.directory_path
+               AND source.id = (
+                   SELECT preferred.id
+                   FROM images preferred
+                   WHERE preferred.image_kind IN ('jpeg', 'heif')
+                     AND preferred.file_stem = source.file_stem
+                     AND preferred.directory_path = source.directory_path
+                   ORDER BY
+                       CASE
+                           WHEN preferred.image_kind = 'jpeg' THEN 0
+                           WHEN preferred.image_kind = 'heif' THEN 1
+                           ELSE 2
+                       END,
+                       preferred.file_path ASC,
+                       preferred.id ASC
+                   LIMIT 1
+               )
            )
          WHERE source.id = ?1
          ORDER BY target.id",
-    ) {
-        Ok(stmt) => stmt,
-        Err(e) => {
-            eprintln!("focus_analysis_writeback_target_ids: prepare {}", e);
-            return vec![image_id];
-        }
-    };
+        )
+        .map_err(|e| {
+            format!(
+                "target planning for image {} prepare failed: {}",
+                image_id, e
+            )
+        })?;
 
-    let rows = match stmt.query_map(params![image_id], |row| row.get::<_, i64>(0)) {
-        Ok(rows) => rows,
-        Err(e) => {
-            eprintln!("focus_analysis_writeback_target_ids: query {}", e);
-            return vec![image_id];
-        }
-    };
+    let rows = stmt
+        .query_map(params![image_id], |row| row.get::<_, i64>(0))
+        .map_err(|e| format!("target planning for image {} query failed: {}", image_id, e))?;
 
-    let ids = rows.filter_map(|row| row.ok()).collect::<Vec<_>>();
-    if ids.is_empty() {
-        vec![image_id]
-    } else {
-        ids
+    // Keep this defensive de-dup even though `id` is unique. DuckDB 1.2.2 can
+    // expose multiple transactional versions of a row to a scan; writeback
+    // plans are normally computed before BEGIN, but the helper's contract is
+    // stronger and never returns the same target twice.
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(
+            row.map_err(|e| format!("target planning for image {} row failed: {}", image_id, e))?,
+        );
     }
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Err(format!(
+            "target planning found no catalogue row for image {}",
+            image_id
+        ));
+    }
+    Ok(ids)
+}
+
+struct FocusAnalysisWritebackPlan {
+    result: FocusAnalysisResult,
+    target_ids: Vec<i64>,
+}
+
+/// Freeze every writeback target before the transaction modifies `images`.
+///
+/// A complete JPEG/HEIF result may copy to hidden same-stem RAW rows, but it
+/// never copies to another visible JPEG/HEIF. The same deterministic rendered
+/// sibling used when a RAW id is projected to its visible counterpart owns the
+/// RAW across every chunk, and chunk-wide claiming guarantees that each row is
+/// targeted at most once in this transaction.
+fn plan_focus_analysis_writebacks(
+    conn: &Connection,
+    results: Vec<FocusAnalysisResult>,
+) -> Result<Vec<FocusAnalysisWritebackPlan>, String> {
+    let results = results
+        .into_iter()
+        .map(sanitized_focus_result)
+        .collect::<Vec<_>>();
+    // A result's own row always belongs to that result. Reserving source ids
+    // before assigning inherited RAW targets prevents an earlier sibling from
+    // stealing a later result's explicit source row in malformed/scoped input.
+    let mut source_ids = std::collections::HashSet::<i64>::new();
+    for result in &results {
+        if !source_ids.insert(result.id) {
+            return Err(format!(
+                "writeback chunk contains duplicate result id {}",
+                result.id
+            ));
+        }
+    }
+    let mut claimed_target_ids = source_ids.clone();
+    let mut emitted_source_ids = std::collections::HashSet::<i64>::new();
+
+    results
+        .into_iter()
+        .map(|result| {
+            let mut target_ids = if result.status == "complete" {
+                focus_analysis_writeback_target_ids(conn, result.id)?
+            } else {
+                vec![result.id]
+            };
+            target_ids.retain(|target_id| {
+                if *target_id == result.id {
+                    emitted_source_ids.insert(*target_id)
+                } else if source_ids.contains(target_id) {
+                    false
+                } else {
+                    claimed_target_ids.insert(*target_id)
+                }
+            });
+            Ok(FocusAnalysisWritebackPlan { result, target_ids })
+        })
+        .collect()
 }
 
 fn replace_face_observations_for_targets(
@@ -8084,6 +8170,192 @@ fn replace_face_observations_for_targets(
     true
 }
 
+fn update_focus_analysis_target(
+    conn: &Connection,
+    result: &FocusAnalysisResult,
+    target_id: i64,
+) -> Result<usize, duckdb::Error> {
+    let is_complete = result.status == "complete";
+    let score = if is_complete {
+        result.focus_score
+    } else {
+        None
+    };
+    let human_score = if is_complete {
+        result.focus_human_score
+    } else {
+        None
+    };
+    let animal_score = if is_complete {
+        result.focus_animal_score
+    } else {
+        None
+    };
+    let foreground_score = if is_complete {
+        result.focus_foreground_score
+    } else {
+        None
+    };
+    let saliency_score = if is_complete {
+        result.focus_saliency_score
+    } else {
+        None
+    };
+    let animal_pose_score = if is_complete {
+        result.focus_animal_pose_score
+    } else {
+        None
+    };
+    let whole_image_score = if is_complete {
+        result.focus_whole_image_score
+    } else {
+        None
+    };
+    let face_count = if is_complete { result.face_count } else { None };
+    let face_quality_best = if is_complete {
+        result.face_quality_best
+    } else {
+        None
+    };
+    let face_quality_average = if is_complete {
+        result.face_quality_average
+    } else {
+        None
+    };
+    let face_quality_min = if is_complete {
+        result.face_quality_min
+    } else {
+        None
+    };
+    let face_eyes_open_count = if is_complete {
+        result.face_eyes_open_count
+    } else {
+        None
+    };
+    let face_blink_risk_count = if is_complete {
+        result.face_blink_risk_count
+    } else {
+        None
+    };
+    let basis = result.focus_basis.as_deref().unwrap_or("unknown");
+
+    // The target relationship was frozen before BEGIN. This statement updates
+    // one explicit primary key and never re-scans `images` for siblings.
+    conn.execute(
+        "UPDATE images
+         SET focus_score = ?2,
+             focus_basis = ?3,
+             focus_human_score = ?4,
+             focus_animal_score = ?5,
+             focus_foreground_score = ?6,
+             focus_saliency_score = ?7,
+             focus_animal_pose_score = ?8,
+             focus_whole_image_score = ?9,
+             focus_algorithm_version = ?10,
+             focus_analysis_status = ?11,
+             focus_analysis_attempt_id = ?12,
+             focus_scored_at = CURRENT_TIMESTAMP,
+             face_count = ?13,
+             face_quality_best = ?14,
+             face_quality_average = ?15,
+             face_quality_min = ?16,
+             face_eyes_open_count = ?17,
+             face_blink_risk_count = ?18
+         WHERE id = ?1",
+        params![
+            target_id,
+            score,
+            basis,
+            human_score,
+            animal_score,
+            foreground_score,
+            saliency_score,
+            animal_pose_score,
+            whole_image_score,
+            &result.algorithm_version,
+            &result.status,
+            &result.analysis_run_id,
+            face_count,
+            face_quality_best,
+            face_quality_average,
+            face_quality_min,
+            face_eyes_open_count,
+            face_blink_risk_count,
+        ],
+    )
+}
+
+/// Write an already-frozen plan inside the caller's open transaction.
+fn write_focus_analysis_plans_in_transaction(
+    conn: &Connection,
+    plans: &[FocusAnalysisWritebackPlan],
+) -> Result<u64, String> {
+    let mut updated = 0u64;
+
+    for plan in plans {
+        let result = &plan.result;
+        let is_complete = result.status == "complete";
+        let mut updated_target_ids = Vec::with_capacity(plan.target_ids.len());
+
+        for target_id in &plan.target_ids {
+            let row_count =
+                update_focus_analysis_target(conn, result, *target_id).map_err(|e| {
+                    format!(
+                        "row {} target {} update failed: {}",
+                        result.id, target_id, e
+                    )
+                })?;
+            if row_count != 1 {
+                return Err(format!(
+                    "row {} target {} violated one-target/one-row invariant: updated {} rows",
+                    result.id, target_id, row_count
+                ));
+            }
+            updated += 1;
+            updated_target_ids.push(*target_id);
+        }
+
+        if updated_target_ids.is_empty() {
+            continue;
+        }
+
+        if !replace_face_observations_for_targets(conn, result, &updated_target_ids, is_complete) {
+            return Err(format!(
+                "row {} face-observation replacement failed",
+                result.id
+            ));
+        }
+
+        if is_complete {
+            let mut labels = result
+                .auto_keywords
+                .iter()
+                .map(|label| label.trim().to_string())
+                .filter(|label| !label.is_empty())
+                .collect::<Vec<_>>();
+            labels.sort_by_key(|label| label.to_lowercase());
+            labels.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+
+            for target_id in &updated_target_ids {
+                for label in &labels {
+                    if !insert_active_keyword_for_image(
+                        conn,
+                        *target_id,
+                        std::slice::from_ref(label),
+                    ) {
+                        return Err(format!(
+                            "row {} target {} auto-keyword insert failed for {:?}",
+                            result.id, target_id, label
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(updated)
+}
+
 /// Batch writeback for focus-analysis results. Returns the number of rows updated.
 pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) -> u64 {
     if results.is_empty() {
@@ -8099,189 +8371,35 @@ pub async fn update_focus_analysis_results(results: Vec<FocusAnalysisResult>) ->
         }
     };
 
+    // Planning must stay before BEGIN: the bundled DuckDB 1.2.2 can expose
+    // both versions of a row when a transaction re-scans `images` after an
+    // UPDATE. Holding the catalogue mutex makes this frozen plan stable until
+    // the transaction completes.
+    let plans = match plan_focus_analysis_writebacks(conn, results) {
+        Ok(plans) => plans,
+        Err(e) => {
+            eprintln!("update_focus_analysis_results: planning failed: {}", e);
+            return 0;
+        }
+    };
+
     if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         eprintln!("update_focus_analysis_results: begin {}", e);
         return 0;
     }
 
-    let mut updated = 0u64;
-    for result in results {
-        let result = sanitized_focus_result(result);
-        let is_complete = result.status == "complete";
-        let target_ids = if is_complete {
-            focus_analysis_writeback_target_ids(conn, result.id)
-        } else {
-            vec![result.id]
-        };
-
-        let score = if is_complete {
-            result.focus_score
-        } else {
-            None
-        };
-        let human_score = if is_complete {
-            result.focus_human_score
-        } else {
-            None
-        };
-        let animal_score = if is_complete {
-            result.focus_animal_score
-        } else {
-            None
-        };
-        let foreground_score = if is_complete {
-            result.focus_foreground_score
-        } else {
-            None
-        };
-        let saliency_score = if is_complete {
-            result.focus_saliency_score
-        } else {
-            None
-        };
-        let animal_pose_score = if is_complete {
-            result.focus_animal_pose_score
-        } else {
-            None
-        };
-        let whole_image_score = if is_complete {
-            result.focus_whole_image_score
-        } else {
-            None
-        };
-        let face_count = if is_complete { result.face_count } else { None };
-        let face_quality_best = if is_complete {
-            result.face_quality_best
-        } else {
-            None
-        };
-        let face_quality_average = if is_complete {
-            result.face_quality_average
-        } else {
-            None
-        };
-        let face_quality_min = if is_complete {
-            result.face_quality_min
-        } else {
-            None
-        };
-        let face_eyes_open_count = if is_complete {
-            result.face_eyes_open_count
-        } else {
-            None
-        };
-        let face_blink_risk_count = if is_complete {
-            result.face_blink_risk_count
-        } else {
-            None
-        };
-        let basis = result
-            .focus_basis
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-
-        match conn.execute(
-            "UPDATE images
-             SET focus_score = ?2,
-                 focus_basis = ?3,
-                 focus_human_score = ?4,
-                 focus_animal_score = ?5,
-                 focus_foreground_score = ?6,
-                 focus_saliency_score = ?7,
-                 focus_animal_pose_score = ?8,
-                 focus_whole_image_score = ?9,
-                 focus_algorithm_version = ?10,
-                 focus_analysis_status = ?11,
-                 focus_analysis_attempt_id = ?12,
-                 focus_scored_at = CURRENT_TIMESTAMP,
-                 face_count = ?13,
-                 face_quality_best = ?14,
-                 face_quality_average = ?15,
-                 face_quality_min = ?16,
-                 face_eyes_open_count = ?17,
-                 face_blink_risk_count = ?18
-             WHERE id = ?1
-                OR (
-                    ?11 = 'complete'
-                    AND EXISTS (
-                        SELECT 1 FROM images source
-                        WHERE source.id = ?1
-                          AND source.image_kind IN ('raw', 'jpeg', 'heif')
-                          AND images.image_kind IN ('raw', 'jpeg', 'heif')
-                          AND source.file_stem = images.file_stem
-                          AND source.directory_path = images.directory_path
-                    )
-                )",
-            params![
-                result.id,
-                score,
-                basis,
-                human_score,
-                animal_score,
-                foreground_score,
-                saliency_score,
-                animal_pose_score,
-                whole_image_score,
-                result.algorithm_version,
-                result.status,
-                result.analysis_run_id,
-                face_count,
-                face_quality_best,
-                face_quality_average,
-                face_quality_min,
-                face_eyes_open_count,
-                face_blink_risk_count,
-            ],
-        ) {
-            Ok(n) => {
-                updated += n as u64;
-                if n > 0
-                    && !replace_face_observations_for_targets(
-                        conn,
-                        &result,
-                        &target_ids,
-                        is_complete,
-                    )
-                {
-                    let _ = conn.execute_batch("ROLLBACK;");
-                    return 0;
-                }
-
-                if n > 0 && is_complete {
-                    let mut labels = result
-                        .auto_keywords
-                        .iter()
-                        .map(|label| label.trim().to_string())
-                        .filter(|label| !label.is_empty())
-                        .collect::<Vec<_>>();
-                    labels.sort_by_key(|label| label.to_lowercase());
-                    labels.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
-
-                    for target_id in &target_ids {
-                        for label in &labels {
-                            if !insert_active_keyword_for_image(
-                                conn,
-                                *target_id,
-                                std::slice::from_ref(label),
-                            ) {
-                                let _ = conn.execute_batch("ROLLBACK;");
-                                return 0;
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "update_focus_analysis_results: row {} failed: {}",
-                    result.id, e
-                );
-            }
+    let updated = match write_focus_analysis_plans_in_transaction(conn, &plans) {
+        Ok(updated) => updated,
+        Err(e) => {
+            eprintln!("update_focus_analysis_results: {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return 0;
         }
-    }
+    };
 
     if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("update_focus_analysis_results: commit {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
         return 0;
     }
 
@@ -14522,6 +14640,310 @@ mod face_observation_tests {
 }
 
 #[cfg(test)]
+mod focus_analysis_writeback_tests {
+    use super::*;
+    use duckdb::Connection;
+
+    fn setup() -> Connection {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE images (
+                 id INTEGER PRIMARY KEY,
+                 file_path TEXT NOT NULL,
+                 image_kind VARCHAR,
+                 file_stem VARCHAR,
+                 directory_path VARCHAR,
+                 focus_score DOUBLE,
+                 focus_basis VARCHAR,
+                 focus_human_score DOUBLE,
+                 focus_animal_score DOUBLE,
+                 focus_foreground_score DOUBLE,
+                 focus_saliency_score DOUBLE,
+                 focus_animal_pose_score DOUBLE,
+                 focus_whole_image_score DOUBLE,
+                 focus_algorithm_version VARCHAR,
+                 focus_analysis_status VARCHAR,
+                 focus_analysis_attempt_id VARCHAR,
+                 focus_scored_at TIMESTAMP,
+                 face_count INTEGER,
+                 face_quality_best DOUBLE,
+                 face_quality_average DOUBLE,
+                 face_quality_min DOUBLE,
+                 face_eyes_open_count INTEGER,
+                 face_blink_risk_count INTEGER
+             );
+
+             CREATE SEQUENCE face_observation_id_seq START 1;
+             CREATE TABLE face_observation (
+                 id INTEGER PRIMARY KEY DEFAULT nextval('face_observation_id_seq'),
+                 image_id INTEGER NOT NULL,
+                 analyzed_image_id INTEGER NOT NULL,
+                 face_index INTEGER NOT NULL,
+                 algorithm_version TEXT NOT NULL,
+                 analysis_run_id TEXT NOT NULL,
+                 bounding_box_x DOUBLE NOT NULL,
+                 bounding_box_y DOUBLE NOT NULL,
+                 bounding_box_width DOUBLE NOT NULL,
+                 bounding_box_height DOUBLE NOT NULL,
+                 detection_confidence DOUBLE,
+                 face_capture_quality DOUBLE,
+                 face_focus_score DOUBLE,
+                 left_eye_open_score DOUBLE,
+                 right_eye_open_score DOUBLE,
+                 eyes_open_score DOUBLE,
+                 blink_risk_score DOUBLE,
+                 left_eye_x DOUBLE,
+                 left_eye_y DOUBLE,
+                 right_eye_x DOUBLE,
+                 right_eye_y DOUBLE,
+                 nose_x DOUBLE,
+                 nose_y DOUBLE,
+                 mouth_left_x DOUBLE,
+                 mouth_left_y DOUBLE,
+                 mouth_right_x DOUBLE,
+                 mouth_right_y DOUBLE,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 UNIQUE (image_id, algorithm_version, face_index)
+             );
+
+             INSERT INTO images (id, file_path, image_kind, file_stem, directory_path) VALUES
+                 (10, '/a/shot.nef',  'raw',   'shot', '/a'),
+                 (11, '/a/shot.jpg',  'jpeg',  'shot', '/a'),
+                 (12, '/a/shot.heic', 'heif',  'shot', '/a'),
+                 (20, '/a/twin.jpg',  'jpeg',  'twin', '/a'),
+                 (21, '/a/twin.jpeg', 'jpeg',  'twin', '/a'),
+                 (22, '/b/twin.jpg',  'jpeg',  'twin', '/b'),
+                 (23, '/a/shot.psd',  'other', 'shot', '/a'),
+                 (30, '/a/heif.nef',  'raw',   'heif', '/a'),
+                 (31, '/a/heif.heic', 'heif',  'heif', '/a'),
+                 (40, '/a/lone.jpg',  'jpeg',  'lone', '/a'),
+                 (50, '/a/multi.nef',  'raw',  'multi', '/a'),
+                 (51, '/a/multi.jpg',  'jpeg', 'multi', '/a'),
+                 (52, '/a/multi.jpeg', 'jpeg', 'multi', '/a');",
+        )
+        .expect("focus writeback schema");
+        conn
+    }
+
+    fn observation() -> FaceObservationResult {
+        FaceObservationResult {
+            face_index: 0,
+            bounding_box_x: 0.1,
+            bounding_box_y: 0.2,
+            bounding_box_width: 0.3,
+            bounding_box_height: 0.4,
+            detection_confidence: Some(0.9),
+            face_capture_quality: Some(0.8),
+            face_focus_score: Some(50.0),
+            left_eye_open_score: None,
+            right_eye_open_score: None,
+            eyes_open_score: None,
+            blink_risk_score: None,
+            left_eye_x: None,
+            left_eye_y: None,
+            right_eye_x: None,
+            right_eye_y: None,
+            nose_x: None,
+            nose_y: None,
+            mouth_left_x: None,
+            mouth_left_y: None,
+            mouth_right_x: None,
+            mouth_right_y: None,
+        }
+    }
+
+    fn result(id: i64, score: f64) -> FocusAnalysisResult {
+        FocusAnalysisResult {
+            id,
+            focus_score: Some(score),
+            focus_basis: Some("human_face".to_string()),
+            algorithm_version: "writeback-test-v1".to_string(),
+            analysis_run_id: "writeback-test-run".to_string(),
+            status: "complete".to_string(),
+            focus_human_score: Some(score),
+            focus_animal_score: None,
+            focus_foreground_score: None,
+            focus_saliency_score: None,
+            focus_animal_pose_score: None,
+            focus_whole_image_score: Some(score),
+            face_count: Some(1),
+            face_quality_best: Some(0.8),
+            face_quality_average: Some(0.8),
+            face_quality_min: Some(0.8),
+            face_eyes_open_count: Some(0),
+            face_blink_risk_count: Some(0),
+            auto_keywords: Vec::new(),
+            face_observations: vec![observation()],
+        }
+    }
+
+    #[test]
+    fn writeback_targets_match_raw_collapse_semantics() {
+        let conn = setup();
+
+        // JPEG wins the existing JPEG-before-HEIF visible-counterpart order
+        // and is the sole owner of the hidden RAW.
+        assert_eq!(
+            focus_analysis_writeback_target_ids(&conn, 11).unwrap(),
+            vec![10, 11]
+        );
+        assert_eq!(
+            focus_analysis_writeback_target_ids(&conn, 12).unwrap(),
+            vec![12]
+        );
+        assert_eq!(
+            focus_analysis_writeback_target_ids(&conn, 10).unwrap(),
+            vec![10]
+        );
+
+        // Visible same-stem JPEGs remain distinct, as do files in another
+        // directory and non-collapse image kinds.
+        assert_eq!(
+            focus_analysis_writeback_target_ids(&conn, 20).unwrap(),
+            vec![20]
+        );
+        assert_eq!(
+            focus_analysis_writeback_target_ids(&conn, 21).unwrap(),
+            vec![21]
+        );
+        assert_eq!(
+            focus_analysis_writeback_target_ids(&conn, 22).unwrap(),
+            vec![22]
+        );
+        assert_eq!(
+            focus_analysis_writeback_target_ids(&conn, 23).unwrap(),
+            vec![23]
+        );
+        assert_eq!(
+            focus_analysis_writeback_target_ids(&conn, 31).unwrap(),
+            vec![30, 31]
+        );
+        assert_eq!(
+            focus_analysis_writeback_target_ids(&conn, 40).unwrap(),
+            vec![40]
+        );
+        // With two JPEG siblings, the stable file-path ordering—not chunk
+        // order—selects the one rendered owner for the hidden RAW.
+        assert_eq!(
+            focus_analysis_writeback_target_ids(&conn, 51).unwrap(),
+            vec![51]
+        );
+        assert_eq!(
+            focus_analysis_writeback_target_ids(&conn, 52).unwrap(),
+            vec![50, 52]
+        );
+        assert!(focus_analysis_writeback_target_ids(&conn, 999).is_err());
+    }
+
+    #[test]
+    fn writeback_plan_reserves_sources_and_claims_each_target_once() {
+        let conn = setup();
+        let plans = plan_focus_analysis_writebacks(
+            &conn,
+            vec![
+                result(11, 11.0),
+                result(12, 12.0),
+                result(20, 20.0),
+                result(21, 21.0),
+            ],
+        )
+        .expect("writeback plan");
+        let targets = plans
+            .iter()
+            .map(|plan| plan.target_ids.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(targets, vec![vec![10, 11], vec![12], vec![20], vec![21]]);
+
+        let flattened = targets.into_iter().flatten().collect::<Vec<_>>();
+        let unique = flattened
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(flattened.len(), unique.len());
+
+        // An explicit RAW result keeps its own row even when a rendered
+        // sibling precedes it in the chunk.
+        let with_raw_source =
+            plan_focus_analysis_writebacks(&conn, vec![result(11, 11.0), result(10, 10.0)])
+                .expect("plan with explicit raw source");
+        assert_eq!(with_raw_source[0].target_ids, vec![11]);
+        assert_eq!(with_raw_source[1].target_ids, vec![10]);
+
+        // Sanitization happens before fan-out: an invalid complete result is
+        // quarantined as failed and cannot overwrite its hidden RAW sibling.
+        let mut invalid = result(11, 11.0);
+        invalid.focus_score = None;
+        let invalid_plan =
+            plan_focus_analysis_writebacks(&conn, vec![invalid]).expect("invalid result plan");
+        assert_eq!(invalid_plan[0].result.status, "failed");
+        assert_eq!(invalid_plan[0].target_ids, vec![11]);
+
+        assert!(
+            plan_focus_analysis_writebacks(&conn, vec![result(11, 11.0), result(11, 12.0)])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn production_write_body_preserves_independent_twin_results_and_faces() {
+        let conn = setup();
+        let plans = plan_focus_analysis_writebacks(&conn, vec![result(20, 41.0), result(21, 59.0)])
+            .expect("twin plans");
+
+        conn.execute_batch("BEGIN TRANSACTION;").expect("begin");
+        assert_eq!(
+            write_focus_analysis_plans_in_transaction(&conn, &plans),
+            Ok(2)
+        );
+        conn.execute_batch("COMMIT;").expect("commit");
+
+        let scores = conn
+            .prepare("SELECT id, focus_score FROM images WHERE id IN (20, 21) ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(scores, vec![(20, 41.0), (21, 59.0)]);
+
+        let faces = conn
+            .prepare(
+                "SELECT image_id, analyzed_image_id
+                 FROM face_observation
+                 WHERE algorithm_version = 'writeback-test-v1'
+                 ORDER BY image_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(faces, vec![(20, 20), (21, 21)]);
+
+        // Replaying the chunk replaces, rather than duplicates, observations.
+        let replay =
+            plan_focus_analysis_writebacks(&conn, vec![result(20, 41.0), result(21, 59.0)])
+                .expect("replay plans");
+        conn.execute_batch("BEGIN TRANSACTION;")
+            .expect("replay begin");
+        assert_eq!(
+            write_focus_analysis_plans_in_transaction(&conn, &replay),
+            Ok(2)
+        );
+        conn.execute_batch("COMMIT;").expect("replay commit");
+        let face_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM face_observation
+                 WHERE algorithm_version = 'writeback-test-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(face_count, 2);
+    }
+}
+
+#[cfg(test)]
 mod focus_analysis_queue_tests {
     use super::*;
     use duckdb::Connection;
@@ -20361,6 +20783,60 @@ mod pipeline_scale_hardening_tests {
 mod live_repro_tests {
     use super::*;
 
+    const TWIN_REPRO_ALGORITHM: &str = "pldiag-twin-writeback-v1";
+
+    fn twin_repro_observation() -> FaceObservationResult {
+        FaceObservationResult {
+            face_index: 0,
+            bounding_box_x: 0.1,
+            bounding_box_y: 0.2,
+            bounding_box_width: 0.3,
+            bounding_box_height: 0.4,
+            detection_confidence: Some(0.9),
+            face_capture_quality: Some(0.8),
+            face_focus_score: Some(123.0),
+            left_eye_open_score: Some(0.2),
+            right_eye_open_score: Some(0.21),
+            eyes_open_score: Some(0.205),
+            blink_risk_score: Some(0.0),
+            left_eye_x: Some(0.2),
+            left_eye_y: Some(0.6),
+            right_eye_x: Some(0.4),
+            right_eye_y: Some(0.6),
+            nose_x: Some(0.3),
+            nose_y: Some(0.45),
+            mouth_left_x: Some(0.23),
+            mouth_left_y: Some(0.35),
+            mouth_right_x: Some(0.37),
+            mouth_right_y: Some(0.35),
+        }
+    }
+
+    fn twin_repro_result(image_id: i64, score: f64) -> FocusAnalysisResult {
+        FocusAnalysisResult {
+            id: image_id,
+            focus_score: Some(score),
+            focus_basis: Some("human_face".to_string()),
+            algorithm_version: TWIN_REPRO_ALGORITHM.to_string(),
+            analysis_run_id: "twin-repro-attempt".to_string(),
+            status: "complete".to_string(),
+            focus_human_score: Some(score),
+            focus_animal_score: None,
+            focus_foreground_score: None,
+            focus_saliency_score: None,
+            focus_animal_pose_score: None,
+            focus_whole_image_score: Some(score),
+            face_count: Some(1),
+            face_quality_best: Some(0.8),
+            face_quality_average: Some(0.8),
+            face_quality_min: Some(0.8),
+            face_eyes_open_count: Some(1),
+            face_blink_risk_count: Some(0),
+            auto_keywords: Vec::new(),
+            face_observations: vec![twin_repro_observation()],
+        }
+    }
+
     /// S124 diagnostic — reproduce the culling chunk's keyword-insert failure
     /// against a COPY of the real catalogue, through the BUNDLED DuckDB
     /// (1.2.2), not the newer CLI. Skips silently unless PLDIAG_REPRO_DB is
@@ -20409,5 +20885,132 @@ mod live_repro_tests {
         eprintln!("repro insert_or_merge result: {:?}", result);
         let _ = conn.execute_batch("ROLLBACK;");
         assert!(result.is_ok(), "reproduced: {:?}", result);
+    }
+
+    /// S126 diagnostic gate — replay the two visible same-stem JPEG results
+    /// that currently wedge the production queue, through the bundled DuckDB
+    /// engine and the real target/face helpers. Skips unless
+    /// PLDIAG_REPRO_DB points to a disposable WAL-carrying snapshot.
+    /// Every write is enclosed in one transaction and rolled back.
+    #[test]
+    fn repro_twin_writeback_uses_distinct_targets_on_real_catalogue() {
+        let Ok(path) = std::env::var("PLDIAG_REPRO_DB") else {
+            return;
+        };
+        let first_id = std::env::var("PLDIAG_TWIN_FIRST_ID")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(298788);
+        let second_id = std::env::var("PLDIAG_TWIN_SECOND_ID")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(298789);
+
+        let conn = Connection::open(&path).expect("open catalogue copy");
+        let engine_version: String = conn
+            .query_row("SELECT version()", [], |row| row.get(0))
+            .expect("DuckDB version");
+        assert_eq!(
+            engine_version, "v1.2.2",
+            "this regression must run through the app's bundled DuckDB"
+        );
+
+        let mut twin_stmt = conn
+            .prepare(
+                "SELECT id, image_kind, file_stem, directory_path
+                 FROM images
+                 WHERE id IN (?1, ?2)
+                 ORDER BY id",
+            )
+            .expect("prepare twin preflight");
+        let twin_rows = twin_stmt
+            .query_map(params![first_id, second_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .expect("query twin preflight")
+            .map(|row| row.expect("read twin preflight row"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            twin_rows.len(),
+            2,
+            "the snapshot must contain both twin ids"
+        );
+        assert_eq!(twin_rows[0].0, first_id);
+        assert_eq!(twin_rows[1].0, second_id);
+        assert_eq!(twin_rows[0].1, "jpeg");
+        assert_eq!(twin_rows[1].1, "jpeg");
+        assert_eq!(
+            twin_rows[0].2, twin_rows[1].2,
+            "the fixture stems must match"
+        );
+        assert_eq!(
+            twin_rows[0].3, twin_rows[1].3,
+            "the fixture directories must match"
+        );
+        assert_eq!(
+            focus_analysis_writeback_target_ids(&conn, second_id).expect("plan second twin target"),
+            vec![second_id],
+            "the second visible JPEG must target only itself"
+        );
+        assert_eq!(
+            focus_analysis_writeback_target_ids(&conn, first_id).expect("plan first twin target"),
+            vec![first_id],
+            "the first visible JPEG must target only itself"
+        );
+
+        let plans = plan_focus_analysis_writebacks(
+            &conn,
+            vec![
+                twin_repro_result(first_id, 41.0),
+                twin_repro_result(second_id, 59.0),
+            ],
+        )
+        .expect("plan twin writeback");
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].target_ids, vec![first_id]);
+        assert_eq!(plans[1].target_ids, vec![second_id]);
+
+        conn.execute_batch("BEGIN TRANSACTION;").expect("begin");
+        let write_result = write_focus_analysis_plans_in_transaction(&conn, &plans);
+        let scores = conn
+            .prepare(
+                "SELECT id, focus_score
+                 FROM images
+                 WHERE id IN (?1, ?2)
+                 ORDER BY id",
+            )
+            .expect("prepare score verification")
+            .query_map(params![first_id, second_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+            })
+            .expect("query score verification")
+            .map(|row| row.expect("read score verification row"))
+            .collect::<Vec<_>>();
+        let faces = conn
+            .prepare(
+                "SELECT image_id, analyzed_image_id
+                 FROM face_observation
+                 WHERE algorithm_version = ?1
+                   AND image_id IN (?2, ?3)
+                 ORDER BY image_id",
+            )
+            .expect("prepare face verification")
+            .query_map(params![TWIN_REPRO_ALGORITHM, first_id, second_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .expect("query face verification")
+            .map(|row| row.expect("read face verification row"))
+            .collect::<Vec<_>>();
+
+        let _ = conn.execute_batch("ROLLBACK;");
+
+        assert_eq!(write_result, Ok(2));
+        assert_eq!(scores, vec![(first_id, 41.0), (second_id, 59.0)]);
+        assert_eq!(faces, vec![(first_id, first_id), (second_id, second_id)]);
     }
 }
