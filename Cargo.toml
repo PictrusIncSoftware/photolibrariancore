@@ -12,12 +12,13 @@ name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
 [dependencies]
-duckdb = { version = "1.1", features = ["bundled"] }
-lancedb = "0.14"
-arrow-array = "53"
-arrow-schema = "53"
+duckdb = { version = "=1.10505.0", features = ["bundled"] }
+lancedb = "=0.31.0"
+arrow-array = "=58.4.0"
+arrow-schema = "=58.4.0"
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
+chrono = { version = "=0.4.45", default-features = false, features = ["clock"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uniffi = { version = "0.31", features = ["cli"] }

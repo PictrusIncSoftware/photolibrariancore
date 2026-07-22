@@ -63,11 +63,11 @@ rustup target add aarch64-apple-darwin
 
 # Build release version
 echo "Building release build..."
-cargo build --release --target aarch64-apple-darwin
+cargo build --locked --release --target aarch64-apple-darwin
 
 echo ""
 echo "🔄 Generating UniFFI Swift bindings..."
-cargo run --bin uniffi-bindgen generate src/photolibrariancore.udl \
+cargo run --locked --bin uniffi-bindgen generate src/photolibrariancore.udl \
     --language swift --out-dir generated-swift
 
 # Define paths

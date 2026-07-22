@@ -2,8 +2,7 @@
 // DuckDB is used instead of SQLite for better analytical query performance on large image catalogues
 use arrow_array::types::Float32Type;
 use arrow_array::{
-    Array, FixedSizeListArray, Float64Array, Int64Array, RecordBatch, RecordBatchIterator,
-    StringArray, UInt32Array,
+    Array, FixedSizeListArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use duckdb::{params, Connection};
@@ -3864,18 +3863,26 @@ fn sql_compare_op(op: &str) -> Option<&'static str> {
     }
 }
 
-/// Map a `date_in_last` unit token to its DuckDB INTERVAL keyword (S66 —
-/// Gate 3). An allow-list, so unit text can never reach the SQL verbatim;
-/// the tokens are the wire vocabulary the Swift `DateUnit` enum emits (and
-/// Lightroom's own smart-collection unit words). Unknown → None.
-fn interval_unit_sql(unit: &str) -> Option<&'static str> {
-    match unit {
-        "days" => Some("DAY"),
-        "weeks" => Some("WEEK"),
-        "months" => Some("MONTH"),
-        "years" => Some("YEAR"),
+/// Resolve a dynamic `date_in_last` cutoff from the user's local calendar.
+/// DuckDB 1.5 autoloads ICU for CURRENT_DATE, which is not a valid dependency
+/// for the sandboxed bundled build. This function is called every time a query
+/// is constructed, so saved relative-date searches remain dynamic.
+fn relative_date_cutoff(count: u32, unit: &str) -> Option<String>
+{
+    let today = chrono::Local::now().date_naive();
+    let cutoff = match unit
+    {
+        "days" => today.checked_sub_days(chrono::Days::new(count as u64)),
+        "weeks" => count
+            .checked_mul(7)
+            .and_then(|days| today.checked_sub_days(chrono::Days::new(days as u64))),
+        "months" => today.checked_sub_months(chrono::Months::new(count)),
+        "years" => count
+            .checked_mul(12)
+            .and_then(|months| today.checked_sub_months(chrono::Months::new(months))),
         _ => None,
-    }
+    }?;
+    Some(cutoff.format("%Y:%m:%d").to_string())
 }
 
 /// One numeric-subject atom (S65 — ISO / aperture / shutter_speed /
@@ -4302,24 +4309,29 @@ fn predicate_to_sql(p: &QueryPredicate) -> String {
             _ => bad(),
         },
         // Dynamic date (Session 66 — Gate 3 of the smart-collections plan):
-        // "in the last N days/weeks/months/years". THE DATABASE resolves the
-        // cutoff at EXECUTION time — `CURRENT_DATE - INTERVAL` arithmetic at
-        // this one chokepoint — so every consumer (paging, counts, ⌘A, saved
+        // "in the last N days/weeks/months/years". Rust resolves the
+        // cutoff at EXECUTION time — local-calendar arithmetic at this one
+        // chokepoint — so every consumer (paging, counts, ⌘A, saved
         // queries, future surfaces) stays honest by construction, and a saved
         // "Past Month" never freezes into the month it was saved (the S65
         // decision: never snapshot a relative date). The count rides `value`,
         // the unit token rides `op` (zero schema change). This is the arm
         // Lightroom's `captureTime inLast N <unit>` smart-collection rule
-        // maps to. Day-granular like every other date arm: strftime renders
-        // the cutoff in the stored colon form and the comparison is `>=`.
+        // maps to. Day-granular like every other date arm. Do not use
+        // CURRENT_DATE here: DuckDB 1.5 autoloads ICU for it, which is
+        // unavailable in the App Store sandboxed bundled build.
         "date_in_last" => match (p.value.as_deref(), p.op.as_deref())
         {
-            (Some(v), Some(unit)) => match (v.parse::<u32>(), interval_unit_sql(unit))
+            (Some(v), Some(unit)) => match v.parse::<u32>()
             {
-                (Ok(n), Some(u)) if (1..=9999).contains(&n) => format!(
-                    "(SUBSTRING(capture_datetime, 1, 10) >= strftime(CURRENT_DATE - INTERVAL {} {}, '%Y:%m:%d'))",
-                    n, u
-                ),
+                Ok(n) if (1..=9999).contains(&n) => relative_date_cutoff(n, unit)
+                    .map(|cutoff| {
+                        format!(
+                            "(SUBSTRING(capture_datetime, 1, 10) >= '{}')",
+                            cutoff
+                        )
+                    })
+                    .unwrap_or_else(bad),
                 _ => bad(),
             },
             _ => bad(),
@@ -9052,10 +9064,8 @@ fn face_embedding_version_filter(model_version: &str, preprocessing_version: &st
 fn face_embedding_batch(
     records: &[FaceEmbeddingVectorRecord],
     dimension: u32,
-) -> Result<
-    RecordBatchIterator<std::vec::IntoIter<Result<RecordBatch, arrow_schema::ArrowError>>>,
-    arrow_schema::ArrowError,
-> {
+) -> Result<RecordBatch, arrow_schema::ArrowError>
+{
     let schema = face_embedding_schema(dimension);
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -9109,10 +9119,7 @@ fn face_embedding_batch(
         ],
     )?;
 
-    Ok(RecordBatchIterator::new(
-        vec![Ok(batch)].into_iter(),
-        schema.clone(),
-    ))
+    Ok(batch)
 }
 
 pub async fn upsert_face_embeddings(
@@ -14085,14 +14092,10 @@ mod face_embedding_tests {
             embedding_record(2, vec![0.4, 0.5, 0.6]),
         ];
 
-        let batch_iterator = face_embedding_batch(&records, 3).expect("embedding batch");
-        let batches = batch_iterator
-            .collect::<Result<Vec<_>, _>>()
-            .expect("record batches");
+        let batch = face_embedding_batch(&records, 3).expect("embedding batch");
 
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].num_rows(), 2);
-        let vectors = batches[0]
+        assert_eq!(batch.num_rows(), 2);
+        let vectors = batch
             .column_by_name("vector")
             .and_then(|array| array.as_any().downcast_ref::<FixedSizeListArray>())
             .expect("vector column");
@@ -17115,24 +17118,16 @@ mod keyword_tests {
             value: Some(count.to_string()),
         };
 
-        // The four units map to DuckDB INTERVAL keywords; the cutoff is
-        // computed by the DATABASE at execution time, in the stored colon form.
-        assert_eq!(
-            predicate_to_sql(&dil("30", "days")),
-            "(SUBSTRING(capture_datetime, 1, 10) >= strftime(CURRENT_DATE - INTERVAL 30 DAY, '%Y:%m:%d'))"
-        );
-        assert_eq!(
-            predicate_to_sql(&dil("2", "weeks")),
-            "(SUBSTRING(capture_datetime, 1, 10) >= strftime(CURRENT_DATE - INTERVAL 2 WEEK, '%Y:%m:%d'))"
-        );
-        assert_eq!(
-            predicate_to_sql(&dil("1", "months")),
-            "(SUBSTRING(capture_datetime, 1, 10) >= strftime(CURRENT_DATE - INTERVAL 1 MONTH, '%Y:%m:%d'))"
-        );
-        assert_eq!(
-            predicate_to_sql(&dil("3", "years")),
-            "(SUBSTRING(capture_datetime, 1, 10) >= strftime(CURRENT_DATE - INTERVAL 3 YEAR, '%Y:%m:%d'))"
-        );
+        // The four units resolve against the local calendar whenever the
+        // query is constructed, in the catalogue's stored colon form.
+        for (count, unit) in [(30, "days"), (2, "weeks"), (1, "months"), (3, "years")]
+        {
+            let cutoff = relative_date_cutoff(count, unit).expect("relative cutoff");
+            assert_eq!(
+                predicate_to_sql(&dil(&count.to_string(), unit)),
+                format!("(SUBSTRING(capture_datetime, 1, 10) >= '{}')", cutoff)
+            );
+        }
 
         // Malformed -> backstop: zero / negative / non-numeric / oversized
         // counts, an unknown unit, missing either field.
@@ -17149,25 +17144,30 @@ mod keyword_tests {
         assert_eq!(predicate_to_sql(&no_count), "(FALSE)");
     }
 
-    /// date_in_last must EXECUTE on the real engine — the strftime/INTERVAL
-    /// syntax is the risk the string test can't cover (S66 Gate 3). Rows are
-    /// seeded by DuckDB's OWN CURRENT_DATE arithmetic, so the test never reads
-    /// the host clock and cannot go stale. (All assertions stay correct even
-    /// across a midnight boundary between seed and query.)
+    /// date_in_last must EXECUTE on the real engine (S66 Gate 3). Rows are
+    /// seeded from the same local-calendar helper used by query construction.
+    /// The generous 30/400-day separation keeps the assertions correct even
+    /// across a midnight boundary between seed and query.
     #[test]
     fn date_in_last_executes_on_duckdb() {
         use duckdb::Connection;
 
         let conn = Connection::open_in_memory().expect("in-memory db");
-        conn.execute_batch(
-            "CREATE TABLE images (capture_datetime TEXT);
-             INSERT INTO images VALUES
-                 (strftime(CURRENT_DATE - INTERVAL 5 DAY, '%Y:%m:%d') || ' 12:00:00'),
-                 (strftime(CURRENT_DATE - INTERVAL 400 DAY, '%Y:%m:%d') || ' 12:00:00'),
-                 ('1999:01:01 00:00:00'),
-                 (NULL);",
+        conn.execute_batch("CREATE TABLE images (capture_datetime TEXT);")
+            .expect("create date table");
+        let recent = format!(
+            "{} 12:00:00",
+            relative_date_cutoff(5, "days").expect("recent fixture date")
+        );
+        let old = format!(
+            "{} 12:00:00",
+            relative_date_cutoff(400, "days").expect("old fixture date")
+        );
+        conn.execute(
+            "INSERT INTO images VALUES (?1), (?2), ('1999:01:01 00:00:00'), (NULL)",
+            params![recent, old],
         )
-        .expect("seed table");
+        .expect("seed date table");
 
         let dil = |count: &str, unit: &str| QueryPredicate {
             kind: "date_in_last".to_string(),
@@ -21058,6 +21058,100 @@ mod pipeline_scale_hardening_tests {
 }
 
 #[cfg(test)]
+const EXPECTED_BUNDLED_DUCKDB_VERSION: &str = "v1.5.5";
+
+#[cfg(test)]
+mod duckdb_upgrade_tests
+{
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn bundled_engine_has_expected_version_and_single_row_visibility_after_update()
+    {
+        let sequence = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "plcore-duckdb-upgrade-test-{}-{}.db",
+            std::process::id(),
+            sequence
+        ));
+        let wal_path = path.with_extension("db.wal");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&wal_path);
+
+        let conn = Connection::open(&path).expect("open file-backed DuckDB fixture");
+        let engine_version: String = conn
+            .query_row("SELECT version()", [], |row| row.get(0))
+            .expect("read bundled DuckDB version");
+        assert_eq!(engine_version, EXPECTED_BUNDLED_DUCKDB_VERSION);
+
+        conn.execute_batch(
+            "CREATE TABLE images (
+                 id BIGINT PRIMARY KEY,
+                 is_video BOOLEAN NOT NULL,
+                 image_kind VARCHAR NOT NULL,
+                 file_stem VARCHAR NOT NULL,
+                 directory_path VARCHAR NOT NULL,
+                 marker INTEGER NOT NULL
+             );
+             CREATE TABLE keyword (
+                 image_id BIGINT PRIMARY KEY,
+                 is_video BOOLEAN NOT NULL
+             );
+             INSERT INTO images VALUES
+                 (1, FALSE, 'jpeg', 'twin', '/fixture', 0),
+                 (2, FALSE, 'jpeg', 'twin', '/fixture', 0);",
+        )
+        .expect("create row-visibility fixture");
+
+        conn.execute_batch("BEGIN TRANSACTION;")
+            .expect("begin row-visibility transaction");
+        let updated = conn
+            .execute(
+                "UPDATE images
+                 SET marker = 1
+                 WHERE id = ?1
+                    OR EXISTS (
+                        SELECT 1
+                        FROM images source
+                        WHERE source.id = ?1
+                          AND source.image_kind IN ('raw', 'jpeg', 'heif')
+                          AND images.image_kind IN ('raw', 'jpeg', 'heif')
+                          AND source.file_stem = images.file_stem
+                          AND source.directory_path = images.directory_path
+                    )",
+                params![1_i64],
+            )
+            .expect("update same-stem rows");
+        assert_eq!(updated, 2);
+
+        conn.execute(
+            "INSERT INTO keyword (image_id, is_video)
+             VALUES (?1, (SELECT is_video FROM images WHERE id = ?1))",
+            params![1_i64],
+        )
+        .expect("unfenced scalar read must see one logical row");
+
+        conn.execute_batch("ROLLBACK;")
+            .expect("roll back row-visibility transaction");
+        let marker_sum: i64 = conn
+            .query_row("SELECT SUM(marker) FROM images", [], |row| row.get(0))
+            .expect("read rolled-back markers");
+        let keyword_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM keyword", [], |row| row.get(0))
+            .expect("read rolled-back keywords");
+        assert_eq!(marker_sum, 0);
+        assert_eq!(keyword_count, 0);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&wal_path);
+    }
+}
+
+#[cfg(test)]
 mod live_repro_tests {
     use super::*;
 
@@ -21189,7 +21283,7 @@ mod live_repro_tests {
             .query_row("SELECT version()", [], |row| row.get(0))
             .expect("DuckDB version");
         assert_eq!(
-            engine_version, "v1.2.2",
+            engine_version, EXPECTED_BUNDLED_DUCKDB_VERSION,
             "this regression must run through the app's bundled DuckDB"
         );
 
