@@ -5,7 +5,11 @@ use arrow_array::{
     Array, FixedSizeListArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use duckdb::{params, Connection};
+// `params_from_iter` + `types::Value` are what let the ingest path bind a
+// variable number of parameters (one multi-row INSERT per batch instead of one
+// statement per row — see INGEST_MULTI_ROW_CHUNK). `params!` has fixed arity and
+// cannot express that, so both forms are imported and both remain in use.
+use duckdb::{params, params_from_iter, types::Value, Connection};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use std::path::PathBuf;
@@ -1984,6 +1988,291 @@ fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
     Some(conn)
 }
 
+// =====================================================================
+// Ingest INSERT construction (U3 — ingest throughput)
+//
+// WHY THIS EXISTS
+// The original ingest issued one `conn.execute` per record. Under DuckDB
+// 1.5.5 that is dominated by per-STATEMENT query-pipeline construction
+// scaled by TABLE WIDTH — the `images` table is 68 columns wide, and DuckDB
+// allocates and then discards a per-column vector buffer for every statement.
+// Measured on a faithful replica of this exact schema (68 columns,
+// UNIQUE(file_path), all 21 secondary indexes, 5,000 rows):
+//
+//   per-row autocommit (the old shape)            122 rec/s   (8.2 ms/row)
+//   per-row inside an explicit transaction        128 rec/s   (+5% only)
+//   one 50-row INSERT OR IGNORE per batch       2,426 rec/s   (~20x)
+//   per-row with all 21 indexes DROPPED          119 rec/s   (indexes cost 0)
+//
+// So the lever is statements-per-row. Wrapping the per-row loop in a
+// transaction is nearly worthless, and index maintenance is not a contributor
+// at all. Folding a batch into ONE statement is the whole fix.
+//
+// WHAT IS DELIBERATELY UNCHANGED
+// - INSERT OR IGNORE semantics. A multi-row OR IGNORE skips both
+//   pre-existing duplicates AND duplicates appearing inside the same VALUES
+//   list, without failing the statement, and reports only the count actually
+//   inserted. Re-scan resumability against UNIQUE(file_path) is therefore
+//   preserved exactly, and `inserted_count` stays exact.
+// - The canonical directory_path expression
+//   SUBSTRING(file_path, 1, LENGTH(file_path) - INSTR(REVERSE(file_path), '/'))
+//   is emitted verbatim per row, pointed at that row's own file_path
+//   placeholder, so it stays byte-for-byte identical to the backfill UPDATE in
+//   initialize_catalogue's migration block.
+// - Per-record `parse_filename()` derivation of file_stem / image_kind. Rust
+//   still owns the "metype" placeholder and the case-folding convention.
+// - Error isolation. The per-record loop the old code was built around is kept
+//   as a FALLBACK: if the batch statement fails, that batch alone is retried
+//   row by row, so one malformed record still cannot drop its 49 neighbours.
+// =====================================================================
+
+/// Number of bound parameters the ingest INSERT consumes per record.
+///
+/// The VALUES clause emits 48 column expressions from these 47 placeholders:
+/// `directory_path` is an inline expression over the row's own `file_path`
+/// placeholder rather than a separately bound value, and `rotation` is wrapped
+/// in `COALESCE(?, 0)`.
+///
+/// Keep this in lockstep with `build_ingest_insert_sql` and
+/// `push_ingest_row_params`. duckdb's `bind_parameters` binds positionally and
+/// silently *ignores* surplus values, so an off-by-one here misbinds columns
+/// rather than raising an error.
+const INGEST_PARAMS_PER_ROW: usize = 47;
+
+/// Rows folded into a single multi-row INSERT statement.
+///
+/// 50 matches `ScanService.dbBatchSize`, so the common scan case is exactly one
+/// statement per flush and no Swift-side change is required. Larger chunks are
+/// measurably faster still (500 rows ≈ 35x rather than 20x) but each individual
+/// statement then blocks its caller for longer; raising this is a separate,
+/// separately-verified decision, not part of the U3 fix.
+const INGEST_MULTI_ROW_CHUNK: usize = 50;
+
+/// The ingest column list, in binding order.
+///
+/// file_stem and image_kind sit immediately after file_extension to keep the
+/// filename-parsing family (file_name → file_extension → file_stem →
+/// image_kind) visually grouped (decision C6 from the Step (a')
+/// read-and-confirm pass). They are populated per record by parse_filename().
+///
+/// directory_path (Session 19 Step 1, DESIGN-Filter-Aware-Pagination.md §4)
+/// sits adjacent to image_kind for the same visual-grouping reason — it is
+/// another stored derivation consumed by the filter-aware SQL added later in
+/// Session 19. Unlike file_stem / image_kind its value is derived entirely from
+/// file_path with no Rust-side enrichment, so the VALUES clause embeds the
+/// canonical SUBSTRING/INSTR/REVERSE expression directly on the row's file_path
+/// placeholder rather than binding a separately computed parameter. This
+/// guarantees byte-for-byte identical logic between ingest and the backfill
+/// UPDATE in initialize_catalogue's migration block.
+///
+/// The `id` column is omitted and auto-filled by DuckDB via its DEFAULT
+/// nextval() clause.
+const INGEST_COLUMN_LIST: &str = r#"
+        file_path, file_size, file_name, file_extension,
+        file_stem, image_kind, directory_path,
+        created_timestamp, modified_timestamp,
+        camera_make, camera_model, lens_model,
+        focal_length, aperture, shutter_speed, iso,
+        capture_datetime,
+        pixel_width, pixel_height, color_space, bit_depth,
+        gps_latitude, gps_longitude, gps_altitude,
+        copyright, creator, description,
+        rating, flag, color_label,
+        is_video,
+        duration_seconds, frame_rate, video_kind, video_codec, video_bitrate,
+        color_primaries, color_transfer, color_matrix, color_range, dv_profile,
+        has_audio, audio_codec, audio_channels, audio_sample_rate, audio_bitrate,
+        live_photo_id,
+        rotation
+"#;
+
+/// Build an `INSERT OR IGNORE INTO images ... VALUES (...), (...)` statement for
+/// `row_count` records.
+///
+/// Placeholders are numbered contiguously from ?1, with row *r* (0-based) owning
+/// ?(r*47+1) .. ?(r*47+47). `build_ingest_insert_sql(1)` reproduces the original
+/// single-row statement exactly, which is what the per-record fallback path uses
+/// — so both paths bind through identical SQL and cannot drift.
+fn build_ingest_insert_sql(row_count: usize) -> String
+{
+    // ~230 bytes of VALUES text per row once the placeholder indices grow to
+    // four digits, plus the fixed column-list preamble.
+    let mut sql = String::with_capacity(INGEST_COLUMN_LIST.len() + 64 + row_count * 260);
+
+    sql.push_str("INSERT OR IGNORE INTO images (");
+    sql.push_str(INGEST_COLUMN_LIST);
+    sql.push_str(") VALUES ");
+
+    for row in 0..row_count
+    {
+        let base = row * INGEST_PARAMS_PER_ROW;
+
+        if row > 0
+        {
+            sql.push_str(", ");
+        }
+
+        sql.push('(');
+
+        // file_path .. image_kind  →  ?1 .. ?6
+        for n in 1..=6usize
+        {
+            sql.push('?');
+            sql.push_str(&(base + n).to_string());
+            sql.push_str(", ");
+        }
+
+        // directory_path — the canonical derivation, on this row's file_path.
+        // DO NOT rewrite this expression; it must stay identical to the
+        // migration backfill in initialize_catalogue.
+        let file_path_ph = format!("?{}", base + 1);
+        sql.push_str("SUBSTRING(");
+        sql.push_str(&file_path_ph);
+        sql.push_str(", 1, LENGTH(");
+        sql.push_str(&file_path_ph);
+        sql.push_str(") - INSTR(REVERSE(");
+        sql.push_str(&file_path_ph);
+        sql.push_str("), '/')), ");
+
+        // created_timestamp .. live_photo_id  →  ?7 .. ?46
+        for n in 7..=46usize
+        {
+            sql.push('?');
+            sql.push_str(&(base + n).to_string());
+            sql.push_str(", ");
+        }
+
+        // rotation — None / stills coalesce to the schema default of 0.
+        sql.push_str("COALESCE(?");
+        sql.push_str(&(base + 47).to_string());
+        sql.push_str(", 0)");
+
+        sql.push(')');
+    }
+
+    sql
+}
+
+/// Append one record's 47 bound values to `out`, in the order
+/// `build_ingest_insert_sql` numbers its placeholders.
+///
+/// Type conversions match the original `params![]` block exactly: u32/u64/u8 →
+/// i64 for DuckDB INTEGER/BIGINT columns, and `None` → SQL NULL. Widening u64
+/// file sizes to i64 is safe for anything under 9 exabytes.
+fn push_ingest_row_params(record: &ImageMetadata, out: &mut Vec<Value>)
+{
+    // Derive filename-parsing columns via the canonical parser. The Rust core
+    // owns this logic so Swift can be ignorant of the "metype" placeholder and
+    // the case-folding convention; both are enforced here at write time.
+    // (DESIGN-Duplicate-Consolidation.md §5, §7.)
+    let parsed = parse_filename(record.file_name.clone());
+    let image_kind_str = match parsed.kind
+    {
+        ImageKind::Jpeg => "jpeg",
+        ImageKind::Raw => "raw",
+        ImageKind::Other => "other",
+        ImageKind::Heif => "heif",
+        ImageKind::Dng => "dng",
+        ImageKind::Psd => "psd",
+        ImageKind::Tiff => "tiff",
+        ImageKind::Png => "png",
+    };
+
+    fn text(value: &Option<String>) -> Value
+    {
+        match value
+        {
+            Some(s) => Value::Text(s.clone()),
+            None => Value::Null,
+        }
+    }
+
+    fn double(value: Option<f64>) -> Value
+    {
+        match value
+        {
+            Some(v) => Value::Double(v),
+            None => Value::Null,
+        }
+    }
+
+    fn bigint(value: Option<i64>) -> Value
+    {
+        match value
+        {
+            Some(v) => Value::BigInt(v),
+            None => Value::Null,
+        }
+    }
+
+    fn int(value: Option<i32>) -> Value
+    {
+        match value
+        {
+            Some(v) => Value::Int(v),
+            None => Value::Null,
+        }
+    }
+
+    fn boolean(value: Option<bool>) -> Value
+    {
+        match value
+        {
+            Some(v) => Value::Boolean(v),
+            None => Value::Null,
+        }
+    }
+
+    out.push(Value::Text(record.file_path.clone())); // ?1
+    out.push(Value::BigInt(record.file_size as i64)); // ?2  (u64 → i64)
+    out.push(Value::Text(record.file_name.clone())); // ?3
+    out.push(text(&record.file_extension)); // ?4
+    out.push(Value::Text(parsed.stem)); // ?5  file_stem (original case preserved)
+    out.push(Value::Text(image_kind_str.to_string())); // ?6  image_kind (always lowercase)
+    out.push(Value::BigInt(record.created_timestamp)); // ?7
+    out.push(Value::BigInt(record.modified_timestamp)); // ?8
+    out.push(text(&record.camera_make)); // ?9
+    out.push(text(&record.camera_model)); // ?10
+    out.push(text(&record.lens_model)); // ?11
+    out.push(double(record.focal_length)); // ?12
+    out.push(double(record.aperture)); // ?13
+    out.push(double(record.shutter_speed)); // ?14
+    out.push(bigint(record.iso.map(|v| v as i64))); // ?15 (u32 → i64)
+    out.push(text(&record.capture_datetime)); // ?16
+    out.push(bigint(record.pixel_width.map(|v| v as i64))); // ?17 (u32 → i64)
+    out.push(bigint(record.pixel_height.map(|v| v as i64))); // ?18 (u32 → i64)
+    out.push(text(&record.color_space)); // ?19
+    out.push(bigint(record.bit_depth.map(|v| v as i64))); // ?20 (u32 → i64)
+    out.push(double(record.gps_latitude)); // ?21
+    out.push(double(record.gps_longitude)); // ?22
+    out.push(double(record.gps_altitude)); // ?23
+    out.push(text(&record.copyright)); // ?24
+    out.push(text(&record.creator)); // ?25
+    out.push(text(&record.description)); // ?26
+    out.push(bigint(record.rating.map(|v| v as i64))); // ?27 (u8 → i64)
+    out.push(text(&record.flag)); // ?28
+    out.push(text(&record.color_label)); // ?29
+    // --- Video / unified-media (Step 2a) — false/None for stills ---
+    out.push(Value::Boolean(record.is_video)); // ?30
+    out.push(double(record.duration_seconds)); // ?31
+    out.push(double(record.frame_rate)); // ?32
+    out.push(text(&record.video_kind)); // ?33
+    out.push(text(&record.video_codec)); // ?34
+    out.push(bigint(record.video_bitrate)); // ?35
+    out.push(text(&record.color_primaries)); // ?36
+    out.push(text(&record.color_transfer)); // ?37
+    out.push(text(&record.color_matrix)); // ?38
+    out.push(text(&record.color_range)); // ?39
+    out.push(int(record.dv_profile)); // ?40
+    out.push(boolean(record.has_audio)); // ?41
+    out.push(text(&record.audio_codec)); // ?42
+    out.push(int(record.audio_channels)); // ?43
+    out.push(int(record.audio_sample_rate)); // ?44
+    out.push(bigint(record.audio_bitrate)); // ?45
+    out.push(text(&record.live_photo_id)); // ?46
+    out.push(int(record.rotation)); // ?47 (COALESCE(?,0): None/stills → 0)
+}
+
 /// Ingest a batch of image metadata records into the catalogue
 ///
 /// This is the primary data ingestion function. It receives a vector of ImageMetadata
@@ -1999,11 +2288,12 @@ fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
 /// 3. Rust iterates and inserts each record
 /// 4. Returns count of actually inserted records (excludes skipped duplicates)
 ///
-/// Why not batch insert? DuckDB supports batch inserts via prepared statements, but
-/// this per-record approach provides better error isolation — one malformed record
-/// doesn't abort the entire batch. For Milestone 1's sequential batch workflow, the
-/// performance difference is negligible. Consider batch inserts in a future milestone
-/// if throughput becomes a bottleneck.
+/// Batching (U3 fix): records are folded into multi-row INSERT OR IGNORE
+/// statements of at most INGEST_MULTI_ROW_CHUNK rows. The per-record loop this
+/// function used to be is retained as a per-batch fallback, so the error
+/// isolation the original design wanted is unchanged while the common path costs
+/// one statement per batch instead of one per row. See the commentary above
+/// INGEST_PARAMS_PER_ROW for the measurements behind this.
 ///
 /// Parameters:
 /// - metadata: Vector of ImageMetadata structs
@@ -2022,147 +2312,80 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
         }
     };
 
-    // Prepared statement with positional parameters (?1, ?2, ...)
-    // INSERT OR IGNORE: Skip records where file_path already exists (UNIQUE constraint)
-    // The id column is omitted and auto-filled by DuckDB using the DEFAULT nextval() clause
-    //
-    // file_stem and image_kind are positioned immediately after file_extension to
-    // keep the filename-parsing family (file_name → file_extension → file_stem →
-    // image_kind) visually grouped (decision C6 from the Step (a')
-    // read-and-confirm pass). They are populated per-record by parse_filename()
-    // below.
-    //
-    // directory_path (Session 19 Step 1, DESIGN-Filter-Aware-Pagination.md §4)
-    // sits adjacent to image_kind for the same visual-grouping reason — it is
-    // another stored derivation consumed by the filter-aware SQL added later
-    // in Session 19. Unlike file_stem / image_kind, its value is derived
-    // entirely from file_path with no Rust-side enrichment, so the VALUES
-    // clause embeds the canonical SUBSTRING/INSTR/REVERSE expression directly
-    // on ?1 (file_path) rather than binding a separately-computed parameter.
-    // This guarantees byte-for-byte identical logic between ingest and the
-    // backfill UPDATE in initialize_catalogue's migration block.
-    let insert_sql = r#"
-        INSERT OR IGNORE INTO images (
-            file_path, file_size, file_name, file_extension,
-            file_stem, image_kind, directory_path,
-            created_timestamp, modified_timestamp,
-            camera_make, camera_model, lens_model,
-            focal_length, aperture, shutter_speed, iso,
-            capture_datetime,
-            pixel_width, pixel_height, color_space, bit_depth,
-            gps_latitude, gps_longitude, gps_altitude,
-            copyright, creator, description,
-            rating, flag, color_label,
-            is_video,
-            duration_seconds, frame_rate, video_kind, video_codec, video_bitrate,
-            color_primaries, color_transfer, color_matrix, color_range, dv_profile,
-            has_audio, audio_codec, audio_channels, audio_sample_rate, audio_bitrate,
-            live_photo_id,
-            rotation
-        ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6,
-            SUBSTRING(?1, 1, LENGTH(?1) - INSTR(REVERSE(?1), '/')),
-            ?7, ?8, ?9, ?10,
-            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-            ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-            ?30,
-            ?31, ?32, ?33, ?34, ?35,
-            ?36, ?37, ?38, ?39, ?40,
-            ?41, ?42, ?43, ?44, ?45,
-            ?46,
-            COALESCE(?47, 0)
-        )
-    "#;
+    if metadata.is_empty()
+    {
+        return 0;
+    }
 
     let mut inserted_count = 0u32;
 
-    // Iterate through each metadata record and insert individually
-    // Per-record approach: Better error isolation at the cost of slightly lower throughput
-    for record in metadata {
-        // Derive filename-parsing columns via the canonical parser. The Rust core
-        // owns this logic so Swift can be ignorant of the "metype" placeholder
-        // and the case-folding convention; both are enforced here at write time.
-        // (DESIGN-Duplicate-Consolidation.md §5, §7.)
-        let parsed = parse_filename(record.file_name.clone());
-        let image_kind_str = match parsed.kind {
-            ImageKind::Jpeg => "jpeg",
-            ImageKind::Raw => "raw",
-            ImageKind::Other => "other",
-            ImageKind::Heif => "heif",
-            ImageKind::Dng => "dng",
-            ImageKind::Psd => "psd",
-            ImageKind::Tiff => "tiff",
-            ImageKind::Png => "png",
+    // One statement per batch instead of one per row. The SQL text for a
+    // full-size chunk is built once and reused across chunks; only a trailing
+    // partial chunk needs its own string.
+    let full_chunk_sql = build_ingest_insert_sql(INGEST_MULTI_ROW_CHUNK);
+
+    for chunk in metadata.chunks(INGEST_MULTI_ROW_CHUNK)
+    {
+        let partial_chunk_sql;
+        let chunk_sql: &str = if chunk.len() == INGEST_MULTI_ROW_CHUNK
+        {
+            &full_chunk_sql
+        }
+        else
+        {
+            partial_chunk_sql = build_ingest_insert_sql(chunk.len());
+            &partial_chunk_sql
         };
 
-        // Execute the prepared statement with positional parameters
-        // Type conversions: u32/u64 → i64 for DuckDB INTEGER columns
-        // Option<T> fields are passed directly — DuckDB handles NULL for None
-        let result = conn.execute(
-            insert_sql,
-            params![
-                record.file_path,                      // ?1
-                record.file_size as i64, // ?2  (u64 → i64 cast safe for file sizes < 9 exabytes)
-                record.file_name,        // ?3
-                record.file_extension,   // ?4
-                parsed.stem,             // ?5  file_stem (original case preserved)
-                image_kind_str,          // ?6  image_kind (always lowercase: "jpeg"/"raw"/"other")
-                record.created_timestamp, // ?7
-                record.modified_timestamp, // ?8
-                record.camera_make,      // ?9
-                record.camera_model,     // ?10
-                record.lens_model,       // ?11
-                record.focal_length,     // ?12
-                record.aperture,         // ?13
-                record.shutter_speed,    // ?14
-                record.iso.map(|v| v as i64), // ?15 (u32 → i64)
-                record.capture_datetime, // ?16
-                record.pixel_width.map(|v| v as i64), // ?17 (u32 → i64)
-                record.pixel_height.map(|v| v as i64), // ?18 (u32 → i64)
-                record.color_space,      // ?19
-                record.bit_depth.map(|v| v as i64), // ?20 (u32 → i64)
-                record.gps_latitude,     // ?21
-                record.gps_longitude,    // ?22
-                record.gps_altitude,     // ?23
-                record.copyright,        // ?24
-                record.creator,          // ?25
-                record.description,      // ?26
-                record.rating.map(|v| v as i64), // ?27 (u8 → i64)
-                record.flag,             // ?28
-                record.color_label,      // ?29
-                // --- Video / unified-media (Step 2a) — false/None for stills ---
-                record.is_video,          // ?30 (bool)
-                record.duration_seconds,  // ?31
-                record.frame_rate,        // ?32
-                record.video_kind,        // ?33
-                record.video_codec,       // ?34
-                record.video_bitrate,     // ?35
-                record.color_primaries,   // ?36
-                record.color_transfer,    // ?37
-                record.color_matrix,      // ?38
-                record.color_range,       // ?39
-                record.dv_profile,        // ?40
-                record.has_audio,         // ?41
-                record.audio_codec,       // ?42
-                record.audio_channels,    // ?43
-                record.audio_sample_rate, // ?44
-                record.audio_bitrate,     // ?45
-                record.live_photo_id,     // ?46
-                record.rotation,          // ?47 (COALESCE(?,0): None/stills -> 0)
-            ],
-        );
+        let mut values: Vec<Value> = Vec::with_capacity(chunk.len() * INGEST_PARAMS_PER_ROW);
+        for record in chunk
+        {
+            push_ingest_row_params(record, &mut values);
+        }
 
-        match result {
-            // Ok(changed) returns the number of rows affected (1 for insert, 0 for duplicate skip)
+        // Ok(changed) is the number of rows actually inserted. INSERT OR IGNORE
+        // skips duplicates — both rows already in the table and duplicates
+        // appearing within this same VALUES list — without failing the
+        // statement, so this count stays exact and a re-scan stays safe.
+        match conn.execute(chunk_sql, params_from_iter(values.iter()))
+        {
             Ok(changed) => inserted_count += changed as u32,
-            // Log error but continue processing remaining records
-            // This ensures one bad record doesn't abort the entire batch
-            Err(e) => eprintln!("Failed to insert record {}: {}", record.file_path, e),
+
+            // FALLBACK — this is the original per-record path, preserved so the
+            // batch statement cannot cost us the error isolation the old design
+            // was built around. Only the failing batch is retried row by row;
+            // one malformed record still cannot drop its neighbours.
+            Err(batch_error) =>
+            {
+                eprintln!(
+                    "[ingest] Batch insert of {} record(s) failed ({}); retrying this batch per-record",
+                    chunk.len(),
+                    batch_error
+                );
+
+                let single_row_sql = build_ingest_insert_sql(1);
+
+                for record in chunk
+                {
+                    let mut row_values: Vec<Value> = Vec::with_capacity(INGEST_PARAMS_PER_ROW);
+                    push_ingest_row_params(record, &mut row_values);
+
+                    match conn.execute(&single_row_sql, params_from_iter(row_values.iter()))
+                    {
+                        Ok(changed) => inserted_count += changed as u32,
+                        // Log error but continue processing remaining records.
+                        Err(e) =>
+                        {
+                            eprintln!("Failed to insert record {}: {}", record.file_path, e)
+                        }
+                    }
+                }
+            }
         }
     }
 
     // Return count of successfully inserted records
-    // Note: This excludes skipped duplicates (which return Ok(0))
+    // Note: This excludes skipped duplicates (which contribute 0)
     inserted_count
 }
 
@@ -21384,5 +21607,379 @@ mod live_repro_tests {
         assert_eq!(write_result, Ok(2));
         assert_eq!(scores, vec![(first_id, 41.0), (second_id, 59.0)]);
         assert_eq!(faces, vec![(first_id, first_id), (second_id, second_id)]);
+    }
+}
+
+// =====================================================================
+// U3 — ingest batching correctness tests
+//
+// These exercise `build_ingest_insert_sql` + `push_ingest_row_params`, which is
+// where all of the multi-row logic lives, against the REAL catalogue schema via
+// `open_and_migrate_catalogue` (not a hand-rolled fixture table). They
+// deliberately do NOT call `ingest_metadata` itself, because that function reads
+// the process-global CATALOGUE singleton and no other test in this file touches
+// it — taking that global here would make the suite order-dependent.
+//
+// What has to hold, and why:
+//  - duckdb's `bind_parameters` binds positionally and silently BREAKS OUT when
+//    it runs past the statement's parameter count. A placeholder-numbering or
+//    arity mistake therefore misbinds columns instead of erroring, so these
+//    tests assert on scattered column values in the LAST row of a full-size
+//    chunk, not just on row counts.
+//  - INSERT OR IGNORE must keep skipping duplicates — both rows already present
+//    and duplicates inside the same VALUES list — without failing the statement,
+//    or a re-scan stops being safe.
+// =====================================================================
+#[cfg(test)]
+mod ingest_batching_tests
+{
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static INGEST_FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A fresh REAL catalogue file built through the exact
+    /// open_and_migrate_catalogue path production uses.
+    fn fresh_catalogue(tag: &str) -> (std::path::PathBuf, Connection)
+    {
+        let n = INGEST_FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "plcore-ingest-batch-test-{}-{}-{}.db",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+        let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+        (path, conn)
+    }
+
+    fn cleanup(path: &std::path::Path)
+    {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+    }
+
+    /// A minimal ImageMetadata; override fields per test.
+    fn rec(file_path: &str, file_name: &str) -> ImageMetadata
+    {
+        ImageMetadata
+        {
+            file_path: file_path.to_string(),
+            file_size: 1234,
+            file_name: file_name.to_string(),
+            file_extension: Some("nef".to_string()),
+            created_timestamp: 1_700_000_000,
+            modified_timestamp: 1_700_000_001,
+            camera_make: None,
+            camera_model: None,
+            lens_model: None,
+            focal_length: None,
+            aperture: None,
+            shutter_speed: None,
+            iso: None,
+            capture_datetime: None,
+            pixel_width: None,
+            pixel_height: None,
+            color_space: None,
+            bit_depth: None,
+            gps_latitude: None,
+            gps_longitude: None,
+            gps_altitude: None,
+            copyright: None,
+            creator: None,
+            description: None,
+            rating: None,
+            flag: None,
+            color_label: None,
+            rotation: None,
+            is_video: false,
+            duration_seconds: None,
+            frame_rate: None,
+            video_kind: None,
+            video_codec: None,
+            video_bitrate: None,
+            color_primaries: None,
+            color_transfer: None,
+            color_matrix: None,
+            color_range: None,
+            dv_profile: None,
+            has_audio: None,
+            audio_codec: None,
+            audio_channels: None,
+            audio_sample_rate: None,
+            audio_bitrate: None,
+            live_photo_id: None,
+            external_source_id: None,
+        }
+    }
+
+    /// Run one multi-row statement over `records`, exactly as ingest_metadata's
+    /// fast path does, and return the number of rows actually inserted.
+    fn insert_batch(conn: &Connection, records: &[ImageMetadata]) -> usize
+    {
+        let sql = build_ingest_insert_sql(records.len());
+        let mut values: Vec<Value> = Vec::with_capacity(records.len() * INGEST_PARAMS_PER_ROW);
+        for record in records
+        {
+            push_ingest_row_params(record, &mut values);
+        }
+        assert_eq!(
+            values.len(),
+            records.len() * INGEST_PARAMS_PER_ROW,
+            "bound value count must equal rows * INGEST_PARAMS_PER_ROW"
+        );
+        conn.execute(&sql, params_from_iter(values.iter()))
+            .expect("multi-row ingest insert")
+    }
+
+    /// The single-row form must still carry the canonical directory_path
+    /// derivation verbatim, and the rotation COALESCE.
+    #[test]
+    fn single_row_sql_keeps_canonical_directory_path_expression()
+    {
+        let sql = build_ingest_insert_sql(1);
+        assert!(
+            sql.contains("SUBSTRING(?1, 1, LENGTH(?1) - INSTR(REVERSE(?1), '/'))"),
+            "canonical directory_path expression missing:\n{}",
+            sql
+        );
+        assert!(sql.contains("COALESCE(?47, 0)"), "rotation COALESCE missing");
+        assert!(sql.starts_with("INSERT OR IGNORE INTO images ("));
+        // The VALUES clause must open with the same six plain placeholders the
+        // original single-row literal used, then the derived directory_path.
+        assert!(
+            sql.contains("(?1, ?2, ?3, ?4, ?5, ?6, SUBSTRING(?1,"),
+            "unexpected leading placeholder sequence:\n{}",
+            sql
+        );
+        // ...and close on the rotation COALESCE, with no 48th placeholder.
+        assert!(sql.trim_end().ends_with("COALESCE(?47, 0))"));
+        assert!(!sql.contains("?48"), "single-row form must stop at ?47");
+    }
+
+    /// Row 2 of a multi-row statement must offset every placeholder by 47 and
+    /// point its directory_path expression at its OWN file_path placeholder.
+    #[test]
+    fn second_row_placeholders_are_offset_and_self_referential()
+    {
+        let sql = build_ingest_insert_sql(2);
+        assert!(
+            sql.contains("SUBSTRING(?48, 1, LENGTH(?48) - INSTR(REVERSE(?48), '/'))"),
+            "row 2 directory_path must derive from ?48, not ?1:\n{}",
+            sql
+        );
+        assert!(sql.contains("COALESCE(?94, 0)"), "row 2 rotation COALESCE missing");
+        assert!(!sql.contains("?95"), "should not emit a 95th placeholder");
+    }
+
+    /// A multi-row batch must land every row with correctly mapped columns,
+    /// including the two Rust-derived columns and the two SQL-derived ones.
+    #[test]
+    fn multi_row_batch_lands_all_rows_with_correct_columns()
+    {
+        let (path, conn) = fresh_catalogue("columns");
+
+        let mut a = rec("/Volumes/Photos/2024/trip/DSC_0001.NEF", "DSC_0001.NEF");
+        a.iso = Some(6400);
+        a.gps_latitude = Some(51.5);
+        a.file_size = 40_000_000;
+
+        let mut b = rec("/Volumes/Photos/2024/trip/DSC_0002.jpg", "DSC_0002.jpg");
+        b.rotation = Some(270);
+        b.camera_model = Some("Nikon Z8".to_string());
+
+        let mut c = rec("/Volumes/Photos/clips/CLIP_01.mov", "CLIP_01.mov");
+        c.is_video = true;
+        c.file_extension = Some("mov".to_string());
+        c.audio_channels = Some(2);
+        c.live_photo_id = Some("LP-123".to_string());
+
+        let inserted = insert_batch(&conn, &[a, b, c]);
+        assert_eq!(inserted, 3, "all three rows should insert");
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(total, 3);
+
+        // directory_path — derived in SQL from this row's own file_path.
+        let dir: String = conn
+            .query_row(
+                "SELECT directory_path FROM images WHERE file_name = 'DSC_0001.NEF'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("directory_path");
+        assert_eq!(dir, "/Volumes/Photos/2024/trip");
+
+        let clip_dir: String = conn
+            .query_row(
+                "SELECT directory_path FROM images WHERE file_name = 'CLIP_01.mov'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("clip directory_path");
+        assert_eq!(clip_dir, "/Volumes/Photos/clips");
+
+        // file_stem / image_kind — derived in Rust by parse_filename.
+        let (stem, kind): (String, String) = conn
+            .query_row(
+                "SELECT file_stem, image_kind FROM images WHERE file_name = 'DSC_0001.NEF'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("stem/kind");
+        assert_eq!(stem, "DSC_0001");
+        assert_eq!(kind, "raw");
+
+        // Scattered bound values, to catch a placeholder-offset misbinding.
+        let (size, iso, lat): (i64, i64, f64) = conn
+            .query_row(
+                "SELECT file_size, iso, gps_latitude FROM images \
+                 WHERE file_name = 'DSC_0001.NEF'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("row a values");
+        assert_eq!(size, 40_000_000);
+        assert_eq!(iso, 6400);
+        assert!((lat - 51.5).abs() < 1e-9);
+
+        // rotation: Some(270) is stored; None coalesces to the schema default 0.
+        let rot_b: i32 = conn
+            .query_row(
+                "SELECT rotation FROM images WHERE file_name = 'DSC_0002.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("rotation b");
+        assert_eq!(rot_b, 270);
+
+        let rot_a: i32 = conn
+            .query_row(
+                "SELECT rotation FROM images WHERE file_name = 'DSC_0001.NEF'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("rotation a");
+        assert_eq!(rot_a, 0, "None rotation must COALESCE to 0");
+
+        // Video / late columns.
+        let (is_video, channels, lp): (bool, i32, String) = conn
+            .query_row(
+                "SELECT is_video, audio_channels, live_photo_id FROM images \
+                 WHERE file_name = 'CLIP_01.mov'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("clip values");
+        assert!(is_video);
+        assert_eq!(channels, 2);
+        assert_eq!(lp, "LP-123");
+
+        cleanup(&path);
+    }
+
+    /// The whole point of OR IGNORE: a re-scan must be safe. A multi-row
+    /// statement must skip rows already present AND duplicates appearing inside
+    /// the same VALUES list, without failing, and must report only the rows it
+    /// actually inserted.
+    #[test]
+    fn multi_row_or_ignore_preserves_rescan_idempotence()
+    {
+        let (path, conn) = fresh_catalogue("idempotence");
+
+        let a = rec("/p/a.nef", "a.nef");
+        let b = rec("/p/b.nef", "b.nef");
+        assert_eq!(insert_batch(&conn, &[a.clone(), b.clone()]), 2);
+
+        // Re-scan: the identical batch inserts nothing and does not error.
+        assert_eq!(
+            insert_batch(&conn, &[a.clone(), b.clone()]),
+            0,
+            "a re-scan of the same batch must insert 0 rows"
+        );
+
+        // A batch mixing a pre-existing row, an intra-batch duplicate, and a
+        // genuinely new row: only the new one lands.
+        let c = rec("/p/c.nef", "c.nef");
+        let inserted = insert_batch(&conn, &[a.clone(), c.clone(), c.clone(), b.clone()]);
+        assert_eq!(
+            inserted, 1,
+            "only the single new file_path should be inserted"
+        );
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(total, 3, "UNIQUE(file_path) must still hold");
+
+        let dupes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM images WHERE file_path = '/p/c.nef'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("dupe count");
+        assert_eq!(dupes, 1, "intra-statement duplicate must be skipped");
+
+        cleanup(&path);
+    }
+
+    /// A full-size chunk binds INGEST_MULTI_ROW_CHUNK * 47 = 2,350 parameters in
+    /// one statement. Because bind_parameters silently stops at the statement's
+    /// parameter count, the LAST row's values are the ones that prove no
+    /// truncation or off-by-one occurred.
+    #[test]
+    fn full_size_chunk_binds_every_parameter()
+    {
+        let (path, conn) = fresh_catalogue("fullchunk");
+
+        let mut batch: Vec<ImageMetadata> = Vec::with_capacity(INGEST_MULTI_ROW_CHUNK);
+        for i in 0..INGEST_MULTI_ROW_CHUNK
+        {
+            let name = format!("IMG_{:04}.JPG", i);
+            let mut r = rec(&format!("/Volumes/Photos/full/{}", name), &name);
+            r.file_extension = Some("jpg".to_string());
+            r.iso = Some(100 + i as u32);
+            r.rating = Some((i % 6) as u8);
+            r.rotation = Some((i as i32 % 4) * 90);
+            r.audio_bitrate = Some(1_000 + i as i64);
+            batch.push(r);
+        }
+
+        let inserted = insert_batch(&conn, &batch);
+        assert_eq!(inserted, INGEST_MULTI_ROW_CHUNK);
+
+        let last = INGEST_MULTI_ROW_CHUNK - 1;
+        let last_name = format!("IMG_{:04}.JPG", last);
+        let (iso, rating, rotation, bitrate, dir, kind): (i64, i64, i32, i64, String, String) = conn
+            .query_row(
+                "SELECT iso, rating, rotation, audio_bitrate, directory_path, image_kind \
+                 FROM images WHERE file_name = ?1",
+                params![last_name],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .expect("last row of the full chunk");
+
+        assert_eq!(iso, 100 + last as i64, "last row's ?15 must be bound");
+        assert_eq!(rating, (last % 6) as i64);
+        assert_eq!(rotation, (last as i32 % 4) * 90);
+        assert_eq!(bitrate, 1_000 + last as i64, "last row's ?45 must be bound");
+        assert_eq!(dir, "/Volumes/Photos/full");
+        assert_eq!(kind, "jpeg");
+
+        cleanup(&path);
     }
 }

@@ -2197,9 +2197,9 @@ public struct FocusAnalysisWritebackResult: Equatable, Hashable {
         self.targetImageId = targetImageId
     }
 
+    
 
-
-
+    
 }
 
 #if compiler(>=6)
@@ -2213,10 +2213,10 @@ public struct FfiConverterTypeFocusAnalysisWritebackResult: FfiConverterRustBuff
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FocusAnalysisWritebackResult {
         return
             try FocusAnalysisWritebackResult(
-                updated: FfiConverterUInt64.read(from: &buf),
-                failureStage: FfiConverterOptionString.read(from: &buf),
-                failedReason: FfiConverterOptionString.read(from: &buf),
-                sourceImageId: FfiConverterOptionInt64.read(from: &buf),
+                updated: FfiConverterUInt64.read(from: &buf), 
+                failureStage: FfiConverterOptionString.read(from: &buf), 
+                failedReason: FfiConverterOptionString.read(from: &buf), 
+                sourceImageId: FfiConverterOptionInt64.read(from: &buf), 
                 targetImageId: FfiConverterOptionInt64.read(from: &buf)
         )
     }
