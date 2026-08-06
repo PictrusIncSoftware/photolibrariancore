@@ -1034,6 +1034,68 @@ public func FfiConverterTypeDirectorySyncState_lower(_ value: DirectorySyncState
 }
 
 
+public struct EditorSavedImageCatalogueResult: Equatable, Hashable {
+    public var status: EditorSavedImageCatalogueStatus
+    public var imageId: Int64?
+    public var message: String
+    public var vectorCleanupWarning: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(status: EditorSavedImageCatalogueStatus, imageId: Int64?, message: String, vectorCleanupWarning: String?) {
+        self.status = status
+        self.imageId = imageId
+        self.message = message
+        self.vectorCleanupWarning = vectorCleanupWarning
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension EditorSavedImageCatalogueResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEditorSavedImageCatalogueResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EditorSavedImageCatalogueResult {
+        return
+            try EditorSavedImageCatalogueResult(
+                status: FfiConverterTypeEditorSavedImageCatalogueStatus.read(from: &buf), 
+                imageId: FfiConverterOptionInt64.read(from: &buf), 
+                message: FfiConverterString.read(from: &buf), 
+                vectorCleanupWarning: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EditorSavedImageCatalogueResult, into buf: inout [UInt8]) {
+        FfiConverterTypeEditorSavedImageCatalogueStatus.write(value.status, into: &buf)
+        FfiConverterOptionInt64.write(value.imageId, into: &buf)
+        FfiConverterString.write(value.message, into: &buf)
+        FfiConverterOptionString.write(value.vectorCleanupWarning, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEditorSavedImageCatalogueResult_lift(_ buf: RustBuffer) throws -> EditorSavedImageCatalogueResult {
+    return try FfiConverterTypeEditorSavedImageCatalogueResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEditorSavedImageCatalogueResult_lower(_ value: EditorSavedImageCatalogueResult) -> RustBuffer {
+    return FfiConverterTypeEditorSavedImageCatalogueResult.lower(value)
+}
+
+
 public struct FaceClusterMemberRecord: Equatable, Hashable {
     public var runId: String
     public var clusterId: Int64
@@ -1935,6 +1997,72 @@ public func FfiConverterTypeFaceSearchMatchRecord_lift(_ buf: RustBuffer) throws
 #endif
 public func FfiConverterTypeFaceSearchMatchRecord_lower(_ value: FaceSearchMatchRecord) -> RustBuffer {
     return FfiConverterTypeFaceSearchMatchRecord.lower(value)
+}
+
+
+public struct FaceVectorDeleteRetryResult: Equatable, Hashable {
+    public var status: FaceVectorDeleteRetryStatus
+    public var pendingCount: UInt64
+    public var acknowledgedCount: UInt64
+    public var remainingCount: UInt64
+    public var message: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(status: FaceVectorDeleteRetryStatus, pendingCount: UInt64, acknowledgedCount: UInt64, remainingCount: UInt64, message: String) {
+        self.status = status
+        self.pendingCount = pendingCount
+        self.acknowledgedCount = acknowledgedCount
+        self.remainingCount = remainingCount
+        self.message = message
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FaceVectorDeleteRetryResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFaceVectorDeleteRetryResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FaceVectorDeleteRetryResult {
+        return
+            try FaceVectorDeleteRetryResult(
+                status: FfiConverterTypeFaceVectorDeleteRetryStatus.read(from: &buf), 
+                pendingCount: FfiConverterUInt64.read(from: &buf), 
+                acknowledgedCount: FfiConverterUInt64.read(from: &buf), 
+                remainingCount: FfiConverterUInt64.read(from: &buf), 
+                message: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FaceVectorDeleteRetryResult, into buf: inout [UInt8]) {
+        FfiConverterTypeFaceVectorDeleteRetryStatus.write(value.status, into: &buf)
+        FfiConverterUInt64.write(value.pendingCount, into: &buf)
+        FfiConverterUInt64.write(value.acknowledgedCount, into: &buf)
+        FfiConverterUInt64.write(value.remainingCount, into: &buf)
+        FfiConverterString.write(value.message, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFaceVectorDeleteRetryResult_lift(_ buf: RustBuffer) throws -> FaceVectorDeleteRetryResult {
+    return try FfiConverterTypeFaceVectorDeleteRetryResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFaceVectorDeleteRetryResult_lower(_ value: FaceVectorDeleteRetryResult) -> RustBuffer {
+    return FfiConverterTypeFaceVectorDeleteRetryResult.lower(value)
 }
 
 
@@ -4644,6 +4772,175 @@ public func FfiConverterTypeConnector_lower(_ value: Connector) -> RustBuffer {
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
+public enum EditorSavedImageCatalogueStatus: Equatable, Hashable {
+    
+    case inserted
+    case refreshed
+    case notCatalogued
+    case failed
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension EditorSavedImageCatalogueStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEditorSavedImageCatalogueStatus: FfiConverterRustBuffer {
+    typealias SwiftType = EditorSavedImageCatalogueStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EditorSavedImageCatalogueStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .inserted
+        
+        case 2: return .refreshed
+        
+        case 3: return .notCatalogued
+        
+        case 4: return .failed
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: EditorSavedImageCatalogueStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .inserted:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .refreshed:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .notCatalogued:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .failed:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEditorSavedImageCatalogueStatus_lift(_ buf: RustBuffer) throws -> EditorSavedImageCatalogueStatus {
+    return try FfiConverterTypeEditorSavedImageCatalogueStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEditorSavedImageCatalogueStatus_lower(_ value: EditorSavedImageCatalogueStatus) -> RustBuffer {
+    return FfiConverterTypeEditorSavedImageCatalogueStatus.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum FaceVectorDeleteRetryStatus: Equatable, Hashable {
+    
+    case noPendingDeletes
+    case deleted
+    case vectorTableAbsent
+    case deferred
+    case failed
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FaceVectorDeleteRetryStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFaceVectorDeleteRetryStatus: FfiConverterRustBuffer {
+    typealias SwiftType = FaceVectorDeleteRetryStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FaceVectorDeleteRetryStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .noPendingDeletes
+        
+        case 2: return .deleted
+        
+        case 3: return .vectorTableAbsent
+        
+        case 4: return .deferred
+        
+        case 5: return .failed
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FaceVectorDeleteRetryStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .noPendingDeletes:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .deleted:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .vectorTableAbsent:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .deferred:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .failed:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFaceVectorDeleteRetryStatus_lift(_ buf: RustBuffer) throws -> FaceVectorDeleteRetryStatus {
+    return try FfiConverterTypeFaceVectorDeleteRetryStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFaceVectorDeleteRetryStatus_lower(_ value: FaceVectorDeleteRetryStatus) -> RustBuffer {
+    return FfiConverterTypeFaceVectorDeleteRetryStatus.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 public enum ImageKind: Equatable, Hashable {
     
     case jpeg
@@ -7314,6 +7611,21 @@ public func hiddenKeywordsForImage(imageId: Int64)async  -> [KeywordRow]  {
             
         )
 }
+public func imageRecordsWithSameBasename(basename: String)async  -> [ImageRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_image_records_with_same_basename(FfiConverterString.lower(basename)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeImageRecord.lift,
+            errorHandler: nil
+            
+        )
+}
 public func ingestMetadata(metadata: [ImageMetadata])async  -> UInt32  {
     return
         try!  await uniffiRustCallAsync(
@@ -7951,6 +8263,21 @@ public func restoreKeywordForIds(ids: [Int64], path: String)async  -> UInt64  {
             
         )
 }
+public func retryPendingFaceVectorDeletes()async  -> FaceVectorDeleteRetryResult  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_retry_pending_face_vector_deletes(
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeFaceVectorDeleteRetryResult_lift,
+            errorHandler: nil
+            
+        )
+}
 public func saveQuery(name: String, predicates: [QueryPredicate], connectors: [Connector])async  -> SavedQueryInfo?  {
     return
         try!  await uniffiRustCallAsync(
@@ -8217,6 +8544,21 @@ public func updateRatingForIds(ids: [Int64], rating: UInt32)async  -> UInt64  {
             completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+public func upsertEditorSavedImage(metadata: ImageMetadata, insertIfMissing: Bool)async  -> EditorSavedImageCatalogueResult  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_upsert_editor_saved_image(FfiConverterTypeImageMetadata_lower(metadata),FfiConverterBool.lower(insertIfMissing)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeEditorSavedImageCatalogueResult_lift,
             errorHandler: nil
             
         )
@@ -8495,6 +8837,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_hidden_keywords_for_image() != 10588) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_image_records_with_same_basename() != 466) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_ingest_metadata() != 1621) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8624,6 +8969,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_restore_keyword_for_ids() != 5225) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_retry_pending_face_vector_deletes() != 7706) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_save_query() != 43330) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8676,6 +9024,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_rating_for_ids() != 35398) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_upsert_editor_saved_image() != 22797) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_upsert_face_embeddings() != 9499) {

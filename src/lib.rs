@@ -143,6 +143,707 @@ pub struct ImageMetadata {
     pub external_source_id: Option<String>,
 }
 
+#[cfg(test)]
+mod editor_saved_image_tests
+{
+    use super::*;
+
+    fn setup() -> Connection
+    {
+        let conn = Connection::open_in_memory().expect("open editor-save catalogue");
+        conn.execute_batch(
+            "CREATE SEQUENCE images_id_seq START 1;
+             CREATE TABLE images (
+                 id INTEGER PRIMARY KEY DEFAULT nextval('images_id_seq'),
+                 file_path TEXT NOT NULL UNIQUE,
+                 file_size BIGINT NOT NULL,
+                 file_name TEXT NOT NULL,
+                 file_extension TEXT,
+                 file_stem VARCHAR,
+                 image_kind VARCHAR,
+                 directory_path VARCHAR,
+                 created_timestamp INTEGER NOT NULL,
+                 modified_timestamp INTEGER NOT NULL,
+                 camera_make TEXT,
+                 camera_model TEXT,
+                 lens_model TEXT,
+                 focal_length REAL,
+                 aperture REAL,
+                 shutter_speed REAL,
+                 iso INTEGER,
+                 capture_datetime TEXT,
+                 pixel_width INTEGER,
+                 pixel_height INTEGER,
+                 color_space TEXT,
+                 bit_depth INTEGER,
+                 gps_latitude REAL,
+                 gps_longitude REAL,
+                 gps_altitude REAL,
+                 copyright TEXT,
+                 creator TEXT,
+                 description TEXT,
+                 rating INTEGER,
+                 flag TEXT,
+                 color_label TEXT,
+                 rotation INTEGER DEFAULT 0,
+                 focus_score DOUBLE,
+                 focus_basis TEXT,
+                 focus_human_score DOUBLE,
+                 focus_animal_score DOUBLE,
+                 focus_foreground_score DOUBLE,
+                 focus_saliency_score DOUBLE,
+                 focus_animal_pose_score DOUBLE,
+                 focus_whole_image_score DOUBLE,
+                 focus_algorithm_version TEXT,
+                 focus_analysis_status TEXT,
+                 focus_analysis_attempt_id TEXT,
+                 focus_scored_at TIMESTAMP,
+                 face_count INTEGER,
+                 face_quality_best DOUBLE,
+                 face_quality_average DOUBLE,
+                 face_quality_min DOUBLE,
+                 face_eyes_open_count INTEGER,
+                 face_blink_risk_count INTEGER,
+                 is_video BOOLEAN NOT NULL DEFAULT FALSE,
+                 duration_seconds DOUBLE,
+                 frame_rate DOUBLE,
+                 video_kind TEXT,
+                 video_codec TEXT,
+                 video_bitrate BIGINT,
+                 color_primaries TEXT,
+                 color_transfer TEXT,
+                 color_matrix TEXT,
+                 color_range TEXT,
+                 dv_profile INTEGER,
+                 has_audio BOOLEAN,
+                 audio_codec TEXT,
+                 audio_channels INTEGER,
+                 audio_sample_rate INTEGER,
+                 audio_bitrate BIGINT,
+                 live_photo_id TEXT,
+                 external_source_id TEXT,
+                 indexed_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+             );
+
+             CREATE TABLE keyword (
+                 id INTEGER PRIMARY KEY,
+                 image_id INTEGER NOT NULL,
+                 label TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 status INTEGER NOT NULL DEFAULT 1,
+                 origin INTEGER NOT NULL DEFAULT 1,
+                 hidden_at TIMESTAMP,
+                 collection BOOLEAN NOT NULL DEFAULT FALSE,
+                 color BOOLEAN NOT NULL DEFAULT FALSE
+             );
+
+             CREATE TABLE person (
+                 id INTEGER PRIMARY KEY,
+                 display_name TEXT NOT NULL
+             );
+             CREATE TABLE person_face_assignment (
+                 face_observation_id INTEGER PRIMARY KEY,
+                 person_id INTEGER NOT NULL,
+                 image_id INTEGER NOT NULL
+             );
+             CREATE TABLE face_observation (
+                 id INTEGER PRIMARY KEY,
+                 image_id INTEGER NOT NULL,
+                 analyzed_image_id INTEGER NOT NULL
+             );
+             CREATE TABLE face_vector_pending_delete (
+                 face_observation_id INTEGER PRIMARY KEY,
+                 enqueued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+             );
+             CREATE TABLE face_cluster_run (
+                 run_id TEXT PRIMARY KEY
+             );
+             CREATE TABLE face_cluster_member (
+                 run_id TEXT NOT NULL,
+                 face_observation_id INTEGER NOT NULL,
+                 nearest_neighbor_face_observation_id INTEGER
+             );
+
+             CREATE TABLE similar_photo_featureprint (
+                 image_id INTEGER NOT NULL,
+                 algorithm_version TEXT NOT NULL,
+                 source_stamp TEXT NOT NULL,
+                 featureprint_blob BLOB NOT NULL
+             );
+             CREATE TABLE similar_photo_group_member (
+                 image_id INTEGER PRIMARY KEY,
+                 group_id INTEGER NOT NULL,
+                 representative_id INTEGER NOT NULL
+             );
+             CREATE TABLE similar_photo_unit_checkpoint (
+                 algorithm_version TEXT NOT NULL,
+                 unit_key TEXT NOT NULL
+             );",
+        )
+        .expect("create editor-save fixture");
+        conn
+    }
+
+    fn metadata(path: &str, name: &str, extension: &str) -> ImageMetadata
+    {
+        ImageMetadata
+        {
+            file_path: path.to_string(),
+            file_size: 1_000,
+            file_name: name.to_string(),
+            file_extension: Some(extension.to_string()),
+            created_timestamp: 1_700_000_000,
+            modified_timestamp: 1_700_000_100,
+            camera_make: Some("Original Make".to_string()),
+            camera_model: Some("Original Model".to_string()),
+            lens_model: Some("Original Lens".to_string()),
+            focal_length: Some(50.0),
+            aperture: Some(4.0),
+            shutter_speed: Some(0.01),
+            iso: Some(100),
+            capture_datetime: Some("2026:01:02 03:04:05".to_string()),
+            pixel_width: Some(4_000),
+            pixel_height: Some(3_000),
+            color_space: Some("sRGB".to_string()),
+            bit_depth: Some(8),
+            gps_latitude: Some(40.0),
+            gps_longitude: Some(-74.0),
+            gps_altitude: Some(10.0),
+            copyright: Some("Original Copyright".to_string()),
+            creator: Some("Original Creator".to_string()),
+            description: Some("Original Description".to_string()),
+            rating: None,
+            flag: None,
+            color_label: None,
+            rotation: None,
+            is_video: false,
+            duration_seconds: None,
+            frame_rate: None,
+            video_kind: None,
+            video_codec: None,
+            video_bitrate: None,
+            color_primaries: None,
+            color_transfer: None,
+            color_matrix: None,
+            color_range: None,
+            dv_profile: None,
+            has_audio: None,
+            audio_codec: None,
+            audio_channels: None,
+            audio_sample_rate: None,
+            audio_bitrate: None,
+            live_photo_id: None,
+            external_source_id: None,
+        }
+    }
+
+    fn insert(
+        conn: &Connection,
+        record: &ImageMetadata,
+    ) -> EditorSavedImageDatabaseOutcome
+    {
+        upsert_editor_saved_image_database(conn, record, true).expect("insert editor save")
+    }
+
+    #[test]
+    fn missing_path_respects_insert_if_missing()
+    {
+        let conn = setup();
+        let record = metadata("/photos/new.jpg", "new.jpg", "jpg");
+
+        let outcome = upsert_editor_saved_image_database(&conn, &record, false)
+            .expect("not-catalogued outcome");
+
+        assert_eq!(outcome.status, EditorSavedImageCatalogueStatus::NotCatalogued);
+        assert_eq!(outcome.image_id, None);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM images", [], |row| row.get(0))
+            .expect("image count");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn requested_insert_creates_one_zero_rotation_row()
+    {
+        let conn = setup();
+        let mut record = metadata("/photos/new.jpg", "new.jpg", "jpg");
+        record.rating = Some(5);
+        record.flag = Some("pick".to_string());
+        record.color_label = Some("red".to_string());
+        record.rotation = Some(270);
+        record.external_source_id = Some("must-not-transfer".to_string());
+
+        let outcome = insert(&conn, &record);
+
+        assert_eq!(outcome.status, EditorSavedImageCatalogueStatus::Inserted);
+        let id = outcome.image_id.expect("inserted id");
+        let row: (i64, i32, Option<i64>, Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT id, rotation, rating, flag, color_label, external_source_id
+                 FROM images WHERE file_path = ?1",
+                params![record.file_path],
+                |row|
+                {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("inserted row");
+        assert_eq!(row.0, id);
+        assert_eq!(row.1, 0);
+        assert_eq!(row.2, None);
+        assert_eq!(row.3, None);
+        assert_eq!(row.4, None);
+        assert_eq!(row.5, None);
+    }
+
+    #[test]
+    fn refresh_is_id_stable_preserves_curation_and_invalidates_derived_state()
+    {
+        let conn = setup();
+        let jpeg = metadata("/photos/frame.jpg", "frame.jpg", "jpg");
+        let raw = metadata("/photos/frame.nef", "frame.nef", "nef");
+        let other = metadata("/photos/other.jpg", "other.jpg", "jpg");
+        let jpeg_id = insert(&conn, &jpeg).image_id.expect("jpeg id");
+        let raw_id = insert(&conn, &raw).image_id.expect("raw id");
+        let other_id = insert(&conn, &other).image_id.expect("other id");
+
+        conn.execute(
+            "UPDATE images SET
+                 rating = 5,
+                 flag = 'pick',
+                 color_label = 'blue',
+                 rotation = 90,
+                 external_source_id = 'preserve-provenance',
+                 indexed_timestamp = TIMESTAMP '2000-01-01 00:00:00'
+             WHERE id = ?1",
+            params![jpeg_id],
+        )
+        .expect("seed curation");
+        conn.execute(
+            "UPDATE images SET
+                 focus_score = 42,
+                 focus_basis = 'human_face',
+                 focus_human_score = 41,
+                 focus_animal_score = 40,
+                 focus_foreground_score = 39,
+                 focus_saliency_score = 38,
+                 focus_animal_pose_score = 37,
+                 focus_whole_image_score = 36,
+                 focus_algorithm_version = 'old-focus',
+                 focus_analysis_status = 'complete',
+                 focus_analysis_attempt_id = 'old-attempt',
+                 focus_scored_at = CURRENT_TIMESTAMP,
+                 face_count = 1,
+                 face_quality_best = 0.9,
+                 face_quality_average = 0.8,
+                 face_quality_min = 0.7,
+                 face_eyes_open_count = 1,
+                 face_blink_risk_count = 0
+             WHERE id IN (?1, ?2)",
+            params![jpeg_id, raw_id],
+        )
+        .expect("seed focus state");
+
+        let people_root = "People";
+        let person_path = [people_root, "Richard"].join(KEYWORD_PATH_SEPARATOR);
+        conn.execute(
+            "INSERT INTO keyword VALUES
+                 (1, ?1, 'Portfolio', 'Portfolio', 1, ?2, NULL, TRUE, FALSE),
+                 (2, ?1, 'People', 'People', 1, ?3, NULL, FALSE, FALSE),
+                 (3, ?1, 'Richard', ?4, 1, ?3, NULL, FALSE, FALSE)",
+            params![jpeg_id, KEYWORD_ORIGIN_USER, KEYWORD_ORIGIN_FACE, person_path],
+        )
+        .expect("seed keywords");
+        conn.execute("INSERT INTO person VALUES (1, 'Richard')", [])
+            .expect("seed person");
+        conn.execute(
+            "INSERT INTO face_observation VALUES
+                 (101, ?1, ?1),
+                 (102, ?2, ?1)",
+            params![jpeg_id, raw_id],
+        )
+        .expect("seed face observations");
+        conn.execute(
+            "INSERT INTO person_face_assignment VALUES (101, 1, ?1)",
+            params![jpeg_id],
+        )
+        .expect("seed face assignment");
+        conn.execute("INSERT INTO face_cluster_run VALUES ('old-cluster')", [])
+            .expect("seed cluster run");
+        conn.execute(
+            "INSERT INTO face_cluster_member VALUES
+                 ('old-cluster', 101, NULL),
+                 ('old-cluster', 102, 101)",
+            [],
+        )
+        .expect("seed cluster members");
+
+        for id in [jpeg_id, raw_id, other_id]
+        {
+            conn.execute(
+                "INSERT INTO similar_photo_featureprint VALUES (?1, 'old-similar', 'stamp', BLOB 'bytes')",
+                params![id],
+            )
+            .expect("seed featureprint");
+        }
+        conn.execute(
+            "INSERT INTO similar_photo_group_member VALUES
+                 (?1, ?1, ?1),
+                 (?2, ?1, ?1)",
+            params![jpeg_id, other_id],
+        )
+        .expect("seed similar group");
+        conn.execute(
+            "INSERT INTO similar_photo_unit_checkpoint VALUES ('old-similar', 'old-unit')",
+            [],
+        )
+        .expect("seed checkpoint");
+
+        let mut refreshed = metadata("/photos/frame.jpg", "frame.jpg", "jpg");
+        refreshed.file_size = 9_999;
+        refreshed.modified_timestamp = 1_800_000_000;
+        refreshed.camera_model = Some("Refreshed Camera".to_string());
+        refreshed.pixel_width = Some(8_000);
+        refreshed.pixel_height = Some(6_000);
+        refreshed.rating = Some(1);
+        refreshed.flag = Some("reject".to_string());
+        refreshed.color_label = Some("red".to_string());
+        refreshed.rotation = Some(270);
+
+        let outcome = upsert_editor_saved_image_database(&conn, &refreshed, true)
+            .expect("refresh editor save");
+
+        assert_eq!(outcome.status, EditorSavedImageCatalogueStatus::Refreshed);
+        assert_eq!(outcome.image_id, Some(jpeg_id));
+        assert_eq!(outcome.enqueued_face_vector_delete_count, 2);
+        let pending_face_ids: Vec<i64> =
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT face_observation_id
+                     FROM face_vector_pending_delete
+                     ORDER BY face_observation_id",
+                )
+                .expect("prepare queued face-vector ids");
+            stmt.query_map([], |row| row.get(0))
+                .expect("query queued face-vector ids")
+                .filter_map(Result::ok)
+                .collect()
+        };
+        assert_eq!(pending_face_ids, vec![101, 102]);
+
+        let facts: (i64, String, i64, i64, i64, Option<String>, Option<String>, i32, Option<String>, String) = conn
+            .query_row(
+                "SELECT file_size, camera_model, pixel_width, pixel_height,
+                        rating, flag, color_label, rotation, external_source_id,
+                        CAST(indexed_timestamp AS VARCHAR)
+                 FROM images WHERE id = ?1",
+                params![jpeg_id],
+                |row|
+                {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .expect("refreshed facts");
+        assert_eq!(facts.0, 9_999);
+        assert_eq!(facts.1, "Refreshed Camera");
+        assert_eq!(facts.2, 8_000);
+        assert_eq!(facts.3, 6_000);
+        assert_eq!(facts.4, 5);
+        assert_eq!(facts.5.as_deref(), Some("pick"));
+        assert_eq!(facts.6.as_deref(), Some("blue"));
+        assert_eq!(facts.7, 0);
+        assert_eq!(facts.8.as_deref(), Some("preserve-provenance"));
+        assert!(facts.9.starts_with("2000-01-01"));
+
+        let focused: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM images
+                 WHERE id IN (?1, ?2)
+                   AND (focus_analysis_status IS NOT NULL OR face_count IS NOT NULL)",
+                params![jpeg_id, raw_id],
+                |row| row.get(0),
+            )
+            .expect("focus invalidation count");
+        assert_eq!(focused, 0);
+
+        let keyword_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM keyword", [], |row| row.get(0))
+            .expect("keyword count");
+        assert_eq!(keyword_count, 3);
+        let collection_kept: bool = conn
+            .query_row(
+                "SELECT collection FROM keyword WHERE path = 'Portfolio'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("collection preserved");
+        assert!(collection_kept);
+        let people_origins: Vec<i32> =
+        {
+            let mut stmt = conn
+                .prepare("SELECT origin FROM keyword WHERE path = 'People' OR path = ?1 ORDER BY path")
+                .expect("prepare People origins");
+            stmt.query_map(params![person_path], |row| row.get(0))
+                .expect("query People origins")
+                .filter_map(Result::ok)
+                .collect()
+        };
+        assert_eq!(people_origins.len(), 2);
+        assert!(people_origins.iter().all(|origin|
+        {
+            origin & KEYWORD_ORIGIN_USER != 0 && origin & KEYWORD_ORIGIN_FACE == 0
+        }));
+
+        for table in [
+            "person_face_assignment",
+            "face_observation",
+            "face_cluster_member",
+            "face_cluster_run",
+            "similar_photo_group_member",
+            "similar_photo_unit_checkpoint",
+        ]
+        {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| row.get(0))
+                .expect("invalidated table count");
+            assert_eq!(count, 0, "{} must be invalidated", table);
+        }
+        let remaining_feature_ids: Vec<i64> =
+        {
+            let mut stmt = conn
+                .prepare("SELECT image_id FROM similar_photo_featureprint ORDER BY image_id")
+                .expect("prepare remaining featureprints");
+            stmt.query_map([], |row| row.get(0))
+                .expect("query remaining featureprints")
+                .filter_map(Result::ok)
+                .collect()
+        };
+        assert_eq!(remaining_feature_ids, vec![other_id]);
+    }
+
+    #[test]
+    fn refresh_removes_only_auto_keyword_origin_across_rendered_and_raw_halves()
+    {
+        let conn = setup();
+        let jpeg = metadata("/photos/frame.jpg", "frame.jpg", "jpg");
+        let raw = metadata("/photos/frame.nef", "frame.nef", "nef");
+        let other = metadata("/photos/other.jpg", "other.jpg", "jpg");
+        let jpeg_id = insert(&conn, &jpeg).image_id.expect("jpeg id");
+        let raw_id = insert(&conn, &raw).image_id.expect("raw id");
+        let other_id = insert(&conn, &other).image_id.expect("other id");
+
+        conn.execute(
+            "INSERT INTO keyword
+                 (id, image_id, label, path, status, origin, hidden_at, collection, color)
+             VALUES
+                 (1, ?1, 'Auto JPEG', 'Auto JPEG', 1, ?4, NULL, FALSE, FALSE),
+                 (2, ?1, 'User JPEG', 'User JPEG', 1, ?5, NULL, FALSE, FALSE),
+                 (3, ?2, 'Collection RAW', 'Collection RAW', 1, ?4, NULL, TRUE, FALSE),
+                 (4, ?2, 'Color RAW', 'Color RAW', 1, ?4, NULL, FALSE, TRUE),
+                 (5, ?2, 'Face RAW', 'Face RAW', 1, ?6, NULL, FALSE, FALSE),
+                 (6, ?3, 'Unaffected', 'Unaffected', 1, ?4, NULL, FALSE, FALSE)",
+            params![
+                jpeg_id,
+                raw_id,
+                other_id,
+                KEYWORD_ORIGIN_AUTO,
+                KEYWORD_ORIGIN_USER | KEYWORD_ORIGIN_AUTO,
+                KEYWORD_ORIGIN_FACE | KEYWORD_ORIGIN_AUTO,
+            ],
+        )
+        .expect("seed automatic keywords");
+
+        let outcome = upsert_editor_saved_image_database(&conn, &jpeg, true)
+            .expect("refresh rendered half");
+        assert_eq!(outcome.status, EditorSavedImageCatalogueStatus::Refreshed);
+
+        let keyword_state = |id: i64| -> (i32, i32, bool, bool, bool)
+        {
+            conn.query_row(
+                "SELECT origin,
+                        status,
+                        hidden_at IS NOT NULL,
+                        collection,
+                        color
+                 FROM keyword
+                 WHERE id = ?1",
+                params![id],
+                |row|
+                {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("keyword state")
+        };
+
+        assert_eq!(keyword_state(1), (0, 0, true, false, false));
+        assert_eq!(
+            keyword_state(2),
+            (KEYWORD_ORIGIN_USER, 1, false, false, false)
+        );
+        assert_eq!(keyword_state(3), (0, 1, false, true, false));
+        assert_eq!(keyword_state(4), (0, 1, false, false, true));
+        assert_eq!(
+            keyword_state(5),
+            (KEYWORD_ORIGIN_FACE, 1, false, false, false)
+        );
+        assert_eq!(
+            keyword_state(6),
+            (KEYWORD_ORIGIN_AUTO, 1, false, false, false)
+        );
+    }
+
+    #[test]
+    fn face_vector_queue_acknowledges_only_confirmed_safe_ids()
+    {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO face_vector_pending_delete (face_observation_id)
+             VALUES (1), (2), (3)",
+            [],
+        )
+        .expect("seed pending vector deletes");
+
+        assert_eq!(
+            acknowledge_pending_face_vector_deletes_impl(&conn, &[1, 2], false)
+                .expect("unconfirmed acknowledgement"),
+            0
+        );
+        assert_eq!(
+            pending_face_vector_delete_ids_impl(&conn).expect("pending after open failure"),
+            vec![1, 2, 3]
+        );
+
+        assert_eq!(
+            acknowledge_pending_face_vector_deletes_impl(&conn, &[1], true)
+                .expect("confirmed delete acknowledgement"),
+            1
+        );
+        assert_eq!(
+            pending_face_vector_delete_ids_impl(&conn).expect("pending after delete success"),
+            vec![2, 3]
+        );
+
+        assert_eq!(
+            acknowledge_pending_face_vector_deletes_impl(&conn, &[2, 3], true)
+                .expect("proved-absent acknowledgement"),
+            2
+        );
+        assert!(
+            pending_face_vector_delete_ids_impl(&conn)
+                .expect("pending after proved absence")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn face_vector_store_absence_is_proved_without_masking_path_errors()
+    {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("fixture clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "plcore-face-vector-delete-test-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        std::fs::create_dir_all(&root).expect("create vector-delete fixture root");
+
+        let missing = root.join("missing.lancedb");
+        let missing_result = FACE_EMBEDDING_RUNTIME.block_on(
+            open_face_vector_table_at_uri_for_delete(
+                missing.to_string_lossy().as_ref(),
+                "test_missing_store",
+            ),
+        );
+        assert!(matches!(
+            missing_result,
+            Ok(FaceVectorTableForDelete::Absent)
+        ));
+
+        let regular_file = root.join("not-a-directory.lancedb");
+        std::fs::write(&regular_file, b"not a vector store")
+            .expect("create non-directory vector path");
+        let path_error = FACE_EMBEDDING_RUNTIME.block_on(
+            open_face_vector_table_at_uri_for_delete(
+                regular_file.to_string_lossy().as_ref(),
+                "test_path_error",
+            ),
+        );
+        match path_error
+        {
+            Err(message) => assert!(message.contains("not a directory")),
+            _ => panic!("a non-directory vector path must remain an error"),
+        }
+
+        let empty_store = root.join("empty.lancedb");
+        std::fs::create_dir_all(&empty_store).expect("create empty vector store");
+        let empty_result = FACE_EMBEDDING_RUNTIME.block_on(
+            open_face_vector_table_at_uri_for_delete(
+                empty_store.to_string_lossy().as_ref(),
+                "test_empty_store",
+            ),
+        );
+        assert!(matches!(
+            empty_result,
+            Ok(FaceVectorTableForDelete::Absent)
+        ));
+
+        std::fs::remove_dir_all(&root).expect("remove vector-delete fixture root");
+    }
+
+    #[test]
+    fn same_basename_candidates_are_case_folded_exact_and_still_only()
+    {
+        let conn = setup();
+        let first = metadata("/first/Frame.JPG", "Frame.JPG", "JPG");
+        let second = metadata("/second/frame.jpg", "frame.jpg", "jpg");
+        let extension_mismatch = metadata("/third/frame.jpeg", "frame.jpeg", "jpeg");
+        let prefix_mismatch = metadata("/fourth/prefixframe.jpg", "prefixframe.jpg", "jpg");
+        let mut video = metadata("/video/FRAME.jpg", "FRAME.jpg", "jpg");
+        video.is_video = true;
+
+        let first_id = insert(&conn, &first).image_id.expect("first id");
+        let second_id = insert(&conn, &second).image_id.expect("second id");
+        let _ = insert(&conn, &extension_mismatch);
+        let _ = insert(&conn, &prefix_mismatch);
+        let _ = insert(&conn, &video);
+
+        let candidate_ids = image_records_with_same_basename_impl(&conn, "FRAME.jpg")
+            .into_iter()
+            .map(|record| record.id)
+            .collect::<Vec<_>>();
+        assert_eq!(candidate_ids, vec![first_id, second_id]);
+        assert!(image_records_with_same_basename_impl(&conn, "").is_empty());
+    }
+}
+
 /// Represents a complete image record from the database
 ///
 /// This struct contains all columns from the images table, including the auto-generated
@@ -291,6 +992,55 @@ pub struct CanonicalizeFaceEmbeddingsResult {
     pub duplicates_removed: u64,
     pub vectors_deleted: u64,
     pub vector_delete_failed: bool,
+}
+
+/// The catalogue outcome of one editor-written still.
+///
+/// This is deliberately distinct from ordinary scan ingest. A scan skips an
+/// existing path; an editor save has replaced the bytes at that path and must
+/// refresh its file-derived facts while preserving the row's identity and
+/// human curation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorSavedImageCatalogueStatus
+{
+    Inserted,
+    Refreshed,
+    NotCatalogued,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct EditorSavedImageCatalogueResult
+{
+    pub status: EditorSavedImageCatalogueStatus,
+    pub image_id: Option<i64>,
+    pub message: String,
+    pub vector_cleanup_warning: Option<String>,
+}
+
+/// Outcome of retrying the durable DuckDB queue of obsolete LanceDB face
+/// vectors. `VectorTableAbsent` is a proved state (the store directory is
+/// absent, or a successful LanceDB table census found no face table); arbitrary
+/// filesystem, connection, table-open, delete, or acknowledgement errors use
+/// `Deferred`/`Failed` and leave unacknowledged ids queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaceVectorDeleteRetryStatus
+{
+    NoPendingDeletes,
+    Deleted,
+    VectorTableAbsent,
+    Deferred,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct FaceVectorDeleteRetryResult
+{
+    pub status: FaceVectorDeleteRetryStatus,
+    pub pending_count: u64,
+    pub acknowledged_count: u64,
+    pub remaining_count: u64,
+    pub message: String,
 }
 
 /// Compact gallery metadata for a visible similar-photo representative.
@@ -1389,6 +2139,15 @@ fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
         CREATE INDEX IF NOT EXISTS idx_face_observation_algorithm ON face_observation(algorithm_version);
         CREATE INDEX IF NOT EXISTS idx_face_observation_run ON face_observation(analysis_run_id);
 
+        -- Durable cross-store cleanup queue. A catalogue transaction that
+        -- deletes face observations first records their vector ids here. The
+        -- LanceDB delete runs only after commit, and an id leaves this table
+        -- only after a confirmed delete call or a proved-absent vector table.
+        CREATE TABLE IF NOT EXISTS face_vector_pending_delete (
+            face_observation_id INTEGER PRIMARY KEY,
+            enqueued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
         -- === Face recognition cluster diagnostics (developer-only first pass) ===
         -- AuraFace vectors live in LanceDB keyed by face_observation.id. These
         -- DuckDB tables persist the scalar result of one clustering run so
@@ -2387,6 +3146,676 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
     // Return count of successfully inserted records
     // Note: This excludes skipped duplicates (which contribute 0)
     inserted_count
+}
+
+// === Editor-save catalogue refresh =========================================
+//
+// Ordinary scan ingest is intentionally duplicate-skipping. An editor save is
+// different: when its destination already has a catalogue row, the bytes at
+// that stable path have changed and every byte-derived fact must be refreshed
+// in place. The row id and human curation remain stable; machine analysis is
+// invalidated so the normal pipelines can rebuild it from the new bytes.
+
+#[derive(Debug)]
+struct EditorSavedImageDatabaseOutcome
+{
+    status: EditorSavedImageCatalogueStatus,
+    image_id: Option<i64>,
+    message: String,
+    enqueued_face_vector_delete_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditorSavedPersonKeyword
+{
+    image_id: i64,
+    person_name: String,
+}
+
+fn editor_saved_image_kind_name(kind: ImageKind) -> &'static str
+{
+    match kind
+    {
+        ImageKind::Jpeg => "jpeg",
+        ImageKind::Raw => "raw",
+        ImageKind::Other => "other",
+        ImageKind::Heif => "heif",
+        ImageKind::Dng => "dng",
+        ImageKind::Psd => "psd",
+        ImageKind::Tiff => "tiff",
+        ImageKind::Png => "png",
+    }
+}
+
+fn editor_saved_image_id_csv(ids: &[i64]) -> String
+{
+    ids.iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn editor_saved_image_insert(
+    conn: &Connection,
+    metadata: &ImageMetadata,
+) -> Result<i64, String>
+{
+    // The dedicated editor-save input is file metadata, never a curation
+    // carrier. Defensively clear organization/provenance fields and force the
+    // catalogue rotation to zero: the saved pixels already contain geometry.
+    let mut inserted = metadata.clone();
+    inserted.rating = None;
+    inserted.flag = None;
+    inserted.color_label = None;
+    inserted.rotation = Some(0);
+    inserted.external_source_id = None;
+
+    let sql = build_ingest_insert_sql(1);
+    let mut values: Vec<Value> = Vec::with_capacity(INGEST_PARAMS_PER_ROW);
+    push_ingest_row_params(&inserted, &mut values);
+    let changed = conn
+        .execute(&sql, params_from_iter(values.iter()))
+        .map_err(|e| format!("editor saved image insert failed: {}", e))?;
+    if changed != 1
+    {
+        return Err(format!(
+            "editor saved image insert changed {} rows for {:?}",
+            changed, metadata.file_path
+        ));
+    }
+
+    conn.query_row(
+        "SELECT id FROM images WHERE file_path = ?1",
+        params![metadata.file_path.as_str()],
+        |row| row.get::<_, i64>(0),
+    )
+    .map_err(|e| format!("editor saved image id readback failed: {}", e))
+}
+
+fn editor_saved_image_update_facts(
+    conn: &Connection,
+    image_id: i64,
+    metadata: &ImageMetadata,
+) -> Result<(), String>
+{
+    let parsed = parse_filename(metadata.file_name.clone());
+    let image_kind = editor_saved_image_kind_name(parsed.kind);
+    let changed = conn
+        .execute(
+            "UPDATE images SET
+                 file_size = ?2,
+                 file_name = ?3,
+                 file_extension = ?4,
+                 file_stem = ?5,
+                 image_kind = ?6,
+                 directory_path = SUBSTRING(file_path, 1, LENGTH(file_path) - INSTR(REVERSE(file_path), '/')),
+                 created_timestamp = ?7,
+                 modified_timestamp = ?8,
+                 camera_make = ?9,
+                 camera_model = ?10,
+                 lens_model = ?11,
+                 focal_length = ?12,
+                 aperture = ?13,
+                 shutter_speed = ?14,
+                 iso = ?15,
+                 capture_datetime = ?16,
+                 pixel_width = ?17,
+                 pixel_height = ?18,
+                 color_space = ?19,
+                 bit_depth = ?20,
+                 gps_latitude = ?21,
+                 gps_longitude = ?22,
+                 gps_altitude = ?23,
+                 copyright = ?24,
+                 creator = ?25,
+                 description = ?26,
+                 rotation = 0,
+                 is_video = ?27,
+                 duration_seconds = ?28,
+                 frame_rate = ?29,
+                 video_kind = ?30,
+                 video_codec = ?31,
+                 video_bitrate = ?32,
+                 color_primaries = ?33,
+                 color_transfer = ?34,
+                 color_matrix = ?35,
+                 color_range = ?36,
+                 dv_profile = ?37,
+                 has_audio = ?38,
+                 audio_codec = ?39,
+                 audio_channels = ?40,
+                 audio_sample_rate = ?41,
+                 audio_bitrate = ?42,
+                 live_photo_id = ?43
+             WHERE id = ?1",
+            params![
+                image_id,
+                metadata.file_size as i64,
+                metadata.file_name.as_str(),
+                metadata.file_extension.as_deref(),
+                parsed.stem.as_str(),
+                image_kind,
+                metadata.created_timestamp,
+                metadata.modified_timestamp,
+                metadata.camera_make.as_deref(),
+                metadata.camera_model.as_deref(),
+                metadata.lens_model.as_deref(),
+                metadata.focal_length,
+                metadata.aperture,
+                metadata.shutter_speed,
+                metadata.iso.map(|value| value as i64),
+                metadata.capture_datetime.as_deref(),
+                metadata.pixel_width.map(|value| value as i64),
+                metadata.pixel_height.map(|value| value as i64),
+                metadata.color_space.as_deref(),
+                metadata.bit_depth.map(|value| value as i64),
+                metadata.gps_latitude,
+                metadata.gps_longitude,
+                metadata.gps_altitude,
+                metadata.copyright.as_deref(),
+                metadata.creator.as_deref(),
+                metadata.description.as_deref(),
+                metadata.is_video,
+                metadata.duration_seconds,
+                metadata.frame_rate,
+                metadata.video_kind.as_deref(),
+                metadata.video_codec.as_deref(),
+                metadata.video_bitrate,
+                metadata.color_primaries.as_deref(),
+                metadata.color_transfer.as_deref(),
+                metadata.color_matrix.as_deref(),
+                metadata.color_range.as_deref(),
+                metadata.dv_profile,
+                metadata.has_audio,
+                metadata.audio_codec.as_deref(),
+                metadata.audio_channels,
+                metadata.audio_sample_rate,
+                metadata.audio_bitrate,
+                metadata.live_photo_id.as_deref(),
+            ],
+        )
+        .map_err(|e| format!("editor saved image fact refresh failed: {}", e))?;
+
+    if changed != 1
+    {
+        return Err(format!(
+            "editor saved image fact refresh changed {} rows for id {}",
+            changed, image_id
+        ));
+    }
+    Ok(())
+}
+
+fn editor_saved_image_collect_face_ids(
+    conn: &Connection,
+    affected_ids: &[i64],
+) -> Result<Vec<i64>, String>
+{
+    let ids = editor_saved_image_id_csv(affected_ids);
+    let sql = format!(
+        "SELECT id FROM face_observation
+         WHERE image_id IN ({0}) OR analyzed_image_id IN ({0})
+         ORDER BY id",
+        ids
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("editor saved face-id census prepare failed: {}", e))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|e| format!("editor saved face-id census failed: {}", e))?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+fn editor_saved_image_collect_people(
+    conn: &Connection,
+    face_ids: &[i64],
+) -> Result<Vec<EditorSavedPersonKeyword>, String>
+{
+    if face_ids.is_empty()
+    {
+        return Ok(Vec::new());
+    }
+    let ids = editor_saved_image_id_csv(face_ids);
+    let sql = format!(
+        "SELECT DISTINCT assignment.image_id, person.display_name
+         FROM person_face_assignment assignment
+         JOIN person ON person.id = assignment.person_id
+         WHERE assignment.face_observation_id IN ({})
+         ORDER BY assignment.image_id, person.display_name",
+        ids
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("editor saved People census prepare failed: {}", e))?;
+    let rows = stmt
+        .query_map([], |row|
+        {
+            Ok(EditorSavedPersonKeyword
+            {
+                image_id: row.get(0)?,
+                person_name: row.get(1)?,
+            })
+        })
+        .map_err(|e| format!("editor saved People census failed: {}", e))?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+fn editor_saved_image_collect_cluster_runs(
+    conn: &Connection,
+    face_ids: &[i64],
+) -> Result<Vec<String>, String>
+{
+    if face_ids.is_empty()
+    {
+        return Ok(Vec::new());
+    }
+    let ids = editor_saved_image_id_csv(face_ids);
+    let sql = format!(
+        "SELECT DISTINCT run_id FROM face_cluster_member
+         WHERE face_observation_id IN ({0})
+            OR nearest_neighbor_face_observation_id IN ({0})
+         ORDER BY run_id",
+        ids
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("editor saved face-cluster census prepare failed: {}", e))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("editor saved face-cluster census failed: {}", e))?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+fn editor_saved_image_collect_similar_groups(
+    conn: &Connection,
+    affected_ids: &[i64],
+) -> Result<Vec<i64>, String>
+{
+    let ids = editor_saved_image_id_csv(affected_ids);
+    let sql = format!(
+        "SELECT DISTINCT group_id FROM similar_photo_group_member
+         WHERE image_id IN ({0})
+            OR group_id IN ({0})
+            OR representative_id IN ({0})
+         ORDER BY group_id",
+        ids
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("editor saved similar-group census prepare failed: {}", e))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|e| format!("editor saved similar-group census failed: {}", e))?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+fn editor_saved_image_preserve_people_keywords(
+    conn: &Connection,
+    people: &[EditorSavedPersonKeyword],
+) -> Result<(), String>
+{
+    let clear_face_mask = !KEYWORD_ORIGIN_FACE;
+    for identity in people
+    {
+        let person_path = ["People", identity.person_name.as_str()].join(KEYWORD_PATH_SEPARATOR);
+        conn.execute(
+            "UPDATE keyword
+             SET origin = ((origin | ?1) & ?2)
+             WHERE image_id = ?3
+               AND status = 1
+               AND (path = 'People' OR path = ?4)
+               AND (origin & ?5) <> 0",
+            params![
+                KEYWORD_ORIGIN_USER,
+                clear_face_mask,
+                identity.image_id,
+                person_path,
+                KEYWORD_ORIGIN_FACE,
+            ],
+        )
+        .map_err(|e| format!("editor saved People preservation failed: {}", e))?;
+    }
+    Ok(())
+}
+
+fn editor_saved_image_remove_auto_keyword_origin(
+    conn: &Connection,
+    affected_ids: &[i64],
+) -> Result<(), String>
+{
+    let affected = editor_saved_image_id_csv(affected_ids);
+    let clear_auto_mask = !KEYWORD_ORIGIN_AUTO;
+    conn.execute(
+        &format!(
+            "UPDATE keyword
+             SET origin = (origin & ?1)
+             WHERE image_id IN ({})
+               AND (origin & ?2) <> 0",
+            affected
+        ),
+        params![clear_auto_mask, KEYWORD_ORIGIN_AUTO],
+    )
+    .map_err(|e| format!("editor saved automatic-keyword invalidation failed: {}", e))?;
+
+    // A pure automatic projection no longer describes the rewritten bytes.
+    // Keep the row for recovery/history, but hide it unless an orthogonal
+    // collection or color membership still needs the active row. USER and FACE
+    // provenance survived the mask above and therefore never reaches origin 0.
+    conn.execute_batch(&format!(
+        "UPDATE keyword
+         SET status = 0,
+             hidden_at = CURRENT_TIMESTAMP
+         WHERE image_id IN ({})
+           AND status = 1
+           AND origin = 0
+           AND COALESCE(collection, FALSE) = FALSE
+           AND COALESCE(color, FALSE) = FALSE;",
+        affected
+    ))
+    .map_err(|e| format!("editor saved automatic-keyword hide failed: {}", e))?;
+
+    Ok(())
+}
+
+fn editor_saved_image_enqueue_face_vector_deletes(
+    conn: &Connection,
+    face_ids: &[i64],
+) -> Result<u64, String>
+{
+    if face_ids.is_empty()
+    {
+        return Ok(0);
+    }
+
+    let faces = editor_saved_image_id_csv(face_ids);
+    conn.execute(
+        &format!(
+            "INSERT OR IGNORE INTO face_vector_pending_delete
+                 (face_observation_id, enqueued_at)
+             SELECT id, CURRENT_TIMESTAMP
+             FROM face_observation
+             WHERE id IN ({})",
+            faces
+        ),
+        [],
+    )
+    .map(|changed| changed as u64)
+    .map_err(|e| format!("editor saved face-vector enqueue failed: {}", e))
+}
+
+fn editor_saved_image_invalidate_analysis(
+    conn: &Connection,
+    affected_ids: &[i64],
+    face_ids: &[i64],
+    people: &[EditorSavedPersonKeyword],
+    cluster_runs: &[String],
+    similar_group_ids: &[i64],
+) -> Result<u64, String>
+{
+    let affected = editor_saved_image_id_csv(affected_ids);
+    conn.execute_batch(&format!(
+        "UPDATE images SET
+             focus_score = NULL,
+             focus_basis = NULL,
+             focus_human_score = NULL,
+             focus_animal_score = NULL,
+             focus_foreground_score = NULL,
+             focus_saliency_score = NULL,
+             focus_animal_pose_score = NULL,
+             focus_whole_image_score = NULL,
+             focus_algorithm_version = NULL,
+             focus_analysis_status = NULL,
+             focus_analysis_attempt_id = NULL,
+             focus_scored_at = NULL,
+             face_count = NULL,
+             face_quality_best = NULL,
+             face_quality_average = NULL,
+             face_quality_min = NULL,
+             face_eyes_open_count = NULL,
+             face_blink_risk_count = NULL
+         WHERE id IN ({0});
+         DELETE FROM similar_photo_featureprint WHERE image_id IN ({0});",
+        affected
+    ))
+    .map_err(|e| format!("editor saved scalar/featureprint invalidation failed: {}", e))?;
+
+    editor_saved_image_remove_auto_keyword_origin(conn, affected_ids)?;
+    editor_saved_image_preserve_people_keywords(conn, people)?;
+
+    let enqueued_face_vector_delete_count =
+        editor_saved_image_enqueue_face_vector_deletes(conn, face_ids)?;
+    if !face_ids.is_empty()
+    {
+        let faces = editor_saved_image_id_csv(face_ids);
+        conn.execute_batch(&format!(
+            "DELETE FROM person_face_assignment WHERE face_observation_id IN ({0});
+             DELETE FROM face_observation WHERE id IN ({0});",
+            faces
+        ))
+        .map_err(|e| format!("editor saved face invalidation failed: {}", e))?;
+    }
+
+    // A clustering run is one global relationship graph. Removing only the
+    // changed face would leave its cluster counts and transitive membership
+    // looking authoritative, so invalidate every run that referenced it.
+    for run_id in cluster_runs
+    {
+        conn.execute(
+            "DELETE FROM face_cluster_member WHERE run_id = ?1",
+            params![run_id.as_str()],
+        )
+        .map_err(|e| format!("editor saved face-cluster member invalidation failed: {}", e))?;
+        conn.execute(
+            "DELETE FROM face_cluster_run WHERE run_id = ?1",
+            params![run_id.as_str()],
+        )
+        .map_err(|e| format!("editor saved face-cluster run invalidation failed: {}", e))?;
+    }
+
+    let similar_groups = editor_saved_image_id_csv(similar_group_ids);
+    let group_predicate = if similar_group_ids.is_empty()
+    {
+        "FALSE".to_string()
+    }
+    else
+    {
+        format!("group_id IN ({})", similar_groups)
+    };
+    conn.execute_batch(&format!(
+        "DELETE FROM similar_photo_group_member
+         WHERE image_id IN ({0})
+            OR representative_id IN ({0})
+            OR {1};
+         DELETE FROM similar_photo_unit_checkpoint;",
+        affected, group_predicate
+    ))
+    .map_err(|e| format!("editor saved similar-photo invalidation failed: {}", e))?;
+
+    Ok(enqueued_face_vector_delete_count)
+}
+
+fn upsert_editor_saved_image_database(
+    conn: &Connection,
+    metadata: &ImageMetadata,
+    insert_if_missing: bool,
+) -> Result<EditorSavedImageDatabaseOutcome, String>
+{
+    if metadata.file_path.trim().is_empty() || metadata.file_name.trim().is_empty()
+    {
+        return Err("The editor-saved image path and file name must not be empty.".to_string());
+    }
+
+    let existing_id = match conn.query_row(
+        "SELECT id FROM images WHERE file_path = ?1",
+        params![metadata.file_path.as_str()],
+        |row| row.get::<_, i64>(0),
+    )
+    {
+        Ok(id) => Some(id),
+        Err(duckdb::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(format!("editor saved image lookup failed: {}", e)),
+    };
+
+    let Some(image_id) = existing_id else
+    {
+        if !insert_if_missing
+        {
+            return Ok(EditorSavedImageDatabaseOutcome
+            {
+                status: EditorSavedImageCatalogueStatus::NotCatalogued,
+                image_id: None,
+                message: "The saved image was not already in the catalogue.".to_string(),
+                enqueued_face_vector_delete_count: 0,
+            });
+        }
+
+        conn.execute_batch("BEGIN TRANSACTION;")
+            .map_err(|e| format!("editor saved image insert BEGIN failed: {}", e))?;
+        let inserted_id = match editor_saved_image_insert(conn, metadata)
+        {
+            Ok(id) => id,
+            Err(message) =>
+            {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(message);
+            }
+        };
+        if let Err(e) = conn.execute_batch("COMMIT;")
+        {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(format!("editor saved image insert COMMIT failed: {}", e));
+        }
+        return Ok(EditorSavedImageDatabaseOutcome
+        {
+            status: EditorSavedImageCatalogueStatus::Inserted,
+            image_id: Some(inserted_id),
+            message: "The saved image was added to the catalogue.".to_string(),
+            enqueued_face_vector_delete_count: 0,
+        });
+    };
+
+    // Freeze every dependent id before BEGIN. The focus writeback helper owns
+    // the same rendered-JPEG -> hidden-RAW fan-out rule as the analysis writer,
+    // so a refreshed rendered half cannot leave inherited RAW facts stale.
+    let mut affected_ids = focus_analysis_writeback_target_ids(conn, image_id)
+        .map_err(|reason| format!("editor saved image dependency planning failed: {}", reason))?;
+    affected_ids.push(image_id);
+    affected_ids.sort_unstable();
+    affected_ids.dedup();
+
+    let face_ids = editor_saved_image_collect_face_ids(conn, &affected_ids)?;
+    let people = editor_saved_image_collect_people(conn, &face_ids)?;
+    let cluster_runs = editor_saved_image_collect_cluster_runs(conn, &face_ids)?;
+    let similar_group_ids = editor_saved_image_collect_similar_groups(conn, &affected_ids)?;
+
+    conn.execute_batch("BEGIN TRANSACTION;")
+        .map_err(|e| format!("editor saved image refresh BEGIN failed: {}", e))?;
+    let refresh_result = editor_saved_image_update_facts(conn, image_id, metadata)
+        .and_then(|()|
+        {
+            editor_saved_image_invalidate_analysis(
+                conn,
+                &affected_ids,
+                &face_ids,
+                &people,
+                &cluster_runs,
+                &similar_group_ids,
+            )
+        });
+    let enqueued_face_vector_delete_count = match refresh_result
+    {
+        Ok(count) => count,
+        Err(message) =>
+        {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(message);
+        }
+    };
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(format!("editor saved image refresh COMMIT failed: {}", e));
+    }
+
+    Ok(EditorSavedImageDatabaseOutcome
+    {
+        status: EditorSavedImageCatalogueStatus::Refreshed,
+        image_id: Some(image_id),
+        message: "The existing catalogue record was refreshed from the saved image.".to_string(),
+        enqueued_face_vector_delete_count,
+    })
+}
+
+/// Insert one editor-written image when requested, or refresh an existing path
+/// in place. DuckDB commits first; stale LanceDB face vectors are then removed
+/// on the proven private embedding runtime. A vector cleanup failure is a
+/// warning, never a false rollback claim about the already-committed catalogue.
+pub async fn upsert_editor_saved_image(
+    metadata: ImageMetadata,
+    insert_if_missing: bool,
+) -> EditorSavedImageCatalogueResult
+{
+    let database_outcome =
+    {
+        let catalogue = CATALOGUE.lock().unwrap();
+        let conn = match catalogue.as_ref()
+        {
+            Some(conn) => conn,
+            None =>
+            {
+                return EditorSavedImageCatalogueResult
+                {
+                    status: EditorSavedImageCatalogueStatus::Failed,
+                    image_id: None,
+                    message: "Catalogue not initialized.".to_string(),
+                    vector_cleanup_warning: None,
+                }
+            }
+        };
+        upsert_editor_saved_image_database(conn, &metadata, insert_if_missing)
+    };
+
+    let database_outcome = match database_outcome
+    {
+        Ok(outcome) => outcome,
+        Err(message) =>
+        {
+            eprintln!("upsert_editor_saved_image: {}", message);
+            return EditorSavedImageCatalogueResult
+            {
+                status: EditorSavedImageCatalogueStatus::Failed,
+                image_id: None,
+                message,
+                vector_cleanup_warning: None,
+            };
+        }
+    };
+
+    let mut vector_cleanup_warning = None;
+    if database_outcome.enqueued_face_vector_delete_count > 0
+    {
+        let cleanup = retry_pending_face_vector_deletes().await;
+        if cleanup.remaining_count > 0
+            || matches!(
+                cleanup.status,
+                FaceVectorDeleteRetryStatus::Deferred | FaceVectorDeleteRetryStatus::Failed
+            )
+        {
+            vector_cleanup_warning = Some(format!(
+                "The catalogue was refreshed, but obsolete face-vector cleanup is still queued. PhotoLibrarian will retry at launch and before the next face-index build. {}",
+                cleanup.message
+            ));
+        }
+    }
+
+    EditorSavedImageCatalogueResult
+    {
+        status: database_outcome.status,
+        image_id: database_outcome.image_id,
+        message: database_outcome.message,
+        vector_cleanup_warning,
+    }
 }
 
 /// Get the total count of images in the catalogue
@@ -3627,6 +5056,55 @@ pub async fn get_all_images(
         "",
         media_type,
     )
+}
+
+fn image_records_with_same_basename_impl(
+    conn: &Connection,
+    basename: &str,
+) -> Vec<ImageRecord>
+{
+    if basename.is_empty()
+    {
+        return Vec::new();
+    }
+
+    let predicate = format!(
+        "LOWER(file_name) = LOWER({})",
+        sql_string_literal(basename)
+    );
+    execute_image_record_query(
+        conn,
+        &predicate,
+        "id ASC",
+        i64::MAX,
+        0,
+        false,
+        false,
+        false,
+        "",
+        MediaType::StillsOnly,
+    )
+}
+
+/// Return the narrow full-record candidate set Swift needs to resolve exact
+/// catalogue ownership of a save destination. Basename comparison is
+/// case-folded; Rust deliberately does not guess path, symlink, or hard-link
+/// identity. Swift checks exact path first, then filesystem canonical entry.
+pub async fn image_records_with_same_basename(
+    basename: String,
+) -> Vec<ImageRecord>
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref()
+    {
+        Some(conn) => conn,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+    image_records_with_same_basename_impl(conn, &basename)
 }
 
 /// Get images from the catalogue with pagination and proper global sort order
@@ -9217,6 +10695,13 @@ static FACE_EMBEDDING_RUNTIME: once_cell::sync::Lazy<tokio::runtime::Runtime> =
             .expect("create face embedding Tokio runtime")
     });
 
+/// Serializes durable pending-delete retries without holding a blocking mutex
+/// across LanceDB awaits. Editor refresh, launch recovery, and index build can
+/// all request a retry; one queue consumer at a time keeps acknowledgement
+/// ordering deterministic and every delete idempotent.
+static FACE_VECTOR_DELETE_RETRY_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
+
 fn face_embedding_schema(dimension: u32) -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("face_observation_id", DataType::Int64, false),
@@ -10770,35 +12255,414 @@ fn canonicalize_face_assignments_impl(conn: &Connection) -> (u64, u64, bool) {
     (reassigned, duplicates_removed, true)
 }
 
-/// Delete the twin rows' vectors from LanceDB. An unopenable table is treated
-/// as "no vector store yet" (fresh catalogue / index never built) — success
-/// with zero deletions; only a failing delete CALL flags a retry.
-async fn delete_noncanonical_face_vectors(doomed: Vec<i64>) -> (u64, bool) {
-    if doomed.is_empty() {
+enum FaceVectorTableForDelete
+{
+    Absent,
+    Present(lancedb::Table),
+}
+
+/// Open the face-vector table without collapsing every open error into
+/// "missing". Absence is proved only by a missing local store directory or a
+/// successful LanceDB table census that does not contain the face table.
+async fn open_face_vector_table_for_delete(
+    operation: &str,
+) -> Result<FaceVectorTableForDelete, String>
+{
+    let uri = face_embedding_store_uri()
+        .ok_or_else(|| format!("{}: catalogue path is not initialized", operation))?;
+
+    open_face_vector_table_at_uri_for_delete(&uri, operation).await
+}
+
+async fn open_face_vector_table_at_uri_for_delete(
+    uri: &str,
+    operation: &str,
+) -> Result<FaceVectorTableForDelete, String>
+{
+
+    match std::fs::metadata(uri)
+    {
+        Ok(metadata) =>
+        {
+            if !metadata.is_dir()
+            {
+                return Err(format!(
+                    "{}: face-vector store path is not a directory: {}",
+                    operation, uri
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(FaceVectorTableForDelete::Absent);
+        }
+        Err(error) =>
+        {
+            return Err(format!(
+                "{}: face-vector store metadata failed for {}: {}",
+                operation, uri, error
+            ));
+        }
+    }
+
+    let database = lancedb::connect(uri)
+        .execute()
+        .await
+        .map_err(|error| format!("{}: face-vector store connect failed: {}", operation, error))?;
+    let table_names = database
+        .table_names()
+        .execute()
+        .await
+        .map_err(|error| format!("{}: face-vector table census failed: {}", operation, error))?;
+    if !table_names.iter().any(|name| name == FACE_EMBEDDING_TABLE)
+    {
+        return Ok(FaceVectorTableForDelete::Absent);
+    }
+
+    database
+        .open_table(FACE_EMBEDDING_TABLE)
+        .execute()
+        .await
+        .map(FaceVectorTableForDelete::Present)
+        .map_err(|error| format!("{}: face-vector table open failed: {}", operation, error))
+}
+
+fn pending_face_vector_delete_ids_impl(
+    conn: &Connection,
+) -> Result<Vec<i64>, String>
+{
+    let mut statement = conn
+        .prepare(
+            "SELECT face_observation_id
+             FROM face_vector_pending_delete
+             ORDER BY face_observation_id",
+        )
+        .map_err(|error| format!("pending face-vector query prepare failed: {}", error))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|error| format!("pending face-vector query failed: {}", error))?;
+    let mut ids = Vec::new();
+    for row in rows
+    {
+        ids.push(row.map_err(|error| format!("pending face-vector row failed: {}", error))?);
+    }
+    Ok(ids)
+}
+
+fn pending_face_vector_delete_count_impl(
+    conn: &Connection,
+) -> Result<u64, String>
+{
+    conn.query_row(
+        "SELECT COUNT(*) FROM face_vector_pending_delete",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count.max(0) as u64)
+    .map_err(|error| format!("pending face-vector count failed: {}", error))
+}
+
+/// Remove queue rows only when LanceDB deletion was confirmed, or the caller
+/// proved the vector table absent. `confirmed_safe_to_acknowledge = false` is
+/// deliberately a no-op and is exercised by the durability regression tests.
+fn acknowledge_pending_face_vector_deletes_impl(
+    conn: &Connection,
+    ids: &[i64],
+    confirmed_safe_to_acknowledge: bool,
+) -> Result<u64, String>
+{
+    if ids.is_empty() || !confirmed_safe_to_acknowledge
+    {
+        return Ok(0);
+    }
+
+    let id_list = editor_saved_image_id_csv(ids);
+    conn.execute(
+        &format!(
+            "DELETE FROM face_vector_pending_delete
+             WHERE face_observation_id IN ({})",
+            id_list
+        ),
+        [],
+    )
+    .map(|changed| changed as u64)
+    .map_err(|error| format!("pending face-vector acknowledgement failed: {}", error))
+}
+
+fn pending_face_vector_delete_ids_from_catalogue() -> Result<Vec<i64>, String>
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = catalogue
+        .as_ref()
+        .ok_or_else(|| "Catalogue not initialized.".to_string())?;
+    pending_face_vector_delete_ids_impl(conn)
+}
+
+fn pending_face_vector_delete_count_from_catalogue() -> Result<u64, String>
+{
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = catalogue
+        .as_ref()
+        .ok_or_else(|| "Catalogue not initialized.".to_string())?;
+    pending_face_vector_delete_count_impl(conn)
+}
+
+fn acknowledge_pending_face_vector_deletes_from_catalogue(
+    ids: &[i64],
+    confirmed_safe_to_acknowledge: bool,
+) -> Result<u64, String>
+{
+    if ids.is_empty() || !confirmed_safe_to_acknowledge
+    {
+        return Ok(0);
+    }
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = catalogue
+        .as_ref()
+        .ok_or_else(|| "Catalogue not initialized.".to_string())?;
+    acknowledge_pending_face_vector_deletes_impl(
+        conn,
+        ids,
+        confirmed_safe_to_acknowledge,
+    )
+}
+
+async fn retry_pending_face_vector_deletes_impl() -> FaceVectorDeleteRetryResult
+{
+    let _retry_guard = FACE_VECTOR_DELETE_RETRY_LOCK.lock().await;
+    let pending_ids = match pending_face_vector_delete_ids_from_catalogue()
+    {
+        Ok(ids) => ids,
+        Err(message) =>
+        {
+            return FaceVectorDeleteRetryResult
+            {
+                status: FaceVectorDeleteRetryStatus::Failed,
+                pending_count: 0,
+                acknowledged_count: 0,
+                remaining_count: 0,
+                message,
+            };
+        }
+    };
+    let pending_count = pending_ids.len() as u64;
+    if pending_ids.is_empty()
+    {
+        return FaceVectorDeleteRetryResult
+        {
+            status: FaceVectorDeleteRetryStatus::NoPendingDeletes,
+            pending_count: 0,
+            acknowledged_count: 0,
+            remaining_count: 0,
+            message: "No obsolete face vectors are waiting for deletion.".to_string(),
+        };
+    }
+
+    let table = match open_face_vector_table_for_delete("retry_pending_face_vector_deletes").await
+    {
+        Ok(FaceVectorTableForDelete::Absent) =>
+        {
+            return match acknowledge_pending_face_vector_deletes_from_catalogue(
+                &pending_ids,
+                true,
+            )
+            {
+                Ok(acknowledged_count) =>
+                {
+                    let remaining_count = pending_face_vector_delete_count_from_catalogue()
+                        .unwrap_or_else(|_| pending_count.saturating_sub(acknowledged_count));
+                    FaceVectorDeleteRetryResult
+                    {
+                        status: if remaining_count == 0
+                        {
+                            FaceVectorDeleteRetryStatus::VectorTableAbsent
+                        }
+                        else
+                        {
+                            FaceVectorDeleteRetryStatus::Deferred
+                        },
+                        pending_count,
+                        acknowledged_count,
+                        remaining_count,
+                        message: if remaining_count == 0
+                        {
+                            "The face-vector table is absent; queued obsolete ids were safely acknowledged."
+                                .to_string()
+                        }
+                        else
+                        {
+                            "The face-vector table is absent, but newer queued ids remain for another retry."
+                                .to_string()
+                        },
+                    }
+                }
+                Err(message) => FaceVectorDeleteRetryResult
+                {
+                    status: FaceVectorDeleteRetryStatus::Deferred,
+                    pending_count,
+                    acknowledged_count: 0,
+                    remaining_count: pending_count,
+                    message,
+                },
+            };
+        }
+        Ok(FaceVectorTableForDelete::Present(table)) => table,
+        Err(message) =>
+        {
+            let _ = acknowledge_pending_face_vector_deletes_from_catalogue(
+                &pending_ids,
+                false,
+            );
+            return FaceVectorDeleteRetryResult
+            {
+                status: FaceVectorDeleteRetryStatus::Deferred,
+                pending_count,
+                acknowledged_count: 0,
+                remaining_count: pending_count,
+                message,
+            };
+        }
+    };
+
+    let mut acknowledged_count = 0u64;
+    for chunk in pending_ids.chunks(500)
+    {
+        let filter = format!(
+            "face_observation_id IN ({})",
+            editor_saved_image_id_csv(chunk)
+        );
+        if let Err(error) = table.delete(&filter).await
+        {
+            let _ = acknowledge_pending_face_vector_deletes_from_catalogue(chunk, false);
+            let remaining_count = pending_face_vector_delete_count_from_catalogue()
+                .unwrap_or_else(|_| pending_count.saturating_sub(acknowledged_count));
+            return FaceVectorDeleteRetryResult
+            {
+                status: FaceVectorDeleteRetryStatus::Deferred,
+                pending_count,
+                acknowledged_count,
+                remaining_count,
+                message: format!("Face-vector deletion was deferred: {}", error),
+            };
+        }
+
+        match acknowledge_pending_face_vector_deletes_from_catalogue(chunk, true)
+        {
+            Ok(count) => acknowledged_count += count,
+            Err(message) =>
+            {
+                let remaining_count = pending_face_vector_delete_count_from_catalogue()
+                    .unwrap_or_else(|_| pending_count.saturating_sub(acknowledged_count));
+                return FaceVectorDeleteRetryResult
+                {
+                    status: FaceVectorDeleteRetryStatus::Deferred,
+                    pending_count,
+                    acknowledged_count,
+                    remaining_count,
+                    message,
+                };
+            }
+        }
+    }
+
+    let remaining_count = match pending_face_vector_delete_count_from_catalogue()
+    {
+        Ok(count) => count,
+        Err(message) =>
+        {
+            return FaceVectorDeleteRetryResult
+            {
+                status: FaceVectorDeleteRetryStatus::Failed,
+                pending_count,
+                acknowledged_count,
+                remaining_count: pending_count.saturating_sub(acknowledged_count),
+                message,
+            };
+        }
+    };
+    let status = if remaining_count == 0
+    {
+        FaceVectorDeleteRetryStatus::Deleted
+    }
+    else
+    {
+        FaceVectorDeleteRetryStatus::Deferred
+    };
+    FaceVectorDeleteRetryResult
+    {
+        status,
+        pending_count,
+        acknowledged_count,
+        remaining_count,
+        message: if remaining_count == 0
+        {
+            "Queued obsolete face vectors were deleted and acknowledged.".to_string()
+        }
+        else
+        {
+            "Some obsolete face-vector ids remain queued for a later retry.".to_string()
+        },
+    }
+}
+
+/// Retry every durable obsolete-face-vector id. Queue rows survive every
+/// unconfirmed store error; the API is safe to call at launch, before an index
+/// build, and immediately after an editor-refresh transaction commits.
+pub async fn retry_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
+{
+    match FACE_EMBEDDING_RUNTIME
+        .spawn(retry_pending_face_vector_deletes_impl())
+        .await
+    {
+        Ok(result) => result,
+        Err(error) =>
+        {
+            let remaining_count = pending_face_vector_delete_count_from_catalogue().unwrap_or(0);
+            FaceVectorDeleteRetryResult
+            {
+                status: FaceVectorDeleteRetryStatus::Failed,
+                pending_count: remaining_count,
+                acknowledged_count: 0,
+                remaining_count,
+                message: format!("Face-vector cleanup runtime failed: {}", error),
+            }
+        }
+    }
+}
+
+/// Delete canonical-migration twin vectors from LanceDB. Unlike the historical
+/// implementation, arbitrary open errors are failures; only a proved-absent
+/// table is a successful no-op.
+async fn delete_face_vectors_by_observation_ids(
+    doomed: Vec<i64>,
+    operation: &'static str,
+) -> (u64, bool)
+{
+    if doomed.is_empty()
+    {
         return (0, false);
     }
-    let table = match open_face_embedding_table().await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!(
-                "canonicalize_face_embeddings: open table ({}) — treating as empty store",
-                e
-            );
-            return (0, false);
+    let table = match open_face_vector_table_for_delete(operation).await
+    {
+        Ok(FaceVectorTableForDelete::Absent) => return (0, false),
+        Ok(FaceVectorTableForDelete::Present(table)) => table,
+        Err(message) =>
+        {
+            eprintln!("{}", message);
+            return (0, true);
         }
     };
     let mut failed = false;
-    for chunk in doomed.chunks(500) {
+    for chunk in doomed.chunks(500)
+    {
         let filter = format!(
             "face_observation_id IN ({})",
-            chunk
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
+            editor_saved_image_id_csv(chunk)
         );
-        if let Err(e) = table.delete(&filter).await {
-            eprintln!("canonicalize_face_embeddings: vector delete failed: {}", e);
+        if let Err(e) = table.delete(&filter).await
+        {
+            eprintln!("{}: face-vector delete failed: {}", operation, e);
             failed = true;
         }
     }
@@ -10850,7 +12714,10 @@ pub async fn canonicalize_face_embeddings() -> CanonicalizeFaceEmbeddingsResult 
 
     // Phase 2 — the LanceDB delete on the embedding runtime, lock released.
     let (vectors_deleted, vector_delete_failed) = FACE_EMBEDDING_RUNTIME
-        .spawn(delete_noncanonical_face_vectors(doomed))
+        .spawn(delete_face_vectors_by_observation_ids(
+            doomed,
+            "canonicalize_face_embeddings",
+        ))
         .await
         .unwrap_or((0, true));
 

@@ -9,6 +9,20 @@ namespace photolibrariancore {
     [Async]
     u32 ingest_metadata(sequence<ImageMetadata> metadata);
 
+    // Editor save: unlike ordinary duplicate-skipping scan ingest, refresh an
+    // existing path in place because its bytes changed. Insert only when the
+    // caller explicitly requests it.
+    [Async]
+    EditorSavedImageCatalogueResult upsert_editor_saved_image(
+        ImageMetadata metadata,
+        boolean insert_if_missing
+    );
+
+    // Retry durable face-vector cleanup queued by committed editor refreshes.
+    // Arbitrary store errors preserve the queue for the next launch/build.
+    [Async]
+    FaceVectorDeleteRetryResult retry_pending_face_vector_deletes();
+
     // Lightroom catalog import (Docs/DESIGN-Lightroom-Catalog-Import.md).
     // Merge a chunk of LR-sourced records into the catalogue (matched on
     // file_path; per-row check-then-UPDATE-or-INSERT). Reuses ImageMetadata as
@@ -34,6 +48,11 @@ namespace photolibrariancore {
     // apply_duplicate_filter / apply_raw_jpeg_collapse: Step 4a filter booleans.
     [Async]
     sequence<ImageRecord> get_all_images(u32 limit, u32 offset, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse, MediaType media_type);
+
+    // Narrow case-folded basename census for Swift save-destination ownership
+    // resolution. Swift retains exact-path/canonical-entry authority.
+    [Async]
+    sequence<ImageRecord> image_records_with_same_basename(string basename);
 
     // Get images from the catalogue with pagination and proper global sort order
     // Returns a paginated list of image records ordered by capture_datetime DESC NULLS LAST, created_timestamp DESC
@@ -1037,6 +1056,38 @@ dictionary CanonicalizeFaceEmbeddingsResult {
     u64 duplicates_removed;
     u64 vectors_deleted;
     boolean vector_delete_failed;
+};
+
+// One editor-save catalogue transaction. Variant order must match Rust.
+enum EditorSavedImageCatalogueStatus {
+    "Inserted",
+    "Refreshed",
+    "NotCatalogued",
+    "Failed",
+};
+
+dictionary EditorSavedImageCatalogueResult {
+    EditorSavedImageCatalogueStatus status;
+    i64? image_id;
+    string message;
+    string? vector_cleanup_warning;
+};
+
+// Durable obsolete-face-vector cleanup receipt. Variant order must match Rust.
+enum FaceVectorDeleteRetryStatus {
+    "NoPendingDeletes",
+    "Deleted",
+    "VectorTableAbsent",
+    "Deferred",
+    "Failed",
+};
+
+dictionary FaceVectorDeleteRetryResult {
+    FaceVectorDeleteRetryStatus status;
+    u64 pending_count;
+    u64 acknowledged_count;
+    u64 remaining_count;
+    string message;
 };
 
 dictionary SimilarPhotoStackSummary {
