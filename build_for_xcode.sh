@@ -70,6 +70,43 @@ echo "🔄 Generating UniFFI Swift bindings..."
 cargo run --locked --bin uniffi-bindgen generate src/photolibrariancore.udl \
     --language swift --out-dir generated-swift
 
+# Swift's Release optimizer (EarlyPerfInliner, observed through Swift 6.3.3)
+# crashes compiling UniffiHandleMap's implicit deinit under -O + whole-module
+# optimization. The @_optimize(none) deinit below keeps Release builds alive;
+# bindgen regenerates the file without it, so it is re-applied here on every
+# run (idempotent) rather than by hand. If the anchor ever disappears in a
+# future UniFFI version, this FAILS the build loudly instead of shipping a
+# binding that crashes the Release compile.
+echo ""
+echo "🔧 Re-applying the Release-optimizer deinit annotation to the binding..."
+python3 - "generated-swift/photolibrariancore.swift" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+with open(path) as handle:
+    source = handle.read()
+
+anchor = "fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {"
+if "@_optimize(none)" in source:
+    print("→ annotation already present")
+elif anchor not in source:
+    sys.exit("UniffiHandleMap anchor not found — the Release-optimizer deinit "
+             "annotation was NOT applied. Apply it by hand before any Release "
+             "build (see PhotoLibrarian CLAUDE.md, Release-build rule).")
+else:
+    insertion = anchor + "\n" \
+        + "    // SCRIPT-APPLIED by build_for_xcode.sh after every bindgen run:\n" \
+        + "    // Swift's Release optimizer (EarlyPerfInliner, observed through\n" \
+        + "    // 6.3.3) crashes on this class's implicit deinit under -O +\n" \
+        + "    // whole-module optimization.\n" \
+        + "    @_optimize(none)\n" \
+        + "    deinit {}\n"
+    source = source.replace(anchor, insertion, 1)
+    with open(path, "w") as handle:
+        handle.write(source)
+    print("→ annotation inserted")
+PYEOF
+
 # Define paths
 RUST_LIB="target/aarch64-apple-darwin/release/libphotolibrariancore.a"
 GENERATED_SWIFT_DIR="generated-swift"
