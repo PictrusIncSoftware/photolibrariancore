@@ -358,6 +358,13 @@ fileprivate let UNIFFI_HANDLEMAP_INITIAL: UInt64 = 1
 fileprivate let UNIFFI_HANDLEMAP_DELTA: UInt64 = 2
 
 fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
+    // SCRIPT-APPLIED by build_for_xcode.sh after every bindgen run:
+    // Swift's Release optimizer (EarlyPerfInliner, observed through
+    // 6.3.3) crashes on this class's implicit deinit under -O +
+    // whole-module optimization.
+    @_optimize(none)
+    deinit {}
+
     // All mutation happens with this lock held, which is why we implement @unchecked Sendable.
     private let lock = NSLock()
     private var map: [UInt64: T] = [:]
