@@ -4119,11 +4119,11 @@ fn media_predicate(media_type: MediaType) -> Option<&'static str> {
 /// the pre-extraction call sites — Queue item 4 (Chunk 6) will parameterize
 /// this as a separate change. Both inputs are treated as untrusted strings
 /// that may legitimately contain single quotes (paths with apostrophes,
-/// for instance).
+/// for instance) AND the `LIKE` wildcards `%` / `_` (see C1 below).
 ///
 /// Arms:
 /// - (empty,  empty)  → empty predicate (no path/date filter)
-/// - (path,   empty)  → `file_path LIKE 'PATH%'`
+/// - (path,   empty)  → `file_path LIKE 'PATH%' ESCAPE '\'`
 /// - (empty,  date)   → `capture_datetime LIKE 'DATE%'`
 /// - (path,   date)   → both, AND-joined
 ///
@@ -4132,7 +4132,19 @@ fn media_predicate(media_type: MediaType) -> Option<&'static str> {
 /// wrapper — see `execute_image_record_query` /
 /// `execute_image_count_query` / `execute_file_path_projection_query`.
 fn build_path_date_predicate(path_prefix: &str, date_prefix: &str) -> String {
-    let escaped_path = path_prefix.replace("'", "''");
+    // C1 (adversarial review, HIGH): the folder prefix is untrusted text that may
+    // legitimately contain the `LIKE` wildcards `_` and `%` — `/Volumes/Peg_RAWmain`
+    // is a real volume name. Left unescaped its `_` matches ANY single character, so
+    // that scope also swept in the unrelated `/Volumes/PegXRAWmain`. Neutralize the
+    // wildcards with the shared helper FIRST, then double the single quotes for the
+    // surrounding SQL literal — the same order `filename_ilike_atom` uses — and pin
+    // `ESCAPE '\'` on the two `file_path LIKE` forms below.
+    //
+    // The `LIKE 'literal%'` SHAPE is deliberately kept (rather than switching to
+    // `starts_with`): this is the hot sidebar/gallery predicate, and a literal-prefix
+    // LIKE stays index/zone-map friendly. Only the wildcard vocabulary changes here,
+    // never the access path.
+    let escaped_path = escape_for_ilike(path_prefix).replace('\'', "''");
     let escaped_date = date_prefix.replace("'", "''");
 
     // Apple Photos library originals live INSIDE a `.photoslibrary` package and are
@@ -4145,6 +4157,11 @@ fn build_path_date_predicate(path_prefix: &str, date_prefix: &str) -> String {
     // UNLESS the prefix itself points into a `.photoslibrary` (the Apple Library node's
     // own scope, which legitimately shows only those files). An empty prefix
     // (All Sources) excludes nothing. Mirrors `ScanService.isInsideApplePhotosLibrary`.
+    //
+    // The `%` wildcards in this pattern are INTENTIONAL and stay unescaped: the
+    // string is a fixed literal with no user data in it, and it has to match the
+    // package segment anywhere in the path. Only the caller-supplied prefix above
+    // is wildcard-escaped (C1).
     let apple_exclusion = if !path_prefix.is_empty() && !path_prefix.contains(".photoslibrary") {
         " AND file_path NOT LIKE '%.photoslibrary/%'"
     } else {
@@ -4153,10 +4170,13 @@ fn build_path_date_predicate(path_prefix: &str, date_prefix: &str) -> String {
 
     match (path_prefix.is_empty(), date_prefix.is_empty()) {
         (true, true) => String::new(),
-        (false, true) => format!("file_path LIKE '{}%'{}", escaped_path, apple_exclusion),
+        (false, true) => format!(
+            "file_path LIKE '{}%' ESCAPE '\\'{}",
+            escaped_path, apple_exclusion
+        ),
         (true, false) => format!("capture_datetime LIKE '{}%'", escaped_date),
         (false, false) => format!(
-            "file_path LIKE '{}%' AND capture_datetime LIKE '{}%'{}",
+            "file_path LIKE '{}%' ESCAPE '\\' AND capture_datetime LIKE '{}%'{}",
             escaped_path, escaped_date, apple_exclusion
         ),
     }
@@ -5301,6 +5321,38 @@ pub struct RelocateResult {
     pub message: String,
 }
 
+/// The bulk prefix rewrite executed by `relocate_file_path_prefix`.
+///
+/// Rewrites file_path AND directory_path from the OLD file_path. The new-path
+/// subexpression is repeated because a SET clause cannot reference a column
+/// value being assigned in the same statement. ?1 = new_prefix, ?2 = old_prefix
+/// (LENGTH(?2) drives the tail split; ?2 is reused in the WHERE).
+///
+/// C1 (adversarial review, HIGH): the WHERE was `file_path LIKE ?2 || '/%'`.
+/// `?2` is a raw path prefix that can legitimately contain the `LIKE` wildcards
+/// `_` and `%` — with `/Volumes/Peg_RAWmain` the `_` matched ANY character, so
+/// the rewrite also captured rows under the unrelated `/Volumes/PegXRAWmain`
+/// and re-pointed them at the new root: silent catalogue corruption on a cold
+/// but destructive path. `starts_with` is a plain literal-prefix test with no
+/// wildcard vocabulary at all, so it needs no escaping and matches EXACTLY the
+/// same rows as the old pattern for any wildcard-free prefix — still strictly
+/// UNDER the old root, since the `|| '/'` requires the separator and the bare
+/// prefix row (no trailing slash) therefore still cannot match.
+///
+/// Matching on the bound parameter directly is also why this site takes
+/// `starts_with` rather than `ESCAPE '\'`: an escaped pattern would have to be
+/// threaded through as a SECOND parameter alongside the raw `?2` that
+/// LENGTH/SUBSTR still need unescaped. Cold path, so the index-friendly
+/// literal-prefix LIKE shape (kept in `build_path_date_predicate`) buys nothing
+/// here.
+const RELOCATE_PREFIX_UPDATE_SQL: &str = "UPDATE images \
+    SET file_path = ?1 || SUBSTR(file_path, LENGTH(?2) + 1), \
+        directory_path = SUBSTRING( \
+            ?1 || SUBSTR(file_path, LENGTH(?2) + 1), 1, \
+            LENGTH(?1 || SUBSTR(file_path, LENGTH(?2) + 1)) \
+                - INSTR(REVERSE(?1 || SUBSTR(file_path, LENGTH(?2) + 1)), '/')) \
+    WHERE starts_with(file_path, ?2 || '/')";
+
 /// Re-point every catalogued row under `old_prefix` to `new_prefix` — a bulk
 /// path-prefix rewrite for the Source-panel relocate feature (no re-scan).
 /// Rewrites BOTH `file_path` AND the stored `directory_path` (the canonical
@@ -5309,10 +5361,15 @@ pub struct RelocateResult {
 /// rolls the whole thing back and reports `ok = false`.
 ///
 /// `old_prefix` / `new_prefix` are absolute root paths WITHOUT a trailing
-/// slash; only rows strictly under them (`LIKE old_prefix || '/%'`) move, so a
-/// sibling like `.../InPutTest2` is never caught by `.../InPutTest`. The SQL
-/// was validated against a real 1,587-row catalogue copy before shipping
-/// (S51 Gate 2).
+/// slash; only rows strictly under them (`starts_with(file_path, old_prefix || '/')`)
+/// move, so a sibling like `.../InPutTest2` is never caught by `.../InPutTest`,
+/// and the bare prefix row itself — which carries no trailing slash — is left
+/// alone exactly as before. The SQL was validated against a real 1,587-row
+/// catalogue copy before shipping (S51 Gate 2).
+///
+/// The statement lives in `RELOCATE_PREFIX_UPDATE_SQL` so the test suite can
+/// execute the PRODUCTION text against a fixture catalogue instead of a copy
+/// that could drift from it.
 pub async fn relocate_file_path_prefix(old_prefix: String, new_prefix: String) -> RelocateResult {
     let catalogue = CATALOGUE.lock().unwrap();
     let conn = match catalogue.as_ref() {
@@ -5351,19 +5408,7 @@ pub async fn relocate_file_path_prefix(old_prefix: String, new_prefix: String) -
         };
     }
 
-    // Rewrite file_path AND directory_path from the OLD file_path. The new-path
-    // subexpression is repeated because a SET clause cannot reference a column
-    // value being assigned in the same statement. ?1 = new_prefix, ?2 =
-    // old_prefix (LENGTH(?2) drives the tail split; ?2 is reused in the WHERE).
-    let update_sql = "UPDATE images \
-        SET file_path = ?1 || SUBSTR(file_path, LENGTH(?2) + 1), \
-            directory_path = SUBSTRING( \
-                ?1 || SUBSTR(file_path, LENGTH(?2) + 1), 1, \
-                LENGTH(?1 || SUBSTR(file_path, LENGTH(?2) + 1)) \
-                    - INSTR(REVERSE(?1 || SUBSTR(file_path, LENGTH(?2) + 1)), '/')) \
-        WHERE file_path LIKE ?2 || '/%'";
-
-    let changed = match conn.execute(update_sql, params![new_prefix, old_prefix]) {
+    let changed = match conn.execute(RELOCATE_PREFIX_UPDATE_SQL, params![new_prefix, old_prefix]) {
         Ok(n) => n as u64,
         Err(e) => {
             eprintln!("relocate_file_path_prefix: update failed: {}", e);
@@ -18550,16 +18595,17 @@ mod keyword_tests {
         // Empty (All Sources) → no filter at all, nothing excluded.
         assert_eq!(build_path_date_predicate("", ""), "");
 
-        // A folder prefix → its files MINUS any nested Apple library.
+        // A folder prefix → its files MINUS any nested Apple library. The prefix
+        // LIKE carries ESCAPE (C1); the fixed Apple exclusion keeps its wildcards.
         assert_eq!(
             build_path_date_predicate("/Users/richardwagner/", ""),
-            "file_path LIKE '/Users/richardwagner/%' AND file_path NOT LIKE '%.photoslibrary/%'"
+            "file_path LIKE '/Users/richardwagner/%' ESCAPE '\\' AND file_path NOT LIKE '%.photoslibrary/%'"
         );
 
         // The Apple Library scope (prefix inside a `.photoslibrary`) is exempt.
         assert_eq!(
             build_path_date_predicate("/Users/x/Pictures/Photos Library.photoslibrary/", ""),
-            "file_path LIKE '/Users/x/Pictures/Photos Library.photoslibrary/%'"
+            "file_path LIKE '/Users/x/Pictures/Photos Library.photoslibrary/%' ESCAPE '\\'"
         );
 
         // Date-only (no folder) is unchanged — Apple is not excluded from Dates.
@@ -18571,8 +18617,146 @@ mod keyword_tests {
         // Folder + date → exclusion still appended after both clauses.
         assert_eq!(
             build_path_date_predicate("/Users/richardwagner/", "2026:06:"),
-            "file_path LIKE '/Users/richardwagner/%' AND capture_datetime LIKE '2026:06:%' AND file_path NOT LIKE '%.photoslibrary/%'"
+            "file_path LIKE '/Users/richardwagner/%' ESCAPE '\\' AND capture_datetime LIKE '2026:06:%' AND file_path NOT LIKE '%.photoslibrary/%'"
         );
+    }
+
+    /// C1 (adversarial review, HIGH): a folder prefix carrying a `LIKE` wildcard
+    /// must scope to ITS OWN tree only. `/Volumes/Peg_RAWmain` is a real volume
+    /// name; before the fix its `_` matched any single character, so selecting
+    /// that folder in the sidebar silently dragged in every file under the
+    /// unrelated `/Volumes/PegXRAWmain` as well (and the counts alongside them).
+    ///
+    /// Executed on a real engine rather than asserted as text: the predicate can
+    /// read correctly while the wildcard still fires, so only running it proves
+    /// the `ESCAPE` clause is actually in force.
+    #[test]
+    fn path_date_predicate_escapes_wildcards_in_folder_prefix()
+    {
+        use duckdb::Connection;
+
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE images (file_path VARCHAR, capture_datetime VARCHAR);
+             INSERT INTO images VALUES
+                 -- The real tree.
+                 ('/Volumes/Peg_RAWmain/a.nef',     '2026:06:01 10:00:00'),
+                 ('/Volumes/Peg_RAWmain/sub/b.nef', '2026:07:01 10:00:00'),
+                 -- The '_' neighbour: the underscore matched this 'X' before the fix.
+                 ('/Volumes/PegXRAWmain/c.nef',     '2026:06:02 10:00:00'),
+                 ('/Volumes/PegXRAWmain/sub/d.nef', '2026:06:03 10:00:00'),
+                 -- A '%' neighbour, for the other wildcard.
+                 ('/Volumes/100%Backup/e.nef',        '2026:06:04 10:00:00'),
+                 ('/Volumes/100AnythingBackup/f.nef', '2026:06:05 10:00:00');",
+        )
+        .expect("schema + seed");
+
+        let matched = |prefix: &str, date: &str| -> i64
+        {
+            let sql = format!(
+                "SELECT COUNT(*) FROM images WHERE {}",
+                build_path_date_predicate(prefix, date)
+            );
+            conn.query_row(&sql, [], |r| r.get(0)).expect("count")
+        };
+
+        // The underscore is literal: the two Peg_RAWmain rows and nothing else.
+        assert_eq!(
+            matched("/Volumes/Peg_RAWmain/", ""),
+            2,
+            "'_' must match a literal underscore, not the neighbour's 'X'"
+        );
+
+        // The '%' is literal too — it must not swallow "Anything".
+        assert_eq!(
+            matched("/Volumes/100%Backup/", ""),
+            1,
+            "'%' must not act as a wildcard"
+        );
+
+        // The ordinary case still resolves to its own rows: the fix narrows the
+        // wildcard-bearing prefix without breaking wildcard-free ones.
+        assert_eq!(matched("/Volumes/PegXRAWmain/", ""), 2);
+
+        // Escaping holds in the path+date arm as well (only a.nef is June).
+        assert_eq!(matched("/Volumes/Peg_RAWmain/", "2026:06:"), 1);
+    }
+
+    /// C1 (adversarial review, HIGH), relocate half: the bulk prefix rewrite must
+    /// move ONLY the rows under its own root. The WHERE was
+    /// `file_path LIKE ?2 || '/%'`, so an old prefix of `/Volumes/Peg_RAWmain`
+    /// also matched `/Volumes/PegXRAWmain/…` and re-pointed that unrelated tree at
+    /// the new location — silent catalogue corruption on a destructive path.
+    ///
+    /// Runs `RELOCATE_PREFIX_UPDATE_SQL` — the production statement itself — so
+    /// the test cannot drift from what `relocate_file_path_prefix` executes. Also
+    /// pins the two boundary behaviours: the stored `directory_path` is rewritten
+    /// alongside `file_path`, and the bare prefix row (no trailing slash, so not
+    /// strictly under the root) is left alone exactly as the LIKE form left it.
+    #[test]
+    fn relocate_prefix_update_moves_only_its_own_tree()
+    {
+        use duckdb::Connection;
+
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE images (file_path VARCHAR, directory_path VARCHAR);
+             INSERT INTO images VALUES
+                 -- The tree being relocated.
+                 ('/Volumes/Peg_RAWmain/a.nef',     '/Volumes/Peg_RAWmain'),
+                 ('/Volumes/Peg_RAWmain/sub/b.nef', '/Volumes/Peg_RAWmain/sub'),
+                 -- The wildcard neighbour: '_' matched this 'X' before the fix.
+                 ('/Volumes/PegXRAWmain/c.nef',     '/Volumes/PegXRAWmain'),
+                 -- The bare prefix row: no trailing slash, so never 'under' the root.
+                 ('/Volumes/Peg_RAWmain',           '/Volumes');",
+        )
+        .expect("schema + seed");
+
+        let changed = conn
+            .execute(
+                RELOCATE_PREFIX_UPDATE_SQL,
+                params!["/Volumes/NewRoot", "/Volumes/Peg_RAWmain"],
+            )
+            .expect("relocate rewrite");
+        assert_eq!(changed, 2, "only the rows strictly under the old root move");
+
+        let exists = |file_path: &str, directory_path: &str| -> i64
+        {
+            conn.query_row(
+                "SELECT COUNT(*) FROM images WHERE file_path = ? AND directory_path = ?",
+                params![file_path, directory_path],
+                |r| r.get(0),
+            )
+            .expect("lookup")
+        };
+
+        // Own rows: file_path AND the stored directory_path both rewritten.
+        assert_eq!(exists("/Volumes/NewRoot/a.nef", "/Volumes/NewRoot"), 1);
+        assert_eq!(
+            exists("/Volumes/NewRoot/sub/b.nef", "/Volumes/NewRoot/sub"),
+            1,
+            "nested tail and its directory_path survive the split"
+        );
+
+        // The wildcard neighbour is untouched, path and directory alike.
+        assert_eq!(
+            exists("/Volumes/PegXRAWmain/c.nef", "/Volumes/PegXRAWmain"),
+            1,
+            "the '_' neighbour must not be re-pointed at the new root"
+        );
+
+        // The prefix row itself never moves (unchanged from the LIKE form).
+        assert_eq!(
+            exists("/Volumes/Peg_RAWmain", "/Volumes"),
+            1,
+            "the bare prefix row is not strictly under the root"
+        );
+
+        // No row was duplicated or dropped along the way.
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))
+            .expect("total");
+        assert_eq!(total, 4);
     }
 
     /// Pair keyword parity on a real in-memory engine (S67): the sidecar
