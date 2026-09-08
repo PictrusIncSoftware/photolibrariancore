@@ -732,6 +732,93 @@ namespace photolibrariancore {
     [Async]
     FilePathsResult get_file_paths_for_filters(string path_prefix, string date_prefix, boolean apply_duplicate_filter, boolean apply_raw_jpeg_collapse, MediaType media_type);
 
+    // ⭐ §10.2 (Whole-Machine Scan, slice S4) — THE MEMBERSHIP PRE-FILTER.
+    // RULED shape, Richard, Aug 26, 2026:
+    //
+    //     FilePathsResult filter_uncatalogued_paths(sequence<string> paths);
+    //
+    // Sits beside `get_file_paths_for_filters` because that is its precedent:
+    // the same `FilePathsResult` wrapper, the same failure discipline, the same
+    // projection-only spirit, the same "path strings exactly as stored"
+    // contract. Chunked at ~1,000 paths per call by the Swift caller — one
+    // round trip per chunk, bounded lowering cost.
+    //
+    // Returns the subset of `paths` the catalogue does NOT already hold, in the
+    // ORDER SUPPLIED (input multiplicity preserved). Comparison is exact string
+    // equality against `images.file_path` via `IN (?, …)`.
+    //
+    // ⚠️ NEVER `LIKE` (the S168 4b lesson): a real path is wildcard-LIVE in
+    // `LIKE` — `/Volumes/Peg_RAWmain`'s `_` matches any single character — so a
+    // pattern-matching membership test would silently call a NEIGHBOUR volume's
+    // file "catalogued" and skip a real photograph forever.
+    //
+    // ⚠️ NO media stance, deliberately. `images` is the unified media table
+    // (S70): a catalogued VIDEO is catalogued, and a `MediaType` gate here
+    // would re-extract every video on every run.
+    //
+    // Error vs empty: result.ok == false is a GENUINE failure (catalogue not
+    // initialized, prepare/query error) with error_message populated and paths
+    // empty. result.ok == true with an empty paths sequence is a valid
+    // zero-match meaning "every path you gave me is already catalogued" — the
+    // common case on a re-run, never a problem.
+    //
+    // ⭐ THE FAILURE DIRECTION IS THE INVERSE OF `computeDiff`'s, deliberately.
+    // On ok == false the caller treats the WHOLE chunk as uncatalogued and lets
+    // every path through to extraction. This filter feeds an ADDITION and is
+    // only ever an OPTIMISATION (the ingest behind it is idempotent —
+    // INSERT OR IGNORE against UNIQUE(file_path)), so a failed chunk costs
+    // REDONE WORK and nothing else; failing the other way would silently skip
+    // real files. REDO WORK, NEVER SKIP.
+    [Async]
+    FilePathsResult filter_uncatalogued_paths(sequence<string> paths);
+
+    // ⭐ S6 §(d) — THE DIRECTORY-EXACT LIFTS. RULED shape, Richard, Aug 27,
+    // 2026 (mini-design ruling 5: "page the four named lifts … via the new
+    // Rust `file_paths_in_directory` helper serving three call sites").
+    //
+    // Folder Sync asked three per-directory questions with SUBTREE-WIDE prefix
+    // queries and then discarded everything that was not a direct child:
+    // `computeDiff`'s catalogue side, the removal lookup, and the thumbnail
+    // staleness pass. Flag `/Volumes/Peg_RAWmain` and that is the whole
+    // volume's path list (re-lifted on every further mtime change) plus the
+    // whole volume's `ImageRecord`s across the @MainActor UniFFI boundary (the
+    // S57 trap). These two ask for ONE directory.
+    //
+    // Both use the CANONICAL DERIVED directory expression (the protected S5
+    // expression over `file_path`, NOT the stored `directory_path` column), so
+    // their key space is byte-identical to the Sources tree's, to the
+    // monitor's `catalogDirs` snapshot, and to `directory_sync_state`.
+    //
+    // ⚠️ EXACT EQUALITY, NEVER `LIKE` (the S168 4b lesson): a directory path is
+    // wildcard-LIVE in `LIKE` — `/Volumes/Peg_RAWmain`'s `_` matches any single
+    // character — so a pattern test would fold a NEIGHBOUR volume's files into
+    // this directory's answer, which on the REMOVAL path is silent data loss.
+    //
+    // Direct children ONLY: a catalogued sub-directory owns its own rows and
+    // its own sync node. Raw catalogue truth — no duplicate filter, no RAW+JPEG
+    // collapse.
+    //
+    // `file_paths_in_directory` keeps the A9 `FilePathsResult` error-vs-empty
+    // discipline, and that distinction is LOAD-BEARING: `FolderSyncSweep` turns
+    // ok == false into its `nil` ("truth unavailable"), which is what stops an
+    // unreadable catalogue from reading as "every file was deleted". It carries
+    // NO media stance — `images` is the unified media table (S70) and the disk
+    // side lists `allMediaExtensions`, so an asymmetric gate would flag every
+    // catalogued video as a phantom arrival (the S72 lesson).
+    //
+    // `image_records_in_directory` is its records sibling for the two callers
+    // that need `id` / `ImageRecord` rather than a path. It DOES thread
+    // `media_type`, because those callers legitimately differ: the removal
+    // lookup passes Both (a vanished VIDEO must resolve to an id or the S72
+    // `−N` loop returns), the staleness pass passes StillsOnly. It returns an
+    // empty sequence on failure — the record-returning convention, and the safe
+    // direction for both callers (remove nothing / rebuild nothing).
+    [Async]
+    FilePathsResult file_paths_in_directory(string directory_path);
+
+    [Async]
+    sequence<ImageRecord> image_records_in_directory(string directory_path, MediaType media_type);
+
     // A10 (sidebar bulk-copy records enumeration): records-returning
     // sibling of `get_file_paths_for_filters`. Returns the full
     // `ImageRecord` set matching the current filter state, unordered,

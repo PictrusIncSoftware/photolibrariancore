@@ -7216,6 +7216,36 @@ public func faceRecognitionMenuStates(ids: [Int64], algorithmVersion: String, mo
             
         )
 }
+public func filePathsInDirectory(directoryPath: String)async  -> FilePathsResult  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_file_paths_in_directory(FfiConverterString.lower(directoryPath)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeFilePathsResult_lift,
+            errorHandler: nil
+            
+        )
+}
+public func filterUncataloguedPaths(paths: [String])async  -> FilePathsResult  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_filter_uncatalogued_paths(FfiConverterSequenceString.lower(paths)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeFilePathsResult_lift,
+            errorHandler: nil
+            
+        )
+}
 public func findCounterpartImage(filePath: String)async  -> ImageRecord?  {
     return
         try!  await uniffiRustCallAsync(
@@ -7614,6 +7644,21 @@ public func hiddenKeywordsForImage(imageId: Int64)async  -> [KeywordRow]  {
             completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeKeywordRow.lift,
+            errorHandler: nil
+            
+        )
+}
+public func imageRecordsInDirectory(directoryPath: String, mediaType: MediaType)async  -> [ImageRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_image_records_in_directory(FfiConverterString.lower(directoryPath),FfiConverterTypeMediaType_lower(mediaType)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeImageRecord.lift,
             errorHandler: nil
             
         )
@@ -8760,6 +8805,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_face_recognition_menu_states() != 45593) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_file_paths_in_directory() != 64301) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_filter_uncatalogued_paths() != 1310) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_find_counterpart_image() != 51699) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8842,6 +8893,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_hidden_keywords_for_image() != 10588) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_image_records_in_directory() != 49545) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_image_records_with_same_basename() != 466) {

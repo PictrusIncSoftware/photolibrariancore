@@ -6193,6 +6193,43 @@ fn predicate_to_sql(p: &QueryPredicate) -> String {
             },
             _ => bad(),
         },
+        // ⭐ S6 §(f) — THE DATES-SIDEBAR REACHABILITY EXCLUSION.
+        //
+        // Sources subtracts a broken subtree with XOR (`Connector::Xor` → `<>`),
+        // which is exact ONLY because every exclusion is a SUBSET of an
+        // inclusion (the invariant recorded at SourceLocationsView.swift:747).
+        // A broken subtree is NOT a subset of a date scope, so
+        // `(D1 OR D2) <> B` would ADD BACK every record under `B` that falls
+        // outside the selected dates. The fold offers only AND / OR / `<>` —
+        // there is no NOT connector — so the negation has to live in the ATOM.
+        //
+        // `starts_with`, never `LIKE`: the S168 slice-4b lesson. A real path is
+        // wildcard-LIVE in `LIKE` (`/Volumes/Peg_RAWmain`'s `_` matches any
+        // single character), and here that would silently exclude a NEIGHBOUR
+        // volume's photographs from every date.
+        //
+        // ⚠️ THE FAILURE DIRECTION IS INVERTED, DELIBERATELY. Every inclusion
+        // arm in this function degrades to `(FALSE)` — match nothing. This arm
+        // is an EXCLUSION that is always ANDed onto a scope, so `(FALSE)` would
+        // BLANK THE WHOLE GALLERY on a malformed value. Its identity is
+        // `(TRUE)` — "exclude nothing" — so a bad exclusion costs the user a
+        // few gray tiles that the next sweep heals, never an empty date.
+        //
+        // No Apple-library clause (unlike `path_prefix`): this atom SUBTRACTS,
+        // and a subtraction that quietly also subtracted every `.photoslibrary`
+        // record would remove Apple photographs from every date the moment one
+        // unrelated source went missing.
+        //
+        // Rides the EXISTING `kind` + `value` wire fields (the S58 / S75
+        // precedent) — no `.udl` change, no bindgen.
+        "path_prefix_not" => match p.value.as_deref()
+        {
+            Some(v) if !v.is_empty() => format!(
+                "(NOT starts_with(file_path, '{}'))",
+                v.replace('\'', "''")
+            ),
+            _ => "(TRUE)".to_string(),
+        },
         "capture_prefix" => match p.value.as_deref()
         {
             Some(v) if !v.is_empty() => format!(
@@ -20637,6 +20674,113 @@ mod query_builder_tests {
         assert_eq!(build_filter_predicate(&[], &[]), "");
     }
 
+    /// ⭐ S6 §(f) — the Dates-sidebar reachability exclusion, at the ATOM.
+    ///
+    /// Three things are pinned here, each of which was a live hazard:
+    ///  • `starts_with`, never `LIKE` — a stored path is wildcard-LIVE in
+    ///    `LIKE` (the S168 4b lesson), and `/Volumes/Peg_RAWmain`'s `_` would
+    ///    quietly drag `/Volumes/PegXRAWmain` out of every date.
+    ///  • the INVERTED failure direction — every inclusion arm degrades to
+    ///    `(FALSE)`, but this arm is always ANDed onto a date scope, so
+    ///    `(FALSE)` would BLANK the gallery. Its identity is `(TRUE)`.
+    ///  • quote escaping, so a folder with an apostrophe cannot break the SQL.
+    ///
+    /// Mutation proof: return `bad()` from the empty arm and the last two
+    /// assertions FAIL; swap `starts_with` for `LIKE` and the first FAILS.
+    #[test]
+    fn path_prefix_not_negates_and_fails_inert() {
+        assert_eq!(
+            predicate_to_sql(&value_pred("path_prefix_not", "/Volumes/Peg_RAWmain/")),
+            "(NOT starts_with(file_path, '/Volumes/Peg_RAWmain/'))"
+        );
+        assert_eq!(
+            predicate_to_sql(&value_pred("path_prefix_not", "/Volumes/Bob's Drive/")),
+            "(NOT starts_with(file_path, '/Volumes/Bob''s Drive/'))"
+        );
+
+        // Missing / empty value → exclude NOTHING. The opposite of every
+        // inclusion arm, and the whole point: a malformed exclusion must never
+        // empty a date.
+        assert_eq!(
+            predicate_to_sql(&value_pred("path_prefix_not", "")),
+            "(TRUE)"
+        );
+        assert_eq!(predicate_to_sql(&qp("path_prefix_not")), "(TRUE)");
+    }
+
+    /// ⭐ S6 §(f) — the SHAPE Dates builds, executed against real rows:
+    /// `(capture_prefix D1 OR capture_prefix D2) AND (NOT B1) AND (NOT B2)`.
+    ///
+    /// This is the assertion the design turns on. Sources subtracts with XOR,
+    /// which is exact only because every exclusion is a SUBSET of an inclusion;
+    /// a broken subtree is NOT a subset of a date scope, so an XOR fold would
+    /// ADD BACK the broken volume's out-of-date records. Both folds are run
+    /// here on the same rows and the XOR one is shown to be wrong.
+    #[test]
+    fn dates_scope_subtracts_broken_subtrees_where_xor_would_add_them_back() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE images (id INTEGER, file_path TEXT, capture_datetime TEXT);
+             INSERT INTO images VALUES
+                 (1, '/Volumes/Good/2026/a.jpg',          '2026:06:01 10:00:00'),
+                 (2, '/Volumes/Broken/2026/b.jpg',        '2026:06:01 11:00:00'),
+                 (3, '/Volumes/Broken/1999/old.jpg',      '1999:01:01 09:00:00'),
+                 (4, '/Volumes/BrokenX/2026/near.jpg',    '2026:06:01 12:00:00'),
+                 (5, '/Volumes/Good/2025/prior.jpg',      '2025:06:01 10:00:00');",
+        )
+        .expect("seed");
+
+        let ids = |predicate: &str| -> Vec<i64> {
+            let sql = format!(
+                "SELECT id FROM images WHERE {} ORDER BY id",
+                predicate
+            );
+            let mut stmt = conn.prepare(&sql).expect("prepare");
+            let rows = stmt
+                .query_map([], |row| row.get::<_, i64>(0))
+                .expect("query");
+            rows.map(|r| r.expect("row")).collect()
+        };
+
+        // Two selected days, minus one broken volume.
+        let predicates = vec![
+            value_pred("capture_prefix", "2026:06:01"),
+            value_pred("capture_prefix", "2025:06:01"),
+            value_pred("path_prefix_not", "/Volumes/Broken/"),
+        ];
+        let and_fold = build_filter_predicate(
+            &predicates,
+            &[Connector::Or, Connector::And],
+        );
+
+        // id 2 lives on the broken volume and is subtracted; id 3 is on the
+        // broken volume but outside the dates and was never in scope; id 4 is
+        // the wildcard neighbour that a `LIKE` exclusion would wrongly remove.
+        assert_eq!(
+            ids(&and_fold),
+            vec![1, 4, 5],
+            "the AND-of-NOT fold keeps the in-date healthy rows and the \
+             neighbour volume, and drops only the broken subtree"
+        );
+
+        // The S128 Sources mechanism, applied to the same scope: XOR ADDS BACK
+        // the broken volume's 1999 photograph, because that row is outside the
+        // date union and XOR is symmetric difference, not subtraction.
+        let xor_fold = build_filter_predicate(
+            &[
+                value_pred("capture_prefix", "2026:06:01"),
+                value_pred("capture_prefix", "2025:06:01"),
+                value_pred("path_prefix", "/Volumes/Broken/"),
+            ],
+            &[Connector::Or, Connector::Xor],
+        );
+        assert!(
+            ids(&xor_fold).contains(&3),
+            "XOR is unsound for Dates — it re-admits the broken volume's \
+             out-of-date rows, which is exactly why path_prefix_not exists"
+        );
+    }
+
     #[test]
     fn scoped_filter_keeps_query_and_sidebar_groups_separate() {
         let query = vec![rating("gte", 4), flag("pick")];
@@ -21973,6 +22117,394 @@ pub async fn get_file_paths_for_filters(
             error_message: Some(msg),
         },
     }
+}
+
+// === §10.2 — the whole-machine membership pre-filter (S4) ==================
+//
+// Authority: `Docs/DESIGN-Whole-Machine-Scan.md` §10.1 / §10.2, RULED shape
+// Richard, Aug 26, 2026.
+//
+// ⭐ WHY THIS EXISTS. At the DB layer a re-scan is already cheap —
+// `INSERT OR IGNORE` against `UNIQUE(file_path)` measured 2,426 rec/s — but
+// NOTHING UPSTREAM SKIPS ANYTHING. `ScanService.processOneURL` fully extracts
+// every discovered path (`attributesOfItem`, `CGImageSourceCreateWithURL`,
+// `CGImageSourceCopyPropertiesAtIndex`, or a whole `AVURLAsset` load) and only
+// then hands the row to `ingest_metadata` to be discarded. THE SAVING IS THE
+// EXTRACTION, NOT THE INSERT: on a machine where most files are already
+// catalogued this is the difference between a re-run costing days and costing
+// minutes — and, per §11, it also removes the placeholder exposure for
+// already-claimed cloud trees, because a path that never reaches extraction
+// never reaches a byte read either.
+//
+// ⚠️ EXACT MATCH ONLY — NEVER `LIKE` (the S168 4b lesson). A real path can
+// contain both `LIKE` wildcards: `/Volumes/Peg_RAWmain` is a live volume on
+// this machine, and its `_` matches ANY single character. A membership test
+// written with `LIKE` would silently call `/Volumes/PegXRAWmain/a.nef`
+// "catalogued" and skip a real file forever. This uses `IN (?, ?, …)` with
+// bound parameters, which has no wildcard vocabulary at all.
+
+/// How many paths ride one `IN (…)` probe. The Swift caller already chunks at
+/// ~1,000 per FFI call (§10.2, "one round trip per chunk, bounded lowering
+/// cost"); this SECOND, smaller bound exists so the SQL statement's parameter
+/// count stays modest no matter what a future caller passes.
+const MEMBERSHIP_PROBE_CHUNK: usize = 500;
+
+/// Return the subset of `paths` that the catalogue does NOT already hold.
+///
+/// Impl form (takes `&Connection`) so the unit tests can drive it against a
+/// real temp-file catalogue built through the production migration path —
+/// the `delete_keyword_paths_impl` / `keyword_management_rows_impl` shape.
+///
+/// Contract:
+/// - Input order and multiplicity are PRESERVED for the paths that survive.
+///   The result is "the same sequence with the catalogued entries removed",
+///   which is what makes it a drop-in pre-filter for a directory listing.
+/// - Comparison is exact string equality against `images.file_path`, which is
+///   how ingest stores it ("path strings … exactly as stored", `udl:732`).
+/// - The media stance is deliberately ABSENT. `images` is the unified media
+///   table (S70), so a catalogued VIDEO must count as catalogued here; a
+///   `MediaType` gate would re-extract every video on every run.
+fn filter_uncatalogued_paths_impl(
+    conn: &Connection,
+    paths: &[String],
+) -> Result<Vec<String>, String> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // One probe per chunk; the catalogued set accumulates across chunks and is
+    // then used to filter the ORIGINAL sequence in order.
+    let mut catalogued: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(paths.len());
+
+    for chunk in paths.chunks(MEMBERSHIP_PROBE_CHUNK) {
+        // Deduplicate WITHIN the chunk so a repeated path does not inflate the
+        // bound-parameter count. The de-dup is a query-side detail only; the
+        // caller's sequence is filtered untouched below.
+        let mut distinct: Vec<&String> = Vec::with_capacity(chunk.len());
+        let mut seen: std::collections::HashSet<&str> =
+            std::collections::HashSet::with_capacity(chunk.len());
+        for path in chunk {
+            if seen.insert(path.as_str()) {
+                distinct.push(path);
+            }
+        }
+        if distinct.is_empty() {
+            continue;
+        }
+
+        let placeholders = std::iter::repeat("?")
+            .take(distinct.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT file_path FROM images WHERE file_path IN ({})",
+            placeholders
+        );
+
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("filter_uncatalogued_paths: prepare {}", e);
+                return Err(format!("prepare failed: {}", e));
+            }
+        };
+
+        let values: Vec<Value> = distinct
+            .iter()
+            .map(|p| Value::Text((*p).clone()))
+            .collect();
+
+        let rows = stmt.query_map(params_from_iter(values.iter()), |row| {
+            let stored: String = row.get(0)?;
+            Ok(stored)
+        });
+
+        match rows {
+            Ok(iter) => {
+                for row in iter {
+                    match row {
+                        Ok(stored) => {
+                            catalogued.insert(stored);
+                        }
+                        Err(e) => {
+                            eprintln!("filter_uncatalogued_paths: row {}", e);
+                            return Err(format!("row read failed: {}", e));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("filter_uncatalogued_paths: query {}", e);
+                return Err(format!("query failed: {}", e));
+            }
+        }
+    }
+
+    Ok(paths
+        .iter()
+        .filter(|p| !catalogued.contains(p.as_str()))
+        .cloned()
+        .collect())
+}
+
+/// §10.2 — the membership pre-filter the whole-machine general-ingest arm runs
+/// in front of metadata extraction. Returns the paths that are NOT yet in the
+/// catalogue, in the order they were supplied.
+///
+/// **Error vs empty** — the `get_file_paths_for_filters` (A9) discipline,
+/// verbatim: `ok == false` is a genuine failure (catalogue not initialized,
+/// prepare/query error) with `error_message` populated and `paths` empty;
+/// `ok == true` with an empty `paths` is a valid zero-match, and for THIS
+/// function that specifically means "every path you gave me is already
+/// catalogued" — which on a re-run is the common case, not a problem.
+///
+/// ⭐ **THE FAILURE DIRECTION IS THE INVERSE OF `FolderSyncSweep.computeDiff`'s,
+/// deliberately (§10.2).** When this returns `ok == false` the caller must
+/// treat the WHOLE chunk as uncatalogued and let every path through to
+/// extraction. `computeDiff` feeds a REMOVAL, so an unreadable truth there must
+/// never read as "these files are gone" (it returns `nil`). This feeds an
+/// ADDITION, and it is only ever an OPTIMISATION — the ingest path behind it is
+/// already idempotent (`INSERT OR IGNORE` against `UNIQUE(file_path)`). A
+/// failed chunk therefore costs REDONE WORK and nothing else, while failing the
+/// other way would SILENTLY SKIP REAL FILES and leave the user no way to know
+/// the scan under-catalogued their drive. **Redo work, never skip.**
+///
+/// ⚠️ Exact-match membership (`IN`), never `LIKE` — see the section header: a
+/// path is wildcard-live in `LIKE`, and `/Volumes/Peg_RAWmain` is the live
+/// counter-example on this very machine.
+pub async fn filter_uncatalogued_paths(paths: Vec<String>) -> FilePathsResult {
+    // An empty request is answered without touching the catalogue at all —
+    // and, deliberately, WITHOUT reporting "not initialized". Zero paths in,
+    // zero paths out, ok.
+    if paths.is_empty() {
+        return FilePathsResult {
+            ok: true,
+            paths: Vec::new(),
+            error_message: None,
+        };
+    }
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return FilePathsResult {
+                ok: false,
+                paths: Vec::new(),
+                error_message: Some("catalogue not initialized".to_string()),
+            };
+        }
+    };
+
+    match filter_uncatalogued_paths_impl(conn, &paths) {
+        Ok(remaining) => FilePathsResult {
+            ok: true,
+            paths: remaining,
+            error_message: None,
+        },
+        Err(msg) => FilePathsResult {
+            ok: false,
+            paths: Vec::new(),
+            error_message: Some(msg),
+        },
+    }
+}
+
+// === S6 §(d) — the DIRECTORY-EXACT lifts ====================================
+//
+// Authority: the R4 / §14 mini-design, ruling 5 (RULED Richard, Aug 27, 2026):
+// "page the four named lifts … via the new Rust `file_paths_in_directory`
+// helper serving three call sites."
+//
+// ⭐ WHY THIS EXISTS. Folder Sync asks three questions per flagged / synced
+// directory, and all three were answered with a SUBTREE-WIDE prefix query:
+//
+//   1. `FolderSyncSweep.computeDiff`        → `get_file_paths_for_filters(dir + "/")`
+//   2. `FolderSyncService`'s removal lookup → `get_image_records_for_filters(dir + "/")`
+//   3. `FolderSyncService`'s staleness pass → `get_image_records_for_filters(dir + "/")`
+//
+// Every one of them then threw away everything that was not a DIRECT CHILD.
+// Flag `/Volumes/Peg_RAWmain` and question 1 lifts the whole volume's path
+// list — and re-lifts it on every further mtime change — while 2 and 3 lift
+// the whole volume's `ImageRecord`s across the `@MainActor` UniFFI boundary
+// (the S57 trap). Asking for ONE directory turns an unbounded lift into a
+// bounded one at all three sites.
+//
+// ⚠️ EXACT EQUALITY, NEVER `LIKE` — the S168 slice-4b lesson, the same reason
+// `filter_uncatalogued_paths` above uses `IN (?, …)`. A directory path is
+// wildcard-LIVE in `LIKE`: `/Volumes/Peg_RAWmain` is a live volume on this
+// machine and its `_` matches ANY single character, so a pattern-matching
+// directory test would fold a NEIGHBOUR volume's files into this directory's
+// answer — which on the REMOVAL path (site 2) is silent data loss. The
+// comparison here is `=` against a bound parameter, which has no wildcard
+// vocabulary at all.
+//
+// ⚠️ TWO functions, ONE predicate. The ruling names one helper, but sites 2
+// and 3 need `id` / `ImageRecord` (a removal needs ids; `buildIfMissing` takes
+// a record) and site 1 needs the `FilePathsResult` ok-vs-empty distinction
+// that keeps an unreadable truth from reading as mass deletion. So the ruled
+// bounding is delivered by a paths function and a records sibling that share
+// `DIRECTORY_EXACT_PREDICATE` — one place where the exact-match semantics
+// live, one `.udl` + bindgen event.
+
+/// The catalogued-parent-directory test, as a bound-parameter predicate.
+///
+/// Uses the CANONICAL DERIVED directory expression — the protected S5
+/// expression over `file_path` that `get_distinct_directory_paths` and
+/// `directory_image_counts` both use — deliberately NOT the stored
+/// `directory_path` column, so the key space here is byte-identical to the
+/// Sources tree's, to the monitor's `catalogDirs` snapshot, and to the
+/// `directory_sync_state` rows folder sync keys on.
+const DIRECTORY_EXACT_PREDICATE: &str =
+    "SUBSTRING(file_path, 1, LENGTH(file_path) - INSTR(REVERSE(file_path), '/')) = ?";
+
+/// Site 1 — every catalogued file path whose derived parent directory is
+/// EXACTLY `directory_path`. Direct children only; a catalogued sub-directory
+/// owns its own row set and its own sync node.
+///
+/// **Error vs empty** — the A9 / §10.2 discipline, verbatim and LOAD-BEARING
+/// here: `ok == false` is a genuine failure (catalogue not initialized,
+/// prepare/query error) with `error_message` populated and `paths` empty;
+/// `ok == true` with empty `paths` is a valid zero-match. `FolderSyncSweep`
+/// turns `ok == false` into its `nil` ("truth unavailable"), which is what
+/// stops an unreadable catalogue from reading as "every file was deleted".
+///
+/// **No media stance and no view filters, deliberately.** `images` is the
+/// unified media table (S70) and folder sync compares against a disk listing
+/// that admits `allMediaExtensions` — an asymmetric gate on either side reads
+/// every catalogued video as a phantom arrival (the S72 lesson). No duplicate
+/// filter, no RAW+JPEG collapse: this is raw catalogue truth.
+///
+/// **No `.photoslibrary` exclusion.** `build_path_date_predicate` appends one
+/// for a non-Apple folder prefix, but it cannot bite on a DIRECT-CHILD set: a
+/// child of `dir` matches `%.photoslibrary/%` only if `dir` itself is inside
+/// (or is) a library package, and folder sync never watches those — the
+/// monitor filters them out of `catalogDirs` before any sweep. Omitting it is
+/// therefore set-identical, and keeps this helper honest for any future caller
+/// that legitimately asks about a library's own directory.
+///
+/// **Path contract**: values are returned EXACTLY as stored. Order is
+/// UNSPECIFIED — every caller builds a `Set`.
+pub async fn file_paths_in_directory(directory_path: String) -> FilePathsResult {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return FilePathsResult {
+                ok: false,
+                paths: Vec::new(),
+                error_message: Some("catalogue not initialized".to_string()),
+            };
+        }
+    };
+
+    match file_paths_in_directory_impl(conn, &directory_path) {
+        Ok(paths) => FilePathsResult {
+            ok: true,
+            paths,
+            error_message: None,
+        },
+        Err(msg) => FilePathsResult {
+            ok: false,
+            paths: Vec::new(),
+            error_message: Some(msg),
+        },
+    }
+}
+
+/// Impl form (takes `&Connection`) so the unit tests can drive it against a
+/// real temp-file catalogue built through the production migration path — the
+/// `filter_uncatalogued_paths_impl` shape.
+fn file_paths_in_directory_impl(
+    conn: &Connection,
+    directory_path: &str,
+) -> Result<Vec<String>, String> {
+    // An empty directory string is answered as a zero-match rather than a
+    // query: no catalogued file has an empty parent directory, and letting it
+    // through would only spend a scan proving that.
+    if directory_path.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let sql = format!(
+        "SELECT file_path FROM images WHERE {}",
+        DIRECTORY_EXACT_PREDICATE
+    );
+
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("file_paths_in_directory: prepare {}", e);
+            return Err(format!("prepare failed: {}", e));
+        }
+    };
+
+    let rows = match stmt.query_map(params![directory_path], |row| row.get::<_, String>(0)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("file_paths_in_directory: query {}", e);
+            return Err(format!("query failed: {}", e));
+        }
+    };
+
+    let mut paths: Vec<String> = Vec::new();
+    for row in rows {
+        match row {
+            Ok(p) => paths.push(p),
+            Err(e) => {
+                eprintln!("file_paths_in_directory: row {}", e);
+                return Err(format!("row read failed: {}", e));
+            }
+        }
+    }
+
+    Ok(paths)
+}
+
+/// Sites 2 and 3 — the records sibling of `file_paths_in_directory`, for the
+/// two callers that need `id` / `ImageRecord` rather than a path.
+///
+/// Same directory-exact predicate (`DIRECTORY_EXACT_PREDICATE`), same
+/// direct-children-only contract, same raw-catalogue stance (no duplicate
+/// filter, no RAW+JPEG collapse). `media_type` IS threaded here because the
+/// two callers legitimately differ: the removal lookup passes `Both` (a
+/// vanished VIDEO must resolve to an id, or the S72 `−N` loop returns), while
+/// the thumbnail-staleness pass passes `StillsOnly` (video posters rebuild
+/// through the builder's own path).
+///
+/// Returns an empty vec on failure — the established record-returning
+/// convention, and the safe direction for both callers: the removal path
+/// removes nothing and the staleness path rebuilds nothing.
+pub async fn image_records_in_directory(
+    directory_path: String,
+    media_type: MediaType,
+) -> Vec<ImageRecord> {
+    if directory_path.is_empty() {
+        return Vec::new();
+    }
+
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    // The projection helper takes a literal WHERE fragment, so the directory
+    // is quote-escaped and inlined here rather than bound. Same escaping the
+    // rest of `predicate_to_sql` uses, and still an EQUALITY test — no
+    // wildcard vocabulary is introduced.
+    let predicate = format!(
+        "SUBSTRING(file_path, 1, LENGTH(file_path) - INSTR(REVERSE(file_path), '/')) = '{}'",
+        directory_path.replace('\'', "''")
+    );
+
+    execute_image_record_projection_query(conn, &predicate, false, false, media_type)
 }
 
 /// A10 (sidebar bulk-copy records enumeration): return the full
@@ -24030,6 +24562,433 @@ mod ingest_batching_tests
         assert_eq!(bitrate, 1_000 + last as i64, "last row's ?45 must be bound");
         assert_eq!(dir, "/Volumes/Photos/full");
         assert_eq!(kind, "jpeg");
+
+        cleanup(&path);
+    }
+}
+
+// ============================================================================
+// §10.2 — the whole-machine membership pre-filter (slice S4)
+// ============================================================================
+//
+// Authority: `Docs/DESIGN-Whole-Machine-Scan.md` §10.1 / §10.2.
+//
+// These run against a REAL temp-file catalogue built through the production
+// `open_and_migrate_catalogue` path, so the schema under test is the shipped
+// schema — the `ingest_batching_tests` fixture shape, kept local to this
+// module because those helpers are private to theirs.
+#[cfg(test)]
+mod membership_filter_tests
+{
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static MEMBERSHIP_FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn fresh_catalogue(tag: &str) -> (std::path::PathBuf, Connection)
+    {
+        let n = MEMBERSHIP_FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "plcore-membership-filter-test-{}-{}-{}.db",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+        let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+        (path, conn)
+    }
+
+    fn cleanup(path: &std::path::Path)
+    {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+    }
+
+    /// Put one row in the catalogue at `file_path`. Only the five NOT NULL
+    /// columns are supplied; everything else takes its DDL default, which is
+    /// all a membership test needs.
+    fn catalogue(conn: &Connection, file_path: &str)
+    {
+        let file_name = file_path.rsplit('/').next().unwrap_or(file_path);
+        conn.execute(
+            "INSERT INTO images (file_path, file_size, file_name, \
+             created_timestamp, modified_timestamp) VALUES (?, ?, ?, ?, ?)",
+            params![file_path, 1234_i64, file_name, 1_700_000_000_i64, 1_700_000_001_i64],
+        )
+        .expect("fixture row");
+    }
+
+    fn owned(paths: &[&str]) -> Vec<String>
+    {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    /// The core contract: a present/absent MIX returns exactly the absent
+    /// ones, in the order supplied.
+    #[test]
+    fn filter_returns_only_the_uncatalogued_paths_in_order()
+    {
+        let (path, conn) = fresh_catalogue("mix");
+
+        catalogue(&conn, "/Volumes/Photos/2024/a.nef");
+        catalogue(&conn, "/Volumes/Photos/2024/c.jpg");
+        // A catalogued VIDEO must count as catalogued: `images` is the unified
+        // media table (S70), and a media-gated membership test would re-extract
+        // every video on every whole-machine run.
+        catalogue(&conn, "/Volumes/Photos/2024/clip.mov");
+
+        let asked = owned(&[
+            "/Volumes/Photos/2024/a.nef",     // catalogued  → removed
+            "/Volumes/Photos/2024/b.nef",     // absent      → kept
+            "/Volumes/Photos/2024/c.jpg",     // catalogued  → removed
+            "/Volumes/Photos/2024/clip.mov",  // catalogued  → removed
+            "/Volumes/Photos/2024/d.heic",    // absent      → kept
+        ]);
+
+        let remaining = filter_uncatalogued_paths_impl(&conn, &asked)
+            .expect("membership probe must succeed on a live catalogue");
+
+        assert_eq!(
+            remaining,
+            owned(&[
+                "/Volumes/Photos/2024/b.nef",
+                "/Volumes/Photos/2024/d.heic"
+            ]),
+            "only the absent paths survive, in the order supplied"
+        );
+
+        // The all-catalogued case is a valid ZERO-MATCH, not a failure — this
+        // is the common shape of a re-run, and §10.1's whole point.
+        let all_present = owned(&[
+            "/Volumes/Photos/2024/a.nef",
+            "/Volumes/Photos/2024/c.jpg",
+        ]);
+        let none = filter_uncatalogued_paths_impl(&conn, &all_present)
+            .expect("an all-catalogued chunk is a success, not an error");
+        assert!(none.is_empty(), "a fully-catalogued chunk filters down to nothing");
+
+        // And the mirror: nothing catalogued yet ⇒ everything survives.
+        let fresh = owned(&["/Volumes/Photos/2025/new-1.nef", "/Volumes/Photos/2025/new-2.nef"]);
+        let survivors = filter_uncatalogued_paths_impl(&conn, &fresh)
+            .expect("probe");
+        assert_eq!(survivors, fresh, "an entirely new directory passes through whole");
+
+        cleanup(&path);
+    }
+
+    /// ⚠️ THE S168 4b LESSON, pinned. A path is WILDCARD-LIVE in `LIKE`:
+    /// `/Volumes/Peg_RAWmain` is a real volume on this machine and its `_`
+    /// matches ANY single character, while `%` matches any run. A membership
+    /// test written with pattern matching would call a NEIGHBOUR volume's file
+    /// "catalogued" and skip a real photograph forever — silently, with the
+    /// user given no way to know the scan under-catalogued their drive.
+    ///
+    /// Mutation proof: swap the `IN (?, …)` probe for `LIKE` and this test
+    /// FAILS on its first assertion.
+    #[test]
+    fn filter_treats_like_wildcards_in_paths_as_literal_characters()
+    {
+        let (path, conn) = fresh_catalogue("wildcards");
+
+        // The live case. Only the underscore-bearing volume is catalogued.
+        catalogue(&conn, "/Volumes/Peg_RAWmain/2024/IMG_0001.nef");
+        // A path carrying the OTHER wildcard, catalogued verbatim.
+        catalogue(&conn, "/Volumes/Photos/100% keepers/best.jpg");
+
+        let asked = owned(&[
+            // Differs from the catalogued path ONLY where `_` sits. Under a
+            // `LIKE` probe this would match and be wrongly dropped.
+            "/Volumes/PegXRAWmain/2024/IMG_0001.nef",
+            "/Volumes/PegYRAWmain/2024/IMGx0001.nef",
+            // `%` as a literal: this is NOT the catalogued "100% keepers" row.
+            "/Volumes/Photos/100XX keepers/best.jpg",
+            // The genuine members, for the positive half of the proof.
+            "/Volumes/Peg_RAWmain/2024/IMG_0001.nef",
+            "/Volumes/Photos/100% keepers/best.jpg",
+        ]);
+
+        let remaining = filter_uncatalogued_paths_impl(&conn, &asked).expect("probe");
+
+        assert_eq!(
+            remaining,
+            owned(&[
+                "/Volumes/PegXRAWmain/2024/IMG_0001.nef",
+                "/Volumes/PegYRAWmain/2024/IMGx0001.nef",
+                "/Volumes/Photos/100XX keepers/best.jpg"
+            ]),
+            "`_` and `%` in a stored path must compare as LITERAL characters — \
+             a neighbour volume's photograph is never 'already catalogued'"
+        );
+
+        cleanup(&path);
+    }
+
+    /// The EMPTY-LIST case, both halves — §10.2's "ok == true with empty paths
+    /// is a valid zero-match", plus the async wrapper's short-circuit, which
+    /// must answer `ok` WITHOUT ever reporting "catalogue not initialized"
+    /// (a zero-path request is not a failure, and the whole-machine walk emits
+    /// no batch for an empty directory but a future caller may still ask).
+    #[test]
+    fn filter_handles_the_empty_list_as_a_valid_zero_match()
+    {
+        let (path, conn) = fresh_catalogue("empty");
+        catalogue(&conn, "/Volumes/Photos/2024/a.nef");
+
+        let nothing: Vec<String> = Vec::new();
+        let remaining = filter_uncatalogued_paths_impl(&conn, &nothing)
+            .expect("an empty request is a success, never an error");
+        assert!(remaining.is_empty(), "empty in, empty out");
+
+        cleanup(&path);
+
+        // The FFI wrapper answers an empty request without touching the
+        // catalogue at all — proven here with NO catalogue installed in the
+        // global, which is the state that would otherwise return ok == false.
+        let result = futures::executor::block_on(filter_uncatalogued_paths(Vec::new()));
+        assert!(result.ok, "an empty request must never report a failure");
+        assert!(result.paths.is_empty());
+        assert!(result.error_message.is_none());
+    }
+
+    /// Chunking is an internal detail and must not change the answer: a
+    /// request larger than `MEMBERSHIP_PROBE_CHUNK` spans several `IN` probes,
+    /// and the catalogued set has to accumulate across all of them.
+    #[test]
+    fn filter_spans_multiple_probe_chunks_without_losing_membership()
+    {
+        let (path, conn) = fresh_catalogue("chunked");
+
+        // 1,200 paths — well past the 500-path probe chunk. Every third one is
+        // catalogued, so each chunk carries both classes.
+        let total = MEMBERSHIP_PROBE_CHUNK * 2 + 200;
+        let mut asked: Vec<String> = Vec::with_capacity(total);
+        let mut expected: Vec<String> = Vec::new();
+        for i in 0..total
+        {
+            let p = format!("/Volumes/Photos/bulk/img-{:05}.nef", i);
+            if i % 3 == 0
+            {
+                catalogue(&conn, &p);
+            }
+            else
+            {
+                expected.push(p.clone());
+            }
+            asked.push(p);
+        }
+
+        let remaining = filter_uncatalogued_paths_impl(&conn, &asked).expect("probe");
+        assert_eq!(remaining.len(), expected.len());
+        assert_eq!(remaining, expected, "membership must hold across chunk boundaries");
+
+        cleanup(&path);
+    }
+}
+
+// ============================================================================
+// S6 §(d) — the directory-exact lifts (`file_paths_in_directory`)
+// ============================================================================
+//
+// Authority: the R4 / §14 mini-design, ruling 5 (RULED Richard, Aug 27, 2026).
+//
+// These run against a REAL temp-file catalogue built through the production
+// `open_and_migrate_catalogue` path, so the schema under test is the shipped
+// schema — the `membership_filter_tests` fixture shape, kept local to this
+// module because those helpers are private to theirs.
+#[cfg(test)]
+mod directory_exact_tests
+{
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static DIRECTORY_FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn fresh_catalogue(tag: &str) -> (std::path::PathBuf, Connection)
+    {
+        let n = DIRECTORY_FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "plcore-directory-exact-test-{}-{}-{}.db",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+        let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+        (path, conn)
+    }
+
+    fn cleanup(path: &std::path::Path)
+    {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+    }
+
+    fn catalogue(conn: &Connection, file_path: &str)
+    {
+        let file_name = file_path.rsplit('/').next().unwrap_or(file_path);
+        conn.execute(
+            "INSERT INTO images (file_path, file_size, file_name, \
+             created_timestamp, modified_timestamp) VALUES (?, ?, ?, ?, ?)",
+            params![file_path, 1234_i64, file_name, 1_700_000_000_i64, 1_700_000_001_i64],
+        )
+        .expect("fixture row");
+    }
+
+    fn sorted(mut v: Vec<String>) -> Vec<String>
+    {
+        v.sort();
+        v
+    }
+
+    /// The core contract: DIRECT CHILDREN ONLY. A catalogued sub-directory owns
+    /// its own rows and its own sync node, so folding its files into the parent's
+    /// answer would double-count every add and mis-scope every removal.
+    ///
+    /// Mutation proof: change the predicate from `=` to a `starts_with` prefix
+    /// test and the first assertion FAILS on the sub-directory's file.
+    #[test]
+    fn directory_query_returns_direct_children_only()
+    {
+        let (path, conn) = fresh_catalogue("direct");
+
+        catalogue(&conn, "/Volumes/Photos/2024/a.nef");
+        catalogue(&conn, "/Volumes/Photos/2024/b.jpg");
+        // A catalogued VIDEO is catalogued: `images` is the unified media table
+        // (S70), and folder sync's disk side lists video too — an asymmetric
+        // gate would read this clip as a phantom new arrival (the S72 lesson).
+        catalogue(&conn, "/Volumes/Photos/2024/clip.mov");
+        // Strictly below — belongs to ITS OWN directory node.
+        catalogue(&conn, "/Volumes/Photos/2024/edits/c.tif");
+        // A sibling directory, and the parent itself.
+        catalogue(&conn, "/Volumes/Photos/2025/d.nef");
+        catalogue(&conn, "/Volumes/Photos/loose.jpg");
+
+        assert_eq!(
+            sorted(file_paths_in_directory_impl(&conn, "/Volumes/Photos/2024").expect("probe")),
+            vec![
+                "/Volumes/Photos/2024/a.nef".to_string(),
+                "/Volumes/Photos/2024/b.jpg".to_string(),
+                "/Volumes/Photos/2024/clip.mov".to_string(),
+            ],
+            "direct children only — never the sub-directory, never a sibling"
+        );
+
+        assert_eq!(
+            file_paths_in_directory_impl(&conn, "/Volumes/Photos/2024/edits").expect("probe"),
+            vec!["/Volumes/Photos/2024/edits/c.tif".to_string()],
+            "the sub-directory answers for itself"
+        );
+
+        assert_eq!(
+            file_paths_in_directory_impl(&conn, "/Volumes/Photos").expect("probe"),
+            vec!["/Volumes/Photos/loose.jpg".to_string()],
+            "the parent sees only what actually sits in it"
+        );
+
+        // A directory with no catalogued files is a valid ZERO-MATCH, never an
+        // error — and `FolderSyncSweep` depends on that distinction, because it
+        // turns an ERROR into "truth unavailable" rather than "everything was
+        // deleted".
+        let empty = file_paths_in_directory_impl(&conn, "/Volumes/Photos/2026")
+            .expect("an empty directory is a success, not an error");
+        assert!(empty.is_empty());
+
+        // An empty request is answered without a query.
+        assert!(file_paths_in_directory_impl(&conn, "").expect("probe").is_empty());
+
+        cleanup(&path);
+    }
+
+    /// ⚠️ THE S168 4b LESSON, pinned on the directory side. A directory path is
+    /// WILDCARD-LIVE in `LIKE`: `/Volumes/Peg_RAWmain` is a real volume on this
+    /// machine and its `_` matches ANY single character. A directory test written
+    /// with pattern matching would fold a NEIGHBOUR volume's files into this
+    /// directory's answer — and on the REMOVAL path (site 2) that is a confirm
+    /// dialog offering to delete catalogue records for photographs that are
+    /// perfectly fine, on a different drive.
+    ///
+    /// Mutation proof: swap the `= ?` comparison for `LIKE ?` and this FAILS.
+    #[test]
+    fn directory_query_treats_like_wildcards_as_literal_characters()
+    {
+        let (path, conn) = fresh_catalogue("wildcards");
+
+        catalogue(&conn, "/Volumes/Peg_RAWmain/2024/IMG_0001.nef");
+        // The neighbour that `_` would match.
+        catalogue(&conn, "/Volumes/PegXRAWmain/2024/IMG_0002.nef");
+        // The other wildcard, as a literal directory name.
+        catalogue(&conn, "/Volumes/Photos/100% keepers/best.jpg");
+        catalogue(&conn, "/Volumes/Photos/100XX keepers/other.jpg");
+
+        assert_eq!(
+            file_paths_in_directory_impl(&conn, "/Volumes/Peg_RAWmain/2024").expect("probe"),
+            vec!["/Volumes/Peg_RAWmain/2024/IMG_0001.nef".to_string()],
+            "`_` compares as a LITERAL character — a neighbour volume's \
+             photograph never joins this directory's answer"
+        );
+
+        assert_eq!(
+            file_paths_in_directory_impl(&conn, "/Volumes/Photos/100% keepers").expect("probe"),
+            vec!["/Volumes/Photos/100% keepers/best.jpg".to_string()],
+            "`%` compares as a LITERAL character"
+        );
+
+        cleanup(&path);
+    }
+
+    /// The derived-directory expression must agree with the one the Sources
+    /// tree, the monitor's `catalogDirs` snapshot and `directory_sync_state` all
+    /// key on — otherwise a directory could be flagged under one spelling and
+    /// answered under another. Proven by construction: every key
+    /// `get_distinct_directory_paths` derives round-trips through this helper.
+    #[test]
+    fn directory_keys_agree_with_the_canonical_derived_expression()
+    {
+        let (path, conn) = fresh_catalogue("keys");
+
+        let seeded = [
+            "/Volumes/Photos/2024/a.nef",
+            "/Volumes/Photos/2024/edits/c.tif",
+            "/Volumes/Photos/2025/d.nef",
+            "/Users/rw/Pictures/e.jpg",
+        ];
+        for p in seeded
+        {
+            catalogue(&conn, p);
+        }
+
+        // The canonical key set, read through the protected S5 expression.
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT SUBSTRING(file_path, 1, LENGTH(file_path) - \
+                 INSTR(REVERSE(file_path), '/')) FROM images ORDER BY 1",
+            )
+            .expect("prepare");
+        let dirs: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect();
+        assert_eq!(dirs.len(), 4, "four distinct catalogued directories");
+
+        // Every canonical key answers non-empty, and the union of the answers is
+        // exactly the catalogue — no file is orphaned between spellings, none is
+        // counted twice.
+        let mut union: Vec<String> = Vec::new();
+        for dir in &dirs
+        {
+            let rows = file_paths_in_directory_impl(&conn, dir).expect("probe");
+            assert!(!rows.is_empty(), "canonical key '{}' must answer", dir);
+            union.extend(rows);
+        }
+        assert_eq!(
+            sorted(union),
+            sorted(seeded.iter().map(|s| s.to_string()).collect()),
+            "the per-directory answers partition the catalogue exactly"
+        );
 
         cleanup(&path);
     }
