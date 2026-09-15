@@ -1902,9 +1902,19 @@ fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
             -- "Directory-Path Extraction SQL — Gotcha" note in CLAUDE.md for the
             -- alternative left-anchored form that must NOT be used). Nullable in
             -- DDL — the non-null invariant is enforced at the populate-time
-            -- contract (new-record ingest + one-time backfill), same pattern as
+            -- contract (new-record ingest + backfill), same pattern as
             -- file_stem / image_kind above. Consumed by the RAW+JPEG pair-collapse
             -- subquery introduced in Session 19 Step 4.
+            -- ⭐ S173 — this column is now the INDEXED KEY SPACE the per-directory
+            -- FFIs answer from (DIRECTORY_EXACT_PREDICATE), not just a
+            -- convenience copy. A ONE-TIME repair converges it onto the canonical
+            -- expression and then builds idx_images_directory_path over it (the
+            -- index-gated step in Rust, after this batch — search
+            -- `directory_path_backfill_sql`). It is NOT re-run every launch: the
+            -- index's existence is the migration marker. Any NEW write path that
+            -- sets or rewrites file_path MUST set directory_path from that same
+            -- expression in the same statement — see the write-path list in the
+            -- S173 comment at that step.
             directory_path VARCHAR,
             created_timestamp INTEGER NOT NULL,  -- Unix epoch seconds
             modified_timestamp INTEGER NOT NULL, -- Unix epoch seconds
@@ -2020,6 +2030,26 @@ fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
         ALTER TABLE images ADD COLUMN IF NOT EXISTS image_kind VARCHAR;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS directory_path VARCHAR;
 
+        -- ⭐ S173 — directory_path's authoritative repair and its index are NOT
+        -- in this batch. They run as their own index-gated step in Rust, after
+        -- execute_batch returns and BEFORE the migration transaction opens:
+        -- search `directory_path_backfill_sql`. Two reasons, both load-bearing.
+        --   1. COST. The repair is a full-table UPDATE guarded by a per-row
+        --      string computation. Run unconditionally it charged EVERY launch
+        --      for a migration that is finished after the first — 236 ms on the
+        --      owner's 580,832-row catalogue, scaling with catalogue size.
+        --   2. BLAST RADIUS. A statement inside this batch that fails aborts
+        --      execute_batch and makes catalogue open return None — the whole
+        --      catalogue fails to open. The old Step 3 merely logged. A data
+        --      repair must not be able to take the catalogue down with it, so
+        --      it runs as its own conn.execute with log-and-continue.
+        -- The ALTER above still creates the column here; the repair and the
+        -- index both sit downstream of this batch, in that order.
+        --
+        -- S62 rule honoured there: the column already exists by then, so the
+        -- repair is an UPDATE — never `ALTER TABLE ... ADD COLUMN ... DEFAULT
+        -- <expr>`.
+
         -- Intelligent culling / focus-analysis columns (Session 76). ADD COLUMN
         -- with NO default (S62 WAL rule). Existing rows stay NULL and therefore
         -- naturally form the pending analysis queue.
@@ -2094,6 +2124,17 @@ fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
         CREATE INDEX IF NOT EXISTS idx_face_quality_min ON images(face_quality_min);
         CREATE INDEX IF NOT EXISTS idx_face_eyes_open_count ON images(face_eyes_open_count);
         CREATE INDEX IF NOT EXISTS idx_face_blink_risk_count ON images(face_blink_risk_count);
+
+        -- ⭐ S173 — idx_images_directory_path is deliberately NOT here. It is
+        -- created by the index-gated repair step in Rust below (search
+        -- `directory_path_backfill_sql`), immediately AFTER the repair that
+        -- makes the column correct, and only if that repair succeeded. Keeping
+        -- it out of this block is what makes a fresh catalogue and an upgraded
+        -- catalogue take the SAME path: fresh → table empty → repair touches 0
+        -- rows → index created; upgraded → repair rewrites the divergent rows →
+        -- index created over correct values. Were it here, a failed repair
+        -- would still leave the index built (over wrong values) and the
+        -- index-as-marker retry could never fire.
 
         -- === Face observations (Vision detection, pre-recognition) ===
         -- One row per detected human face per image/algorithm version. This is
@@ -2577,6 +2618,114 @@ fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
         Err(e) => eprintln!("Failed to query schema: {}", e),
     }
 
+    // --- ⭐ S173 — directory_path repair + index: ONE TIME, SELF-HEALING -----
+    //
+    // WHAT THIS IS. S173 makes the per-directory FFIs pivot on the STORED
+    // `directory_path` column instead of re-deriving the protected S5
+    // expression per row (see DIRECTORY_EXACT_PREDICATE). A key space has to be
+    // exact, so a catalogue written before S173 — where the column was a
+    // best-effort convenience copy filled only `WHERE directory_path IS NULL`,
+    // and where a path rewrite could leave a stale value behind — has to be
+    // converged onto the canonical expression ONCE, and indexed.
+    //
+    // THE INDEX'S EXISTENCE IS THE MIGRATION MARKER. `idx_images_directory_path`
+    // has never existed on `images` before S173, so "absent" is exactly
+    // "this catalogue has not been repaired yet". Probing for it is therefore a
+    // marker that cannot be forged by a partially-applied repair, and it costs
+    // one catalogue-metadata lookup. ⚠️ A FUTURE CHANGE TO THE CANONICAL RULE
+    // MUST RENAME THE INDEX (or drop it) TO FORCE A RE-REPAIR — otherwise the
+    // marker reads "done" for a rule that is no longer the one it was done for.
+    //
+    // SELF-HEALING BY CONSTRUCTION, not by re-running. The index is created
+    // ONLY after the repair reports success, so a repair that fails leaves the
+    // index ABSENT and the NEXT launch retries from scratch. Nothing is
+    // recorded as done that was not done.
+    //
+    // WHY NOT EVERY LAUNCH (the first S173 shape). Re-running the repair
+    // unconditionally charged every launch for a migration finished after the
+    // first, and it scales with catalogue size. On the owner's real 580,832-row
+    // catalogue the adversarial review measured the no-op re-run at ~93 ms
+    // without the index and ~230 ms with it present (236 ms per launch), and
+    // the one-time index build at ~700 ms. Against that, re-running bought only
+    // the ability to paper over a future write path that forgot the column —
+    // which is a bug to FIX at the write site, not to hide at open.
+    //
+    // Re-measured end-to-end after this change, release build, on a copy of
+    // that same 580,832-row catalogue (one fresh process per open, so no
+    // in-process warmth carries across; these whole-open figures run lower than
+    // the review's per-statement ones and are quoted as the floor, not as a
+    // correction to them):
+    //   first open, nothing to repair + index build   133.6 ms   (once)
+    //   first open, ALL 580,832 rows repaired + index 165.1 ms   (once)
+    //   every later open, marker present               26.7 ms   (= the
+    //       pre-S173 baseline for the REST of this migration block; S173's own
+    //       recurring share is the metadata probe below and nothing else)
+    //   the no-op repair UPDATE alone, index present   41.8 ms   (what every
+    //       launch used to pay and now pays never)
+    // On every later launch this whole block is one metadata probe: no scan,
+    // no UPDATE.
+    //
+    // WHY NOT IN THE SCHEMA BATCH. A failing statement inside execute_batch
+    // aborts the batch and makes catalogue open return None — a data repair
+    // that could fail the whole catalogue open, where the old Step 3 merely
+    // logged. Each statement here is its own autocommit conn.execute with
+    // log-and-continue, restoring that blast radius.
+    //
+    // ORDER IS LOAD-BEARING: ALTER (schema batch) → probe → repair → index.
+    // Repair first so the index is never built over values that are about to be
+    // rewritten. And the index CANNOT move into the migration transaction
+    // below: DuckDB refuses `CREATE INDEX` in a transaction holding outstanding
+    // updates to the same table ("Cannot create index with outstanding
+    // updates"). This block deliberately sits BEFORE that BEGIN TRANSACTION,
+    // in autocommit.
+    let directory_index_present = match conn.query_row(
+        "SELECT COUNT(*) FROM duckdb_indexes() \
+         WHERE table_name = 'images' AND index_name = 'idx_images_directory_path'",
+        [],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(count) => count > 0,
+        Err(e) => {
+            // Unreadable marker → assume NOT repaired. Both statements below
+            // are idempotent (`IS NULL OR <>` converges; `IF NOT EXISTS`
+            // no-ops), so the cost of guessing wrong is one scan, while the
+            // cost of guessing "done" would be an unrepaired key space.
+            eprintln!(
+                "[migration] directory_path index probe failed ({}); treating the \
+                 catalogue as unrepaired",
+                e
+            );
+            false
+        }
+    };
+
+    if !directory_index_present {
+        match conn.execute(&directory_path_backfill_sql(), []) {
+            Ok(changed) => {
+                eprintln!(
+                    "[migration] directory_path repaired (NULL or divergent): {} rows",
+                    changed
+                );
+                // Only now — a repair that failed must NOT leave the marker.
+                match conn.execute_batch(
+                    "CREATE INDEX IF NOT EXISTS idx_images_directory_path ON images(directory_path);",
+                ) {
+                    Ok(()) => eprintln!("[migration] idx_images_directory_path created"),
+                    Err(e) => eprintln!(
+                        "[migration] Failed to create idx_images_directory_path ({}); \
+                         the next launch will retry the repair",
+                        e
+                    ),
+                }
+            }
+            Err(e) => eprintln!(
+                "[migration] Failed to repair directory_path ({}); the index is left \
+                 absent so the next launch retries",
+                e
+            ),
+        }
+    }
+
     // --- Backfill migration (DESIGN-Duplicate-Consolidation.md §8;
     // --- DESIGN-Filter-Aware-Pagination.md §4 added Step 3 in Session 19) ----
     //
@@ -2596,16 +2745,17 @@ fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
     //      but the design wants a belt-and-braces UPDATE to enforce the
     //      lowercase-canonical convention even on data ingested before
     //      it was a stated invariant.
-    //   3. Populate directory_path for any row where it is NULL, using the
-    //      canonical SUBSTRING/INSTR/REVERSE extraction (mirrors
-    //      get_distinct_directory_paths). Pure SQL UPDATE — no Rust
-    //      round-trip per row. On a fresh database this is a no-op.
+    //   3. (⭐ S173) directory_path no longer lives here — it moved OUT of this
+    //      transaction into the index-gated repair step above, so that
+    //      `idx_images_directory_path` can be built right after it (DuckDB
+    //      refuses CREATE INDEX inside a transaction with outstanding updates
+    //      to the same table) and so that a repair failure cannot roll back
+    //      Steps 1/2/4. The step marker below records the move.
     //
-    // Idempotency: the WHERE clauses on all three steps mean that running this
+    // Idempotency: the WHERE clauses on every step mean that running this
     // block a second time has no work to do — rows with non-NULL file_stem
-    // and image_kind are skipped, rows whose file_extension already matches
-    // LOWER(file_extension) are skipped, and rows with non-NULL directory_path
-    // are skipped.
+    // and image_kind are skipped, and rows whose file_extension already
+    // matches LOWER(file_extension) are skipped.
     if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         eprintln!("[migration] Failed to begin transaction: {}", e);
         return None;
@@ -2670,24 +2820,17 @@ fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
         Err(e) => eprintln!("[migration] Failed to normalize file_extension: {}", e),
     }
 
-    // Step 3: backfill directory_path for any row where it is NULL.
-    // Pure SQL UPDATE — directory_path is derived directly from file_path
-    // via the canonical SUBSTRING/INSTR/REVERSE extraction (mirrors
-    // get_distinct_directory_paths; see also the "Directory-Path Extraction
-    // SQL — Gotcha" note in CLAUDE.md for the left-anchored form that must
-    // NOT be used). Idempotent via WHERE directory_path IS NULL; the
-    // file_path LIKE '%/%' guard mirrors get_distinct_directory_paths'
-    // safety convention against pathological rows lacking a slash.
-    match conn.execute(
-        "UPDATE images \
-         SET directory_path = SUBSTRING(file_path, 1, LENGTH(file_path) - INSTR(REVERSE(file_path), '/')) \
-         WHERE directory_path IS NULL AND file_path LIKE '%/%'",
-        [],
-    )
-    {
-        Ok(changed) => eprintln!("[migration] backfilled directory_path for {} rows", changed),
-        Err(e) => eprintln!("[migration] Failed to backfill directory_path: {}", e),
-    }
+    // Step 3: directory_path — MOVED above this transaction in S173.
+    //
+    // It used to live here as a `WHERE directory_path IS NULL` fill, running on
+    // every launch inside this transaction. S173 promoted it to the
+    // authoritative `IS NULL OR <> canonical` repair, gated it on the absence
+    // of `idx_images_directory_path`, and moved it ABOVE the BEGIN TRANSACTION
+    // so the index can be created immediately after it: DuckDB rejects
+    // `CREATE INDEX` inside a transaction holding outstanding updates to the
+    // same table, which this block is. See the long S173 comment at that step
+    // for the full reasoning. The step number is kept so Steps 1, 2 and 4 still
+    // read in order.
 
     // Step 4: reclassify formats promoted to their own ImageKind
     // (Docs/DESIGN-Lightroom-Catalog-Import.md §7a). DNG left the Raw class;
@@ -2784,6 +2927,64 @@ fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
 //   as a FALLBACK: if the batch statement fails, that batch alone is retried
 //   row by row, so one malformed record still cannot drop its 49 neighbours.
 // =====================================================================
+
+/// ⭐ S173 — the canonical parent-directory derivation, as a template over one
+/// path expression (`{0}` is substituted three times).
+///
+/// THE PROTECTED S5 EXPRESSION, named. The S5 bug was a HAND-DERIVED variant of
+/// this arithmetic: a left-anchored `LENGTH(file_path) - LENGTH(filename)` form
+/// that landed one character past the last `/`, so every distinct filename
+/// length produced its own bogus "directory" — `richar`, `Wa`, `Wagner Fami` —
+/// and every Sources-panel image count read (0). The fix (core commit
+/// `f7bb320`) was this SUBSTRING/INSTR/REVERSE form, and CLAUDE.md's
+/// "do NOT rewrite" note has guarded it since. Naming it is the opposite of
+/// re-deriving it: it gives `build_ingest_insert_sql` and the directory tests
+/// ONE spelling that cannot drift from the schema's authoritative backfill.
+///
+/// Semantics, for the record: `INSTR(REVERSE(p), '/')` is the 1-based offset of
+/// the LAST `/` counted from the end, so `LENGTH(p) - that` is the length of
+/// everything strictly before that `/` — the parent path with NO trailing
+/// slash. A root-level file (`/a.jpg`) yields `''`; a path with no `/` at all
+/// yields the whole string (`INSTR` returns 0).
+const CANONICAL_DIRECTORY_PATH_EXPR: &str =
+    "SUBSTRING({0}, 1, LENGTH({0}) - INSTR(REVERSE({0}), '/'))";
+
+/// `CANONICAL_DIRECTORY_PATH_EXPR` applied to one path expression — a bound
+/// placeholder (`?1`) or a column name (`file_path`).
+fn canonical_directory_path_sql(path_expr: &str) -> String
+{
+    CANONICAL_DIRECTORY_PATH_EXPR.replace("{0}", path_expr)
+}
+
+/// ⭐ S173 — the ONE-TIME `directory_path` repair statement, BUILT FROM
+/// `CANONICAL_DIRECTORY_PATH_EXPR` rather than hand-copied, so the migration
+/// and the ingest INSERT cannot drift apart by construction.
+///
+/// `IS NULL **or** different` is the whole point: a pre-S19 row has no value and
+/// a row whose `file_path` was rewritten by a pre-S173 path can carry a STALE
+/// one. Both are divergences from the key space the per-directory FFIs now
+/// answer from, and both are converged here.
+///
+/// NO `file_path LIKE '%/%'` GUARD, deliberately. The old Step 3 carried one;
+/// the ingest INSERT never has (`build_ingest_insert_sql` and
+/// `merge_records_into` both apply the expression unconditionally), and a
+/// slash-less `file_path` derives to the whole string rather than NULL. Keeping
+/// the guard would have left exactly those rows as a permanent stored-vs-derived
+/// divergence — the one class this statement exists to eliminate. (Root-level
+/// files like `/a.jpg` derive to `''` under both; on the owner's real catalogue
+/// there are 0 slash-less rows.)
+///
+/// Run by `open_and_migrate_catalogue` ONLY when `idx_images_directory_path` is
+/// absent — see the marker discussion there.
+fn directory_path_backfill_sql() -> String
+{
+    let canonical = canonical_directory_path_sql("file_path");
+    format!(
+        "UPDATE images SET directory_path = {} \
+         WHERE directory_path IS NULL OR directory_path <> {}",
+        canonical, canonical
+    )
+}
 
 /// Number of bound parameters the ingest INSERT consumes per record.
 ///
@@ -2883,15 +3084,11 @@ fn build_ingest_insert_sql(row_count: usize) -> String
 
         // directory_path — the canonical derivation, on this row's file_path.
         // DO NOT rewrite this expression; it must stay identical to the
-        // migration backfill in initialize_catalogue.
-        let file_path_ph = format!("?{}", base + 1);
-        sql.push_str("SUBSTRING(");
-        sql.push_str(&file_path_ph);
-        sql.push_str(", 1, LENGTH(");
-        sql.push_str(&file_path_ph);
-        sql.push_str(") - INSTR(REVERSE(");
-        sql.push_str(&file_path_ph);
-        sql.push_str("), '/')), ");
+        // authoritative backfill in the schema batch. ⭐ S173 built it from
+        // CANONICAL_DIRECTORY_PATH_EXPR rather than re-assembling it by hand
+        // here, so ingest and the backfill share one spelling by construction.
+        sql.push_str(&canonical_directory_path_sql(&format!("?{}", base + 1)));
+        sql.push_str(", ");
 
         // created_timestamp .. live_photo_id  →  ?7 .. ?46
         for n in 7..=46usize
@@ -3232,17 +3429,16 @@ fn editor_saved_image_insert(
     .map_err(|e| format!("editor saved image id readback failed: {}", e))
 }
 
-fn editor_saved_image_update_facts(
-    conn: &Connection,
-    image_id: i64,
-    metadata: &ImageMetadata,
-) -> Result<(), String>
-{
-    let parsed = parse_filename(metadata.file_name.clone());
-    let image_kind = editor_saved_image_kind_name(parsed.kind);
-    let changed = conn
-        .execute(
-            "UPDATE images SET
+/// The editor-save facts UPDATE, hoisted to a `const` so the S173 drift test
+/// (`canonical_directory_path_expression_has_not_drifted`) can assert against
+/// the PRODUCTION text rather than a copy of it.
+///
+/// ⚠️ `directory_path` here is a HAND-COPY of `CANONICAL_DIRECTORY_PATH_EXPR`
+/// (byte-identical today) — it cannot be built from
+/// `canonical_directory_path_sql` without making the whole statement a runtime
+/// `String`, and the drift test is the cheaper guard. Do NOT rewrite the
+/// expression; see the S5 note on the constant.
+const EDITOR_SAVED_IMAGE_UPDATE_FACTS_SQL: &str = "UPDATE images SET
                  file_size = ?2,
                  file_name = ?3,
                  file_extension = ?4,
@@ -3287,7 +3483,19 @@ fn editor_saved_image_update_facts(
                  audio_sample_rate = ?41,
                  audio_bitrate = ?42,
                  live_photo_id = ?43
-             WHERE id = ?1",
+             WHERE id = ?1";
+
+fn editor_saved_image_update_facts(
+    conn: &Connection,
+    image_id: i64,
+    metadata: &ImageMetadata,
+) -> Result<(), String>
+{
+    let parsed = parse_filename(metadata.file_name.clone());
+    let image_kind = editor_saved_image_kind_name(parsed.kind);
+    let changed = conn
+        .execute(
+            EDITOR_SAVED_IMAGE_UPDATE_FACTS_SQL,
             params![
                 image_id,
                 metadata.file_size as i64,
@@ -14921,6 +15129,43 @@ pub struct MergeChunkResult {
     pub image_ids: Vec<i64>,
 }
 
+/// The merge INSERT (Lightroom / Apple-Photos / copy-import), hoisted to a
+/// `const` so the S173 drift test
+/// (`canonical_directory_path_expression_has_not_drifted`) can assert against
+/// the PRODUCTION text rather than a copy of it.
+///
+/// ⚠️ `directory_path` here is a HAND-COPY of `CANONICAL_DIRECTORY_PATH_EXPR`
+/// over this row's own `?1` placeholder (byte-identical today). Do NOT rewrite
+/// the expression; see the S5 note on the constant. It mirrors
+/// `build_ingest_insert_sql`'s column set exactly — a column added to one
+/// belongs in the other.
+const MERGE_RECORDS_INSERT_SQL: &str = "INSERT INTO images ( \
+                    file_path, file_size, file_name, file_extension, \
+                    file_stem, image_kind, directory_path, \
+                    created_timestamp, modified_timestamp, \
+                    camera_make, camera_model, lens_model, \
+                    focal_length, aperture, shutter_speed, iso, \
+                    capture_datetime, pixel_width, pixel_height, color_space, bit_depth, \
+                    gps_latitude, gps_longitude, gps_altitude, \
+                    copyright, creator, description, \
+                    rating, flag, color_label, rotation, external_source_id, \
+                    is_video, \
+                    duration_seconds, frame_rate, video_kind, video_codec, video_bitrate, \
+                    color_primaries, color_transfer, color_matrix, color_range, dv_profile, \
+                    has_audio, audio_codec, audio_channels, audio_sample_rate, audio_bitrate, \
+                    live_photo_id \
+                 ) VALUES ( \
+                    ?1, ?2, ?3, ?4, ?5, ?6, \
+                    SUBSTRING(?1, 1, LENGTH(?1) - INSTR(REVERSE(?1), '/')), \
+                    ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
+                    ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, \
+                    ?32, \
+                    ?33, ?34, ?35, ?36, ?37, \
+                    ?38, ?39, ?40, ?41, ?42, \
+                    ?43, ?44, ?45, ?46, ?47, \
+                    ?48 \
+                 ) RETURNING id";
+
 /// The image-merge logic, on a borrowed connection (so it is testable against an
 /// in-memory catalogue). Wrapped by `merge_lightroom_records`, which locks the
 /// global CATALOGUE. Per-row **check-then-UPDATE-or-INSERT** — see §4 for WHY
@@ -15015,32 +15260,7 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
                 ImageKind::Png => "png",
             };
             conn.query_row(
-                "INSERT INTO images ( \
-                    file_path, file_size, file_name, file_extension, \
-                    file_stem, image_kind, directory_path, \
-                    created_timestamp, modified_timestamp, \
-                    camera_make, camera_model, lens_model, \
-                    focal_length, aperture, shutter_speed, iso, \
-                    capture_datetime, pixel_width, pixel_height, color_space, bit_depth, \
-                    gps_latitude, gps_longitude, gps_altitude, \
-                    copyright, creator, description, \
-                    rating, flag, color_label, rotation, external_source_id, \
-                    is_video, \
-                    duration_seconds, frame_rate, video_kind, video_codec, video_bitrate, \
-                    color_primaries, color_transfer, color_matrix, color_range, dv_profile, \
-                    has_audio, audio_codec, audio_channels, audio_sample_rate, audio_bitrate, \
-                    live_photo_id \
-                 ) VALUES ( \
-                    ?1, ?2, ?3, ?4, ?5, ?6, \
-                    SUBSTRING(?1, 1, LENGTH(?1) - INSTR(REVERSE(?1), '/')), \
-                    ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, \
-                    ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, \
-                    ?32, \
-                    ?33, ?34, ?35, ?36, ?37, \
-                    ?38, ?39, ?40, ?41, ?42, \
-                    ?43, ?44, ?45, ?46, ?47, \
-                    ?48 \
-                 ) RETURNING id",
+                MERGE_RECORDS_INSERT_SQL,
                 params![
                     record.file_path,
                     record.file_size as i64,
@@ -22351,14 +22571,55 @@ pub async fn filter_uncatalogued_paths(paths: Vec<String>) -> FilePathsResult {
 
 /// The catalogued-parent-directory test, as a bound-parameter predicate.
 ///
-/// Uses the CANONICAL DERIVED directory expression — the protected S5
-/// expression over `file_path` that `get_distinct_directory_paths` and
-/// `directory_image_counts` both use — deliberately NOT the stored
-/// `directory_path` column, so the key space here is byte-identical to the
-/// Sources tree's, to the monitor's `catalogDirs` snapshot, and to the
-/// `directory_sync_state` rows folder sync keys on.
-const DIRECTORY_EXACT_PREDICATE: &str =
-    "SUBSTRING(file_path, 1, LENGTH(file_path) - INSTR(REVERSE(file_path), '/')) = ?";
+/// ⭐ S173 — pivots on the STORED, INDEXED `directory_path` column rather than
+/// re-deriving the S5 expression over `file_path` for every row in the table.
+///
+/// **This is not a change of question, only of how it is answered.** The column
+/// carries the canonical derivation at every point a row can enter or move, and
+/// a one-time migration converged every pre-S173 row onto it.
+///
+/// ⚠️ **Only TWO of those sites are built from the named constant.**
+/// `build_ingest_insert_sql` (the multi-row ingest INSERT — and therefore also
+/// the editor-save insert, which goes through that same builder) and
+/// `directory_path_backfill_sql` (the migration repair) call
+/// `canonical_directory_path_sql` and cannot drift. The rest are HAND-COPIES of
+/// the expression, byte-identical today but textually independent:
+///
+/// - `EDITOR_SAVED_IMAGE_UPDATE_FACTS_SQL` — the editor-save facts UPDATE
+/// - `MERGE_RECORDS_INSERT_SQL` — the Lightroom / Apple-Photos / copy-import
+///   merge INSERT (`merge_records_into`)
+/// - `RELOCATE_PREFIX_UPDATE_SQL` — the relocate prefix rewrite, the only
+///   statement in the crate that rewrites `file_path`
+/// - `build_destination_family_predicate` — a READER, not a write path: it
+///   inlines the expression over an escaped literal path
+///
+/// They are pinned by `canonical_directory_path_expression_has_not_drifted`,
+/// which asserts each one still CONTAINS the constant's text; a future edit to
+/// one copy alone fails the suite rather than silently splitting the key space.
+///
+/// **The repair is ONE-TIME, not every-open.** `open_and_migrate_catalogue`
+/// runs it only while `idx_images_directory_path` is absent — see the marker
+/// discussion there. A row that DIVERGES after that migration (a write path
+/// that forgets the column) stays diverged and is a bug to fix at the write
+/// site, not something open-time papers over.
+///
+/// The key space is byte-identical to the Sources tree's, to the monitor's
+/// `catalogDirs` snapshot, and to the `directory_sync_state` rows folder sync
+/// keys on — verified on the owner's real 580,832-row catalogue, where stored
+/// and derived differ on 0 rows and the two predicates return identical path
+/// sets.
+///
+/// **Why it was worth doing.** The derived form is unindexable: it is a
+/// per-row string computation, so every call scanned the whole table. The
+/// folder-sync sweep calls these FFIs once per catalogued directory — 3,827 of
+/// them on that catalogue. Measured over 200 real directories: 3.35 s wall /
+/// 17.2 s CPU derived, versus 0.15 s wall / 0.27 s CPU on the indexed column
+/// (~22x wall, ~64x CPU). The CPU figure is the one that matters, because the
+/// sweep competes with the scanner for cores.
+///
+/// Still an EQUALITY test against a bound parameter — no wildcard vocabulary,
+/// so paths containing `%` or `_` are matched literally, exactly as before.
+const DIRECTORY_EXACT_PREDICATE: &str = "directory_path = ?";
 
 /// Site 1 — every catalogued file path whose derived parent directory is
 /// EXACTLY `directory_path`. Direct children only; a catalogued sub-directory
@@ -22495,14 +22756,45 @@ pub async fn image_records_in_directory(
         }
     };
 
-    // The projection helper takes a literal WHERE fragment, so the directory
-    // is quote-escaped and inlined here rather than bound. Same escaping the
-    // rest of `predicate_to_sql` uses, and still an EQUALITY test — no
-    // wildcard vocabulary is introduced.
-    let predicate = format!(
-        "SUBSTRING(file_path, 1, LENGTH(file_path) - INSTR(REVERSE(file_path), '/')) = '{}'",
-        directory_path.replace('\'', "''")
-    );
+    image_records_in_directory_impl(conn, &directory_path, media_type)
+}
+
+/// ⭐ S173 — `DIRECTORY_EXACT_PREDICATE` with its bound `?` replaced by a
+/// quote-escaped literal.
+///
+/// `execute_image_record_projection_query` takes a literal WHERE fragment and
+/// binds no parameters (`query_map([], …)`), so this site cannot pass the
+/// directory as a bound value without changing that shared helper's signature
+/// for all of its callers. SUBSTITUTING INTO THE SHARED CONSTANT is the next
+/// best thing: the column name and the comparison operator have exactly ONE
+/// spelling in the crate, so the bound and literal forms cannot drift apart —
+/// change the const and this moves with it. Pinned by
+/// `directory_exact_records_predicate_is_built_from_the_shared_constant`.
+///
+/// Still an EQUALITY test, so no wildcard vocabulary is introduced: a directory
+/// containing `%` or `_` is matched literally (the S168 4b lesson). The escape
+/// is the `'` → `''` doubling the rest of `predicate_to_sql` uses.
+fn directory_exact_literal_predicate(directory_path: &str) -> String
+{
+    DIRECTORY_EXACT_PREDICATE.replace('?', &format!("'{}'", directory_path.replace('\'', "''")))
+}
+
+/// Impl form (takes `&Connection`) so the unit tests can drive the PRODUCTION
+/// query against a real temp-file catalogue — the `file_paths_in_directory_impl`
+/// shape, and the only way to pin that this site reads the STORED column rather
+/// than re-deriving the expression.
+fn image_records_in_directory_impl(
+    conn: &Connection,
+    directory_path: &str,
+    media_type: MediaType,
+) -> Vec<ImageRecord>
+{
+    if directory_path.is_empty()
+    {
+        return Vec::new();
+    }
+
+    let predicate = directory_exact_literal_predicate(directory_path);
 
     execute_image_record_projection_query(conn, &predicate, false, false, media_type)
 }
@@ -22958,10 +23250,12 @@ pub async fn get_destination_family_records(
 /// - Classify the input extension via classify_extension. Other-kind inputs
 ///   return None immediately — they have no counterpart concept.
 /// - SQL fetches all parent+stem candidates EXCLUDING the input's own path,
-///   ordered ASC by file_extension. Parent-directory derivation in SQL uses
-///   the standard SUBSTRING + LENGTH + INSTR + REVERSE idiom matching
-///   get_distinct_directory_paths. Stem derivation in SQL strips
-///   file_extension and the dot separator from file_name.
+///   ordered ASC by file_extension. The parent-directory test reads the
+///   STORED, INDEXED `directory_path` column (⭐ S173 — the third twin of
+///   `DIRECTORY_EXACT_PREDICATE`); it used to re-derive the SUBSTRING +
+///   LENGTH + INSTR + REVERSE expression for every row in the table. Stem
+///   derivation in SQL strips file_extension and the dot separator from
+///   file_name.
 /// - Rust iterates the returned rows in the SQL-imposed order, classifies
 ///   each candidate's extension, and returns the first row whose kind is
 ///   the opposite of the input's kind. The LIMIT-1 semantic is enforced
@@ -22998,16 +23292,49 @@ pub async fn get_destination_family_records(
 /// - None if input is Other-kind, malformed, or has no counterpart in the
 ///   catalogue
 pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord> {
-    // 1. Parse parent directory and basename from the input path.
-    //    Pure string operation — no filesystem I/O, no canonicalization.
-    //    Trusts the input. Risk 3 in DESIGN-image-classification.md.
-    let last_slash = match file_path.rfind('/') {
-        Some(pos) => pos,
+    // 1-3. Parse and classify BEFORE taking the catalogue mutex — ⭐ S173.
+    //
+    // The pre-S173 shape did the malformed-path and Other-kind early returns
+    // first and only then locked, so a right-click on a `.txt` or a `.psd` never
+    // contended with a running scan. The first S173 pass moved the whole body
+    // into `find_counterpart_image_impl` (a conn-taking impl is the only way the
+    // suite can drive the PRODUCTION query against a temp-file catalogue — it
+    // deliberately never touches the process-global CATALOGUE singleton, which
+    // would make the tests order-dependent; see the U3 preamble) and took the
+    // lock a few microseconds earlier as a side effect. This restores the fast
+    // path: the parse/classify is pure string work over borrowed bytes, and a
+    // `None` here means the impl would have returned `None` anyway, so nothing
+    // below the lock can change the answer.
+    counterpart_lookup_parts(&file_path)?;
+
+    // 4. Acquire lock and validate connection.
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
         None => {
-            // No slash → no parent directory. Cannot be a real file path.
+            eprintln!("Catalogue not initialized");
             return None;
         }
     };
+
+    find_counterpart_image_impl(conn, &file_path)
+}
+
+/// Steps 1-3 of the counterpart lookup — the whole part that needs no
+/// catalogue: parent directory, stem, and the OPPOSITE kind to look for.
+///
+/// `None` means "this input has no counterpart CONCEPT": no parent directory,
+/// no extension, or an extension whose kind has no JPEG↔RAW partner. Shared by
+/// the FFI (which uses it to bail out BEFORE locking — ⭐ S173) and by
+/// `find_counterpart_image_impl` (which needs the values), so the two can never
+/// disagree about which inputs are answerable.
+fn counterpart_lookup_parts(file_path: &str) -> Option<(&str, &str, ImageKind)>
+{
+    // 1. Parse parent directory and basename from the input path.
+    //    Pure string operation — no filesystem I/O, no canonicalization.
+    //    Trusts the input. Risk 3 in DESIGN-image-classification.md.
+    //    No slash → no parent directory. Cannot be a real file path.
+    let last_slash = file_path.rfind('/')?;
 
     let parent_dir = &file_path[..last_slash];
     let basename = &file_path[(last_slash + 1)..];
@@ -23015,20 +23342,16 @@ pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord> {
     // 2. Parse stem and extension from the basename.
     //    rfind('.') finds the LAST dot, which handles multi-dot filenames
     //    such as IMG.2024-05-13.NEF correctly (stem = "IMG.2024-05-13").
-    let last_dot = match basename.rfind('.') {
-        Some(pos) => pos,
-        None => {
-            // No extension → cannot be classified as JPEG or RAW.
-            return None;
-        }
-    };
+    //    No extension → cannot be classified as JPEG or RAW.
+    let last_dot = basename.rfind('.')?;
 
     let stem = &basename[..last_dot];
     let ext = &basename[(last_dot + 1)..];
 
     // 3. Classify the input extension; Other-kind inputs have no counterpart.
     let input_kind = classify_extension(ext.to_string());
-    let target_kind = match input_kind {
+    let target_kind = match input_kind
+    {
         ImageKind::Jpeg => ImageKind::Raw,
         ImageKind::Raw => ImageKind::Jpeg,
         ImageKind::Other => return None,
@@ -23043,19 +23366,41 @@ pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord> {
         ImageKind::Dng | ImageKind::Psd | ImageKind::Tiff | ImageKind::Png => return None,
     };
 
-    // 4. Acquire lock and validate connection.
-    let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref() {
-        Some(c) => c,
-        None => {
-            eprintln!("Catalogue not initialized");
-            return None;
-        }
-    };
+    Some((parent_dir, stem, target_kind))
+}
+
+/// Impl form (takes `&Connection`) — see the S173 note on the FFI above.
+fn find_counterpart_image_impl(conn: &Connection, file_path: &str) -> Option<ImageRecord>
+{
+    // 1-3. (Re-run here, not passed in: the FFI's call is a pre-lock GATE, and
+    //       the impl must stand alone for the suite and for any future caller.
+    //       Pure borrowed-string work — a few nanoseconds against a SQL query.)
+    let (parent_dir, stem, target_kind) = counterpart_lookup_parts(file_path)?;
+
+    // 4. (Lock acquired by the FFI wrapper above — ⭐ S173.)
 
     // 5. Parameterized query for parent+stem candidates.
-    //    Parent-directory derivation in SQL: SUBSTRING + LENGTH + INSTR +
-    //    REVERSE — matches the project idiom in get_distinct_directory_paths.
+    //    Parent-directory test: the STORED, INDEXED `directory_path` column.
+    //    ⭐ S173 — the one twin of DIRECTORY_EXACT_PREDICATE that is still
+    //    spelled by hand. `image_records_in_directory` now SUBSTITUTES into the
+    //    const (`directory_exact_literal_predicate`); this query cannot, because
+    //    it already binds `?2` and `?3` and so must spell the parameter `?1`
+    //    rather than reuse the const's bare `?` — DuckDB will not mix numbered
+    //    and positional placeholders in one statement, and this SQL is one
+    //    `r#"…"#` literal, not an assembled string. Same question, same key
+    //    space; the two must move together.
+    //
+    //    Not a change of question. Every write path that creates or moves a
+    //    row stores directory_path by the CANONICAL_DIRECTORY_PATH_EXPR rule
+    //    (the drift test pins all six sites), and the one-time S173 repair
+    //    re-converged every pre-existing row while `idx_images_directory_path`
+    //    was still absent — the index IS the migration marker, so a row that
+    //    diverges after that migration stays diverged (see the long note on
+    //    DIRECTORY_EXACT_PREDICATE). Still an EQUALITY test against a bound
+    //    parameter, so stems and directories containing `%` or `_` keep matching
+    //    literally. Measured on the owner's real 580,832-row catalogue: 18 ms
+    //    derived → 1 ms on the indexed column.
+    //
     //    Stem derivation in SQL: strip file_extension + 1 (the dot) from
     //    file_name; guarded by IS NOT NULL and != '' so the arithmetic is
     //    well-defined.
@@ -23098,7 +23443,7 @@ pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord> {
                 )
             END AS duplicate_group_id
         FROM images
-        WHERE SUBSTRING(file_path, 1, LENGTH(file_path) - INSTR(REVERSE(file_path), '/')) = ?1
+        WHERE directory_path = ?1
           AND file_extension IS NOT NULL
           AND file_extension != ''
           AND SUBSTRING(file_name, 1, LENGTH(file_name) - LENGTH(file_extension) - 1) = ?2
@@ -24826,21 +25171,213 @@ mod directory_exact_tests
         let _ = std::fs::remove_file(path.with_extension("db.wal"));
     }
 
+    /// Catalogue a row the way PRODUCTION does — `directory_path` derived in
+    /// SQL from this row's own `file_path`, exactly as `build_ingest_insert_sql`
+    /// and `merge_records_into` emit it.
+    ///
+    /// ⭐ S173 — this used to omit `directory_path`, which was harmless while
+    /// the directory FFIs re-derived the expression per row and is NOT harmless
+    /// now that they pivot on the stored column. A fixture that skips the column
+    /// is testing a row shape production cannot produce.
     fn catalogue(conn: &Connection, file_path: &str)
     {
         let file_name = file_path.rsplit('/').next().unwrap_or(file_path);
+        let sql = format!(
+            "INSERT INTO images (file_path, file_size, file_name, directory_path, \
+             created_timestamp, modified_timestamp) VALUES (?1, ?2, ?3, {}, ?4, ?5)",
+            canonical_directory_path_sql("?1")
+        );
         conn.execute(
-            "INSERT INTO images (file_path, file_size, file_name, \
-             created_timestamp, modified_timestamp) VALUES (?, ?, ?, ?, ?)",
+            &sql,
             params![file_path, 1234_i64, file_name, 1_700_000_000_i64, 1_700_000_001_i64],
         )
         .expect("fixture row");
+    }
+
+    /// Catalogue a row with a BROKEN `directory_path` — `None` for the NULL
+    /// case (every pre-S19 row), `Some(junk)` for the divergent case (a stale
+    /// copy that survived a path rewrite). The shape the schema must repair.
+    fn catalogue_with_broken_directory(
+        conn: &Connection,
+        file_path: &str,
+        directory_path: Option<&str>,
+    )
+    {
+        let file_name = file_path.rsplit('/').next().unwrap_or(file_path);
+        conn.execute(
+            "INSERT INTO images (file_path, file_size, file_name, directory_path, \
+             created_timestamp, modified_timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                file_path,
+                1234_i64,
+                file_name,
+                directory_path,
+                1_700_000_000_i64,
+                1_700_000_001_i64
+            ],
+        )
+        .expect("fixture row");
+    }
+
+    /// Every `file_path` whose CANONICAL DERIVED parent is `dir`, read through
+    /// the protected S5 expression rather than through the stored column — the
+    /// independent oracle the switched predicate is measured against.
+    fn derived_paths_in_directory(conn: &Connection, dir: &str) -> Vec<String>
+    {
+        let sql = format!(
+            "SELECT file_path FROM images WHERE {} = ?1",
+            canonical_directory_path_sql("file_path")
+        );
+        let mut stmt = conn.prepare(&sql).expect("prepare derived probe");
+        let rows: Vec<String> = stmt
+            .query_map(params![dir], |r| r.get::<_, String>(0))
+            .expect("derived probe")
+            .map(|r| r.expect("row"))
+            .collect();
+        sorted(rows)
+    }
+
+    /// ⭐ S173 — as `catalogue`, plus the `file_extension` that
+    /// `find_counterpart_image`'s stem arithmetic needs
+    /// (`SUBSTRING(file_name, 1, LENGTH(file_name) - LENGTH(file_extension) - 1)`).
+    /// Stored lowercase, which is what the migration's `LOWER(file_extension)`
+    /// normalisation guarantees on every production row; `file_name` keeps its
+    /// original case, as production does.
+    fn catalogue_media(conn: &Connection, file_path: &str)
+    {
+        let file_name = file_path.rsplit('/').next().unwrap_or(file_path);
+        let extension = file_name
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_lowercase())
+            .expect("a fixture media path must carry an extension");
+        let sql = format!(
+            "INSERT INTO images (file_path, file_size, file_name, file_extension, \
+             directory_path, created_timestamp, modified_timestamp) \
+             VALUES (?1, ?2, ?3, ?4, {}, ?5, ?6)",
+            canonical_directory_path_sql("?1")
+        );
+        conn.execute(
+            &sql,
+            params![
+                file_path,
+                1234_i64,
+                file_name,
+                extension,
+                1_700_000_000_i64,
+                1_700_000_001_i64
+            ],
+        )
+        .expect("fixture media row");
+    }
+
+    /// ⭐ S173 — `find_counterpart_image_impl` AS IT READ BEFORE the switch:
+    /// the same parse, the same stem/extension/exclude-self conditions, the same
+    /// `ORDER BY file_extension ASC`, the same Rust-side opposite-kind scan —
+    /// differing ONLY in that the parent-directory test re-derives the protected
+    /// S5 expression per row instead of reading the stored column. This is the
+    /// independent "before" oracle the switched query is measured against.
+    fn counterpart_via_derived_expression(conn: &Connection, file_path: &str) -> Option<String>
+    {
+        let last_slash = file_path.rfind('/')?;
+        let parent_dir = &file_path[..last_slash];
+        let basename = &file_path[(last_slash + 1)..];
+        let last_dot = basename.rfind('.')?;
+        let stem = &basename[..last_dot];
+        let ext = &basename[(last_dot + 1)..];
+
+        let target_kind = match classify_extension(ext.to_string())
+        {
+            ImageKind::Jpeg => ImageKind::Raw,
+            ImageKind::Raw => ImageKind::Jpeg,
+            _ => return None,
+        };
+
+        let sql = format!(
+            "SELECT file_path, file_extension FROM images \
+             WHERE {} = ?1 \
+               AND file_extension IS NOT NULL \
+               AND file_extension != '' \
+               AND SUBSTRING(file_name, 1, LENGTH(file_name) - LENGTH(file_extension) - 1) = ?2 \
+               AND file_path != ?3 \
+             ORDER BY file_extension ASC",
+            canonical_directory_path_sql("file_path")
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .expect("prepare derived counterpart probe");
+        let candidates: Vec<(String, String)> = stmt
+            .query_map(params![parent_dir, stem, file_path], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .expect("derived counterpart probe")
+            .map(|r| r.expect("row"))
+            .collect();
+
+        candidates
+            .into_iter()
+            .find(|(_, candidate_ext)| classify_extension(candidate_ext.clone()) == target_kind)
+            .map(|(path, _)| path)
     }
 
     fn sorted(mut v: Vec<String>) -> Vec<String>
     {
         v.sort();
         v
+    }
+
+    /// ⭐ S173 — is the MIGRATION MARKER present? `open_and_migrate_catalogue`
+    /// runs the `directory_path` repair only while `idx_images_directory_path`
+    /// is ABSENT, and creates the index only once that repair has succeeded.
+    fn directory_index_present(conn: &Connection) -> bool
+    {
+        let found: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM duckdb_indexes() \
+                 WHERE table_name = 'images' AND index_name = 'idx_images_directory_path'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("duckdb_indexes()");
+        found > 0
+    }
+
+    /// ⭐ S173 — turn a migrated catalogue back into a PRE-S173 one by removing
+    /// the marker. This is how the suite reaches the REAL upgrade path:
+    /// `fresh_catalogue` already ran the migration (on an empty table), so
+    /// without this every "reopen" would find the marker and correctly do
+    /// nothing.
+    fn drop_directory_index(conn: &Connection)
+    {
+        conn.execute_batch("DROP INDEX IF EXISTS idx_images_directory_path;")
+            .expect("drop the S173 migration marker");
+    }
+
+    /// Rows whose stored `directory_path` is NULL or differs from the canonical
+    /// derivation — the count the repair drives to zero.
+    fn divergent_row_count(conn: &Connection) -> i64
+    {
+        conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM images WHERE directory_path IS NULL OR directory_path <> {}",
+                canonical_directory_path_sql("file_path")
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .expect("divergence count")
+    }
+
+    /// SQL with every whitespace character removed, for the drift test below.
+    ///
+    /// Safe for exactly these statements: the only string literal anywhere in
+    /// the canonical expression is `'/'`, which contains no whitespace, so
+    /// stripping cannot change what any of them MEAN. It ignores pure
+    /// re-indentation (`SUBSTRING( ?1` vs `SUBSTRING(?1`) while still catching
+    /// every change to the arithmetic, the operators, the argument order or the
+    /// column names — which is precisely what "drift" is.
+    fn sql_without_whitespace(sql: &str) -> String
+    {
+        sql.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
     /// The core contract: DIRECT CHILDREN ONLY. A catalogued sub-directory owns
@@ -24991,5 +25528,686 @@ mod directory_exact_tests
         );
 
         cleanup(&path);
+    }
+
+    // ========================================================================
+    // ⭐ S173 — the stored-column switch.
+    //
+    // DIRECTORY_EXACT_PREDICATE now reads `directory_path = ?` instead of
+    // re-deriving the S5 expression per row. That is only safe while the
+    // stored column IS the derived expression for every row, so these tests pin
+    // the legs of that argument: the ONE-TIME migration repairs the column and
+    // builds its marker index, the marker makes the repair non-recurring and
+    // self-healing, the predicates answer identically on adversarial paths, and
+    // each directory-exact site really does read the stored column.
+    // ========================================================================
+
+    /// Leg 1 — THE REAL UPGRADE PATH. A pre-S173 catalogue is one with divergent
+    /// or NULL `directory_path` rows and NO `idx_images_directory_path`. ONE
+    /// open must do both halves: repair the rows AND create the index. The
+    /// repaired rows are then visible to the switched predicate.
+    ///
+    /// The `drop_directory_index` call is what makes this the upgrade path
+    /// rather than a re-run: `fresh_catalogue` already migrated the (empty)
+    /// fixture, so the marker has to be removed for the divergent rows to be
+    /// staged the way a real pre-S173 catalogue stages them.
+    ///
+    /// Mutation proof: restore the old `WHERE directory_path IS NULL` guard and
+    /// the divergent rows stay wrong and stay invisible; restore the old
+    /// `AND file_path LIKE '%/%'` guard and the slash-less row stays NULL; move
+    /// the CREATE INDEX back above the repair and the index assertion still
+    /// passes but the self-healing test below fails.
+    #[test]
+    fn open_and_migrate_repairs_null_and_divergent_directory_path()
+    {
+        let (path, conn) = fresh_catalogue("backfill");
+
+        // NULL — every row written before Session 19 added the column.
+        catalogue_with_broken_directory(&conn, "/Volumes/Photos/2024/null_row.nef", None);
+        // DIVERGED — a stale value pointing at the row's OLD home.
+        catalogue_with_broken_directory(
+            &conn,
+            "/Volumes/Photos/2024/moved_row.nef",
+            Some("/Volumes/OldDrive/2019"),
+        );
+        // DIVERGED the other way — a trailing slash, the classic near-miss.
+        catalogue_with_broken_directory(
+            &conn,
+            "/Volumes/Photos/2024/slashy_row.nef",
+            Some("/Volumes/Photos/2024/"),
+        );
+        // Slash-less: the old backfill's `file_path LIKE '%/%'` guard skipped
+        // this row forever, while ingest would have derived the whole string.
+        catalogue_with_broken_directory(&conn, "bare_name.jpg", None);
+        // A correct row, to prove the repair is not a blanket rewrite.
+        catalogue(&conn, "/Volumes/Photos/2024/already_right.nef");
+
+        // Stage the genuine pre-S173 shape: broken rows AND no marker.
+        drop_directory_index(&conn);
+        assert!(
+            !directory_index_present(&conn),
+            "the fixture is now shaped like a pre-S173 catalogue"
+        );
+        assert_eq!(divergent_row_count(&conn), 4, "four rows need repair");
+
+        // Before the repair the switched predicate sees only the correct row —
+        // this is exactly the silent-no-op the repair exists to prevent.
+        assert_eq!(
+            sorted(file_paths_in_directory_impl(&conn, "/Volumes/Photos/2024").expect("probe")),
+            vec!["/Volumes/Photos/2024/already_right.nef".to_string()],
+            "pre-repair: broken rows are invisible to the stored-column probe"
+        );
+
+        drop(conn);
+        let conn = open_and_migrate_catalogue(&path).expect("reopen runs the migration");
+
+        // BOTH halves, from that ONE open.
+        assert_eq!(
+            divergent_row_count(&conn),
+            0,
+            "no row is left NULL or divergent after the upgrade open"
+        );
+        assert!(
+            directory_index_present(&conn),
+            "the same open that repaired the rows built the index over them"
+        );
+
+        assert_eq!(
+            sorted(file_paths_in_directory_impl(&conn, "/Volumes/Photos/2024").expect("probe")),
+            vec![
+                "/Volumes/Photos/2024/already_right.nef".to_string(),
+                "/Volumes/Photos/2024/moved_row.nef".to_string(),
+                "/Volumes/Photos/2024/null_row.nef".to_string(),
+                "/Volumes/Photos/2024/slashy_row.nef".to_string(),
+            ],
+            "post-repair: every row answers for its real parent directory"
+        );
+
+        // The stale value is gone, not merely shadowed.
+        assert!(
+            file_paths_in_directory_impl(&conn, "/Volumes/OldDrive/2019")
+                .expect("probe")
+                .is_empty(),
+            "the diverged row no longer answers for its stale directory"
+        );
+
+        // And the repair statement is idempotent in its own right: run it again
+        // by hand (bypassing the marker) and it changes nothing.
+        let rerun = conn
+            .execute(&directory_path_backfill_sql(), [])
+            .expect("hand re-run of the repair");
+        assert_eq!(rerun, 0, "the repair is idempotent — a re-run touches 0 rows");
+
+        cleanup(&path);
+    }
+
+    /// ⭐ S173 — THE MARKER. The repair is a ONE-TIME migration, not an
+    /// every-launch sweep: it cost 236 ms per launch on the owner's 580,832-row
+    /// catalogue and scales with catalogue size, so it runs only while
+    /// `idx_images_directory_path` is absent.
+    ///
+    /// Both directions are pinned here, because each is load-bearing:
+    ///
+    /// - MARKER PRESENT → the repair does NOT run. A row hand-diverged after
+    ///   the migration stays diverged across a reopen. (This is the deliberate
+    ///   trade: a write path that forgets the column is a bug to fix at the
+    ///   write site, not something open-time silently papers over. It is also
+    ///   the only way to prove no scan is happening.)
+    /// - MARKER ABSENT → the repair runs again. Dropping the index is exactly
+    ///   the state a FAILED repair leaves behind — the index is created only
+    ///   after the repair succeeds — so this is the self-healing retry, proven
+    ///   rather than asserted.
+    ///
+    /// Mutation proof: un-gate the repair (run it unconditionally) and the
+    /// "still diverged" assertion fails; create the index BEFORE the repair, or
+    /// outside its success arm, and the retry leg can never fire in production.
+    #[test]
+    fn directory_path_repair_runs_once_and_retries_only_when_the_marker_is_absent()
+    {
+        let (path, conn) = fresh_catalogue("marker");
+
+        catalogue(&conn, "/Volumes/Photos/2024/correct.nef");
+        assert!(
+            directory_index_present(&conn),
+            "a fresh catalogue is migrated on its first open: empty table, \
+             repair touches 0 rows, index created"
+        );
+
+        // Hand-diverge a row while the marker stands.
+        catalogue_with_broken_directory(
+            &conn,
+            "/Volumes/Photos/2024/regressed.nef",
+            Some("/Volumes/OldDrive/2019"),
+        );
+        assert_eq!(divergent_row_count(&conn), 1);
+
+        // MARKER PRESENT → no repair. No scan, no UPDATE, zero recurring cost.
+        drop(conn);
+        let conn = open_and_migrate_catalogue(&path).expect("reopen with the marker present");
+        assert_eq!(
+            divergent_row_count(&conn),
+            1,
+            "the migration is ONE-TIME: with the index present the repair does \
+             not run, so the hand-diverged row is still diverged"
+        );
+
+        // MARKER ABSENT → repair. This is what a FAILED repair leaves behind,
+        // and the next launch finishes the job.
+        drop_directory_index(&conn);
+        drop(conn);
+        let conn = open_and_migrate_catalogue(&path).expect("reopen with the marker absent");
+        assert_eq!(
+            divergent_row_count(&conn),
+            0,
+            "a missing index is a missing migration: the next open repairs"
+        );
+        assert!(
+            directory_index_present(&conn),
+            "...and re-creates the marker, so the launch after that is free again"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Leg 2 — PARITY. On paths chosen to break a careless implementation, the
+    /// switched stored-column predicate returns EXACTLY what the protected S5
+    /// expression returns. Same question, cheaper answer.
+    ///
+    /// Mutation proof: make the fixture insert omit `directory_path` and every
+    /// assertion below fails with an empty left-hand side.
+    #[test]
+    fn switched_predicate_matches_the_canonical_derived_expression()
+    {
+        let (path, conn) = fresh_catalogue("parity");
+
+        let seeded = [
+            // Unicode, including a combining-friendly name and a non-Latin dir.
+            "/Volumes/Photos/Ärchiv/Motörhead/ünïcode.nef",
+            "/Volumes/Photos/Ärchiv/Motörhead/写真.jpg",
+            // LIKE wildcards as literal directory and file characters.
+            "/Volumes/Photos/100% keepers/best_shot.jpg",
+            "/Volumes/Photos/100XX keepers/decoy.jpg",
+            "/Volumes/Peg_RAWmain/2024/IMG_0001.nef",
+            "/Volumes/PegXRAWmain/2024/IMG_0002.nef",
+            // Spaces, and a trailing space inside a directory name.
+            "/Volumes/Photos/Wagner Family /reunion 2019.jpg",
+            "/Volumes/Photos/Wagner Family/reunion 2020.jpg",
+            // A parent that is a strict PREFIX of another parent — the case a
+            // prefix test would fold together and equality must not.
+            "/Volumes/Photos/2024/a.nef",
+            "/Volumes/Photos/2024b/b.nef",
+            "/Volumes/Photos/2024/edits/c.tif",
+            // A root-level file: parent derives to the EMPTY string.
+            "/root_level.jpg",
+        ];
+        for p in seeded
+        {
+            catalogue(&conn, p);
+        }
+
+        // Every distinct canonical key in the fixture, read through the
+        // protected expression — including the empty one the root file makes.
+        let key_sql = format!(
+            "SELECT DISTINCT {} FROM images ORDER BY 1",
+            canonical_directory_path_sql("file_path")
+        );
+        let mut stmt = conn.prepare(&key_sql).expect("prepare keys");
+        let keys: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("keys")
+            .map(|r| r.expect("row"))
+            .collect();
+        assert!(
+            keys.contains(&String::new()),
+            "the root-level file contributes the empty key"
+        );
+
+        for key in &keys
+        {
+            let derived = derived_paths_in_directory(&conn, key);
+
+            if key.is_empty()
+            {
+                // The FFI answers the empty request without a query — an
+                // UNCHANGED pre-S173 contract, not a consequence of the switch.
+                // Pin it against the derived oracle's disagreement so the
+                // exception stays deliberate and visible.
+                assert_eq!(
+                    derived,
+                    vec!["/root_level.jpg".to_string()],
+                    "the derived expression does place the root file under ''"
+                );
+                assert!(
+                    file_paths_in_directory_impl(&conn, key).expect("probe").is_empty(),
+                    "an empty directory request is short-circuited, by contract"
+                );
+                continue;
+            }
+
+            assert_eq!(
+                sorted(file_paths_in_directory_impl(&conn, key).expect("probe")),
+                derived,
+                "stored-column and derived-expression answers differ for '{}'",
+                key
+            );
+        }
+
+        // Spot-pin the two that would silently over-match under LIKE or a
+        // prefix test, so a regression names itself rather than hiding in the
+        // loop above.
+        assert_eq!(
+            file_paths_in_directory_impl(&conn, "/Volumes/Peg_RAWmain/2024").expect("probe"),
+            vec!["/Volumes/Peg_RAWmain/2024/IMG_0001.nef".to_string()],
+            "`_` stays a literal character on the stored column too"
+        );
+        assert_eq!(
+            sorted(file_paths_in_directory_impl(&conn, "/Volumes/Photos/2024").expect("probe")),
+            vec!["/Volumes/Photos/2024/a.nef".to_string()],
+            "a parent that PREFIXES another parent keeps its own row set"
+        );
+
+        // And the union still partitions the catalogue, minus the root-level
+        // file the empty-key contract excludes.
+        let mut union: Vec<String> = Vec::new();
+        for key in keys.iter().filter(|k| !k.is_empty())
+        {
+            union.extend(file_paths_in_directory_impl(&conn, key).expect("probe"));
+        }
+        assert_eq!(
+            sorted(union),
+            sorted(
+                seeded
+                    .iter()
+                    .filter(|p| **p != "/root_level.jpg")
+                    .map(|s| s.to_string())
+                    .collect()
+            ),
+            "the per-directory answers still partition the catalogue exactly"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Leg 3 — the index the switch exists for is actually created by the
+    /// production open-and-migrate path, on `images` (it has always existed on
+    /// the dead `videos` table and never on this one). A FRESH catalogue takes
+    /// the same path an upgraded one does: empty table → repair touches 0 rows →
+    /// index created.
+    ///
+    /// Mutation proof: delete the CREATE INDEX from the repair step and this
+    /// fails — the predicate would still be CORRECT, just back to a full scan,
+    /// which is the failure mode a correctness-only test cannot see.
+    #[test]
+    fn directory_path_index_exists_after_open_and_migrate()
+    {
+        let (path, conn) = fresh_catalogue("index");
+
+        let found: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM duckdb_indexes() \
+                 WHERE table_name = 'images' AND index_name = 'idx_images_directory_path'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("duckdb_indexes()");
+        assert_eq!(found, 1, "idx_images_directory_path must exist on images");
+
+        // And it survives a reopen — `CREATE INDEX IF NOT EXISTS` after the
+        // backfill must not fail against a catalogue that already has it.
+        drop(conn);
+        let conn = open_and_migrate_catalogue(&path).expect("reopen");
+        let found_again: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM duckdb_indexes() \
+                 WHERE table_name = 'images' AND index_name = 'idx_images_directory_path'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("duckdb_indexes()");
+        assert_eq!(found_again, 1, "the index survives a reopen, exactly once");
+
+        cleanup(&path);
+    }
+
+    /// Leg 4 — ⭐ S173: `find_counterpart_image` on the stored column.
+    ///
+    /// The Open RAW / Open JPEG menu lookup was the one directory-EXACT site the
+    /// first S173 pass left on the derived expression (18 ms → 1 ms on the
+    /// owner's real 580,832-row catalogue). This pins that the switch is a
+    /// change of MECHANISM only: on a fixture built to break a careless
+    /// implementation, the function's answer is identical to what the pre-S173
+    /// derived-expression form returns for EVERY seeded path, and the
+    /// counterpart is found only in the input's own exact directory.
+    ///
+    /// Mutation proof: relax `directory_path = ?1` to a `LIKE`/prefix test and
+    /// the `/a/b2` and `/a/PegXRAW` assertions fail; make `catalogue_media` omit
+    /// `directory_path` and every lookup returns None.
+    #[test]
+    fn counterpart_lookup_is_directory_exact_on_the_stored_column()
+    {
+        let (path, conn) = fresh_catalogue("counterpart");
+
+        let seeded = [
+            // The RAW+JPEG pair, in the directory that must win.
+            "/a/b/SHOT_01.NEF",
+            "/a/b/SHOT_01.JPG",
+            // A SIBLING directory whose path has the pair's directory as a
+            // strict PREFIX, holding the same stem. A prefix or LIKE test folds
+            // these two directories together; equality must not.
+            "/a/b2/SHOT_01.JPG",
+            "/a/b2/SHOT_01.NEF",
+            // A CHILD directory of the pair's, same stem again — direct
+            // children only, so this is never a counterpart either.
+            "/a/b/edits/SHOT_01.JPG",
+            // `%` and `_` as LITERAL characters in both the directory name and
+            // the stem, each with a decoy that LIKE would over-match: `PegXRAW`
+            // for the directory's `_`, and two same-directory stems for the
+            // stem's `%` and `_`.
+            "/a/Peg_RAW/100%_odd shot.NEF",
+            "/a/Peg_RAW/100%_odd shot.JPG",
+            "/a/PegXRAW/100%_odd shot.NEF",
+            "/a/PegXRAW/100%_odd shot.JPG",
+            "/a/Peg_RAW/100ZZZ_odd shot.JPG",
+            "/a/Peg_RAW/100%Xodd shot.JPG",
+        ];
+        for p in seeded
+        {
+            catalogue_media(&conn, p);
+        }
+
+        let counterpart = |input: &str| -> Option<String> {
+            find_counterpart_image_impl(&conn, input).map(|r| r.file_path)
+        };
+
+        // The pair resolves both ways, inside its own directory.
+        assert_eq!(
+            counterpart("/a/b/SHOT_01.NEF"),
+            Some("/a/b/SHOT_01.JPG".to_string()),
+            "RAW finds the JPEG that sits beside it"
+        );
+        assert_eq!(
+            counterpart("/a/b/SHOT_01.JPG"),
+            Some("/a/b/SHOT_01.NEF".to_string()),
+            "JPEG finds the RAW that sits beside it"
+        );
+
+        // The prefix sibling keeps its OWN pair — it never reaches into `/a/b`,
+        // and `/a/b` never reaches into it.
+        assert_eq!(
+            counterpart("/a/b2/SHOT_01.JPG"),
+            Some("/a/b2/SHOT_01.NEF".to_string()),
+            "a directory that PREFIX-extends another keeps its own counterpart"
+        );
+
+        // A same-stem file in the child directory has no counterpart of its own:
+        // the parent's RAW is one directory up, which equality excludes.
+        assert_eq!(
+            counterpart("/a/b/edits/SHOT_01.JPG"),
+            None,
+            "a child directory does not inherit the parent's counterpart"
+        );
+
+        // `_` in the directory name stays literal: `/a/Peg_RAW` and `/a/PegXRAW`
+        // are separate key spaces, each answering only for itself.
+        assert_eq!(
+            counterpart("/a/Peg_RAW/100%_odd shot.NEF"),
+            Some("/a/Peg_RAW/100%_odd shot.JPG".to_string()),
+            "`_` stays a literal character in the directory name"
+        );
+        assert_eq!(
+            counterpart("/a/PegXRAW/100%_odd shot.NEF"),
+            Some("/a/PegXRAW/100%_odd shot.JPG".to_string()),
+            "the `X` decoy directory answers only for its own rows"
+        );
+
+        // And the stem decoys — which share the directory and would match the
+        // real stem under LIKE — are not returned in its place. (Proven by the
+        // two assertions above naming the exact JPEG; these paths have no
+        // counterpart of their own, since no RAW carries their stem.)
+        assert_eq!(
+            counterpart("/a/Peg_RAW/100ZZZ_odd shot.JPG"),
+            None,
+            "`%` in the stem does not match an arbitrary run of characters"
+        );
+        assert_eq!(
+            counterpart("/a/Peg_RAW/100%Xodd shot.JPG"),
+            None,
+            "`_` in the stem does not match an arbitrary single character"
+        );
+
+        // PARITY — the switched query answers exactly as the pre-S173 derived
+        // expression does, for every seeded path. This is the before/after proof
+        // the per-path assertions above only sample.
+        for p in seeded
+        {
+            assert_eq!(
+                counterpart(p),
+                counterpart_via_derived_expression(&conn, p),
+                "stored-column and derived-expression counterpart differ for '{}'",
+                p
+            );
+        }
+
+        cleanup(&path);
+    }
+
+    /// Leg 5 — ⭐ S173: the counterpart query really does read the STORED
+    /// column. A MECHANISM probe, built deliberately on a row shape production
+    /// cannot hold: `file_path` says `/a/c` while the stored `directory_path`
+    /// says `/a/b`. The migration repairs exactly that divergence when it runs
+    /// (Leg 1), so the only way this shape can exist is to hand-write it —
+    /// which is what makes it a clean discriminator between the two
+    /// implementations rather than a hazard.
+    ///
+    /// This is the mutation proof Leg 4 cannot be: Leg 4 asserts the two forms
+    /// AGREE, so it passes under either one. Restore
+    /// `SUBSTRING(file_path, 1, LENGTH(file_path) - INSTR(REVERSE(file_path),
+    /// '/')) = ?1` in `find_counterpart_image_impl` and only THIS test fails.
+    #[test]
+    fn counterpart_lookup_reads_the_stored_column_not_the_derived_expression()
+    {
+        let (path, conn) = fresh_catalogue("counterpart-mechanism");
+
+        // file_path's real parent is /a/c; the stored column claims /a/b.
+        conn.execute(
+            "INSERT INTO images (file_path, file_size, file_name, file_extension, \
+             directory_path, created_timestamp, modified_timestamp) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "/a/c/DIVERGE_01.NEF",
+                1234_i64,
+                "DIVERGE_01.NEF",
+                "nef",
+                "/a/b",
+                1_700_000_000_i64,
+                1_700_000_001_i64
+            ],
+        )
+        .expect("diverged fixture row");
+
+        // The two implementations disagree here, and only here. The switched
+        // query answers from the stored column...
+        assert_eq!(
+            find_counterpart_image_impl(&conn, "/a/b/DIVERGE_01.JPG").map(|r| r.file_path),
+            Some("/a/c/DIVERGE_01.NEF".to_string()),
+            "the counterpart query pivots on the stored directory_path column"
+        );
+        // ...while the pre-S173 derived expression cannot see the row at all.
+        assert_eq!(
+            counterpart_via_derived_expression(&conn, "/a/b/DIVERGE_01.JPG"),
+            None,
+            "the derived expression places this row under /a/c, so it disagrees"
+        );
+
+        // And the divergence is not a standing hazard: drop the migration marker
+        // (⭐ S173 — `fresh_catalogue` already migrated this fixture, so without
+        // this the reopen correctly does nothing) and reopening runs the repair,
+        // after which both forms agree again.
+        drop_directory_index(&conn);
+        drop(conn);
+        let conn = open_and_migrate_catalogue(&path).expect("reopen runs the repair");
+        assert_eq!(
+            find_counterpart_image_impl(&conn, "/a/b/DIVERGE_01.JPG").map(|r| r.file_path),
+            None,
+            "the repaired row no longer answers for its stale directory"
+        );
+        assert_eq!(
+            find_counterpart_image_impl(&conn, "/a/c/DIVERGE_01.JPG").map(|r| r.file_path),
+            Some("/a/c/DIVERGE_01.NEF".to_string()),
+            "the repaired row answers for its real directory"
+        );
+
+        cleanup(&path);
+    }
+
+    /// Leg 6 — ⭐ S173 (M4): `image_records_in_directory` reads the STORED
+    /// column too. The same MECHANISM probe as Leg 5, aimed at the third
+    /// directory-exact site — the one whose predicate is a quoted literal
+    /// rather than a bound parameter, and which therefore could most easily
+    /// have been left behind on the derived expression.
+    ///
+    /// Mutation proof: put `SUBSTRING(file_path, 1, LENGTH(file_path) -
+    /// INSTR(REVERSE(file_path), '/')) = '…'` back into
+    /// `directory_exact_literal_predicate` and the first two assertions swap.
+    #[test]
+    fn directory_records_query_reads_the_stored_column_not_the_derived_expression()
+    {
+        let (path, conn) = fresh_catalogue("records-mechanism");
+
+        // file_path's real parent is /a/c; the stored column claims /a/b.
+        catalogue_with_broken_directory(&conn, "/a/c/DIVERGE_01.NEF", Some("/a/b"));
+        // ...and an ordinary, correct row in that same real directory.
+        catalogue(&conn, "/a/c/CORRECT_01.NEF");
+
+        let paths = |dir: &str| -> Vec<String> {
+            sorted(
+                image_records_in_directory_impl(&conn, dir, MediaType::Both)
+                    .into_iter()
+                    .map(|r| r.file_path)
+                    .collect(),
+            )
+        };
+
+        // The diverged row answers for what the STORED column says...
+        assert_eq!(
+            paths("/a/b"),
+            vec!["/a/c/DIVERGE_01.NEF".to_string()],
+            "the records query pivots on the stored directory_path column"
+        );
+        // ...and NOT for the directory its file_path derives to. A correct row
+        // in that same directory still answers, so this is a discriminator and
+        // not simply an empty catalogue.
+        assert_eq!(
+            paths("/a/c"),
+            vec!["/a/c/CORRECT_01.NEF".to_string()],
+            "the hand-diverged row is not found under its derived parent; the \
+             correct row beside it is"
+        );
+
+        // The empty request is answered without a query, as the FFI contracts.
+        assert!(
+            image_records_in_directory_impl(&conn, "", MediaType::Both).is_empty(),
+            "an empty directory request is short-circuited, by contract"
+        );
+
+        cleanup(&path);
+    }
+
+    /// ⭐ S173 (M4) — the records site's literal predicate is BUILT FROM
+    /// `DIRECTORY_EXACT_PREDICATE`, not hand-spelled beside it.
+    ///
+    /// `execute_image_record_projection_query` binds no parameters, so this site
+    /// cannot take the bound form; substituting into the shared constant is what
+    /// keeps the column name and the comparison operator to ONE spelling.
+    ///
+    /// Mutation proof: re-inline `format!("directory_path = '{}'", …)` and the
+    /// first assertion still passes today but the second fails the moment the
+    /// constant changes — which is the drift this pins.
+    #[test]
+    fn directory_exact_records_predicate_is_built_from_the_shared_constant()
+    {
+        assert_eq!(
+            directory_exact_literal_predicate("/Volumes/Photos/2024"),
+            "directory_path = '/Volumes/Photos/2024'",
+            "the literal form reads as expected"
+        );
+        assert_eq!(
+            directory_exact_literal_predicate("/Volumes/Photos/2024"),
+            DIRECTORY_EXACT_PREDICATE.replace('?', "'/Volumes/Photos/2024'"),
+            "it is the SHARED constant with its bound `?` substituted — change \
+             the constant and this site moves with it"
+        );
+        // The `'` → `''` escape, and no wildcard vocabulary introduced.
+        assert_eq!(
+            directory_exact_literal_predicate("/Volumes/Rick's Photos/100% keepers"),
+            "directory_path = '/Volumes/Rick''s Photos/100% keepers'",
+            "single quotes are doubled; `%` and `_` stay literal under `=`"
+        );
+    }
+
+    /// ⭐ S173 (L2) — THE HAND-COPIES HAVE NOT DRIFTED.
+    ///
+    /// Only `build_ingest_insert_sql` and `directory_path_backfill_sql` are
+    /// built from `CANONICAL_DIRECTORY_PATH_EXPR`. Every other site that writes
+    /// or tests `directory_path` spells the protected S5 expression out by hand
+    /// — byte-identical today, textually independent forever. This test is the
+    /// ONLY thing standing between a well-meaning edit to one of them and a
+    /// silently split key space: a row written through the drifted site would
+    /// land under a directory no reader ever asks about.
+    ///
+    /// Mutation proof: change one character of the arithmetic in ANY of the
+    /// statements below and this fails, naming the site.
+    #[test]
+    fn canonical_directory_path_expression_has_not_drifted()
+    {
+        let contains = |site: &str, sql: &str, path_expr: &str| {
+            let needle = sql_without_whitespace(&canonical_directory_path_sql(path_expr));
+            assert!(
+                sql_without_whitespace(sql).contains(&needle),
+                "{} no longer contains the canonical directory_path expression \
+                 over `{}` — it has DRIFTED from CANONICAL_DIRECTORY_PATH_EXPR.\n\
+                 expected to find: {}\n\
+                 in: {}",
+                site,
+                path_expr,
+                needle,
+                sql
+            );
+        };
+
+        // The two DERIVED sites — anchors. If these ever fail, the constant
+        // itself or its substitution helper is broken, not a copy.
+        contains(
+            "build_ingest_insert_sql(1)",
+            &build_ingest_insert_sql(1),
+            "?1",
+        );
+        contains(
+            "directory_path_backfill_sql()",
+            &directory_path_backfill_sql(),
+            "file_path",
+        );
+
+        // The HAND-COPIES.
+        contains(
+            "EDITOR_SAVED_IMAGE_UPDATE_FACTS_SQL",
+            EDITOR_SAVED_IMAGE_UPDATE_FACTS_SQL,
+            "file_path",
+        );
+        contains("MERGE_RECORDS_INSERT_SQL", MERGE_RECORDS_INSERT_SQL, "?1");
+        contains(
+            "RELOCATE_PREFIX_UPDATE_SQL",
+            RELOCATE_PREFIX_UPDATE_SQL,
+            "?1 || SUBSTR(file_path, LENGTH(?2) + 1)",
+        );
+
+        // `build_destination_family_predicate` inlines the expression over an
+        // escaped literal path, so it is asserted on its OUTPUT.
+        let sample = "/Volumes/Photos/2026/01_january/15/RSW_0001.NEF";
+        contains(
+            "build_destination_family_predicate",
+            &build_destination_family_predicate(sample, "RSW_0001.NEF"),
+            &format!("'{}'", sample),
+        );
     }
 }
