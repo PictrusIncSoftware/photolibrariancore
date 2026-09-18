@@ -1102,6 +1102,10 @@ pub struct FocusAnalysisResult {
 /// the full helper/statement context and the underlying DuckDB error for the
 /// analysis job and Operation Log flight recorders. A failed transaction
 /// always reports `updated == 0`, even if statements ran before rollback.
+///
+/// `warnings` (S179) rides BOTH the success and the failure path: it carries
+/// the non-fatal anomalies the chunk survived, which the run would otherwise
+/// have no way to record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FocusAnalysisWritebackResult
 {
@@ -1110,6 +1114,36 @@ pub struct FocusAnalysisWritebackResult
     pub failed_reason: Option<String>,
     pub source_image_id: Option<i64>,
     pub target_image_id: Option<i64>,
+    pub warnings: Vec<FocusAnalysisWritebackWarning>,
+}
+
+/// One non-fatal anomaly recorded while a focus-analysis writeback chunk ran.
+///
+/// `reason_code` is a stable machine-readable token Swift copies VERBATIM into
+/// the Operation Log (it must not be routed through the failure-stage code
+/// mapping, which would degrade it to `focus_writeback_failed`):
+///
+/// - `focus_writeback_count_anomaly` — the engine reported a change count
+///   other than 1 for a primary-key UPDATE, but the table itself confirmed
+///   that exactly one physical row carries the new attempt id, so the write
+///   was accepted. This is the DuckDB 1.5.5 artefact S179 exists to survive.
+/// - `focus_writeback_chunk_retried` — the chunk's first transaction could not
+///   be verified, rolled back cleanly, and was replayed once. The ids/counts
+///   are the tripping target's and `detail` carries the first failure's full
+///   text, diagnostic included.
+///
+/// `matching_rows` / `distinct_rowids` are `-1` when the verification SELECT
+/// itself failed (that case can never be accepted — it takes the failure arm).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FocusAnalysisWritebackWarning
+{
+    pub reason_code: String,
+    pub source_image_id: i64,
+    pub target_image_id: i64,
+    pub row_count: i64,
+    pub matching_rows: i64,
+    pub distinct_rowids: i64,
+    pub detail: String,
 }
 
 /// One detected human face from the Vision enrichment pass.
@@ -2110,20 +2144,56 @@ fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
         CREATE INDEX IF NOT EXISTS idx_rating ON images(rating);
         CREATE INDEX IF NOT EXISTS idx_flag ON images(flag);
         CREATE INDEX IF NOT EXISTS idx_color_label ON images(color_label);
-        CREATE INDEX IF NOT EXISTS idx_focus_score ON images(focus_score);
-        CREATE INDEX IF NOT EXISTS idx_focus_human_score ON images(focus_human_score);
-        CREATE INDEX IF NOT EXISTS idx_focus_animal_score ON images(focus_animal_score);
-        CREATE INDEX IF NOT EXISTS idx_focus_foreground_score ON images(focus_foreground_score);
-        CREATE INDEX IF NOT EXISTS idx_focus_saliency_score ON images(focus_saliency_score);
-        CREATE INDEX IF NOT EXISTS idx_focus_animal_pose_score ON images(focus_animal_pose_score);
-        CREATE INDEX IF NOT EXISTS idx_focus_whole_image_score ON images(focus_whole_image_score);
-        CREATE INDEX IF NOT EXISTS idx_focus_analysis_status ON images(focus_analysis_status);
-        CREATE INDEX IF NOT EXISTS idx_face_count ON images(face_count);
-        CREATE INDEX IF NOT EXISTS idx_face_quality_best ON images(face_quality_best);
-        CREATE INDEX IF NOT EXISTS idx_face_quality_average ON images(face_quality_average);
-        CREATE INDEX IF NOT EXISTS idx_face_quality_min ON images(face_quality_min);
-        CREATE INDEX IF NOT EXISTS idx_face_eyes_open_count ON images(face_eyes_open_count);
-        CREATE INDEX IF NOT EXISTS idx_face_blink_risk_count ON images(face_blink_risk_count);
+
+        -- deprecated — targeted for deletion
+        --
+        -- ⭐ S179 — the FOURTEEN secondary ART indexes on the focus/face
+        -- columns are RETIRED, and are actively dropped by the autocommit step
+        -- in Rust below (search `FOCUS_WRITEBACK_RETIRED_INDEXES`). They must
+        -- stay out of this batch or every open would recreate them ahead of
+        -- that drop.
+        --
+        -- CREATE INDEX IF NOT EXISTS idx_focus_score ON images(focus_score);
+        -- CREATE INDEX IF NOT EXISTS idx_focus_human_score ON images(focus_human_score);
+        -- CREATE INDEX IF NOT EXISTS idx_focus_animal_score ON images(focus_animal_score);
+        -- CREATE INDEX IF NOT EXISTS idx_focus_foreground_score ON images(focus_foreground_score);
+        -- CREATE INDEX IF NOT EXISTS idx_focus_saliency_score ON images(focus_saliency_score);
+        -- CREATE INDEX IF NOT EXISTS idx_focus_animal_pose_score ON images(focus_animal_pose_score);
+        -- CREATE INDEX IF NOT EXISTS idx_focus_whole_image_score ON images(focus_whole_image_score);
+        -- CREATE INDEX IF NOT EXISTS idx_focus_analysis_status ON images(focus_analysis_status);
+        -- CREATE INDEX IF NOT EXISTS idx_face_count ON images(face_count);
+        -- CREATE INDEX IF NOT EXISTS idx_face_quality_best ON images(face_quality_best);
+        -- CREATE INDEX IF NOT EXISTS idx_face_quality_average ON images(face_quality_average);
+        -- CREATE INDEX IF NOT EXISTS idx_face_quality_min ON images(face_quality_min);
+        -- CREATE INDEX IF NOT EXISTS idx_face_eyes_open_count ON images(face_eyes_open_count);
+        -- CREATE INDEX IF NOT EXISTS idx_face_blink_risk_count ON images(face_blink_risk_count);
+        --
+        -- WHY. Two independent reasons, and the second alone would be enough.
+        --
+        -- 1. They COST correctness. DuckDB executes an UPDATE as DELETE +
+        --    INSERT whenever any updated column carries an index; that is the
+        --    branch whose reported change count is the scan size rather than
+        --    the number of rows modified (the count is taken before the
+        --    operator deduplicates row ids), and it is the branch carrying the
+        --    unreleased 1.5.x index-flush defect. Every focus-analysis
+        --    writeback wrote 14 indexed columns, so every writeback took it —
+        --    which is what three whole-catalogue runs died on. Without them the
+        --    writeback UPDATE, and the editor-save focus invalidation that
+        --    writes the same columns, run as in-place updates.
+        --
+        -- 2. They BUY nothing. DuckDB uses an ART only for a single predicate
+        --    expected to match fewer than 2,048 rows, and no focus/face
+        --    predicate in this app can produce one: focus_analysis_status has
+        --    two distinct values over 541k rows (floor 182,969 matches); every
+        --    Focus/Face Quality predicate is `col IS NOT NULL AND col >=
+        --    (SELECT quantile_cont(...))` — two filters plus a whole-column
+        --    aggregate no ART can serve, with a tightest bucket of ~6,055 rows;
+        --    `face_count > 3` matches 3,384. The hand-typed face thresholds
+        --    measure 4 ms warm with no index at all.
+        --
+        -- The eight indexes kept above serve equality/range filters that CAN
+        -- be selective (a camera model, a capture day, a rating) and none of
+        -- them is written by the focus-analysis writeback.
 
         -- ⭐ S173 — idx_images_directory_path is deliberately NOT here. It is
         -- created by the index-gated repair step in Rust below (search
@@ -2723,6 +2793,35 @@ fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
                  absent so the next launch retries",
                 e
             ),
+        }
+    }
+
+    // ⭐ S179 — drop the retired focus/face secondary indexes.
+    //
+    // The rationale is on the block comment in the schema batch above (where
+    // their CREATE statements are retired): an indexed column turns every
+    // focus-analysis writeback UPDATE into a DELETE + INSERT, which is the
+    // branch with the unreliable change count and the 1.5.x index-flush
+    // defect, and no focus/face predicate this app issues can use an ART
+    // anyway.
+    //
+    // Placement matches the S173 step above and for the same two reasons: it
+    // sits in the AUTOCOMMIT window before the migration `BEGIN TRANSACTION`,
+    // and each statement is its own `conn.execute` with log-and-continue —
+    // inside `execute_batch` one failing DROP would abort the batch and make
+    // the whole catalogue open return None.
+    //
+    // No marker gates this: `IF EXISTS` is self-idempotent, so a fresh
+    // catalogue pays 14 no-op statements and an upgraded one pays them once
+    // for real. Deliberately NOT gated on the S173 marker, whose meaning is
+    // "directory_path has been repaired" and nothing else.
+    for index_name in FOCUS_WRITEBACK_RETIRED_INDEXES {
+        if let Err(e) = conn.execute(&format!("DROP INDEX IF EXISTS {}", index_name), []) {
+            eprintln!(
+                "[migration] Failed to drop retired index {} ({}); the writeback will \
+                 still run, but through the delete+insert path S179 retired",
+                index_name, e
+            );
         }
     }
 
@@ -9983,6 +10082,81 @@ const FOCUS_WRITEBACK_STAGE_BEGIN: &str = "begin";
 const FOCUS_WRITEBACK_STAGE_APPLY: &str = "apply";
 const FOCUS_WRITEBACK_STAGE_COMMIT: &str = "commit";
 
+/// The fourteen secondary ART indexes S179 retired, dropped at every catalogue
+/// open. They sat on the very columns `update_focus_analysis_target` writes,
+/// which forced every writeback UPDATE down DuckDB's DELETE + INSERT branch —
+/// the branch whose reported change count is the scan size rather than the
+/// number of rows modified. The full rationale (including why no focus/face
+/// predicate could use them) is on the retired CREATE block in
+/// `open_and_migrate_catalogue`'s schema batch.
+///
+/// ⚠️ Adding an index on ANY column that statement writes re-arms the defect.
+/// `focus_writeback_update_columns_carry_no_index` fails if one appears.
+const FOCUS_WRITEBACK_RETIRED_INDEXES: [&str; 14] = [
+    "idx_focus_score",
+    "idx_focus_human_score",
+    "idx_focus_animal_score",
+    "idx_focus_foreground_score",
+    "idx_focus_saliency_score",
+    "idx_focus_animal_pose_score",
+    "idx_focus_whole_image_score",
+    "idx_focus_analysis_status",
+    "idx_face_count",
+    "idx_face_quality_best",
+    "idx_face_quality_average",
+    "idx_face_quality_min",
+    "idx_face_eyes_open_count",
+    "idx_face_blink_risk_count",
+];
+
+/// Every `images` column `update_focus_analysis_target`'s UPDATE assigns (the
+/// 18-column SET list; `focus_scored_at` takes CURRENT_TIMESTAMP rather than a
+/// bound parameter but is written just the same). An index on ANY of these
+/// puts the statement back on the delete+insert path.
+///
+/// Read only by `focus_writeback_update_columns_carry_no_index` and by
+/// `setup_indexed()`, which is the whole point of it: it is a guard list, not
+/// production data.
+#[cfg(test)]
+const FOCUS_WRITEBACK_UPDATED_COLUMNS: [&str; 18] = [
+    "focus_score",
+    "focus_basis",
+    "focus_human_score",
+    "focus_animal_score",
+    "focus_foreground_score",
+    "focus_saliency_score",
+    "focus_animal_pose_score",
+    "focus_whole_image_score",
+    "focus_algorithm_version",
+    "focus_analysis_status",
+    "focus_analysis_attempt_id",
+    "focus_scored_at",
+    "face_count",
+    "face_quality_best",
+    "face_quality_average",
+    "face_quality_min",
+    "face_eyes_open_count",
+    "face_blink_risk_count",
+];
+
+/// S179 warning reason codes. Swift copies these into the Operation Log
+/// verbatim — they are a stable vocabulary, not display text.
+const FOCUS_WRITEBACK_WARNING_COUNT_ANOMALY: &str = "focus_writeback_count_anomaly";
+const FOCUS_WRITEBACK_WARNING_CHUNK_RETRIED: &str = "focus_writeback_chunk_retried";
+
+/// What the apply-stage verification saw when the engine's change count was
+/// not 1 AND the table could not confirm the write. Its presence on a failure
+/// is what marks that failure as the one class the chunk retries once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FocusWritebackInvariantFacts
+{
+    source_image_id: i64,
+    target_image_id: i64,
+    row_count: i64,
+    matching_rows: i64,
+    distinct_rowids: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FocusAnalysisWritebackFailure
 {
@@ -9990,6 +10164,10 @@ struct FocusAnalysisWritebackFailure
     reason: String,
     source_image_id: Option<i64>,
     target_image_id: Option<i64>,
+    /// `Some` ONLY for the S179 unverified-row-count failure. Every other
+    /// failure (a real DuckDB error, a keyword/face statement failure, a
+    /// BEGIN/COMMIT failure) leaves this `None` and is never retried.
+    invariant_facts: Option<FocusWritebackInvariantFacts>,
 }
 
 impl FocusAnalysisWritebackFailure
@@ -10006,10 +10184,25 @@ impl FocusAnalysisWritebackFailure
             reason,
             source_image_id,
             target_image_id,
+            invariant_facts: None,
         }
     }
 
+    fn with_invariant_facts(mut self, facts: FocusWritebackInvariantFacts) -> Self
+    {
+        self.invariant_facts = Some(facts);
+        self
+    }
+
     fn into_result(self) -> FocusAnalysisWritebackResult
+    {
+        self.into_result_with_warnings(Vec::new())
+    }
+
+    fn into_result_with_warnings(
+        self,
+        warnings: Vec<FocusAnalysisWritebackWarning>,
+    ) -> FocusAnalysisWritebackResult
     {
         FocusAnalysisWritebackResult {
             updated: 0,
@@ -10017,11 +10210,20 @@ impl FocusAnalysisWritebackFailure
             failed_reason: Some(self.reason),
             source_image_id: self.source_image_id,
             target_image_id: self.target_image_id,
+            warnings,
         }
     }
 }
 
 fn successful_focus_analysis_writeback(updated: u64) -> FocusAnalysisWritebackResult
+{
+    successful_focus_analysis_writeback_with_warnings(updated, Vec::new())
+}
+
+fn successful_focus_analysis_writeback_with_warnings(
+    updated: u64,
+    warnings: Vec<FocusAnalysisWritebackWarning>,
+) -> FocusAnalysisWritebackResult
 {
     FocusAnalysisWritebackResult {
         updated,
@@ -10029,21 +10231,27 @@ fn successful_focus_analysis_writeback(updated: u64) -> FocusAnalysisWritebackRe
         failed_reason: None,
         source_image_id: None,
         target_image_id: None,
+        warnings,
     }
 }
 
+/// Roll the chunk's transaction back and report whether that ROLLBACK
+/// succeeded. The bool is load-bearing for S179's single retry: a failed
+/// ROLLBACK leaves the shared connection's transaction state unknown, and a
+/// replay on an unknown connection is not a recovery.
 fn rollback_focus_analysis_failure(
     conn: &Connection,
     mut failure: FocusAnalysisWritebackFailure,
-) -> FocusAnalysisWritebackFailure
+) -> (FocusAnalysisWritebackFailure, bool)
 {
     if let Err(rollback_error) = conn.execute_batch("ROLLBACK;") {
         failure.reason = format!(
             "{}; update_focus_analysis_results: ROLLBACK failed: {}",
             failure.reason, rollback_error
         );
+        return (failure, false);
     }
-    failure
+    (failure, true)
 }
 
 fn focus_analysis_writeback_target_ids(
@@ -10097,8 +10305,10 @@ fn focus_analysis_writeback_target_ids(
             )
         })?;
 
-    // Keep this defensive de-dup even though `id` is unique. DuckDB 1.2.2 can
-    // expose multiple transactional versions of a row to a scan; writeback
+    // Keep this defensive de-dup even though `id` is unique. The bundled
+    // DuckDB 1.5.5 has re-opened the double-version class S127 believed
+    // retired: three whole-catalogue runs saw the engine report TWO rows for a
+    // primary-key UPDATE on a table with zero duplicate ids (S179). Writeback
     // plans are normally computed before BEGIN, but the helper's contract is
     // stronger and never returns the same target twice.
     let mut ids = Vec::new();
@@ -10304,10 +10514,466 @@ fn replace_face_observations_for_targets(
     Ok(())
 }
 
+/// Disable ART index scans for the life of this guard, and restore the engine
+/// defaults on EVERY exit path — including an early `return` or a `?`.
+///
+/// This exists because the verification must not be performed with the same
+/// mechanism it is checking. In bundled DuckDB 1.5.5 the index-scan path emits
+/// matching rows from persistent storage and from transaction-local storage in
+/// two phases, and a delete+insert temporarily retains duplicate row ids in the
+/// ART until commit (`table_scan.cpp`, `physical_update.cpp`) — precisely how a
+/// primary-key UPDATE comes to report 2. A `WHERE id = ?` verification that
+/// went through the ART would inherit that behaviour and confirm nothing.
+///
+/// `SET`/`RESET` are both accepted inside an open transaction on this engine,
+/// and a `SET` does not disturb the transaction's uncommitted work (both
+/// verified against the bundled crate).
+///
+/// ⚠️ COST, stated honestly: the three verification statements each become a
+/// full sequential scan of `images` — measured at ≈ 0.255 s cold (0.001 s warm)
+/// per scan on the live 541,082-row / 2.6 GB catalogue, with the global
+/// `CATALOGUE` mutex held. That is acceptable ONLY because this path runs on
+/// the rare `row_count != 1` branch, which the index retirement should stop
+/// from firing at all. If it ever fires on every target of a chunk, the bill is
+/// ~42 scans for that chunk.
+///
+/// ⚠️ SCOPE: an unqualified `SET` on these two writes the GLOBAL default (both
+/// carry `SettingScopeTarget::GLOBAL_DEFAULT`), so a leaked `index_scan_max_count
+/// = 0` would disable ART index scans for every query the process issues until
+/// it quits. That is why the two SETs are applied SEPARATELY and why `Drop`
+/// always attempts both RESETs regardless of what landed.
+struct FocusWritebackIndexScansDisabled<'a>
+{
+    conn: &'a Connection,
+    /// True only when BOTH settings landed. False means the verification ran
+    /// against engine defaults, and it says so rather than silently pretending.
+    active: bool,
+}
+
+impl<'a> FocusWritebackIndexScansDisabled<'a>
+{
+    fn new(conn: &'a Connection) -> Self
+    {
+        // MAX(index_scan_max_count, index_scan_percentage * row_count) is the
+        // engine's own threshold expression, so zeroing both disables the path.
+        //
+        // Applied as two SEPARATE statements, deliberately: `execute_batch`
+        // runs them one at a time and returns on the first error, so a failure
+        // on the second would silently leave the first applied — globally.
+        let mut active = true;
+        for statement in [
+            "SET index_scan_max_count = 0;",
+            "SET index_scan_percentage = 0;",
+        ] {
+            if let Err(e) = conn.execute_batch(statement) {
+                active = false;
+                eprintln!(
+                    "update_focus_analysis_results: could not disable index scans for the \
+                     writeback verification ({}: {}); verifying with engine defaults",
+                    statement, e
+                );
+            }
+        }
+        Self { conn, active }
+    }
+
+    /// Test-only: a guard that never applied its settings, so the fail-closed
+    /// path can be exercised. There is no input through which a caller can make
+    /// a valid `SET` fail, so this seam is the only way to reach that branch.
+    /// `Drop` still attempts both RESETs, which is harmless — they are
+    /// idempotent when the matching `SET` never landed.
+    #[cfg(test)]
+    fn inactive_for_test(conn: &'a Connection) -> Self
+    {
+        Self {
+            conn,
+            active: false,
+        }
+    }
+}
+
+/// Build the verification's index-scan guard. Production always takes the real
+/// one; a test probe may ask for the inactive one to exercise fail-closed.
+#[cfg(test)]
+fn focus_writeback_index_scan_guard<'a>(
+    conn: &'a Connection,
+    probe: FocusApplyProbeRef<'_>,
+) -> FocusWritebackIndexScansDisabled<'a>
+{
+    if probe.map_or(false, |probe| probe.force_index_scan_settings_failure) {
+        return FocusWritebackIndexScansDisabled::inactive_for_test(conn);
+    }
+    FocusWritebackIndexScansDisabled::new(conn)
+}
+
+#[cfg(not(test))]
+fn focus_writeback_index_scan_guard<'a>(
+    conn: &'a Connection,
+    _probe: FocusApplyProbeRef<'_>,
+) -> FocusWritebackIndexScansDisabled<'a>
+{
+    FocusWritebackIndexScansDisabled::new(conn)
+}
+
+impl<'a> Drop for FocusWritebackIndexScansDisabled<'a>
+{
+    fn drop(&mut self)
+    {
+        // Unconditional and independent: `RESET` is idempotent and harmless
+        // when the matching `SET` never landed, and one of the two failing must
+        // not stop the other. A partially-applied pair that never got reset
+        // would degrade every later query in the process.
+        for statement in [
+            "RESET index_scan_max_count;",
+            "RESET index_scan_percentage;",
+        ] {
+            if let Err(e) = self.conn.execute_batch(statement) {
+                eprintln!(
+                    "update_focus_analysis_results: could not restore the index-scan settings \
+                     after the writeback verification ({}: {})",
+                    statement, e
+                );
+            }
+        }
+    }
+}
+
+/// What the apply-stage verification found. Two INDEPENDENT questions, each
+/// with its own job, both answered with index scans disabled:
+///
+/// - V1 asks about the TARGET row: is there exactly one live row for this id,
+///   does it carry the new attempt id, and does it sit on one physical rowid?
+///   Duplicate physical rows for one id are V1's territory and no one else's.
+/// - V2 asks about the TRANSACTION: which ids has this transaction stamped with
+///   this attempt id? `CURRENT_TIMESTAMP` is the transaction's START time in
+///   DuckDB, so every `update_focus_analysis_target` call in one transaction
+///   wrote the identical `focus_scored_at` and the set is exactly recoverable.
+///   V1 cannot see the dangerous case — the engine stamping some OTHER row —
+///   and V2 is the check that can.
+struct FocusWritebackVerification
+{
+    rows_for_id: i64,
+    matching_rows: i64,
+    distinct_rowids: i64,
+    stamped_ids: Vec<i64>,
+    expected_ids: Vec<i64>,
+    diagnostic: String,
+    /// Non-empty when a check could not be run at all. A verification that did
+    /// not happen can never accept a write.
+    note: String,
+}
+
+impl FocusWritebackVerification
+{
+    fn confirms_single_write(&self) -> bool
+    {
+        self.note.is_empty()
+            && self.rows_for_id == 1
+            && self.matching_rows == 1
+            && self.distinct_rowids == 1
+            && self.stamped_ids == self.expected_ids
+    }
+
+    fn describe(&self) -> String
+    {
+        format!(
+            "rows_for_id={} matching_rows={} distinct_rowids={}; this transaction stamped ids {:?}, expected {:?}{}; rows: {}",
+            self.rows_for_id,
+            self.matching_rows,
+            self.distinct_rowids,
+            self.stamped_ids,
+            self.expected_ids,
+            self.note,
+            self.diagnostic
+        )
+    }
+}
+
+/// Ask the TABLE, not the statement, whether the write landed.
+///
+/// `expected_ids` must be every target this transaction has already written
+/// through `update_focus_analysis_target` under `attempt_id`, plus the one
+/// being verified, sorted. Nothing else in the transaction writes
+/// `images.focus_analysis_attempt_id` (the other statements touch
+/// `face_observation` and `keyword`), so the set is exact.
+fn focus_writeback_verification(
+    conn: &Connection,
+    target_id: i64,
+    attempt_id: &str,
+    expected_ids: Vec<i64>,
+    probe: FocusApplyProbeRef<'_>,
+) -> FocusWritebackVerification
+{
+    let index_scans = focus_writeback_index_scan_guard(conn, probe);
+
+    let diagnostic = focus_writeback_target_diagnostic(conn, target_id);
+    let mut note = String::new();
+    if !index_scans.active {
+        // The check could not be performed the way it was designed — it may
+        // have gone through the very mechanism it is meant to step around. A
+        // non-empty note makes `confirms_single_write` false, so this fails
+        // CLOSED: the chunk is retried and, if it trips again, reported.
+        note = "; the index-scan settings could not be applied, so this verification may have run through the ART".to_string();
+    }
+
+    // V1 — the target row itself.
+    let (rows_for_id, matching_rows, distinct_rowids) = match conn.query_row(
+        "SELECT COUNT(*),
+                COUNT(*) FILTER (WHERE focus_analysis_attempt_id = ?2),
+                COUNT(DISTINCT rowid)
+         FROM images
+         WHERE id = ?1",
+        params![target_id, attempt_id],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    ) {
+        Ok(counts) => counts,
+        Err(e) => {
+            // APPEND, never assign: `note` may already carry the "settings
+            // could not be applied" text, and losing that would hide from the
+            // operator that the check may have run through the ART.
+            note = format!("{}; the target-row verification SELECT failed: {}", note, e);
+            (-1, -1, -1)
+        }
+    };
+
+    // V2 — everything this transaction stamped.
+    let stamped_ids = match focus_writeback_stamped_ids(conn, attempt_id) {
+        Ok(ids) => ids,
+        Err(e) => {
+            note = format!(
+                "{}; the transaction-wide verification SELECT failed: {}",
+                note, e
+            );
+            Vec::new()
+        }
+    };
+
+    FocusWritebackVerification {
+        rows_for_id,
+        matching_rows,
+        distinct_rowids,
+        stamped_ids,
+        expected_ids,
+        diagnostic,
+        note,
+    }
+}
+
+fn focus_writeback_stamped_ids(
+    conn: &Connection,
+    attempt_id: &str,
+) -> Result<Vec<i64>, duckdb::Error>
+{
+    // CAST mirrors the assignment the UPDATE performs into the TIMESTAMP
+    // column. DuckDB fixes CURRENT_TIMESTAMP at transaction start, so this
+    // selects exactly the rows THIS transaction wrote under this attempt id —
+    // earlier committed chunks of the same run carry a different value.
+    let mut stmt = conn.prepare(
+        "SELECT id
+         FROM images
+         WHERE focus_analysis_attempt_id = ?1
+           AND focus_scored_at = CAST(CURRENT_TIMESTAMP AS TIMESTAMP)
+         ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![attempt_id], |row| row.get::<_, i64>(0))?;
+    // ⚠️ NOT deduplicated, deliberately. `expected_ids` is unique BY
+    // CONSTRUCTION — it is the set of ids this transaction planned to stamp —
+    // and that is exactly what makes a strict list comparison a DETECTOR: any
+    // repeat on the stamped side is a physical row nobody planned to write.
+    //
+    // V1 only ever looks at the CURRENT target, so a duplicate physical row
+    // behind an EARLIER target of the same transaction is invisible to it;
+    // strict V2 is the only thing that can see that, and it is reachable
+    // precisely when the engine under-reports a change count — the failure mode
+    // this whole check exists for. `ORDER BY id` is what makes the two sides
+    // comparable.
+    rows.collect()
+}
+
+/// Capture every catalogue row the engine currently exposes for `target_id`.
+///
+/// This is EVIDENCE, not a decision: it shows what the engine saw at the
+/// moment the change count disagreed with the primary key, and it is folded
+/// into the warning or the failure text. Deliberately infallible — a
+/// diagnostic that cannot be gathered must never mask the verification that
+/// follows it. Its callers hold the index-scan guard above.
+///
+/// The timestamp is cast to VARCHAR at the statement, the crate's existing
+/// idiom for reading a DuckDB TIMESTAMP back into Rust.
+fn focus_writeback_target_diagnostic(conn: &Connection, target_id: i64) -> String
+{
+    let mut stmt = match conn.prepare(
+        "SELECT rowid, id, focus_analysis_attempt_id, CAST(focus_scored_at AS VARCHAR)
+         FROM images
+         WHERE id = ?1",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => return format!("<diagnostic unavailable: prepare failed: {}>", e),
+    };
+    let rows = match stmt.query_map(params![target_id], |row| {
+        Ok(format!(
+            "rowid={} id={} attempt={} scored_at={}",
+            row.get::<_, Option<i64>>(0)?
+                .map_or_else(|| "NULL".to_string(), |v| v.to_string()),
+            row.get::<_, Option<i64>>(1)?
+                .map_or_else(|| "NULL".to_string(), |v| v.to_string()),
+            row.get::<_, Option<String>>(2)?.unwrap_or_else(|| "NULL".to_string()),
+            row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "NULL".to_string()),
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(e) => return format!("<diagnostic unavailable: execute failed: {}>", e),
+    };
+
+    let mut rendered = Vec::new();
+    for row in rows {
+        match row {
+            Ok(text) => rendered.push(text),
+            Err(e) => rendered.push(format!("<row unavailable: {}>", e)),
+        }
+    }
+    if rendered.is_empty() {
+        return "<no rows>".to_string();
+    }
+    rendered.join("; ")
+}
+
+/// Test-only seam for the apply-stage UPDATE (S179).
+///
+/// A probe names ONE target id, says whether the real UPDATE should still run,
+/// and supplies the change count to report in place of the engine's own — the
+/// exact shape of the anomaly this fix answers. `fire_limit` bounds how many
+/// attempts it fires on, so "first attempt only" (the retry test) is
+/// expressible without a global static.
+///
+/// `collateral_id` simulates the dangerous case V1 structurally cannot see: the
+/// engine stamping some OTHER row with this transaction's attempt id and
+/// timestamp. Only V2 can catch that, which is what makes V2 load-bearing.
+///
+/// Production never constructs one: outside `cfg(test)` the referent type is
+/// uninhabited, so `FocusApplyProbeRef` can only ever be `None`.
+#[cfg(test)]
+struct FocusApplyProbe
+{
+    target_id: i64,
+    run_real_update: bool,
+    reported_row_count: usize,
+    /// `None` fires on every attempt; `Some(n)` fires on the first `n` only.
+    fire_limit: Option<u32>,
+    /// When set, ALSO stamp this id with the same attempt id and transaction
+    /// timestamp — a write the chunk never planned.
+    collateral_id: Option<i64>,
+    /// When set, INSERT an UNSTAMPED duplicate physical row carrying this id
+    /// after the real UPDATE. V2 stays clean (the transaction stamped exactly
+    /// the id it planned) and only V1 can see the second physical row.
+    duplicate_after_id: Option<i64>,
+    /// When true, the verification runs with a guard that never applied its
+    /// settings — the fail-closed path.
+    force_index_scan_settings_failure: bool,
+    firings: std::cell::Cell<u32>,
+}
+
+#[cfg(test)]
+impl FocusApplyProbe
+{
+    fn new(target_id: i64, run_real_update: bool, reported_row_count: usize) -> Self
+    {
+        Self {
+            target_id,
+            run_real_update,
+            reported_row_count,
+            fire_limit: None,
+            collateral_id: None,
+            duplicate_after_id: None,
+            force_index_scan_settings_failure: false,
+            firings: std::cell::Cell::new(0),
+        }
+    }
+
+    fn firing_at_most(mut self, attempts: u32) -> Self
+    {
+        self.fire_limit = Some(attempts);
+        self
+    }
+
+    fn also_stamping(mut self, collateral_id: i64) -> Self
+    {
+        self.collateral_id = Some(collateral_id);
+        self
+    }
+
+    fn inserting_duplicate_after(mut self, duplicate_after_id: i64) -> Self
+    {
+        self.duplicate_after_id = Some(duplicate_after_id);
+        self
+    }
+
+    fn forcing_index_scan_settings_failure(mut self) -> Self
+    {
+        self.force_index_scan_settings_failure = true;
+        self
+    }
+
+    /// `Some((row_count_to_report, run_real_update, collateral_id,
+    /// duplicate_after_id))` when armed for this target on this attempt.
+    fn report_for(&self, target_id: i64) -> Option<(usize, bool, Option<i64>, Option<i64>)>
+    {
+        if target_id != self.target_id {
+            return None;
+        }
+        let firings = self.firings.get();
+        if let Some(limit) = self.fire_limit {
+            if firings >= limit {
+                return None;
+            }
+        }
+        self.firings.set(firings + 1);
+        Some((
+            self.reported_row_count,
+            self.run_real_update,
+            self.collateral_id,
+            self.duplicate_after_id,
+        ))
+    }
+}
+
+#[cfg(test)]
+type FocusApplyProbeRef<'a> = Option<&'a FocusApplyProbe>;
+
+/// Uninhabited outside tests: every production call site passes `None` and no
+/// other value can exist.
+#[cfg(not(test))]
+type FocusApplyProbeRef<'a> = Option<&'a std::convert::Infallible>;
+
+#[cfg(test)]
+fn focus_apply_probe_report(
+    probe: FocusApplyProbeRef<'_>,
+    target_id: i64,
+) -> Option<(usize, bool, Option<i64>, Option<i64>)>
+{
+    probe.and_then(|probe| probe.report_for(target_id))
+}
+
+#[cfg(not(test))]
+fn focus_apply_probe_report(
+    _probe: FocusApplyProbeRef<'_>,
+    _target_id: i64,
+) -> Option<(usize, bool, Option<i64>, Option<i64>)>
+{
+    None
+}
+
 fn update_focus_analysis_target(
     conn: &Connection,
     result: &FocusAnalysisResult,
     target_id: i64,
+    probe: FocusApplyProbeRef<'_>,
 ) -> Result<usize, duckdb::Error> {
     let is_complete = result.status == "complete";
     let score = if is_complete {
@@ -10373,9 +11039,32 @@ fn update_focus_analysis_target(
     };
     let basis = result.focus_basis.as_deref().unwrap_or("unknown");
 
+    // Test-only (S179). In production `probe_report` is provably `None`.
+    let probe_report = focus_apply_probe_report(probe, target_id);
+    if let Some((_, _, Some(collateral_id), _)) = probe_report {
+        // Stand in for the engine stamping a row this chunk never planned —
+        // same attempt id, same transaction timestamp, different row. Only V2
+        // can see this.
+        conn.execute(
+            "UPDATE images
+             SET focus_analysis_attempt_id = ?2,
+                 focus_scored_at = CAST(CURRENT_TIMESTAMP AS TIMESTAMP)
+             WHERE id = ?1",
+            params![collateral_id, &result.analysis_run_id],
+        )?;
+    }
+    if let Some((reported_row_count, run_real_update, _, _)) = probe_report {
+        if !run_real_update {
+            // The probe stands in for the whole statement: the retry tests
+            // need a transaction whose row genuinely never receives the new
+            // attempt id, which is what the verification must then catch.
+            return Ok(reported_row_count);
+        }
+    }
+
     // The target relationship was frozen before BEGIN. This statement updates
     // one explicit primary key and never re-scans `images` for siblings.
-    conn.execute(
+    let row_count = conn.execute(
         "UPDATE images
          SET focus_score = ?2,
              focus_basis = ?3,
@@ -10416,16 +11105,42 @@ fn update_focus_analysis_target(
             face_eyes_open_count,
             face_blink_risk_count,
         ],
-    )
+    )?;
+
+    // Test-only (S179): report the probe's count in place of the engine's.
+    // Test-only (S179): an UNSTAMPED duplicate physical row behind this id —
+    // V2 stays clean and only V1 can see it.
+    if let Some((_, _, _, Some(duplicate_after_id))) = probe_report {
+        conn.execute(
+            "INSERT INTO images (id, file_path, image_kind, file_stem, directory_path)
+             VALUES (?1, '/a/probe-duplicate.jpg', 'jpeg', 'probe-dup', '/a')",
+            params![duplicate_after_id],
+        )?;
+    }
+
+    Ok(probe_report.map_or(row_count, |(reported_row_count, _, _, _)| reported_row_count))
 }
 
 /// Write an already-frozen plan inside the caller's open transaction.
+///
+/// `warnings` is an OUT parameter, not a return value, so a non-fatal anomaly
+/// survives an early `return Err`: the observation that the engine
+/// mis-reported a change count is real evidence even when the chunk later
+/// fails for an unrelated reason and rolls back.
 fn write_focus_analysis_plans_in_transaction(
     conn: &Connection,
     plans: &[FocusAnalysisWritebackPlan],
+    probe: FocusApplyProbeRef<'_>,
+    warnings: &mut Vec<FocusAnalysisWritebackWarning>,
 ) -> Result<u64, FocusAnalysisWritebackFailure>
 {
     let mut updated = 0u64;
+    // Every (target, attempt id) this TRANSACTION has written through
+    // `update_focus_analysis_target`, across all plans — `updated_target_ids`
+    // below is per-plan and cannot serve as V2's expected set. The attempt id
+    // rides along rather than being assumed constant: a chunk carries one run
+    // id today, but the verification must not depend on that.
+    let mut stamped_this_transaction: Vec<(i64, &str)> = Vec::new();
 
     for plan in plans {
         let result = &plan.result;
@@ -10434,7 +11149,7 @@ fn write_focus_analysis_plans_in_transaction(
 
         for target_id in &plan.target_ids {
             let row_count =
-                update_focus_analysis_target(conn, result, *target_id).map_err(|e| {
+                update_focus_analysis_target(conn, result, *target_id, probe).map_err(|e| {
                     FocusAnalysisWritebackFailure::new(
                         FOCUS_WRITEBACK_STAGE_APPLY,
                         format!(
@@ -10446,18 +11161,88 @@ fn write_focus_analysis_plans_in_transaction(
                     )
                 })?;
             if row_count != 1 {
-                return Err(FocusAnalysisWritebackFailure::new(
-                    FOCUS_WRITEBACK_STAGE_APPLY,
-                    format!(
-                        "update_focus_analysis_target: UPDATE images violated one-target/one-row invariant for source_image_id={} target_image_id={}: updated {} rows",
-                        result.id, target_id, row_count
-                    ),
-                    Some(result.id),
-                    Some(*target_id),
-                ));
+                // S179: the change count is the ENGINE's claim about a
+                // primary-key UPDATE, and bundled DuckDB 1.5.5 has been caught
+                // reporting 2 for one. Under the DELETE + INSERT branch that
+                // count is the SCAN size — rows fed to the update operator,
+                // taken before it deduplicates row ids — so 2 is an artifact of
+                // a double-emitting index scan, not evidence of a second row
+                // (`physical_update.cpp`, `table_scan.cpp`). Retiring the
+                // fourteen secondary indexes takes this statement off that
+                // branch entirely; this check is what survives it if anything
+                // ever puts it back.
+                //
+                // Ask the TABLE, with index scans disabled, and run for ANY
+                // count other than 1 — an engine that under-reports is
+                // answered by exactly the same question.
+                //
+                // `result.analysis_run_id` IS the attempt id: it is what the
+                // statement above binds to `focus_analysis_attempt_id`.
+                let mut expected_ids = stamped_this_transaction
+                    .iter()
+                    .filter(|(_, attempt)| *attempt == result.analysis_run_id.as_str())
+                    .map(|(id, _)| *id)
+                    .collect::<Vec<_>>();
+                expected_ids.push(*target_id);
+                expected_ids.sort_unstable();
+                expected_ids.dedup();
+
+                let verification = focus_writeback_verification(
+                    conn,
+                    *target_id,
+                    &result.analysis_run_id,
+                    expected_ids,
+                    probe,
+                );
+
+                if verification.confirms_single_write() {
+                    // One live row for this id, carrying the new attempt id, on
+                    // one physical rowid — and this transaction stamped exactly
+                    // the rows it meant to. The update landed exactly once, so
+                    // count the target once, precisely as `row_count == 1`
+                    // does, and record what the engine claimed.
+                    warnings.push(FocusAnalysisWritebackWarning {
+                        reason_code: FOCUS_WRITEBACK_WARNING_COUNT_ANOMALY.to_string(),
+                        source_image_id: result.id,
+                        target_image_id: *target_id,
+                        row_count: row_count as i64,
+                        matching_rows: verification.matching_rows,
+                        distinct_rowids: verification.distinct_rowids,
+                        detail: format!(
+                            "update_focus_analysis_target: UPDATE images reported {} rows for source_image_id={} target_image_id={}, but the catalogue confirms one write of focus_analysis_attempt_id={:?}: {}",
+                            row_count,
+                            result.id,
+                            target_id,
+                            result.analysis_run_id,
+                            verification.describe()
+                        ),
+                    });
+                } else {
+                    return Err(FocusAnalysisWritebackFailure::new(
+                        FOCUS_WRITEBACK_STAGE_APPLY,
+                        format!(
+                            "update_focus_analysis_target: UPDATE images violated one-target/one-row invariant for source_image_id={} target_image_id={}: updated {} rows; the catalogue could not confirm the write for focus_analysis_attempt_id={:?}: {}",
+                            result.id,
+                            target_id,
+                            row_count,
+                            result.analysis_run_id,
+                            verification.describe()
+                        ),
+                        Some(result.id),
+                        Some(*target_id),
+                    )
+                    .with_invariant_facts(FocusWritebackInvariantFacts {
+                        source_image_id: result.id,
+                        target_image_id: *target_id,
+                        row_count: row_count as i64,
+                        matching_rows: verification.matching_rows,
+                        distinct_rowids: verification.distinct_rowids,
+                    }));
+                }
             }
             updated += 1;
             updated_target_ids.push(*target_id);
+            stamped_this_transaction.push((*target_id, result.analysis_run_id.as_str()));
         }
 
         if updated_target_ids.is_empty() {
@@ -10501,19 +11286,33 @@ fn write_focus_analysis_plans_in_transaction(
     Ok(updated)
 }
 
-fn update_focus_analysis_results_impl(
+/// Plan, BEGIN, apply and COMMIT ONE attempt at a writeback chunk.
+///
+/// On failure the transaction is already rolled back; the `bool` reports
+/// whether that ROLLBACK succeeded. It is `false` when no transaction had been
+/// opened yet (planning/BEGIN failures) — those are never retried anyway.
+///
+/// An attempt collects its own warnings and hands them to the caller ONLY when
+/// it commits. A rolled-back attempt's anomalies describe writes that no longer
+/// exist, so their TEXT is folded into the failure reason (and therefore into
+/// the `chunk_retried` warning's detail, which is that reason) while the
+/// warnings themselves are dropped. That keeps `anomalies=N` and the Operation
+/// Log counting accepted anomalies once each, instead of double-counting an
+/// anomaly a retry re-observes.
+fn focus_analysis_writeback_attempt(
     conn: &Connection,
     results: Vec<FocusAnalysisResult>,
-) -> FocusAnalysisWritebackResult
+    probe: FocusApplyProbeRef<'_>,
+    warnings: &mut Vec<FocusAnalysisWritebackWarning>,
+) -> Result<u64, (FocusAnalysisWritebackFailure, bool)>
 {
-    if results.is_empty() {
-        return successful_focus_analysis_writeback(0);
-    }
+    let mut attempt_warnings: Vec<FocusAnalysisWritebackWarning> = Vec::new();
 
-    // Planning must stay before BEGIN: the bundled DuckDB 1.2.2 can expose
+    // Planning must stay before BEGIN: the bundled DuckDB engine can expose
     // both versions of a row when a transaction re-scans `images` after an
-    // UPDATE. Holding the catalogue mutex makes this frozen plan stable until
-    // the transaction completes.
+    // UPDATE — a class S127 believed retired at 1.5.5 and S179 saw return.
+    // Holding the catalogue mutex makes this frozen plan stable until the
+    // transaction completes.
     let plans = match plan_focus_analysis_writebacks(conn, results) {
         Ok(plans) => plans,
         Err(failure) => {
@@ -10521,7 +11320,7 @@ fn update_focus_analysis_results_impl(
                 "update_focus_analysis_results: {} failure: {}",
                 failure.stage, failure.reason
             );
-            return failure.into_result();
+            return Err((failure, false));
         }
     };
 
@@ -10536,20 +11335,23 @@ fn update_focus_analysis_results_impl(
             None,
         );
         eprintln!("{}", failure.reason);
-        return failure.into_result();
+        return Err((failure, false));
     }
 
-    let updated = match write_focus_analysis_plans_in_transaction(conn, &plans) {
-        Ok(updated) => updated,
-        Err(failure) => {
-            let failure = rollback_focus_analysis_failure(conn, failure);
-            eprintln!(
-                "update_focus_analysis_results: {} failure: {}",
-                failure.stage, failure.reason
-            );
-            return failure.into_result();
-        }
-    };
+    let updated =
+        match write_focus_analysis_plans_in_transaction(conn, &plans, probe, &mut attempt_warnings)
+        {
+            Ok(updated) => updated,
+            Err(failure) => {
+                let (failure, rolled_back) = rollback_focus_analysis_failure(conn, failure);
+                let failure = fold_rolled_back_warnings(failure, attempt_warnings);
+                eprintln!(
+                    "update_focus_analysis_results: {} failure: {}",
+                    failure.stage, failure.reason
+                );
+                return Err((failure, rolled_back));
+            }
+        };
 
     if let Err(e) = conn.execute_batch("COMMIT;") {
         let failure = FocusAnalysisWritebackFailure::new(
@@ -10558,12 +11360,105 @@ fn update_focus_analysis_results_impl(
             None,
             None,
         );
-        let failure = rollback_focus_analysis_failure(conn, failure);
+        let (failure, rolled_back) = rollback_focus_analysis_failure(conn, failure);
+        let failure = fold_rolled_back_warnings(failure, attempt_warnings);
         eprintln!("{}", failure.reason);
-        return failure.into_result();
+        return Err((failure, rolled_back));
     }
 
-    successful_focus_analysis_writeback(updated)
+    warnings.append(&mut attempt_warnings);
+    Ok(updated)
+}
+
+/// Fold a rolled-back attempt's anomaly text into its own failure reason.
+///
+/// The observations are real and worth keeping; the WARNINGS are not, because
+/// the writes they describe were rolled back and a retry would re-observe and
+/// re-emit them.
+fn fold_rolled_back_warnings(
+    mut failure: FocusAnalysisWritebackFailure,
+    warnings: Vec<FocusAnalysisWritebackWarning>,
+) -> FocusAnalysisWritebackFailure
+{
+    if warnings.is_empty() {
+        return failure;
+    }
+    let details = warnings
+        .iter()
+        .map(|warning| warning.detail.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    failure.reason = format!(
+        "{}; the rolled-back attempt had also survived {} row-count anomal{}: {}",
+        failure.reason,
+        warnings.len(),
+        if warnings.len() == 1 { "y" } else { "ies" },
+        details
+    );
+    failure
+}
+
+fn update_focus_analysis_results_impl(
+    conn: &Connection,
+    results: Vec<FocusAnalysisResult>,
+    probe: FocusApplyProbeRef<'_>,
+) -> FocusAnalysisWritebackResult
+{
+    if results.is_empty() {
+        return successful_focus_analysis_writeback(0);
+    }
+
+    let mut warnings = Vec::new();
+    // The chunk is cloned ONCE so a retry can re-plan from the same inputs;
+    // planning consumes the results. A chunk is the analysis lane count (≈14),
+    // so this is negligible beside the Vision work that produced it.
+    let retry_results = results.clone();
+
+    let (first_failure, rolled_back) =
+        match focus_analysis_writeback_attempt(conn, results, probe, &mut warnings) {
+            Ok(updated) => {
+                return successful_focus_analysis_writeback_with_warnings(updated, warnings);
+            }
+            Err(failure) => failure,
+        };
+
+    // S179: retry ONE time, and only for the one class this fix is about — an
+    // apply-stage change count the table could not confirm — and only when the
+    // ROLLBACK succeeded, so the shared connection's transaction state is
+    // known. Every other failure (a real DuckDB error, a keyword/face
+    // statement failure, BEGIN/COMMIT) fails exactly as it did before.
+    //
+    // The evidence for retrying: each tripping row wrote cleanly on the very
+    // next run, so the anomaly is transient rather than a property of the row.
+    let facts = match (&first_failure.invariant_facts, rolled_back) {
+        (Some(facts), true) => facts.clone(),
+        _ => return first_failure.into_result_with_warnings(warnings),
+    };
+
+    warnings.push(FocusAnalysisWritebackWarning {
+        reason_code: FOCUS_WRITEBACK_WARNING_CHUNK_RETRIED.to_string(),
+        source_image_id: facts.source_image_id,
+        target_image_id: facts.target_image_id,
+        row_count: facts.row_count,
+        matching_rows: facts.matching_rows,
+        distinct_rowids: facts.distinct_rowids,
+        detail: first_failure.reason.clone(),
+    });
+    eprintln!(
+        "update_focus_analysis_results: replaying the chunk once after an unverified apply-stage row count: {}",
+        first_failure.reason
+    );
+
+    match focus_analysis_writeback_attempt(conn, retry_results, probe, &mut warnings) {
+        Ok(updated) => successful_focus_analysis_writeback_with_warnings(updated, warnings),
+        Err((mut failure, _)) => {
+            failure.reason = format!(
+                "{}; update_focus_analysis_results: the chunk still failed after one retry",
+                failure.reason
+            );
+            failure.into_result_with_warnings(warnings)
+        }
+    }
 }
 
 /// Batch writeback for focus-analysis results. The returned receipt separates
@@ -10593,7 +11488,7 @@ pub async fn update_focus_analysis_results(
         }
     };
 
-    update_focus_analysis_results_impl(conn, results)
+    update_focus_analysis_results_impl(conn, results, None)
 }
 
 /// Count durable face observations for the requested focus/enrichment algorithm
@@ -17478,7 +18373,7 @@ mod focus_analysis_writeback_tests {
 
         conn.execute_batch("BEGIN TRANSACTION;").expect("begin");
         assert_eq!(
-            write_focus_analysis_plans_in_transaction(&conn, &plans),
+            write_focus_analysis_plans_in_transaction(&conn, &plans, None, &mut Vec::new()),
             Ok(2)
         );
         conn.execute_batch("COMMIT;").expect("commit");
@@ -17513,7 +18408,7 @@ mod focus_analysis_writeback_tests {
         conn.execute_batch("BEGIN TRANSACTION;")
             .expect("replay begin");
         assert_eq!(
-            write_focus_analysis_plans_in_transaction(&conn, &replay),
+            write_focus_analysis_plans_in_transaction(&conn, &replay, None, &mut Vec::new()),
             Ok(2)
         );
         conn.execute_batch("COMMIT;").expect("replay commit");
@@ -17533,10 +18428,10 @@ mod focus_analysis_writeback_tests {
     {
         let conn = setup();
 
-        let empty = update_focus_analysis_results_impl(&conn, Vec::new());
+        let empty = update_focus_analysis_results_impl(&conn, Vec::new(), None);
         assert_eq!(empty, successful_focus_analysis_writeback(0));
 
-        let receipt = update_focus_analysis_results_impl(&conn, vec![result(40, 73.0)]);
+        let receipt = update_focus_analysis_results_impl(&conn, vec![result(40, 73.0)], None);
         assert_eq!(receipt, successful_focus_analysis_writeback(1));
 
         let score: f64 = conn
@@ -17556,7 +18451,7 @@ mod focus_analysis_writeback_tests {
         let mut with_keyword = result(40, 73.0);
         with_keyword.auto_keywords = vec!["adult".to_string()];
 
-        let receipt = update_focus_analysis_results_impl(&conn, vec![with_keyword]);
+        let receipt = update_focus_analysis_results_impl(&conn, vec![with_keyword], None);
 
         assert_eq!(receipt.updated, 0);
         assert_eq!(receipt.failure_stage.as_deref(), Some("apply"));
@@ -17592,7 +18487,7 @@ mod focus_analysis_writeback_tests {
         conn.execute_batch("DROP TABLE face_observation;")
             .expect("drop face table to force apply failure");
 
-        let receipt = update_focus_analysis_results_impl(&conn, vec![result(20, 41.0)]);
+        let receipt = update_focus_analysis_results_impl(&conn, vec![result(20, 41.0)], None);
 
         assert_eq!(receipt.updated, 0);
         assert_eq!(receipt.failure_stage.as_deref(), Some("apply"));
@@ -17613,6 +18508,809 @@ mod focus_analysis_writeback_tests {
             )
             .expect("rolled-back focus score");
         assert_eq!(score, None);
+    }
+
+    // ── S179: the apply-stage verification, the single retry, and the warning
+    // carrier. `FocusApplyProbe` stands in for bundled DuckDB 1.5.5 reporting
+    // an impossible change count for a primary-key UPDATE.
+    //
+    // ⚠️ EVERY scenario below runs on BOTH engine branches, because the branch
+    // is the whole premise of the change: with no index on an updated column
+    // DuckDB updates in place, and with one it runs DELETE + INSERT — the
+    // branch whose reported change count is the scan size and whose ART
+    // temporarily retains duplicate row ids. `on_both_branches` threads a label
+    // into every assertion so a failure names the branch it happened on.
+
+    const IN_PLACE: &str = "in-place branch (no index on an updated column)";
+    const DELETE_INSERT: &str = "delete+insert branch (indexes on updated columns)";
+
+    /// The same fixture as `setup()`, plus secondary indexes on two columns the
+    /// writeback UPDATE writes — which is precisely what puts the statement on
+    /// DuckDB's delete+insert path.
+    fn setup_indexed() -> Connection
+    {
+        let conn = setup();
+        let indexed_columns = ["focus_score", "face_count"];
+        for column in indexed_columns {
+            conn.execute_batch(&format!(
+                "CREATE INDEX idx_test_{} ON images({});",
+                column, column
+            ))
+            .unwrap_or_else(|e| panic!("index on {}: {}", column, e));
+        }
+        // ⚠️ The fixture's WHOLE JOB is to be on the other engine branch, and
+        // DuckDB only takes the delete+insert path when an updated column is
+        // indexed (`table_catalog_entry.cpp`). Without this, repointing these
+        // indexes at an unwritten column would silently turn `on_both_branches`
+        // into two copies of the in-place branch and nothing would notice.
+        assert!(
+            indexed_columns
+                .iter()
+                .any(|column| FOCUS_WRITEBACK_UPDATED_COLUMNS.contains(column)),
+            "setup_indexed() must index at least one column the writeback UPDATE writes, \
+             or it is not the delete+insert branch at all"
+        );
+        conn
+    }
+
+    fn on_both_branches(scenario: impl Fn(&Connection, &str))
+    {
+        scenario(&setup(), IN_PLACE);
+        scenario(&setup_indexed(), DELETE_INSERT);
+    }
+
+    /// The chunk every S179 test drives: a visible JPEG that owns a hidden NEF
+    /// twin (targets 10 and 11) plus a lone JPEG (target 40) — three target
+    /// updates, the shape the live failures tripped on.
+    fn twin_chunk() -> Vec<FocusAnalysisResult>
+    {
+        vec![result(11, 11.0), result(40, 73.0)]
+    }
+
+    fn focus_row(conn: &Connection, id: i64) -> (Option<f64>, Option<String>, Option<String>)
+    {
+        conn.query_row(
+            "SELECT focus_score, focus_analysis_status, focus_analysis_attempt_id
+             FROM images
+             WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("focus row")
+    }
+
+    fn rows_carrying_test_attempt(conn: &Connection) -> i64
+    {
+        conn.query_row(
+            "SELECT COUNT(*) FROM images
+             WHERE focus_analysis_attempt_id = 'writeback-test-run'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("attempt row count")
+    }
+
+    fn assert_twin_chunk_rows_written(conn: &Connection, branch: &str)
+    {
+        // Source and hidden RAW twin carry the SAME propagated values; the
+        // lone JPEG carries its own.
+        for id in [10, 11] {
+            assert_eq!(
+                focus_row(conn, id),
+                (
+                    Some(11.0),
+                    Some("complete".to_string()),
+                    Some("writeback-test-run".to_string())
+                ),
+                "{}: id {}",
+                branch,
+                id
+            );
+        }
+        assert_eq!(
+            focus_row(conn, 40),
+            (
+                Some(73.0),
+                Some("complete".to_string()),
+                Some("writeback-test-run".to_string())
+            ),
+            "{}",
+            branch
+        );
+
+        let faces = conn
+            .prepare(
+                "SELECT image_id, analyzed_image_id
+                 FROM face_observation
+                 WHERE algorithm_version = 'writeback-test-v1'
+                 ORDER BY image_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(faces, vec![(10, 11), (11, 11), (40, 40)], "{}", branch);
+    }
+
+    #[test]
+    fn focus_writeback_healthy_twin_chunk()
+    {
+        on_both_branches(|conn, branch| {
+            let receipt = update_focus_analysis_results_impl(conn, twin_chunk(), None);
+
+            assert_eq!(receipt.failure_stage, None, "{}", branch);
+            assert_eq!(receipt.failed_reason, None, "{}", branch);
+            assert_eq!(receipt.updated, 3, "{}", branch);
+            assert!(receipt.warnings.is_empty(), "{}", branch);
+            assert_twin_chunk_rows_written(conn, branch);
+        });
+    }
+
+    #[test]
+    fn focus_writeback_count_anomaly_is_accepted()
+    {
+        on_both_branches(|conn, branch| {
+            // The real UPDATE still runs; only the reported count is a lie.
+            let probe = FocusApplyProbe::new(11, true, 2);
+
+            let receipt = update_focus_analysis_results_impl(conn, twin_chunk(), Some(&probe));
+
+            assert_eq!(
+                receipt.failure_stage, None,
+                "{}: {:?}",
+                branch, receipt.failed_reason
+            );
+            assert_eq!(
+                receipt.updated, 3,
+                "{}: the anomalous target is counted once",
+                branch
+            );
+            assert_eq!(receipt.warnings.len(), 1, "{}", branch);
+            let warning = &receipt.warnings[0];
+            assert_eq!(warning.reason_code, "focus_writeback_count_anomaly", "{}", branch);
+            assert_eq!(warning.source_image_id, 11, "{}", branch);
+            assert_eq!(warning.target_image_id, 11, "{}", branch);
+            assert_eq!(warning.row_count, 2, "{}", branch);
+            assert_eq!(warning.matching_rows, 1, "{}", branch);
+            assert_eq!(warning.distinct_rowids, 1, "{}", branch);
+            assert!(
+                warning.detail.contains("rowid="),
+                "{}: detail must carry what the engine saw: {}",
+                branch,
+                warning.detail
+            );
+            assert!(warning.detail.contains("source_image_id=11"), "{}", branch);
+            // V2: this transaction stamped exactly the two targets it meant to.
+            assert!(
+                warning.detail.contains("stamped ids [10, 11], expected [10, 11]"),
+                "{}: detail must name the transaction-wide id sets: {}",
+                branch,
+                warning.detail
+            );
+            assert!(
+                !receipt
+                    .warnings
+                    .iter()
+                    .any(|w| w.reason_code == "focus_writeback_chunk_retried"),
+                "{}",
+                branch
+            );
+            assert_twin_chunk_rows_written(conn, branch);
+        });
+    }
+
+    #[test]
+    fn focus_writeback_anomaly_on_twin_target()
+    {
+        on_both_branches(|conn, branch| {
+            // The tripping target is the hidden RAW twin, not the source row —
+            // the shape job 6 hit (source 220024 → target 71808).
+            let probe = FocusApplyProbe::new(10, true, 2);
+
+            let receipt = update_focus_analysis_results_impl(conn, twin_chunk(), Some(&probe));
+
+            assert_eq!(
+                receipt.failure_stage, None,
+                "{}: {:?}",
+                branch, receipt.failed_reason
+            );
+            assert_eq!(receipt.updated, 3, "{}", branch);
+            assert_eq!(receipt.warnings.len(), 1, "{}", branch);
+            let warning = &receipt.warnings[0];
+            assert_eq!(warning.reason_code, "focus_writeback_count_anomaly", "{}", branch);
+            assert_eq!(warning.source_image_id, 11, "{}", branch);
+            assert_eq!(warning.target_image_id, 10, "{}", branch);
+            assert_eq!(warning.row_count, 2, "{}", branch);
+            assert_eq!(warning.matching_rows, 1, "{}", branch);
+            assert_eq!(warning.distinct_rowids, 1, "{}", branch);
+            // The RAW twin is written first, so at that point the transaction
+            // has stamped only it.
+            assert!(
+                warning.detail.contains("stamped ids [10], expected [10]"),
+                "{}: detail must name the transaction-wide id sets: {}",
+                branch,
+                warning.detail
+            );
+            assert_twin_chunk_rows_written(conn, branch);
+        });
+    }
+
+    #[test]
+    fn focus_writeback_zero_count_with_real_update_is_accepted()
+    {
+        on_both_branches(|conn, branch| {
+            // An engine that UNDER-reports is the same question, asked the same
+            // way: the table, not the count, decides.
+            let probe = FocusApplyProbe::new(11, true, 0);
+
+            let receipt = update_focus_analysis_results_impl(conn, twin_chunk(), Some(&probe));
+
+            assert_eq!(
+                receipt.failure_stage, None,
+                "{}: {:?}",
+                branch, receipt.failed_reason
+            );
+            assert_eq!(receipt.updated, 3, "{}", branch);
+            assert_eq!(receipt.warnings.len(), 1, "{}", branch);
+            let warning = &receipt.warnings[0];
+            assert_eq!(warning.reason_code, "focus_writeback_count_anomaly", "{}", branch);
+            assert_eq!(warning.row_count, 0, "{}", branch);
+            assert_eq!(warning.matching_rows, 1, "{}", branch);
+            assert_eq!(warning.distinct_rowids, 1, "{}", branch);
+            assert!(
+                warning.detail.contains("stamped ids [10, 11], expected [10, 11]"),
+                "{}: detail must name the transaction-wide id sets: {}",
+                branch,
+                warning.detail
+            );
+            assert_twin_chunk_rows_written(conn, branch);
+        });
+    }
+
+    #[test]
+    fn focus_writeback_retry_succeeds()
+    {
+        on_both_branches(|conn, branch| {
+            // The row genuinely never receives the new attempt id on attempt 1,
+            // so verification cannot confirm the write and the chunk rolls
+            // back. The probe stands down for attempt 2 — the live rows all
+            // wrote cleanly on the next run, which is what the retry is for.
+            let probe = FocusApplyProbe::new(11, false, 2).firing_at_most(1);
+
+            let receipt = update_focus_analysis_results_impl(conn, twin_chunk(), Some(&probe));
+
+            assert_eq!(
+                receipt.failure_stage, None,
+                "{}: {:?}",
+                branch, receipt.failed_reason
+            );
+            assert_eq!(receipt.updated, 3, "{}", branch);
+            assert_eq!(receipt.warnings.len(), 1, "{}", branch);
+            let warning = &receipt.warnings[0];
+            assert_eq!(warning.reason_code, "focus_writeback_chunk_retried", "{}", branch);
+            assert_eq!(warning.source_image_id, 11, "{}", branch);
+            assert_eq!(warning.target_image_id, 11, "{}", branch);
+            assert_eq!(warning.row_count, 2, "{}", branch);
+            // The row exists (one physical rowid) but never received the
+            // attempt id — V1's middle value is what catches it.
+            assert_eq!(warning.matching_rows, 0, "{}", branch);
+            assert_eq!(warning.distinct_rowids, 1, "{}", branch);
+            assert!(
+                warning.detail.contains("violated one-target/one-row invariant"),
+                "{}",
+                branch
+            );
+            assert!(warning.detail.contains("rowid="), "{}", branch);
+            // V2 independently catches the same miss: the RAW twin was stamped,
+            // the JPEG was not.
+            assert!(
+                warning.detail.contains("stamped ids [10], expected [10, 11]"),
+                "{}: detail must name the transaction-wide id sets: {}",
+                branch,
+                warning.detail
+            );
+            assert_twin_chunk_rows_written(conn, branch);
+        });
+    }
+
+    #[test]
+    fn focus_writeback_retry_fails_as_today()
+    {
+        on_both_branches(|conn, branch| {
+            // The probe never stands down, so the retry cannot help — the chunk
+            // must fail in exactly the shape it failed in before S179.
+            let probe = FocusApplyProbe::new(11, false, 2);
+
+            let receipt = update_focus_analysis_results_impl(conn, twin_chunk(), Some(&probe));
+
+            assert_eq!(receipt.updated, 0, "{}", branch);
+            assert_eq!(receipt.failure_stage.as_deref(), Some("apply"), "{}", branch);
+            assert_eq!(receipt.source_image_id, Some(11), "{}", branch);
+            assert_eq!(receipt.target_image_id, Some(11), "{}", branch);
+            let reason = receipt
+                .failed_reason
+                .clone()
+                .expect("invariant failure text");
+            assert!(
+                reason.contains("update_focus_analysis_target: UPDATE images violated one-target/one-row invariant"),
+                "{}: {}",
+                branch,
+                reason
+            );
+            assert!(reason.contains("source_image_id=11"), "{}", branch);
+            assert!(reason.contains("target_image_id=11"), "{}", branch);
+            assert!(reason.contains("rowid="), "{}: {}", branch, reason);
+            assert!(
+                reason.contains("stamped ids [10], expected [10, 11]"),
+                "{}: the failure text must name the transaction-wide id sets: {}",
+                branch,
+                reason
+            );
+            assert!(
+                reason.contains("still failed after one retry"),
+                "{}: the text must say the retry was spent: {}",
+                branch,
+                reason
+            );
+            assert_eq!(
+                receipt
+                    .warnings
+                    .iter()
+                    .filter(|w| w.reason_code == "focus_writeback_chunk_retried")
+                    .count(),
+                1,
+                "{}",
+                branch
+            );
+
+            // Nothing was written: both attempts rolled back.
+            assert_eq!(rows_carrying_test_attempt(conn), 0, "{}", branch);
+            let face_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM face_observation", [], |row| row.get(0))
+                .expect("face count");
+            assert_eq!(face_count, 0, "{}", branch);
+
+            // The connection is not wedged: an ordinary chunk still commits.
+            let healthy = update_focus_analysis_results_impl(conn, vec![result(20, 41.0)], None);
+            assert_eq!(
+                healthy.failure_stage, None,
+                "{}: {:?}",
+                branch, healthy.failed_reason
+            );
+            assert_eq!(healthy.updated, 1, "{}", branch);
+            assert!(healthy.warnings.is_empty(), "{}", branch);
+            assert_eq!(
+                focus_row(conn, 20),
+                (
+                    Some(41.0),
+                    Some("complete".to_string()),
+                    Some("writeback-test-run".to_string())
+                ),
+                "{}",
+                branch
+            );
+        });
+    }
+
+    /// ⭐ V2's own job, and the case V1 STRUCTURALLY cannot see.
+    ///
+    /// The target's own UPDATE runs and lands perfectly — V1 reports a clean
+    /// (1,1,1) — but the engine has ALSO stamped a row this chunk never
+    /// planned. Only the transaction-wide set comparison catches that, so this
+    /// test is what makes V2 load-bearing.
+    #[test]
+    fn focus_writeback_collateral_stamp_is_rejected()
+    {
+        on_both_branches(|conn, branch| {
+            // Target 12 (/a/shot.heic) is in the fixture but not in this chunk.
+            let probe = FocusApplyProbe::new(11, true, 2).also_stamping(12);
+
+            let receipt = update_focus_analysis_results_impl(conn, twin_chunk(), Some(&probe));
+
+            assert_eq!(receipt.failure_stage.as_deref(), Some("apply"), "{}", branch);
+            assert_eq!(receipt.updated, 0, "{}", branch);
+            let reason = receipt
+                .failed_reason
+                .clone()
+                .expect("collateral-stamp failure text");
+            // V1 is CLEAN here — it is looking at the right row, and that row
+            // is right. Only V2 can tell that something else moved.
+            assert!(
+                reason.contains("rows_for_id=1 matching_rows=1 distinct_rowids=1"),
+                "{}: V1 must report a clean triple, proving V2 is the catcher: {}",
+                branch,
+                reason
+            );
+            assert!(
+                reason.contains("stamped ids [10, 11, 12], expected [10, 11]"),
+                "{}: V2 must name the unplanned row: {}",
+                branch,
+                reason
+            );
+            // Rolled back, twice (the retry re-stamps and fails the same way).
+            assert_eq!(rows_carrying_test_attempt(conn), 0, "{}", branch);
+        });
+    }
+
+    /// ⭐ V1's own job, and the case V2 cannot see.
+    ///
+    /// A duplicate physical row appears behind the target's id — the corruption
+    /// the original S126 one-target/one-row invariant was written for — but it
+    /// is UNSTAMPED, so the transaction still stamped exactly the id set it
+    /// planned and strict V2 is clean. Only V1's `rows_for_id` /
+    /// `distinct_rowids` can see the second physical row.
+    #[test]
+    fn focus_writeback_duplicate_physical_rows_are_rejected()
+    {
+        // A fixture WITHOUT the primary key, so a duplicate id is insertable at
+        // all. Everything else matches `setup()`.
+        let conn = setup();
+        conn.execute_batch(
+            "CREATE TABLE images_dup AS SELECT * FROM images;
+             DROP TABLE images;
+             ALTER TABLE images_dup RENAME TO images;",
+        )
+        .expect("primary-key-free fixture");
+
+        // The real UPDATE runs and lands; the probe then plants an unstamped
+        // duplicate and reports the count that makes the verification fire.
+        let probe = FocusApplyProbe::new(40, true, 2).inserting_duplicate_after(40);
+
+        let receipt =
+            update_focus_analysis_results_impl(&conn, vec![result(40, 73.0)], Some(&probe));
+
+        assert_eq!(receipt.failure_stage.as_deref(), Some("apply"));
+        assert_eq!(receipt.updated, 0);
+        let reason = receipt.failed_reason.expect("duplicate-row failure text");
+        assert!(
+            reason.contains("rows_for_id=2"),
+            "V1 must name the duplicate physical rows: {}",
+            reason
+        );
+        assert!(
+            reason.contains("matching_rows=1"),
+            "only the real write carries the attempt id: {}",
+            reason
+        );
+        assert!(
+            reason.contains("distinct_rowids=2"),
+            "V1 must name the two physical rowids: {}",
+            reason
+        );
+        // V2 is SATISFIED — the transaction stamped exactly the id it planned,
+        // and the duplicate is unstamped. V1 is the only check that can reject
+        // this, which is what keeps V1 independently load-bearing.
+        assert!(
+            reason.contains("stamped ids [40], expected [40]"),
+            "V2 must be clean, proving V1 is the catcher: {}",
+            reason
+        );
+    }
+
+    /// ⭐ The fail-closed path: if the index-scan settings cannot be applied,
+    /// the verification may have run through the very mechanism it is meant to
+    /// step around, so it must not ACCEPT — it returns the ordinary apply
+    /// failure, with the invariant facts, and no panic.
+    #[test]
+    fn focus_writeback_unusable_index_scan_settings_fail_closed()
+    {
+        on_both_branches(|conn, branch| {
+            // Without the forced failure this exact probe is
+            // `focus_writeback_count_anomaly_is_accepted` — it commits with one
+            // warning. The ONLY difference here is the unusable guard.
+            let probe = FocusApplyProbe::new(11, true, 2).forcing_index_scan_settings_failure();
+
+            let receipt = update_focus_analysis_results_impl(conn, twin_chunk(), Some(&probe));
+
+            assert_eq!(receipt.failure_stage.as_deref(), Some("apply"), "{}", branch);
+            assert_eq!(receipt.updated, 0, "{}", branch);
+            let reason = receipt
+                .failed_reason
+                .clone()
+                .expect("fail-closed failure text");
+            assert!(
+                reason.contains("the index-scan settings could not be applied"),
+                "{}: the operator must be told the check may have run through the ART: {}",
+                branch,
+                reason
+            );
+            assert!(
+                reason.contains("violated one-target/one-row invariant"),
+                "{}: the ordinary apply failure shape is preserved: {}",
+                branch,
+                reason
+            );
+            // The invariant facts are attached, so the chunk took the retry
+            // gate and spent it — the same shape any unconfirmable count gets.
+            assert_eq!(
+                receipt
+                    .warnings
+                    .iter()
+                    .filter(|w| w.reason_code == "focus_writeback_chunk_retried")
+                    .count(),
+                1,
+                "{}",
+                branch
+            );
+            // Nothing was accepted.
+            assert_eq!(rows_carrying_test_attempt(conn), 0, "{}", branch);
+        });
+    }
+}
+
+/// S179 — the retirement of the fourteen focus/face secondary ART indexes, and
+/// the settings the apply-stage verification leans on.
+#[cfg(test)]
+mod focus_writeback_index_tests
+{
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static INDEX_FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// The eight indexes that STAY. None of them is written by the writeback
+    /// UPDATE, and each serves an equality/range filter that can be selective.
+    const KEPT_INDEXES: [&str; 8] = [
+        "idx_camera_model",
+        "idx_capture_datetime",
+        "idx_color_label",
+        "idx_created_timestamp",
+        "idx_file_extension",
+        "idx_flag",
+        "idx_rating",
+        // The S173 directory_path repair MARKER — its absence re-arms that
+        // migration, so it must survive every S179 drop.
+        "idx_images_directory_path",
+    ];
+
+    fn fixture_path(tag: &str) -> std::path::PathBuf
+    {
+        let n = INDEX_FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "plcore-s179-index-test-{}-{}-{}.db",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+        path
+    }
+
+    fn cleanup(path: &std::path::Path)
+    {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+    }
+
+    fn image_index_names(conn: &Connection) -> Vec<String>
+    {
+        let mut stmt = conn
+            .prepare("SELECT index_name FROM duckdb_indexes() WHERE table_name = 'images' ORDER BY index_name")
+            .expect("prepare duckdb_indexes()");
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query duckdb_indexes()");
+        rows.map(|row| row.expect("index name")).collect()
+    }
+
+    /// Every `images` column reachable through any surviving index, read off
+    /// the engine's own catalogue rather than off our DDL.
+    fn indexed_image_columns(conn: &Connection) -> Vec<(String, String)>
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT index_name, CAST(expressions AS VARCHAR)
+                 FROM duckdb_indexes()
+                 WHERE table_name = 'images'",
+            )
+            .expect("prepare duckdb_indexes() expressions");
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .expect("query duckdb_indexes() expressions");
+        let mut pairs = Vec::new();
+        for row in rows {
+            let (index_name, expressions) = row.expect("index expression row");
+            for column in expressions
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split(',')
+            {
+                let column = column.trim().trim_matches('"').to_string();
+                if !column.is_empty() {
+                    pairs.push((index_name.clone(), column));
+                }
+            }
+        }
+        pairs
+    }
+
+    fn assert_retired_absent_and_kept_present(conn: &Connection, context: &str)
+    {
+        let present = image_index_names(conn);
+        for retired in FOCUS_WRITEBACK_RETIRED_INDEXES {
+            assert!(
+                !present.iter().any(|name| name == retired),
+                "{}: retired index {} is still present ({:?})",
+                context,
+                retired,
+                present
+            );
+        }
+        for kept in KEPT_INDEXES {
+            assert!(
+                present.iter().any(|name| name == kept),
+                "{}: index {} must survive the S179 drop ({:?})",
+                context,
+                kept,
+                present
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_open_creates_no_retired_focus_indexes()
+    {
+        let path = fixture_path("fresh");
+        let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+        assert_retired_absent_and_kept_present(&conn, "fresh open");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn reopening_an_upgraded_catalogue_drops_the_retired_focus_indexes()
+    {
+        let path = fixture_path("upgrade");
+        let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+
+        // Recreate the pre-S179 shape by hand, exactly as the retired schema
+        // lines did, and give the catalogue a row to lose.
+        for index_name in FOCUS_WRITEBACK_RETIRED_INDEXES {
+            let column = index_name
+                .strip_prefix("idx_")
+                .expect("retired index names are idx_<column>");
+            conn.execute_batch(&format!(
+                "CREATE INDEX IF NOT EXISTS {} ON images({});",
+                index_name, column
+            ))
+            .unwrap_or_else(|e| panic!("recreate {}: {}", index_name, e));
+        }
+        conn.execute_batch(
+            "INSERT INTO images (file_path, file_name, file_size, created_timestamp,
+                                 modified_timestamp, is_video, focus_score, face_count)
+             VALUES ('/a/upgrade.jpg', 'upgrade.jpg', 1, 0, 0, FALSE, 42.0, 3);",
+        )
+        .expect("seed a row");
+        let present_before = image_index_names(&conn);
+        for retired in FOCUS_WRITEBACK_RETIRED_INDEXES {
+            assert!(
+                present_before.iter().any(|name| name == retired),
+                "fixture must actually carry {} before the reopen",
+                retired
+            );
+        }
+        drop(conn);
+
+        let conn = open_and_migrate_catalogue(&path).expect("reopen runs the drop");
+        assert_retired_absent_and_kept_present(&conn, "reopen of an upgraded catalogue");
+
+        // The data — and the S173 marker's meaning — are untouched.
+        let (score, faces): (Option<f64>, Option<i32>) = conn
+            .query_row(
+                "SELECT focus_score, face_count FROM images WHERE file_path = '/a/upgrade.jpg'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("row survives the drop");
+        assert_eq!(score, Some(42.0));
+        assert_eq!(faces, Some(3));
+
+        // Idempotent: a third open finds nothing to drop and changes nothing.
+        drop(conn);
+        let conn = open_and_migrate_catalogue(&path).expect("third open");
+        assert_retired_absent_and_kept_present(&conn, "third open");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn focus_writeback_update_columns_carry_no_index()
+    {
+        let path = fixture_path("columns");
+        let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+
+        for (index_name, column) in indexed_image_columns(&conn) {
+            assert!(
+                !FOCUS_WRITEBACK_UPDATED_COLUMNS.contains(&column.as_str()),
+                "index {} covers {}, a column update_focus_analysis_target WRITES. \
+                 An index on any written column puts that UPDATE back on DuckDB's \
+                 DELETE + INSERT branch — the branch whose reported change count is \
+                 the scan size, which is what three whole-catalogue culling runs died \
+                 on (S179). See FOCUS_WRITEBACK_RETIRED_INDEXES and the retired CREATE \
+                 block in open_and_migrate_catalogue for the full rationale.",
+                index_name,
+                column
+            );
+        }
+
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn index_scan_settings_exist_and_the_guard_restores_them()
+    {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+
+        let read = |name: &str| -> String {
+            conn.query_row(
+                "SELECT value FROM duckdb_settings() WHERE name = ?1",
+                params![name],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_else(|e| panic!("setting {} must exist on this engine: {}", name, e))
+        };
+
+        let default_max = read("index_scan_max_count");
+        let default_percentage = read("index_scan_percentage");
+        let as_number = |text: &str| text.parse::<f64>().expect("numeric setting");
+        assert!(as_number(&default_max) > 0.0);
+        assert!(as_number(&default_percentage) > 0.0);
+
+        // Both must be settable and resettable INSIDE an open transaction —
+        // the verification runs mid-chunk, with the writeback transaction held
+        // — and the SET must not disturb that transaction. If a future engine
+        // made SET implicitly commit, the whole verification would silently
+        // move OUTSIDE the writeback transaction, so the data half is pinned
+        // here too and not just the settings half.
+        conn.execute_batch(
+            "CREATE TABLE guard_probe (id INTEGER, v INTEGER);
+             INSERT INTO guard_probe VALUES (1, 100);",
+        )
+        .expect("guard probe table");
+        let probe_value = || -> i64 {
+            conn.query_row("SELECT v FROM guard_probe WHERE id = 1", [], |row| row.get(0))
+                .expect("guard probe value")
+        };
+
+        conn.execute_batch("BEGIN TRANSACTION;").expect("begin");
+        conn.execute_batch("UPDATE guard_probe SET v = 999 WHERE id = 1;")
+            .expect("uncommitted write");
+        {
+            let guard = FocusWritebackIndexScansDisabled::new(&conn);
+            assert!(guard.active, "the engine must accept the index-scan settings");
+            assert_eq!(as_number(&read("index_scan_max_count")), 0.0);
+            assert_eq!(as_number(&read("index_scan_percentage")), 0.0);
+            assert_eq!(
+                probe_value(),
+                999,
+                "the transaction's uncommitted write must still be visible under the guard"
+            );
+        }
+        assert_eq!(
+            read("index_scan_max_count"),
+            default_max,
+            "the guard must restore the engine default on drop"
+        );
+        assert_eq!(read("index_scan_percentage"), default_percentage);
+        assert_eq!(probe_value(), 999, "still inside the same transaction");
+        conn.execute_batch("ROLLBACK;").expect("rollback");
+        assert_eq!(
+            probe_value(),
+            100,
+            "the SET must not have committed the transaction"
+        );
+
+        // And on an error path: the guard restores even when the body returns
+        // early, because restoration is Drop, not a trailing statement.
+        {
+            let _guard = FocusWritebackIndexScansDisabled::new(&conn);
+            let _ = conn.query_row("SELECT * FROM does_not_exist", [], |_| Ok(()));
+        }
+        assert_eq!(read("index_scan_max_count"), default_max);
+        assert_eq!(read("index_scan_percentage"), default_percentage);
     }
 }
 
@@ -24302,6 +26000,13 @@ mod duckdb_upgrade_tests
     }
 }
 
+/// S179 — the live reproduction harness for the focus-analysis writeback
+/// invariant, in its own file because it is a long-form diagnostic rather than
+/// a unit test. Gated on `PLDIAG_REPRO_DB`: with the variable unset the test
+/// returns immediately, so `cargo test --lib` is unaffected on any machine.
+#[cfg(test)]
+mod live_repro_focus_writeback_tests;
+
 #[cfg(test)]
 mod live_repro_tests {
     use super::*;
@@ -24499,7 +26204,7 @@ mod live_repro_tests {
         assert_eq!(plans[1].target_ids, vec![second_id]);
 
         conn.execute_batch("BEGIN TRANSACTION;").expect("begin");
-        let write_result = write_focus_analysis_plans_in_transaction(&conn, &plans);
+        let write_result = write_focus_analysis_plans_in_transaction(&conn, &plans, None, &mut Vec::new());
         let scores = conn
             .prepare(
                 "SELECT id, focus_score

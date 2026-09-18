@@ -2321,15 +2321,17 @@ public struct FocusAnalysisWritebackResult: Equatable, Hashable {
     public var failedReason: String?
     public var sourceImageId: Int64?
     public var targetImageId: Int64?
+    public var warnings: [FocusAnalysisWritebackWarning]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(updated: UInt64, failureStage: String?, failedReason: String?, sourceImageId: Int64?, targetImageId: Int64?) {
+    public init(updated: UInt64, failureStage: String?, failedReason: String?, sourceImageId: Int64?, targetImageId: Int64?, warnings: [FocusAnalysisWritebackWarning]) {
         self.updated = updated
         self.failureStage = failureStage
         self.failedReason = failedReason
         self.sourceImageId = sourceImageId
         self.targetImageId = targetImageId
+        self.warnings = warnings
     }
 
     
@@ -2352,7 +2354,8 @@ public struct FfiConverterTypeFocusAnalysisWritebackResult: FfiConverterRustBuff
                 failureStage: FfiConverterOptionString.read(from: &buf), 
                 failedReason: FfiConverterOptionString.read(from: &buf), 
                 sourceImageId: FfiConverterOptionInt64.read(from: &buf), 
-                targetImageId: FfiConverterOptionInt64.read(from: &buf)
+                targetImageId: FfiConverterOptionInt64.read(from: &buf), 
+                warnings: FfiConverterSequenceTypeFocusAnalysisWritebackWarning.read(from: &buf)
         )
     }
 
@@ -2362,6 +2365,7 @@ public struct FfiConverterTypeFocusAnalysisWritebackResult: FfiConverterRustBuff
         FfiConverterOptionString.write(value.failedReason, into: &buf)
         FfiConverterOptionInt64.write(value.sourceImageId, into: &buf)
         FfiConverterOptionInt64.write(value.targetImageId, into: &buf)
+        FfiConverterSequenceTypeFocusAnalysisWritebackWarning.write(value.warnings, into: &buf)
     }
 }
 
@@ -2378,6 +2382,80 @@ public func FfiConverterTypeFocusAnalysisWritebackResult_lift(_ buf: RustBuffer)
 #endif
 public func FfiConverterTypeFocusAnalysisWritebackResult_lower(_ value: FocusAnalysisWritebackResult) -> RustBuffer {
     return FfiConverterTypeFocusAnalysisWritebackResult.lower(value)
+}
+
+
+public struct FocusAnalysisWritebackWarning: Equatable, Hashable {
+    public var reasonCode: String
+    public var sourceImageId: Int64
+    public var targetImageId: Int64
+    public var rowCount: Int64
+    public var matchingRows: Int64
+    public var distinctRowids: Int64
+    public var detail: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(reasonCode: String, sourceImageId: Int64, targetImageId: Int64, rowCount: Int64, matchingRows: Int64, distinctRowids: Int64, detail: String) {
+        self.reasonCode = reasonCode
+        self.sourceImageId = sourceImageId
+        self.targetImageId = targetImageId
+        self.rowCount = rowCount
+        self.matchingRows = matchingRows
+        self.distinctRowids = distinctRowids
+        self.detail = detail
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FocusAnalysisWritebackWarning: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFocusAnalysisWritebackWarning: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FocusAnalysisWritebackWarning {
+        return
+            try FocusAnalysisWritebackWarning(
+                reasonCode: FfiConverterString.read(from: &buf), 
+                sourceImageId: FfiConverterInt64.read(from: &buf), 
+                targetImageId: FfiConverterInt64.read(from: &buf), 
+                rowCount: FfiConverterInt64.read(from: &buf), 
+                matchingRows: FfiConverterInt64.read(from: &buf), 
+                distinctRowids: FfiConverterInt64.read(from: &buf), 
+                detail: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FocusAnalysisWritebackWarning, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.reasonCode, into: &buf)
+        FfiConverterInt64.write(value.sourceImageId, into: &buf)
+        FfiConverterInt64.write(value.targetImageId, into: &buf)
+        FfiConverterInt64.write(value.rowCount, into: &buf)
+        FfiConverterInt64.write(value.matchingRows, into: &buf)
+        FfiConverterInt64.write(value.distinctRowids, into: &buf)
+        FfiConverterString.write(value.detail, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFocusAnalysisWritebackWarning_lift(_ buf: RustBuffer) throws -> FocusAnalysisWritebackWarning {
+    return try FfiConverterTypeFocusAnalysisWritebackWarning.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFocusAnalysisWritebackWarning_lower(_ value: FocusAnalysisWritebackWarning) -> RustBuffer {
+    return FfiConverterTypeFocusAnalysisWritebackWarning.lower(value)
 }
 
 
@@ -5977,6 +6055,31 @@ fileprivate struct FfiConverterSequenceTypeFocusAnalysisResult: FfiConverterRust
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeFocusAnalysisResult.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFocusAnalysisWritebackWarning: FfiConverterRustBuffer {
+    typealias SwiftType = [FocusAnalysisWritebackWarning]
+
+    public static func write(_ value: [FocusAnalysisWritebackWarning], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFocusAnalysisWritebackWarning.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FocusAnalysisWritebackWarning] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FocusAnalysisWritebackWarning]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFocusAnalysisWritebackWarning.read(from: &buf))
         }
         return seq
     }

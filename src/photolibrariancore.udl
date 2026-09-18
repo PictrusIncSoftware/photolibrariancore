@@ -1220,6 +1220,24 @@ dictionary FocusAnalysisWritebackResult {
     string? failed_reason;
     i64? source_image_id;
     i64? target_image_id;
+    // S179, appended LAST (the S65 wire-growth rule). Swift only READS this
+    // dictionary — there is no hand-written construction site — so, like the
+    // fields above it, this one carries no default.
+    sequence<FocusAnalysisWritebackWarning> warnings;
+};
+
+// S179 — one non-fatal anomaly a writeback chunk survived. `reason_code` is a
+// stable token Swift copies into the Operation Log VERBATIM (never through the
+// failure-stage code mapping). `matching_rows`/`distinct_rowids` are -1 when
+// the verification SELECT itself could not run.
+dictionary FocusAnalysisWritebackWarning {
+    string reason_code;
+    i64 source_image_id;
+    i64 target_image_id;
+    i64 row_count;
+    i64 matching_rows;
+    i64 distinct_rowids;
+    string detail;
 };
 
 dictionary FaceObservationResult {
