@@ -620,7 +620,12 @@ fn live_repro_focus_writeback_invariant_on_real_catalogue()
     }
     else
     {
-        Connection::open(&db_path).expect("[repro] Connection::open failed")
+        let conn = Connection::open(&db_path).expect("[repro] Connection::open failed");
+        // ⭐ R-14 / slice E0 — this branch replays PRODUCTION SQL against a real
+        // catalogue file, so it must carry production's extension policy too;
+        // `migrate: true` gets it for free from open_and_migrate_catalogue.
+        apply_extension_autoload_policy(&conn);
+        conn
     };
     eprintln!(
         "[repro] catalogue open+migrate took {:.1}s",

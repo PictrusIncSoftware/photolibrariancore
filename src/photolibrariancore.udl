@@ -993,6 +993,97 @@ namespace photolibrariancore {
     // copied under the new face-observation ids, never re-embedded.
     [Async]
     MergeSummary merge_catalogue_from_backup(string backup_db_path, string backup_vectors_path, MergeCollisionPolicy policy);
+
+    // === Apple shared-album cleanup (slice N-2, 2026-09-18) ===
+
+    // Catalogued rows under ONE Apple Photos library's `originals/` tree whose
+    // directory under `originals/` has MORE THAN ONE component — the observable
+    // shape of an iCloud Shared Album asset. Read-only. `originals_prefix` is
+    // `<library>/originals/`, built by the caller with the SAME two components
+    // the reader uses; the call is REFUSED (ok = false) unless it is non-empty,
+    // ends with `/originals/` and contains `.photoslibrary/`, because an empty
+    // prefix would degrade the predicate to "any path with two or more slashes".
+    // image_ids and file_paths are INDEX-ALIGNED (one ordered query).
+    [Async]
+    AppleSharedAlbumCleanupTargets apple_shared_album_cleanup_targets(string originals_prefix);
+
+    // The Q-36 dependent guard: how many keyword / face / similar-photo rows the
+    // given image ids carry, and WHICH ids carry any. Read-only. FAIL-CLOSED —
+    // ok = false means the census could not be performed and the caller must
+    // delete NOTHING; an empty encumbered list is only meaningful when ok.
+    [Async]
+    AppleSharedAlbumDependentCensus apple_shared_album_dependent_census(sequence<i64> image_ids);
+
+    // === Swallowed failures (slice 7 / cluster H, 2026-09-19) ===
+    //
+    // ⭐ Every function here is NEW and appended LAST. No existing FFI
+    // signature changed, and no [Throws=] was added: failures travel in
+    // result carriers (FaceEmbeddingStoreResult is the in-repo precedent),
+    // because a [Throws=] would change bindgen's emitted Swift signature and
+    // force every existing call site to gain `try` in one commit.
+
+    // R-31 — how many rows the catalogue could not deserialize, cumulative
+    // since this process started, per query site. NOT drained: a caller that
+    // wants "how many during MY operation" reads this at the start and at the
+    // end and takes the difference, so two callers never steal each other's
+    // counts. The delta is a WINDOW measurement, not an attribution — another
+    // operation running at the same time is counted in it.
+    // site_names and site_counts are INDEX-ALIGNED.
+    [Async]
+    DroppedRowReport dropped_row_report();
+
+    // R-31 — a page of Intelligent Culling candidates, plus the number of rows
+    // the catalogue could not deserialize while building it. A work set with a
+    // non-zero dropped_rows is NEVER complete — the caller must not report
+    // "nothing needed analysis". Supersedes focus_analysis_candidates.
+    [Async]
+    FocusAnalysisCandidatePage focus_analysis_candidate_page(u32 limit, string algorithm_version, string analysis_run_id);
+
+    // The same, intersected with an explicit image-id selection. Supersedes
+    // focus_analysis_candidates_for_ids.
+    [Async]
+    FocusAnalysisCandidatePage focus_analysis_candidate_page_for_ids(sequence<i64> ids, u32 limit, string algorithm_version, string analysis_run_id);
+
+    // R-31 + R-08 — the faces still needing an embedding, plus the dropped-row
+    // count AND the vector store's own reachability. store_ok = false means the
+    // store could not be READ, which is distinct from an index that was never
+    // built (store_ok = true with an empty list). ⛔ On store_ok = false the
+    // list is EMPTY, never "everything is missing".
+    // Supersedes face_embedding_missing_observations.
+    [Async]
+    FaceObservationWorkSet face_embedding_missing_observation_page(
+        string algorithm_version,
+        string model_version,
+        string preprocessing_version,
+        u32 limit
+    );
+
+    // R-08 — the same face search, with the vector store's reachability
+    // carried. ok = false means the store could not be READ, which is NOT the
+    // same answer as "no matching faces"; matches is then empty and the caller
+    // must SAY SO rather than showing a zero-result search.
+    // Supersedes face_embedding_search.
+    [Async]
+    FaceEmbeddingSearchResult face_embedding_search_checked(
+        sequence<i64> seed_face_observation_ids,
+        sequence<i64> candidate_image_ids,
+        string model_version,
+        string preprocessing_version,
+        f64 threshold,
+        u32 limit
+    );
+
+    // R-08 — the drawn-region ("Manually Select Face to Search…") search, with
+    // the same reachability channel. Supersedes face_embedding_search_vector.
+    [Async]
+    FaceEmbeddingSearchResult face_embedding_search_vector_checked(
+        sequence<f32> seed_vector,
+        sequence<i64> candidate_image_ids,
+        string model_version,
+        string preprocessing_version,
+        f64 threshold,
+        u32 limit
+    );
 };
 
 // Image classification categories for JPEG+RAW pair handling.
@@ -1317,6 +1408,12 @@ dictionary FaceRecognitionMenuState {
     string? analysis_status = null;
     u32 face_observation_count;
     u32 indexed_face_count;
+    // slice 7 / R-08, appended LAST. true means the face-embedding store could
+    // not be READ, so indexed_face_count is 0 for want of an answer, NOT
+    // because the index is missing. ⛔ A caller must not offer "Build Face
+    // Recognition Index" on this state — that would re-embed a catalogue that
+    // is already indexed.
+    boolean store_unavailable = false;
 };
 
 dictionary FaceEmbeddingStoreResult {
@@ -1556,6 +1653,13 @@ dictionary MergeChunkResult {
     u64 inserted;
     u64 updated;
     sequence<i64> image_ids;
+    // slice 7 / R-73, appended LAST. The chunk always rolled back correctly on
+    // a row error; what was missing was a CHANNEL to say so, which is why an
+    // import that failed every row reported a clean zero-add with no error.
+    // failed_rows is the CHUNK's length, not 1 — the whole chunk is un-merged
+    // whichever row tripped.
+    u64 failed_rows = 0;
+    string? failure_message = null;
 };
 
 // Lightroom import — one VIDEO record. No ImageMetadata analogue (videos carry
@@ -1831,4 +1935,72 @@ dictionary MergeSummary {
     u64 face_embeddings_copied;
     u64 stack_members_added;
     u64 saved_queries_added;
+};
+
+// === Apple shared-album cleanup (slice N-2, 2026-09-18) ===
+
+// The rows one Apple Photos library's `originals/` tree holds whose directory
+// under `originals/` has MORE THAN ONE component. ok = false means the call was
+// refused or the query failed; both lists are then empty and error_message is
+// set, so a selection that feeds a DELETE fails toward "found nothing".
+dictionary AppleSharedAlbumCleanupTargets {
+    boolean ok;
+    sequence<i64> image_ids;
+    sequence<string> file_paths;   // index-aligned with image_ids
+    string? error_message;
+};
+
+// The Q-36 dependent guard's answer. FAIL-CLOSED: ok = false means the census
+// could not be performed and the caller must delete NOTHING — an empty
+// encumbered_image_ids is only meaningful when ok is true.
+dictionary AppleSharedAlbumDependentCensus {
+    boolean ok;
+    u64 keyword_rows;
+    u64 face_observation_rows;
+    u64 person_face_assignment_rows;
+    u64 face_cluster_member_rows;
+    u64 similar_photo_group_member_rows;
+    u64 similar_photo_featureprint_rows;
+    u64 queued_vector_deletes;
+    sequence<i64> encumbered_image_ids;
+    string? error_message;
+};
+
+// === Swallowed failures (slice 7 / cluster H, 2026-09-19) ===
+
+// R-31 — the cumulative dropped-row census. site_names and site_counts are
+// INDEX-ALIGNED. The numbers are cumulative since the process started and are
+// NOT drained by a read, so a caller takes a DELTA over its own window.
+dictionary DroppedRowReport {
+    u64 total_dropped;
+    sequence<string> site_names;
+    sequence<u64> site_counts;
+};
+
+// R-31 — a page of Intelligent Culling candidates plus the EXACT number of
+// rows the catalogue could not deserialize while building it. dropped_rows > 0
+// means this work set is short, so the run must not report itself complete.
+dictionary FocusAnalysisCandidatePage {
+    sequence<FocusAnalysisCandidate> candidates;
+    u64 dropped_rows;
+};
+
+// R-31 + R-08 — the face-index work set, with everything the caller needs to
+// tell an EMPTY answer from an UNKNOWN one. store_ok = false means the vector
+// store could not be READ; observations is then EMPTY (never "everything is
+// missing", which would re-embed the whole catalogue).
+dictionary FaceObservationWorkSet {
+    sequence<FaceObservationRecord> observations;
+    u64 dropped_rows;
+    boolean store_ok;
+    string? store_error;
+};
+
+// R-08 — a face search plus the vector store's reachability. ok = false means
+// the store could not be READ, which is NOT the same answer as "no matching
+// faces"; matches is then empty and the caller must say so.
+dictionary FaceEmbeddingSearchResult {
+    boolean ok;
+    string? error_message;
+    sequence<FaceSearchMatchRecord> matches;
 };

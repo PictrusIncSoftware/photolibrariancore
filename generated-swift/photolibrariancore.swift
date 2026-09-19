@@ -747,6 +747,154 @@ public func FfiConverterTypeAnalysisJob_lower(_ value: AnalysisJob) -> RustBuffe
 }
 
 
+public struct AppleSharedAlbumCleanupTargets: Equatable, Hashable {
+    public var ok: Bool
+    public var imageIds: [Int64]
+    public var filePaths: [String]
+    public var errorMessage: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(ok: Bool, imageIds: [Int64], filePaths: [String], errorMessage: String?) {
+        self.ok = ok
+        self.imageIds = imageIds
+        self.filePaths = filePaths
+        self.errorMessage = errorMessage
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension AppleSharedAlbumCleanupTargets: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAppleSharedAlbumCleanupTargets: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AppleSharedAlbumCleanupTargets {
+        return
+            try AppleSharedAlbumCleanupTargets(
+                ok: FfiConverterBool.read(from: &buf), 
+                imageIds: FfiConverterSequenceInt64.read(from: &buf), 
+                filePaths: FfiConverterSequenceString.read(from: &buf), 
+                errorMessage: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AppleSharedAlbumCleanupTargets, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.ok, into: &buf)
+        FfiConverterSequenceInt64.write(value.imageIds, into: &buf)
+        FfiConverterSequenceString.write(value.filePaths, into: &buf)
+        FfiConverterOptionString.write(value.errorMessage, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAppleSharedAlbumCleanupTargets_lift(_ buf: RustBuffer) throws -> AppleSharedAlbumCleanupTargets {
+    return try FfiConverterTypeAppleSharedAlbumCleanupTargets.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAppleSharedAlbumCleanupTargets_lower(_ value: AppleSharedAlbumCleanupTargets) -> RustBuffer {
+    return FfiConverterTypeAppleSharedAlbumCleanupTargets.lower(value)
+}
+
+
+public struct AppleSharedAlbumDependentCensus: Equatable, Hashable {
+    public var ok: Bool
+    public var keywordRows: UInt64
+    public var faceObservationRows: UInt64
+    public var personFaceAssignmentRows: UInt64
+    public var faceClusterMemberRows: UInt64
+    public var similarPhotoGroupMemberRows: UInt64
+    public var similarPhotoFeatureprintRows: UInt64
+    public var queuedVectorDeletes: UInt64
+    public var encumberedImageIds: [Int64]
+    public var errorMessage: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(ok: Bool, keywordRows: UInt64, faceObservationRows: UInt64, personFaceAssignmentRows: UInt64, faceClusterMemberRows: UInt64, similarPhotoGroupMemberRows: UInt64, similarPhotoFeatureprintRows: UInt64, queuedVectorDeletes: UInt64, encumberedImageIds: [Int64], errorMessage: String?) {
+        self.ok = ok
+        self.keywordRows = keywordRows
+        self.faceObservationRows = faceObservationRows
+        self.personFaceAssignmentRows = personFaceAssignmentRows
+        self.faceClusterMemberRows = faceClusterMemberRows
+        self.similarPhotoGroupMemberRows = similarPhotoGroupMemberRows
+        self.similarPhotoFeatureprintRows = similarPhotoFeatureprintRows
+        self.queuedVectorDeletes = queuedVectorDeletes
+        self.encumberedImageIds = encumberedImageIds
+        self.errorMessage = errorMessage
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension AppleSharedAlbumDependentCensus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAppleSharedAlbumDependentCensus: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AppleSharedAlbumDependentCensus {
+        return
+            try AppleSharedAlbumDependentCensus(
+                ok: FfiConverterBool.read(from: &buf), 
+                keywordRows: FfiConverterUInt64.read(from: &buf), 
+                faceObservationRows: FfiConverterUInt64.read(from: &buf), 
+                personFaceAssignmentRows: FfiConverterUInt64.read(from: &buf), 
+                faceClusterMemberRows: FfiConverterUInt64.read(from: &buf), 
+                similarPhotoGroupMemberRows: FfiConverterUInt64.read(from: &buf), 
+                similarPhotoFeatureprintRows: FfiConverterUInt64.read(from: &buf), 
+                queuedVectorDeletes: FfiConverterUInt64.read(from: &buf), 
+                encumberedImageIds: FfiConverterSequenceInt64.read(from: &buf), 
+                errorMessage: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AppleSharedAlbumDependentCensus, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.ok, into: &buf)
+        FfiConverterUInt64.write(value.keywordRows, into: &buf)
+        FfiConverterUInt64.write(value.faceObservationRows, into: &buf)
+        FfiConverterUInt64.write(value.personFaceAssignmentRows, into: &buf)
+        FfiConverterUInt64.write(value.faceClusterMemberRows, into: &buf)
+        FfiConverterUInt64.write(value.similarPhotoGroupMemberRows, into: &buf)
+        FfiConverterUInt64.write(value.similarPhotoFeatureprintRows, into: &buf)
+        FfiConverterUInt64.write(value.queuedVectorDeletes, into: &buf)
+        FfiConverterSequenceInt64.write(value.encumberedImageIds, into: &buf)
+        FfiConverterOptionString.write(value.errorMessage, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAppleSharedAlbumDependentCensus_lift(_ buf: RustBuffer) throws -> AppleSharedAlbumDependentCensus {
+    return try FfiConverterTypeAppleSharedAlbumDependentCensus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAppleSharedAlbumDependentCensus_lower(_ value: AppleSharedAlbumDependentCensus) -> RustBuffer {
+    return FfiConverterTypeAppleSharedAlbumDependentCensus.lower(value)
+}
+
+
 public struct BackupCounts: Equatable, Hashable {
     public var imageCount: UInt64
     public var videoCount: UInt64
@@ -1038,6 +1186,64 @@ public func FfiConverterTypeDirectorySyncState_lift(_ buf: RustBuffer) throws ->
 #endif
 public func FfiConverterTypeDirectorySyncState_lower(_ value: DirectorySyncState) -> RustBuffer {
     return FfiConverterTypeDirectorySyncState.lower(value)
+}
+
+
+public struct DroppedRowReport: Equatable, Hashable {
+    public var totalDropped: UInt64
+    public var siteNames: [String]
+    public var siteCounts: [UInt64]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(totalDropped: UInt64, siteNames: [String], siteCounts: [UInt64]) {
+        self.totalDropped = totalDropped
+        self.siteNames = siteNames
+        self.siteCounts = siteCounts
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension DroppedRowReport: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDroppedRowReport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DroppedRowReport {
+        return
+            try DroppedRowReport(
+                totalDropped: FfiConverterUInt64.read(from: &buf), 
+                siteNames: FfiConverterSequenceString.read(from: &buf), 
+                siteCounts: FfiConverterSequenceUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DroppedRowReport, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.totalDropped, into: &buf)
+        FfiConverterSequenceString.write(value.siteNames, into: &buf)
+        FfiConverterSequenceUInt64.write(value.siteCounts, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDroppedRowReport_lift(_ buf: RustBuffer) throws -> DroppedRowReport {
+    return try FfiConverterTypeDroppedRowReport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDroppedRowReport_lower(_ value: DroppedRowReport) -> RustBuffer {
+    return FfiConverterTypeDroppedRowReport.lower(value)
 }
 
 
@@ -1420,6 +1626,64 @@ public func FfiConverterTypeFaceEmbeddingNeighborRecord_lift(_ buf: RustBuffer) 
 #endif
 public func FfiConverterTypeFaceEmbeddingNeighborRecord_lower(_ value: FaceEmbeddingNeighborRecord) -> RustBuffer {
     return FfiConverterTypeFaceEmbeddingNeighborRecord.lower(value)
+}
+
+
+public struct FaceEmbeddingSearchResult: Equatable, Hashable {
+    public var ok: Bool
+    public var errorMessage: String?
+    public var matches: [FaceSearchMatchRecord]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(ok: Bool, errorMessage: String?, matches: [FaceSearchMatchRecord]) {
+        self.ok = ok
+        self.errorMessage = errorMessage
+        self.matches = matches
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FaceEmbeddingSearchResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFaceEmbeddingSearchResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FaceEmbeddingSearchResult {
+        return
+            try FaceEmbeddingSearchResult(
+                ok: FfiConverterBool.read(from: &buf), 
+                errorMessage: FfiConverterOptionString.read(from: &buf), 
+                matches: FfiConverterSequenceTypeFaceSearchMatchRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FaceEmbeddingSearchResult, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.ok, into: &buf)
+        FfiConverterOptionString.write(value.errorMessage, into: &buf)
+        FfiConverterSequenceTypeFaceSearchMatchRecord.write(value.matches, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFaceEmbeddingSearchResult_lift(_ buf: RustBuffer) throws -> FaceEmbeddingSearchResult {
+    return try FfiConverterTypeFaceEmbeddingSearchResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFaceEmbeddingSearchResult_lower(_ value: FaceEmbeddingSearchResult) -> RustBuffer {
+    return FfiConverterTypeFaceEmbeddingSearchResult.lower(value)
 }
 
 
@@ -1879,19 +2143,83 @@ public func FfiConverterTypeFaceObservationResult_lower(_ value: FaceObservation
 }
 
 
+public struct FaceObservationWorkSet: Equatable, Hashable {
+    public var observations: [FaceObservationRecord]
+    public var droppedRows: UInt64
+    public var storeOk: Bool
+    public var storeError: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(observations: [FaceObservationRecord], droppedRows: UInt64, storeOk: Bool, storeError: String?) {
+        self.observations = observations
+        self.droppedRows = droppedRows
+        self.storeOk = storeOk
+        self.storeError = storeError
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FaceObservationWorkSet: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFaceObservationWorkSet: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FaceObservationWorkSet {
+        return
+            try FaceObservationWorkSet(
+                observations: FfiConverterSequenceTypeFaceObservationRecord.read(from: &buf), 
+                droppedRows: FfiConverterUInt64.read(from: &buf), 
+                storeOk: FfiConverterBool.read(from: &buf), 
+                storeError: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FaceObservationWorkSet, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeFaceObservationRecord.write(value.observations, into: &buf)
+        FfiConverterUInt64.write(value.droppedRows, into: &buf)
+        FfiConverterBool.write(value.storeOk, into: &buf)
+        FfiConverterOptionString.write(value.storeError, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFaceObservationWorkSet_lift(_ buf: RustBuffer) throws -> FaceObservationWorkSet {
+    return try FfiConverterTypeFaceObservationWorkSet.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFaceObservationWorkSet_lower(_ value: FaceObservationWorkSet) -> RustBuffer {
+    return FfiConverterTypeFaceObservationWorkSet.lower(value)
+}
+
+
 public struct FaceRecognitionMenuState: Equatable, Hashable {
     public var imageId: Int64
     public var analysisStatus: String?
     public var faceObservationCount: UInt32
     public var indexedFaceCount: UInt32
+    public var storeUnavailable: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(imageId: Int64, analysisStatus: String? = nil, faceObservationCount: UInt32, indexedFaceCount: UInt32) {
+    public init(imageId: Int64, analysisStatus: String? = nil, faceObservationCount: UInt32, indexedFaceCount: UInt32, storeUnavailable: Bool = false) {
         self.imageId = imageId
         self.analysisStatus = analysisStatus
         self.faceObservationCount = faceObservationCount
         self.indexedFaceCount = indexedFaceCount
+        self.storeUnavailable = storeUnavailable
     }
 
     
@@ -1913,7 +2241,8 @@ public struct FfiConverterTypeFaceRecognitionMenuState: FfiConverterRustBuffer {
                 imageId: FfiConverterInt64.read(from: &buf), 
                 analysisStatus: FfiConverterOptionString.read(from: &buf), 
                 faceObservationCount: FfiConverterUInt32.read(from: &buf), 
-                indexedFaceCount: FfiConverterUInt32.read(from: &buf)
+                indexedFaceCount: FfiConverterUInt32.read(from: &buf), 
+                storeUnavailable: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -1922,6 +2251,7 @@ public struct FfiConverterTypeFaceRecognitionMenuState: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.analysisStatus, into: &buf)
         FfiConverterUInt32.write(value.faceObservationCount, into: &buf)
         FfiConverterUInt32.write(value.indexedFaceCount, into: &buf)
+        FfiConverterBool.write(value.storeUnavailable, into: &buf)
     }
 }
 
@@ -2186,6 +2516,60 @@ public func FfiConverterTypeFocusAnalysisCandidate_lift(_ buf: RustBuffer) throw
 #endif
 public func FfiConverterTypeFocusAnalysisCandidate_lower(_ value: FocusAnalysisCandidate) -> RustBuffer {
     return FfiConverterTypeFocusAnalysisCandidate.lower(value)
+}
+
+
+public struct FocusAnalysisCandidatePage: Equatable, Hashable {
+    public var candidates: [FocusAnalysisCandidate]
+    public var droppedRows: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(candidates: [FocusAnalysisCandidate], droppedRows: UInt64) {
+        self.candidates = candidates
+        self.droppedRows = droppedRows
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FocusAnalysisCandidatePage: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFocusAnalysisCandidatePage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FocusAnalysisCandidatePage {
+        return
+            try FocusAnalysisCandidatePage(
+                candidates: FfiConverterSequenceTypeFocusAnalysisCandidate.read(from: &buf), 
+                droppedRows: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FocusAnalysisCandidatePage, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeFocusAnalysisCandidate.write(value.candidates, into: &buf)
+        FfiConverterUInt64.write(value.droppedRows, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFocusAnalysisCandidatePage_lift(_ buf: RustBuffer) throws -> FocusAnalysisCandidatePage {
+    return try FfiConverterTypeFocusAnalysisCandidatePage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFocusAnalysisCandidatePage_lower(_ value: FocusAnalysisCandidatePage) -> RustBuffer {
+    return FfiConverterTypeFocusAnalysisCandidatePage.lower(value)
 }
 
 
@@ -3171,13 +3555,17 @@ public struct MergeChunkResult: Equatable, Hashable {
     public var inserted: UInt64
     public var updated: UInt64
     public var imageIds: [Int64]
+    public var failedRows: UInt64
+    public var failureMessage: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(inserted: UInt64, updated: UInt64, imageIds: [Int64]) {
+    public init(inserted: UInt64, updated: UInt64, imageIds: [Int64], failedRows: UInt64 = UInt64(0), failureMessage: String? = nil) {
         self.inserted = inserted
         self.updated = updated
         self.imageIds = imageIds
+        self.failedRows = failedRows
+        self.failureMessage = failureMessage
     }
 
     
@@ -3198,7 +3586,9 @@ public struct FfiConverterTypeMergeChunkResult: FfiConverterRustBuffer {
             try MergeChunkResult(
                 inserted: FfiConverterUInt64.read(from: &buf), 
                 updated: FfiConverterUInt64.read(from: &buf), 
-                imageIds: FfiConverterSequenceInt64.read(from: &buf)
+                imageIds: FfiConverterSequenceInt64.read(from: &buf), 
+                failedRows: FfiConverterUInt64.read(from: &buf), 
+                failureMessage: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -3206,6 +3596,8 @@ public struct FfiConverterTypeMergeChunkResult: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.inserted, into: &buf)
         FfiConverterUInt64.write(value.updated, into: &buf)
         FfiConverterSequenceInt64.write(value.imageIds, into: &buf)
+        FfiConverterUInt64.write(value.failedRows, into: &buf)
+        FfiConverterOptionString.write(value.failureMessage, into: &buf)
     }
 }
 
@@ -5613,6 +6005,31 @@ fileprivate struct FfiConverterSequenceUInt8: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceUInt64: FfiConverterRustBuffer {
+    typealias SwiftType = [UInt64]
+
+    public static func write(_ value: [UInt64], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterUInt64.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [UInt64] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [UInt64]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterUInt64.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceInt64: FfiConverterRustBuffer {
     typealias SwiftType = [Int64]
 
@@ -6757,6 +7174,36 @@ public func appendOperationLogEntries(runId: Int64, entries: [OperationLogEntryI
             
         )
 }
+public func appleSharedAlbumCleanupTargets(originalsPrefix: String)async  -> AppleSharedAlbumCleanupTargets  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_apple_shared_album_cleanup_targets(FfiConverterString.lower(originalsPrefix)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeAppleSharedAlbumCleanupTargets_lift,
+            errorHandler: nil
+            
+        )
+}
+public func appleSharedAlbumDependentCensus(imageIds: [Int64])async  -> AppleSharedAlbumDependentCensus  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_apple_shared_album_dependent_census(FfiConverterSequenceInt64.lower(imageIds)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeAppleSharedAlbumDependentCensus_lift,
+            errorHandler: nil
+            
+        )
+}
 public func assignColorKeywordForIds(ids: [Int64], label: String)async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
@@ -7154,6 +7601,21 @@ public func distinctNumericValues(field: String)async  -> [Double]  {
             
         )
 }
+public func droppedRowReport()async  -> DroppedRowReport  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_dropped_row_report(
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeDroppedRowReport_lift,
+            errorHandler: nil
+            
+        )
+}
 public func expandCollapseGroupIds(ids: [Int64])async  -> [Int64]  {
     return
         try!  await uniffiRustCallAsync(
@@ -7214,6 +7676,21 @@ public func faceEmbeddingCount(modelVersion: String, preprocessingVersion: Strin
             
         )
 }
+public func faceEmbeddingMissingObservationPage(algorithmVersion: String, modelVersion: String, preprocessingVersion: String, limit: UInt32)async  -> FaceObservationWorkSet  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_face_embedding_missing_observation_page(FfiConverterString.lower(algorithmVersion),FfiConverterString.lower(modelVersion),FfiConverterString.lower(preprocessingVersion),FfiConverterUInt32.lower(limit)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeFaceObservationWorkSet_lift,
+            errorHandler: nil
+            
+        )
+}
 public func faceEmbeddingMissingObservations(algorithmVersion: String, modelVersion: String, preprocessingVersion: String, limit: UInt32)async  -> [FaceObservationRecord]  {
     return
         try!  await uniffiRustCallAsync(
@@ -7259,6 +7736,21 @@ public func faceEmbeddingSearch(seedFaceObservationIds: [Int64], candidateImageI
             
         )
 }
+public func faceEmbeddingSearchChecked(seedFaceObservationIds: [Int64], candidateImageIds: [Int64], modelVersion: String, preprocessingVersion: String, threshold: Double, limit: UInt32)async  -> FaceEmbeddingSearchResult  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_face_embedding_search_checked(FfiConverterSequenceInt64.lower(seedFaceObservationIds),FfiConverterSequenceInt64.lower(candidateImageIds),FfiConverterString.lower(modelVersion),FfiConverterString.lower(preprocessingVersion),FfiConverterDouble.lower(threshold),FfiConverterUInt32.lower(limit)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeFaceEmbeddingSearchResult_lift,
+            errorHandler: nil
+            
+        )
+}
 public func faceEmbeddingSearchVector(seedVector: [Float], candidateImageIds: [Int64], modelVersion: String, preprocessingVersion: String, threshold: Double, limit: UInt32)async  -> [FaceSearchMatchRecord]  {
     return
         try!  await uniffiRustCallAsync(
@@ -7270,6 +7762,21 @@ public func faceEmbeddingSearchVector(seedVector: [Float], candidateImageIds: [I
             completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeFaceSearchMatchRecord.lift,
+            errorHandler: nil
+            
+        )
+}
+public func faceEmbeddingSearchVectorChecked(seedVector: [Float], candidateImageIds: [Int64], modelVersion: String, preprocessingVersion: String, threshold: Double, limit: UInt32)async  -> FaceEmbeddingSearchResult  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_face_embedding_search_vector_checked(FfiConverterSequenceFloat.lower(seedVector),FfiConverterSequenceInt64.lower(candidateImageIds),FfiConverterString.lower(modelVersion),FfiConverterString.lower(preprocessingVersion),FfiConverterDouble.lower(threshold),FfiConverterUInt32.lower(limit)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeFaceEmbeddingSearchResult_lift,
             errorHandler: nil
             
         )
@@ -7420,6 +7927,36 @@ public func focusAnalysisCandidateCountForIds(ids: [Int64], algorithmVersion: St
             completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
             freeFunc: ffi_photolibrariancore_rust_future_free_u64,
             liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+public func focusAnalysisCandidatePage(limit: UInt32, algorithmVersion: String, analysisRunId: String)async  -> FocusAnalysisCandidatePage  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_focus_analysis_candidate_page(FfiConverterUInt32.lower(limit),FfiConverterString.lower(algorithmVersion),FfiConverterString.lower(analysisRunId)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeFocusAnalysisCandidatePage_lift,
+            errorHandler: nil
+            
+        )
+}
+public func focusAnalysisCandidatePageForIds(ids: [Int64], limit: UInt32, algorithmVersion: String, analysisRunId: String)async  -> FocusAnalysisCandidatePage  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_focus_analysis_candidate_page_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterUInt32.lower(limit),FfiConverterString.lower(algorithmVersion),FfiConverterString.lower(analysisRunId)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeFocusAnalysisCandidatePage_lift,
             errorHandler: nil
             
         )
@@ -8794,6 +9331,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_append_operation_log_entries() != 46105) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_apple_shared_album_cleanup_targets() != 59836) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_apple_shared_album_dependent_census() != 3133) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_assign_color_keyword_for_ids() != 11425) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8875,6 +9418,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_distinct_numeric_values() != 29680) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_dropped_row_report() != 56185) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_expand_collapse_group_ids() != 192) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8887,6 +9433,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_face_embedding_count() != 20632) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_face_embedding_missing_observation_page() != 8527) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_face_embedding_missing_observations() != 2533) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8896,7 +9445,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_face_embedding_search() != 34390) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_face_embedding_search_checked() != 31694) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_face_embedding_search_vector() != 46484) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_face_embedding_search_vector_checked() != 47633) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_face_observation_count() != 35248) {
@@ -8927,6 +9482,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_focus_analysis_candidate_count_for_ids() != 64336) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_focus_analysis_candidate_page() != 361) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_focus_analysis_candidate_page_for_ids() != 54240) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_focus_analysis_candidates() != 55146) {

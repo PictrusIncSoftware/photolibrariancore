@@ -41,6 +41,144 @@ static CATALOGUE: once_cell::sync::Lazy<Arc<Mutex<Option<Connection>>>> =
 static CATALOGUE_PATH: once_cell::sync::Lazy<Arc<Mutex<Option<PathBuf>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(None)));
 
+// ===========================================================================
+// Slice 7 / R-31 (2026-09-19) — the dropped-row collector and its census
+// ===========================================================================
+//
+// `row.get::<_, T>()` fails on a NULL in a column read as non-`Option` and on
+// a type mismatch — and this codebase's OWN migration idiom manufactures that
+// precondition: add the column with no DEFAULT per the S62 WAL rule, then
+// backfill; between those two statements the column is NULL. The OUTER
+// `query_map` `Err` arm has always been logged (`eprintln!` + an empty Vec);
+// the per-ROW arm was idiom, so a row the catalogue could not deserialize
+// simply vanished from the answer with no record anywhere.
+//
+// The census is CUMULATIVE since process start, keyed by query site, and it is
+// deliberately **NOT DRAINED**: a reader takes a DELTA over its own window
+// (read once before, once after), so two readers can never steal each other's
+// counts and no reader has to claim an attribution it cannot support.
+//
+// ⚠️ A census failure must never take a query down. Every access recovers a
+// poisoned lock's inner value instead of panicking — the whole FFI surface is
+// `try!` on the Swift side (R-07), so a panic here would kill the app.
+static DROPPED_ROW_CENSUS: once_cell::sync::Lazy<
+    Mutex<std::collections::BTreeMap<&'static str, u64>>,
+> = once_cell::sync::Lazy::new(|| Mutex::new(std::collections::BTreeMap::new()));
+
+fn record_dropped_rows(site: &'static str, count: u64)
+{
+    if count == 0
+    {
+        return;
+    }
+
+    let mut census = DROPPED_ROW_CENSUS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = census.entry(site).or_insert(0);
+    *entry = entry.saturating_add(count);
+}
+
+/// Collect a `query_map` iterator, COUNTING the rows that failed to
+/// deserialize instead of dropping them silently. Returns the rows that
+/// decoded and how many did not.
+///
+/// ⚠️ The `eprintln!` is a developer aid ONLY. Per Q-17 (Sep 18, 2026) stdout
+/// is not a record for anything a user started, and `PLDIAG_TRACE_ENABLED` has
+/// been false since Sep 19 — the durable record is the census above, read as a
+/// delta by the Swift operations that own an Operation Log run.
+fn collect_rows_counted<T>(
+    rows: impl Iterator<Item = duckdb::Result<T>>,
+    site: &'static str,
+) -> (Vec<T>, u64)
+{
+    let mut kept = Vec::new();
+    let mut dropped: u64 = 0;
+    let mut first_error: Option<String> = None;
+
+    for row in rows
+    {
+        match row
+        {
+            Ok(value) => kept.push(value),
+            Err(error) =>
+            {
+                dropped = dropped.saturating_add(1);
+                if first_error.is_none()
+                {
+                    first_error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    if dropped > 0
+    {
+        eprintln!(
+            "{}: dropped {} row(s); first error: {}",
+            site,
+            dropped,
+            first_error.as_deref().unwrap_or("unknown")
+        );
+        record_dropped_rows(site, dropped);
+    }
+
+    (kept, dropped)
+}
+
+/// The same collector, for the sites whose caller has nowhere to put a
+/// per-call count. The drop is still logged and still censused; only the
+/// number is discarded here.
+fn collect_rows<T>(rows: impl Iterator<Item = duckdb::Result<T>>, site: &'static str) -> Vec<T>
+{
+    collect_rows_counted(rows, site).0
+}
+
+/// Slice 7 / R-31 — the census, as the FFI hands it to Swift.
+///
+/// `site_names` and `site_counts` are INDEX-ALIGNED. The numbers are
+/// cumulative since this process started, so a caller that wants "how many
+/// during MY operation" reads this at the start and at the end of its window
+/// and takes the difference.
+#[derive(Debug, Clone)]
+pub struct DroppedRowReport
+{
+    pub total_dropped: u64,
+    pub site_names: Vec<String>,
+    pub site_counts: Vec<u64>,
+}
+
+/// Slice 7 / R-31 — read the cumulative dropped-row census.
+///
+/// ⚠️ NOT DRAINING, by design. Two callers reading deltas over overlapping
+/// windows both see the drops; neither steals the other's counts. The delta is
+/// therefore a WINDOW measurement, not an attribution — another operation
+/// running at the same time is counted in it, which is why the user-facing
+/// wording says "while … was running" rather than "caused by".
+pub async fn dropped_row_report() -> DroppedRowReport
+{
+    let census = DROPPED_ROW_CENSUS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let mut site_names = Vec::with_capacity(census.len());
+    let mut site_counts = Vec::with_capacity(census.len());
+    let mut total_dropped: u64 = 0;
+    for (site, count) in census.iter()
+    {
+        site_names.push((*site).to_string());
+        site_counts.push(*count);
+        total_dropped = total_dropped.saturating_add(*count);
+    }
+
+    DroppedRowReport
+    {
+        total_dropped,
+        site_names,
+        site_counts,
+    }
+}
+
 /// Represents the metadata for a single image file
 ///
 /// This struct mirrors the database schema and serves as the data transfer object
@@ -1237,6 +1375,12 @@ pub struct FaceRecognitionMenuState {
     pub analysis_status: Option<String>,
     pub face_observation_count: u32,
     pub indexed_face_count: u32,
+    /// Slice 7 / R-08, appended LAST. `true` means the face-embedding store
+    /// could not be READ, so `indexed_face_count` is 0 for want of an answer,
+    /// NOT because the index is missing. A caller must not offer "Build Face
+    /// Recognition Index" on this state — that would re-embed a catalogue that
+    /// is already indexed.
+    pub store_unavailable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1871,6 +2015,47 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
     true
 }
 
+/// ⭐ R-14 / LATENT-DEFECT SWEEP, SLICE E0 — turn OFF DuckDB's compiled-in
+/// extension autoload and autoinstall on every connection this crate opens.
+///
+/// The bundled engine is built with `DUCKDB_EXTENSION_AUTOLOAD_DEFAULT=1` and
+/// `DUCKDB_EXTENSION_AUTOINSTALL_DEFAULT=1`, and only `core_functions` is
+/// statically linked. So the FIRST SQL that names an ICU/parquet/json symbol —
+/// `EXTRACT`, `date_part`, `CURRENT_TIMESTAMP::DATE`, `read_parquet` — makes the
+/// engine open a socket from inside a network-denied App Sandbox. Measured: a
+/// deterministic ~0.51 s stall (which is the retry SLEEP, 100 + 400 ms, not
+/// network latency) and then an error, PER STATEMENT. If such a statement ever
+/// lands in the bootstrap batch, the batch aborts at it, the catalogue open
+/// returns None, and the app starts with no library.
+///
+/// With these two applied the same statement fails in under a millisecond with a
+/// local `Catalog Error` naming the extension. S127 fixed two call sites
+/// (`CURRENT_DATE` → chrono); this closes the class.
+///
+/// ⚠️ Applied as two SEPARATE statements, deliberately — `execute_batch` returns
+/// on the first error, so a failure on the second would silently leave only the
+/// first applied. Both are GLOBAL-scope settings, so one application covers every
+/// connection to that DatabaseInstance.
+///
+/// ⚠️ FAIL-OPEN, deliberately: a settings failure is logged and the open
+/// continues. Refusing to open the catalogue because a guard could not be armed
+/// would turn a benign failure into exactly the consequence this fix exists to
+/// prevent.
+pub(crate) fn apply_extension_autoload_policy(conn: &Connection) {
+    for statement in [
+        "SET autoinstall_known_extensions = false;",
+        "SET autoload_known_extensions = false;",
+    ] {
+        if let Err(e) = conn.execute_batch(statement) {
+            eprintln!(
+                "apply_extension_autoload_policy: {} failed ({}); this connection will still \
+                 attempt to autoload extensions",
+                statement, e
+            );
+        }
+    }
+}
+
 /// Open a catalogue database file and run the FULL schema-creation +
 /// migration pass on it (CREATE TABLE IF NOT EXISTS + ALTER ... IF NOT
 /// EXISTS + backfills + CHECKPOINT), returning the open connection.
@@ -1892,6 +2077,12 @@ fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
             return None;
         }
     };
+
+    // ⭐ R-14 / slice E0 — BEFORE the version probe and before the schema batch,
+    // so no statement this function runs can reach the autoload path. This is the
+    // ONE production `Connection::open` in the crate; `initialize_catalogue` and
+    // the additive restore's backup open both come through here.
+    apply_extension_autoload_policy(&conn);
 
     // EXPERIMENT 3: Query DuckDB version to confirm bundled library is being used
     match conn.query_row("SELECT version()", [], |row| row.get::<_, String>(0)) {
@@ -2868,7 +3059,10 @@ fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
             match stmt.query_map([], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             }) {
-                Ok(mapped) => mapped.filter_map(Result::ok).collect(),
+                Ok(mapped) => collect_rows(
+                    mapped,
+                    "open_and_migrate_catalogue.file_stem_backfill",
+                ),
                 Err(e) => {
                     eprintln!("[migration] Failed to query rows needing backfill: {}", e);
                     Vec::new()
@@ -3671,7 +3865,7 @@ fn editor_saved_image_collect_face_ids(
     let rows = stmt
         .query_map([], |row| row.get::<_, i64>(0))
         .map_err(|e| format!("editor saved face-id census failed: {}", e))?;
-    Ok(rows.filter_map(Result::ok).collect())
+    Ok(collect_rows(rows, "editor_saved_image_collect_face_ids"))
 }
 
 fn editor_saved_image_collect_people(
@@ -3705,7 +3899,7 @@ fn editor_saved_image_collect_people(
             })
         })
         .map_err(|e| format!("editor saved People census failed: {}", e))?;
-    Ok(rows.filter_map(Result::ok).collect())
+    Ok(collect_rows(rows, "editor_saved_image_collect_people"))
 }
 
 fn editor_saved_image_collect_cluster_runs(
@@ -3731,7 +3925,7 @@ fn editor_saved_image_collect_cluster_runs(
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(|e| format!("editor saved face-cluster census failed: {}", e))?;
-    Ok(rows.filter_map(Result::ok).collect())
+    Ok(collect_rows(rows, "editor_saved_image_collect_cluster_runs"))
 }
 
 fn editor_saved_image_collect_similar_groups(
@@ -3754,7 +3948,7 @@ fn editor_saved_image_collect_similar_groups(
     let rows = stmt
         .query_map([], |row| row.get::<_, i64>(0))
         .map_err(|e| format!("editor saved similar-group census failed: {}", e))?;
-    Ok(rows.filter_map(Result::ok).collect())
+    Ok(collect_rows(rows, "editor_saved_image_collect_similar_groups"))
 }
 
 fn editor_saved_image_preserve_people_keywords(
@@ -8053,7 +8247,7 @@ pub async fn keywords_for_image(image_id: i64) -> Vec<KeywordRow> {
     });
 
     match mapped {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Ok(iter) => collect_rows(iter, "keywords_for_image"),
         Err(e) => {
             eprintln!("keywords_for_image: query {}", e);
             Vec::new()
@@ -8096,7 +8290,7 @@ fn keyword_vocabulary_impl(conn: &Connection, origin: &str) -> Vec<KeywordNode> 
     });
 
     match mapped {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Ok(iter) => collect_rows(iter, "keyword_vocabulary"),
         Err(e) => {
             eprintln!("keyword_vocabulary: query {}", e);
             Vec::new()
@@ -8212,7 +8406,7 @@ fn keyword_management_rows_impl(
     });
 
     match mapped {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Ok(iter) => collect_rows(iter, "keyword_management_rows"),
         Err(e) => {
             eprintln!("keyword_management_rows: query {}", e);
             Vec::new()
@@ -8321,7 +8515,7 @@ pub async fn keyword_labels() -> Vec<String> {
     });
 
     match mapped {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Ok(iter) => collect_rows(iter, "keyword_labels"),
         Err(e) => {
             eprintln!("keyword_labels: query {}", e);
             Vec::new()
@@ -8507,7 +8701,7 @@ fn list_saved_queries_impl(conn: &Connection) -> Vec<SavedQueryInfo> {
     });
 
     match mapped {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Ok(iter) => collect_rows(iter, "list_saved_queries"),
         Err(e) => {
             eprintln!("list_saved_queries: query {}", e);
             Vec::new()
@@ -8545,7 +8739,7 @@ fn load_saved_query_impl(conn: &Connection, id: i64) -> Option<SavedQueryPayload
     });
 
     let rows = match mapped {
-        Ok(iter) => iter.filter_map(|r| r.ok()),
+        Ok(iter) => collect_rows(iter, "load_saved_query").into_iter(),
         Err(e) => {
             eprintln!("load_saved_query: query {}", e);
             return None;
@@ -8711,7 +8905,7 @@ pub async fn distinct_image_values(field: String) -> Vec<String> {
     let mapped = stmt.query_map([], |row| row.get::<_, String>(0));
 
     match mapped {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Ok(iter) => collect_rows(iter, "distinct_image_values"),
         Err(e) => {
             eprintln!("distinct_image_values: query {}", e);
             Vec::new()
@@ -8770,7 +8964,7 @@ pub async fn distinct_numeric_values(field: String) -> Vec<f64> {
     let mapped = stmt.query_map([], |row| row.get::<_, f64>(0));
 
     match mapped {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Ok(iter) => collect_rows(iter, "distinct_numeric_values"),
         Err(e) => {
             eprintln!("distinct_numeric_values: query {}", e);
             Vec::new()
@@ -8949,7 +9143,7 @@ fn active_analysis_jobs_impl(conn: &Connection) -> Vec<AnalysisJob> {
 
     let mapped = stmt.query_map([], row_to_analysis_job);
     match mapped {
-        Ok(iter) => iter.filter_map(|job| job.ok()).collect(),
+        Ok(iter) => collect_rows(iter, "active_analysis_jobs"),
         Err(e) => {
             eprintln!("active_analysis_jobs: query failed: {}", e);
             Vec::new()
@@ -9502,7 +9696,7 @@ fn list_operation_logs_impl(conn: &Connection, limit: u32) -> Vec<OperationLogRu
     };
 
     match stmt.query_map(params![limit.max(1)], row_to_operation_log_run) {
-        Ok(iter) => iter.filter_map(|run| run.ok()).collect(),
+        Ok(iter) => collect_rows(iter, "list_operation_logs"),
         Err(e) => {
             eprintln!("list_operation_logs: query failed: {}", e);
             Vec::new()
@@ -9558,7 +9752,7 @@ fn operation_log_entries_impl(
     });
 
     match mapped {
-        Ok(iter) => iter.filter_map(|entry| entry.ok()).collect(),
+        Ok(iter) => collect_rows(iter, "operation_log_entries"),
         Err(e) => {
             eprintln!("operation_log_entries: query failed: {}", e);
             Vec::new()
@@ -9913,17 +10107,40 @@ fn focus_analysis_scope_predicate(ids: &[i64]) -> Option<String> {
     ))
 }
 
+/// Slice 7 / R-31 — the culling work set, PLUS the number of rows the
+/// catalogue could not deserialize while building it.
+///
+/// A work set is a query whose answer defines what still needs doing, so a
+/// silent drop here is self-perpetuating: the dropped row is never revisited
+/// and the run reports itself complete. The count is taken from the collector,
+/// not from the process-wide census, so it is EXACT for this call and owes
+/// nothing to lock timing.
+///
+/// ⚠️ A work set with `dropped_rows > 0` is NEVER complete — the caller must
+/// not report "nothing needed analysis".
+#[derive(Debug, Clone)]
+pub struct FocusAnalysisCandidatePage
+{
+    pub candidates: Vec<FocusAnalysisCandidate>,
+    pub dropped_rows: u64,
+}
+
 fn focus_analysis_candidates_impl(
     conn: &Connection,
     limit: u32,
     algorithm_version: &str,
     analysis_run_id: &str,
     scoped_ids: Option<&[i64]>,
-) -> Vec<FocusAnalysisCandidate> {
+) -> FocusAnalysisCandidatePage {
+    let empty = FocusAnalysisCandidatePage
+    {
+        candidates: Vec::new(),
+        dropped_rows: 0,
+    };
     let scope_filter = match scoped_ids {
         Some(ids) => match focus_analysis_scope_predicate(ids) {
             Some(filter) => Some(filter),
-            None => return Vec::new(),
+            None => return empty,
         },
         None => None,
     };
@@ -9941,7 +10158,7 @@ fn focus_analysis_candidates_impl(
         Ok(s) => s,
         Err(e) => {
             eprintln!("focus_analysis_candidates: prepare {}", e);
-            return Vec::new();
+            return empty;
         }
     };
 
@@ -9957,10 +10174,19 @@ fn focus_analysis_candidates_impl(
     );
 
     match mapped {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Ok(iter) =>
+        {
+            let (candidates, dropped_rows) =
+                collect_rows_counted(iter, "focus_analysis_candidates");
+            FocusAnalysisCandidatePage
+            {
+                candidates,
+                dropped_rows,
+            }
+        }
         Err(e) => {
             eprintln!("focus_analysis_candidates: query {}", e);
-            Vec::new()
+            empty
         }
     }
 }
@@ -9995,17 +10221,37 @@ fn focus_analysis_candidate_count_impl(
 /// Return a narrow page of still-image rows whose focus analysis is missing or
 /// stale for the requested algorithm version. The NULL columns are the queue; no
 /// separate enrichment table is persisted.
+///
+/// ⚠️ Slice 7 / R-31: this is the LEGACY shape, kept so nothing breaks while the
+/// Swift halves are sequenced. It DISCARDS the dropped-row count. New callers
+/// use `focus_analysis_candidate_page`; retiring this twin is a sweep-closeout
+/// item.
 pub async fn focus_analysis_candidates(
     limit: u32,
     algorithm_version: String,
     analysis_run_id: String,
 ) -> Vec<FocusAnalysisCandidate> {
+    focus_analysis_candidate_page(limit, algorithm_version, analysis_run_id)
+        .await
+        .candidates
+}
+
+/// Slice 7 / R-31 — the same page, WITH the dropped-row count.
+pub async fn focus_analysis_candidate_page(
+    limit: u32,
+    algorithm_version: String,
+    analysis_run_id: String,
+) -> FocusAnalysisCandidatePage {
     let catalogue = CATALOGUE.lock().unwrap();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
             eprintln!("Catalogue not initialized");
-            return Vec::new();
+            return FocusAnalysisCandidatePage
+            {
+                candidates: Vec::new(),
+                dropped_rows: 0,
+            };
         }
     };
 
@@ -10014,18 +10260,36 @@ pub async fn focus_analysis_candidates(
 
 /// Return focus-analysis candidates intersected with an explicit image-id
 /// selection. Empty selection means empty queue.
+///
+/// ⚠️ Slice 7 / R-31: LEGACY shape — see `focus_analysis_candidates`.
 pub async fn focus_analysis_candidates_for_ids(
     ids: Vec<i64>,
     limit: u32,
     algorithm_version: String,
     analysis_run_id: String,
 ) -> Vec<FocusAnalysisCandidate> {
+    focus_analysis_candidate_page_for_ids(ids, limit, algorithm_version, analysis_run_id)
+        .await
+        .candidates
+}
+
+/// Slice 7 / R-31 — the scoped page, WITH the dropped-row count.
+pub async fn focus_analysis_candidate_page_for_ids(
+    ids: Vec<i64>,
+    limit: u32,
+    algorithm_version: String,
+    analysis_run_id: String,
+) -> FocusAnalysisCandidatePage {
     let catalogue = CATALOGUE.lock().unwrap();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
             eprintln!("Catalogue not initialized");
-            return Vec::new();
+            return FocusAnalysisCandidatePage
+            {
+                candidates: Vec::new(),
+                dropped_rows: 0,
+            };
         }
     };
 
@@ -11624,7 +11888,7 @@ pub async fn face_observations_for_image_ids(
         }
     };
 
-    rows.filter_map(|row| row.ok()).collect()
+    collect_rows(rows, "face_observations_for_image_ids")
 }
 
 pub async fn face_recognition_menu_states(
@@ -11648,16 +11912,30 @@ pub async fn face_recognition_menu_states(
     // identity (analyzed_image_id, face_index), which every stored embedding
     // carries. Without this, every paired photo would read .indexIncomplete
     // forever once twin vectors stop existing.
-    let embedded_pairs = FACE_EMBEDDING_RUNTIME
-        .spawn(async move {
-            stored_face_embeddings(&model_version, &preprocessing_version)
-                .await
+    // ⭐ Slice 7 / R-08: a store that could not be READ must not read as "this
+    // photo has no indexed faces". That is what made the submenu offer "Build
+    // Face Recognition Index" for a catalogue that is already fully indexed.
+    // On a read failure the states are still built — the catalogue half of the
+    // answer is sound — but `store_unavailable` is set and every
+    // `indexed_face_count` stays 0, so the caller can say the honest thing.
+    let stored = FACE_EMBEDDING_RUNTIME
+        .spawn(async move { stored_face_embeddings(&model_version, &preprocessing_version).await })
+        .await
+        .unwrap_or_else(|e| Err(format!("face_recognition_menu_states: embedding task {}", e)));
+
+    let (embedded_pairs, store_unavailable) = match stored {
+        Ok(records) => (
+            records
                 .into_iter()
                 .map(|record| (record.analyzed_image_id, record.face_index))
-                .collect::<std::collections::HashSet<_>>()
-        })
-        .await
-        .unwrap_or_default();
+                .collect::<std::collections::HashSet<_>>(),
+            false,
+        ),
+        Err(message) => {
+            eprintln!("{}", message);
+            (std::collections::HashSet::new(), true)
+        }
+    };
 
     let catalogue = CATALOGUE.lock().unwrap();
     let conn = match catalogue.as_ref() {
@@ -11688,6 +11966,7 @@ pub async fn face_recognition_menu_states(
             analysis_status: row.get(1)?,
             face_observation_count: 0,
             indexed_face_count: 0,
+            store_unavailable,
         })
     }) {
         Ok(rows) => rows,
@@ -11696,7 +11975,8 @@ pub async fn face_recognition_menu_states(
             return Vec::new();
         }
     };
-    for state in image_rows.filter_map(|row| row.ok()) {
+    for state in collect_rows(image_rows, "face_recognition_menu_states.images")
+    {
         states.insert(state.image_id, state);
     }
 
@@ -11728,7 +12008,11 @@ pub async fn face_recognition_menu_states(
             return Vec::new();
         }
     };
-    for (image_id, analyzed_image_id, face_index) in face_rows.filter_map(|row| row.ok()) {
+    for (image_id, analyzed_image_id, face_index) in collect_rows(
+        face_rows,
+        "face_recognition_menu_states.face_observations",
+    )
+    {
         if let Some(state) = states.get_mut(&image_id) {
             state.face_observation_count = state.face_observation_count.saturating_add(1);
             if embedded_pairs.contains(&(analyzed_image_id, face_index as u32)) {
@@ -11742,31 +12026,97 @@ pub async fn face_recognition_menu_states(
         .collect()
 }
 
+/// Slice 7 / R-31 + R-08 — the face-index work set, with everything the caller
+/// needs to tell an EMPTY answer from an UNKNOWN one.
+///
+/// `dropped_rows > 0` means the catalogue could not deserialize some rows, so
+/// the set is short and the index may be incomplete. `store_ok = false` means
+/// the vector store could not be READ (R-08) — distinct from an index that was
+/// never built, which is `store_ok = true` with an empty list.
+///
+/// ⛔ On `store_ok = false` the observation list is EMPTY, never "everything is
+/// missing": the latter would make the builder re-embed the whole catalogue.
+#[derive(Debug, Clone)]
+pub struct FaceObservationWorkSet
+{
+    pub observations: Vec<FaceObservationRecord>,
+    pub dropped_rows: u64,
+    pub store_ok: bool,
+    pub store_error: Option<String>,
+}
+
 /// Return face observations that do not yet have a LanceDB embedding for the
 /// requested model/preprocessing pair. `limit == 0` means no limit.
+///
+/// ⚠️ Slice 7: LEGACY shape, kept so nothing breaks while the Swift halves are
+/// sequenced. It discards the dropped-row count AND the store's reachability.
+/// New callers use `face_embedding_missing_observation_page`.
 pub async fn face_embedding_missing_observations(
     algorithm_version: String,
     model_version: String,
     preprocessing_version: String,
     limit: u32,
 ) -> Vec<FaceObservationRecord> {
-    let embedded_ids = FACE_EMBEDDING_RUNTIME
-        .spawn(async move {
-            stored_face_embeddings(&model_version, &preprocessing_version)
-                .await
-                .into_iter()
-                .map(|record| record.face_observation_id)
-                .collect::<std::collections::HashSet<_>>()
-        })
+    face_embedding_missing_observation_page(
+        algorithm_version,
+        model_version,
+        preprocessing_version,
+        limit,
+    )
+    .await
+    .observations
+}
+
+/// Slice 7 / R-31 + R-08 — the same work set, carrying its dropped-row count
+/// and the vector store's reachability.
+pub async fn face_embedding_missing_observation_page(
+    algorithm_version: String,
+    model_version: String,
+    preprocessing_version: String,
+    limit: u32,
+) -> FaceObservationWorkSet {
+    let stored = FACE_EMBEDDING_RUNTIME
+        .spawn(async move { stored_face_embeddings(&model_version, &preprocessing_version).await })
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            Err(format!(
+                "face_embedding_missing_observations: embedding task {}",
+                e
+            ))
+        });
+
+    let embedded_ids = match stored {
+        Ok(records) => records
+            .into_iter()
+            .map(|record| record.face_observation_id)
+            .collect::<std::collections::HashSet<_>>(),
+        Err(message) => {
+            // ⛔ NEVER "everything is missing" — that would re-embed the whole
+            // catalogue against a store we could not even read.
+            eprintln!("{}", message);
+            return FaceObservationWorkSet
+            {
+                observations: Vec::new(),
+                dropped_rows: 0,
+                store_ok: false,
+                store_error: Some(message),
+            };
+        }
+    };
 
     let catalogue = CATALOGUE.lock().unwrap();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
-            eprintln!("Catalogue not initialized");
-            return Vec::new();
+            let message = "face_embedding_missing_observations: catalogue not initialized";
+            eprintln!("{}", message);
+            return FaceObservationWorkSet
+            {
+                observations: Vec::new(),
+                dropped_rows: 0,
+                store_ok: false,
+                store_error: Some(message.to_string()),
+            };
         }
     };
 
@@ -11812,8 +12162,15 @@ pub async fn face_embedding_missing_observations(
     ) {
         Ok(stmt) => stmt,
         Err(e) => {
-            eprintln!("face_embedding_missing_observations: prepare {}", e);
-            return Vec::new();
+            let message = format!("face_embedding_missing_observations: prepare {}", e);
+            eprintln!("{}", message);
+            return FaceObservationWorkSet
+            {
+                observations: Vec::new(),
+                dropped_rows: 0,
+                store_ok: true,
+                store_error: Some(message),
+            };
         }
     };
 
@@ -11852,8 +12209,15 @@ pub async fn face_embedding_missing_observations(
     }) {
         Ok(rows) => rows,
         Err(e) => {
-            eprintln!("face_embedding_missing_observations: query {}", e);
-            return Vec::new();
+            let message = format!("face_embedding_missing_observations: query {}", e);
+            eprintln!("{}", message);
+            return FaceObservationWorkSet
+            {
+                observations: Vec::new(),
+                dropped_rows: 0,
+                store_ok: true,
+                store_error: Some(message),
+            };
         }
     };
 
@@ -11863,10 +12227,21 @@ pub async fn face_embedding_missing_observations(
         limit as usize
     };
 
-    rows.filter_map(|row| row.ok())
+    let (decoded, dropped_rows) =
+        collect_rows_counted(rows, "face_embedding_missing_observations");
+    let observations = decoded
+        .into_iter()
         .filter(|record| !embedded_ids.contains(&record.id))
         .take(max_count)
-        .collect()
+        .collect();
+
+    FaceObservationWorkSet
+    {
+        observations,
+        dropped_rows,
+        store_ok: true,
+        store_error: None,
+    }
 }
 
 const FACE_EMBEDDING_TABLE: &str = "face_embeddings";
@@ -11937,13 +12312,109 @@ async fn open_or_create_face_embedding_table(
     }
 }
 
-async fn open_face_embedding_table() -> Result<lancedb::Table, lancedb::Error> {
-    let uri = face_embedding_store_uri().ok_or_else(|| lancedb::Error::InvalidInput {
-        message: "catalogue path is not initialized".to_string(),
+/// Slice 7 / R-08 — what a READ-side open of the face-embedding store found.
+///
+/// ⭐ Separating these two is the whole of R-08's fix: `open_table` failing
+/// because the table was never created is the ORDINARY "the face index has not
+/// been built yet" case and must read as an honest EMPTY answer; every other
+/// failure means the store could not be READ, which is NOT the same answer as
+/// "no matching faces".
+enum FaceEmbeddingTableState
+{
+    Present(lancedb::Table),
+    NeverBuilt,
+}
+
+/// The ONE place that decides benign-vs-real for a face-embedding store open.
+///
+/// ⚠️ The benign case is matched on LanceDB 0.31's TYPED
+/// `lancedb::Error::TableNotFound` variant, never on error TEXT. If a LanceDB
+/// bump renames or removes that variant this stops COMPILING — a louder
+/// failure than any runtime text pin could give, and it can never silently
+/// re-classify a real failure as "never built".
+/// `face_embedding_store_classifier_pins_table_not_found` pins both directions.
+fn classify_face_embedding_open_error(
+    error: lancedb::Error,
+    operation: &str,
+) -> Result<FaceEmbeddingTableState, String>
+{
+    match error
+    {
+        lancedb::Error::TableNotFound { .. } => Ok(FaceEmbeddingTableState::NeverBuilt),
+        other => Err(format!(
+            "{}: face-embedding table open failed: {}",
+            operation, other
+        )),
+    }
+}
+
+/// Open the face-embedding store at an explicit URI for READING. The URI
+/// parameter is what lets the classifier be exercised against real on-disk
+/// fixtures without touching the process-global catalogue path.
+async fn open_face_embedding_table_at_uri(
+    uri: &str,
+    operation: &str,
+) -> Result<FaceEmbeddingTableState, String>
+{
+    // Nothing at the path is the never-built case. Probing with `fs::metadata`
+    // FIRST also keeps a read from creating the store directory as a side
+    // effect — the `open_face_vector_table_at_uri_for_delete` shape.
+    match std::fs::metadata(uri)
+    {
+        Ok(metadata) =>
+        {
+            if !metadata.is_dir()
+            {
+                return Err(format!(
+                    "{}: face-embedding store path is not a directory: {}",
+                    operation, uri
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(FaceEmbeddingTableState::NeverBuilt);
+        }
+        Err(error) =>
+        {
+            return Err(format!(
+                "{}: face-embedding store metadata failed for {}: {}",
+                operation, uri, error
+            ));
+        }
+    }
+
+    let database = lancedb::connect(uri).execute().await.map_err(|error| {
+        format!(
+            "{}: face-embedding store connect failed: {}",
+            operation, error
+        )
     })?;
 
-    let db = lancedb::connect(&uri).execute().await?;
-    db.open_table(FACE_EMBEDDING_TABLE).execute().await
+    match database.open_table(FACE_EMBEDDING_TABLE).execute().await
+    {
+        Ok(table) => Ok(FaceEmbeddingTableState::Present(table)),
+        Err(error) => classify_face_embedding_open_error(error, operation),
+    }
+}
+
+/// The production read-side open: resolve the store beside the catalogue, then
+/// classify. An uninitialised catalogue path is a REAL failure, not "never
+/// built" — nothing can be said about a store whose location is unknown.
+async fn open_face_embedding_table_for_read(
+    operation: &str,
+) -> Result<FaceEmbeddingTableState, String>
+{
+    let uri = match face_embedding_store_uri()
+    {
+        Some(uri) => uri,
+        None =>
+        {
+            return Err(format!("{}: catalogue path is not initialized", operation));
+        }
+    };
+
+    open_face_embedding_table_at_uri(&uri, operation).await
 }
 
 fn face_embedding_version_filter(model_version: &str, preprocessing_version: &str) -> String {
@@ -12142,9 +12613,18 @@ async fn upsert_face_embeddings_impl(
 }
 
 async fn face_embedding_total_count() -> u64 {
-    match open_face_embedding_table().await {
-        Ok(table) => table.count_rows(None).await.unwrap_or(0) as u64,
-        Err(_) => 0,
+    // W1 — this feeds an informational total on the store-write result; its
+    // "0 on failure" behaviour is unchanged by slice 7. R-08's fix is scoped to
+    // the READ path whose zero is mistaken for an answer.
+    match open_face_embedding_table_for_read("face_embedding_total_count").await {
+        Ok(FaceEmbeddingTableState::Present(table)) => {
+            table.count_rows(None).await.unwrap_or(0) as u64
+        }
+        Ok(FaceEmbeddingTableState::NeverBuilt) => 0,
+        Err(message) => {
+            eprintln!("{}", message);
+            0
+        }
     }
 }
 
@@ -12159,9 +12639,16 @@ pub async fn face_embedding_count(model_version: String, preprocessing_version: 
 }
 
 async fn face_embedding_count_impl(model_version: String, preprocessing_version: String) -> u64 {
-    let table = match open_face_embedding_table().await {
-        Ok(table) => table,
-        Err(_) => return 0,
+    // W1 — unchanged "0 on failure" behaviour (this is a diagnostic count with
+    // no caller that can present a failure). R-08's honest channel is
+    // `face_embedding_search_checked` / the menu state's `store_unavailable`.
+    let table = match open_face_embedding_table_for_read("face_embedding_count").await {
+        Ok(FaceEmbeddingTableState::Present(table)) => table,
+        Ok(FaceEmbeddingTableState::NeverBuilt) => return 0,
+        Err(message) => {
+            eprintln!("{}", message);
+            return 0;
+        }
     };
     let filter = face_embedding_version_filter(&model_version, &preprocessing_version);
     table.count_rows(Some(filter)).await.unwrap_or(0) as u64
@@ -12176,43 +12663,49 @@ struct StoredFaceEmbedding {
     vector: Vec<f32>,
 }
 
+/// Slice 7 / R-08 — read the stored face embeddings for one model /
+/// preprocessing pair.
+///
+/// ⭐ Returns a `Result` so that **"the store could not be read" and "the store
+/// holds no matching rows" stop being the same value.** Every consumer used to
+/// see `Vec::new()` for both and reported "no matching faces", which on a 247k
+/// catalogue the user cannot sanity-check.
+///
+/// `Ok(vec![])` means, and only means, a genuinely empty answer: the index has
+/// never been built, or it holds nothing for this model/preprocessing pair.
 async fn stored_face_embeddings(
     model_version: &str,
     preprocessing_version: &str,
-) -> Vec<StoredFaceEmbedding> {
-    let table = match open_face_embedding_table().await {
-        Ok(table) => table,
-        Err(e) => {
-            eprintln!("stored_face_embeddings: open {}", e);
-            return Vec::new();
-        }
+) -> Result<Vec<StoredFaceEmbedding>, String> {
+    let table = match open_face_embedding_table_for_read("stored_face_embeddings").await? {
+        FaceEmbeddingTableState::Present(table) => table,
+        // The index has never been built — an honest empty answer.
+        FaceEmbeddingTableState::NeverBuilt => return Ok(Vec::new()),
     };
 
     let filter = face_embedding_version_filter(model_version, preprocessing_version);
-    let matching_count = table.count_rows(Some(filter.clone())).await.unwrap_or(0);
+    // ⚠️ The `.unwrap_or(0)` that used to sit here was V8's sharpest sub-site:
+    // the one failure path that left NO record anywhere, not even on stderr,
+    // and that answered "the index holds nothing" for a store it could not
+    // even count. A count failure is now a failure.
+    let matching_count = table
+        .count_rows(Some(filter.clone()))
+        .await
+        .map_err(|e| format!("stored_face_embeddings: count {}", e))?;
     if matching_count == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    let batches = match table
+    let batches = table
         .query()
         .only_if(filter)
         .limit(matching_count as usize)
         .execute()
         .await
-    {
-        Ok(stream) => match stream.try_collect::<Vec<_>>().await {
-            Ok(batches) => batches,
-            Err(e) => {
-                eprintln!("stored_face_embeddings: collect {}", e);
-                return Vec::new();
-            }
-        },
-        Err(e) => {
-            eprintln!("stored_face_embeddings: query {}", e);
-            return Vec::new();
-        }
-    };
+        .map_err(|e| format!("stored_face_embeddings: query {}", e))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| format!("stored_face_embeddings: collect {}", e))?;
 
     let mut records = Vec::new();
     for batch in batches {
@@ -12277,7 +12770,7 @@ async fn stored_face_embeddings(
             .then(left.image_id.cmp(&right.image_id))
             .then(left.face_index.cmp(&right.face_index))
     });
-    records
+    Ok(records)
 }
 
 fn cosine_f32(left: &[f32], right: &[f32]) -> f64 {
@@ -12324,7 +12817,17 @@ async fn face_embedding_nearest_neighbors_impl(
     limit_per_face: u32,
 ) -> Vec<FaceEmbeddingNeighborRecord> {
     let limit_per_face = limit_per_face.max(1) as usize;
-    let records = stored_face_embeddings(&model_version, &preprocessing_version).await;
+    // W1 — this FFI has NO Swift caller (verified by grep across the app,
+    // excluding the generated binding), so slice 7 does not build a surface
+    // nobody calls: today's "empty on failure" behaviour is kept, with the
+    // failure logged rather than swallowed.
+    let records = match stored_face_embeddings(&model_version, &preprocessing_version).await {
+        Ok(records) => records,
+        Err(message) => {
+            eprintln!("face_embedding_nearest_neighbors: {}", message);
+            return Vec::new();
+        }
+    };
     let mut neighbors = Vec::new();
 
     for (query_index, query) in records.iter().enumerate() {
@@ -12373,6 +12876,50 @@ async fn face_embedding_nearest_neighbors_impl(
     neighbors
 }
 
+/// Slice 7 / R-08 — a face search, with the vector store's reachability
+/// carried out to the caller.
+///
+/// `ok = false` means the store could not be READ, which is NOT the same
+/// answer as "no matching faces": `matches` is then empty and the caller must
+/// SAY SO rather than presenting a zero-result search. `FaceEmbeddingStoreResult`
+/// is the in-repo precedent for this shape.
+#[derive(Debug, Clone)]
+pub struct FaceEmbeddingSearchResult
+{
+    pub ok: bool,
+    pub error_message: Option<String>,
+    pub matches: Vec<FaceSearchMatchRecord>,
+}
+
+impl FaceEmbeddingSearchResult
+{
+    fn from_search(outcome: Result<Vec<FaceSearchMatchRecord>, String>) -> Self
+    {
+        match outcome
+        {
+            Ok(matches) => FaceEmbeddingSearchResult
+            {
+                ok: true,
+                error_message: None,
+                matches,
+            },
+            Err(message) =>
+            {
+                eprintln!("{}", message);
+                FaceEmbeddingSearchResult
+                {
+                    ok: false,
+                    error_message: Some(message),
+                    matches: Vec::new(),
+                }
+            }
+        }
+    }
+}
+
+/// ⚠️ Slice 7: LEGACY shape — an unreadable store is indistinguishable from a
+/// genuine no-match here. Kept so nothing breaks while the Swift halves are
+/// sequenced; new callers use `face_embedding_search_checked`.
 pub async fn face_embedding_search(
     seed_face_observation_ids: Vec<i64>,
     candidate_image_ids: Vec<i64>,
@@ -12381,7 +12928,28 @@ pub async fn face_embedding_search(
     threshold: f64,
     limit: u32,
 ) -> Vec<FaceSearchMatchRecord> {
-    FACE_EMBEDDING_RUNTIME
+    face_embedding_search_checked(
+        seed_face_observation_ids,
+        candidate_image_ids,
+        model_version,
+        preprocessing_version,
+        threshold,
+        limit,
+    )
+    .await
+    .matches
+}
+
+/// Slice 7 / R-08 — the same search, carrying the store's reachability.
+pub async fn face_embedding_search_checked(
+    seed_face_observation_ids: Vec<i64>,
+    candidate_image_ids: Vec<i64>,
+    model_version: String,
+    preprocessing_version: String,
+    threshold: f64,
+    limit: u32,
+) -> FaceEmbeddingSearchResult {
+    let outcome = FACE_EMBEDDING_RUNTIME
         .spawn(face_embedding_search_impl(
             seed_face_observation_ids,
             candidate_image_ids,
@@ -12391,9 +12959,12 @@ pub async fn face_embedding_search(
             limit,
         ))
         .await
-        .unwrap_or_default()
+        .unwrap_or_else(|e| Err(format!("face_embedding_search: task {}", e)));
+
+    FaceEmbeddingSearchResult::from_search(outcome)
 }
 
+/// ⚠️ Slice 7: LEGACY shape — see `face_embedding_search`.
 pub async fn face_embedding_search_vector(
     seed_vector: Vec<f32>,
     candidate_image_ids: Vec<i64>,
@@ -12402,7 +12973,31 @@ pub async fn face_embedding_search_vector(
     threshold: f64,
     limit: u32,
 ) -> Vec<FaceSearchMatchRecord> {
-    FACE_EMBEDDING_RUNTIME
+    face_embedding_search_vector_checked(
+        seed_vector,
+        candidate_image_ids,
+        model_version,
+        preprocessing_version,
+        threshold,
+        limit,
+    )
+    .await
+    .matches
+}
+
+/// Slice 7 / R-08 — the drawn-region ("Manually Select Face to Search…")
+/// search, carrying the store's reachability. ⭐ This is the path V8 named as
+/// the remaining SILENT one: it is offered in every menu state and reported
+/// "0 photos" for a store it could not read.
+pub async fn face_embedding_search_vector_checked(
+    seed_vector: Vec<f32>,
+    candidate_image_ids: Vec<i64>,
+    model_version: String,
+    preprocessing_version: String,
+    threshold: f64,
+    limit: u32,
+) -> FaceEmbeddingSearchResult {
+    let outcome = FACE_EMBEDDING_RUNTIME
         .spawn(face_embedding_search_vector_impl(
             seed_vector,
             candidate_image_ids,
@@ -12412,7 +13007,9 @@ pub async fn face_embedding_search_vector(
             limit,
         ))
         .await
-        .unwrap_or_default()
+        .unwrap_or_else(|e| Err(format!("face_embedding_search_vector: task {}", e)));
+
+    FaceEmbeddingSearchResult::from_search(outcome)
 }
 
 /// Item 7c — resolve seed face_observation ids to their physical-face
@@ -12451,8 +13048,8 @@ fn face_observation_pairs_for_ids(
         Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
     });
     match mapped {
-        Ok(iter) => iter
-            .filter_map(|r| r.ok())
+        Ok(iter) => collect_rows(iter, "face_observation_pairs_for_ids")
+            .into_iter()
             .map(|(analyzed, face_index)| (analyzed, face_index.clamp(0, u32::MAX as i64) as u32))
             .collect(),
         Err(e) => {
@@ -12469,14 +13066,16 @@ async fn face_embedding_search_impl(
     preprocessing_version: String,
     threshold: f64,
     limit: u32,
-) -> Vec<FaceSearchMatchRecord> {
+) -> Result<Vec<FaceSearchMatchRecord>, String> {
     if seed_face_observation_ids.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    let records = stored_face_embeddings(&model_version, &preprocessing_version).await;
+    // Slice 7 / R-08: a store that could not be read propagates as an Err, so
+    // the caller can say "this search has no answer" instead of "0 photos".
+    let records = stored_face_embeddings(&model_version, &preprocessing_version).await?;
     if records.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let seed_ids = seed_face_observation_ids
@@ -12493,7 +13092,7 @@ async fn face_embedding_search_impl(
         })
         .collect::<Vec<_>>();
     if seeds.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let candidate_ids = if candidate_image_ids.is_empty() {
@@ -12558,7 +13157,7 @@ async fn face_embedding_search_impl(
     if limit > 0 {
         matches.truncate(limit as usize);
     }
-    matches
+    Ok(matches)
 }
 
 async fn face_embedding_search_vector_impl(
@@ -12568,14 +13167,15 @@ async fn face_embedding_search_vector_impl(
     preprocessing_version: String,
     threshold: f64,
     limit: u32,
-) -> Vec<FaceSearchMatchRecord> {
+) -> Result<Vec<FaceSearchMatchRecord>, String> {
     if seed_vector.is_empty() || !seed_vector.iter().all(|value| value.is_finite()) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    let records = stored_face_embeddings(&model_version, &preprocessing_version).await;
+    // Slice 7 / R-08: see `face_embedding_search_impl`.
+    let records = stored_face_embeddings(&model_version, &preprocessing_version).await?;
     if records.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let candidate_ids = if candidate_image_ids.is_empty() {
@@ -12638,7 +13238,7 @@ async fn face_embedding_search_vector_impl(
     if limit > 0 {
         matches.truncate(limit as usize);
     }
-    matches
+    Ok(matches)
 }
 
 fn face_cluster_run_is_valid(run: &FaceClusterRunRecord) -> bool {
@@ -12826,7 +13426,7 @@ fn face_cluster_runs_impl(conn: &Connection, limit: u32) -> Vec<FaceClusterRunSu
         }
     };
 
-    rows.filter_map(|row| row.ok()).collect()
+    collect_rows(rows, "face_cluster_runs")
 }
 
 pub async fn face_cluster_runs(limit: u32) -> Vec<FaceClusterRunSummary> {
@@ -12895,7 +13495,7 @@ fn face_cluster_members_impl(conn: &Connection, run_id: &str) -> Vec<FaceCluster
         }
     };
 
-    rows.filter_map(|row| row.ok()).collect()
+    collect_rows(rows, "face_cluster_members")
 }
 
 pub async fn face_cluster_members(run_id: String) -> Vec<FaceClusterMemberRecord> {
@@ -13045,7 +13645,7 @@ fn person_summaries_impl(conn: &Connection) -> Vec<PersonSummaryRecord> {
         }
     };
 
-    rows.filter_map(|row| row.ok()).collect()
+    collect_rows(rows, "person_summaries")
 }
 
 pub async fn person_summaries() -> Vec<PersonSummaryRecord> {
@@ -13119,7 +13719,7 @@ fn person_representative_faces_impl(conn: &Connection) -> Vec<PersonRepresentati
         }
     };
 
-    rows.filter_map(|row| row.ok()).collect()
+    collect_rows(rows, "person_representative_faces")
 }
 
 pub async fn person_representative_faces() -> Vec<PersonRepresentativeFaceRecord> {
@@ -13186,7 +13786,7 @@ fn person_assignments_for_face_observations_impl(
         }
     };
 
-    rows.filter_map(|row| row.ok()).collect()
+    collect_rows(rows, "person_assignments_for_face_observations")
 }
 
 pub async fn person_assignments_for_face_observations(
@@ -13268,7 +13868,7 @@ fn person_face_observation_ids_impl(conn: &Connection, person_id: i64) -> Vec<i6
         }
     };
 
-    rows.filter_map(|row| row.ok()).collect()
+    collect_rows(rows, "person_face_observation_ids")
 }
 
 pub async fn person_face_observation_ids(person_id: i64) -> Vec<i64> {
@@ -13338,7 +13938,8 @@ fn assignable_faces_for_observation_ids(
     };
 
     let mut seen = std::collections::HashSet::<i64>::new();
-    rows.filter_map(|row| row.ok())
+    collect_rows(rows, "assignable_faces_for_observation_ids")
+        .into_iter()
         .filter(|face| seen.insert(face.face_observation_id))
         .collect()
 }
@@ -13878,7 +14479,7 @@ pub async fn canonicalize_face_embeddings() -> CanonicalizeFaceEmbeddingsResult 
                 .prepare("SELECT id FROM face_observation WHERE image_id <> analyzed_image_id")
             {
                 if let Ok(rows) = stmt.query_map([], |row| row.get::<_, i64>(0)) {
-                    ids = rows.filter_map(|r| r.ok()).collect();
+                    ids = collect_rows(rows, "canonicalize_face_embeddings.doomed_ids");
                 }
             }
             ids
@@ -14469,7 +15070,7 @@ fn similar_photo_candidates_impl(
     });
 
     match mapped {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Ok(iter) => collect_rows(iter, "similar_photo_candidates"),
         Err(e) => {
             eprintln!("similar_photo_candidates: query {}", e);
             Vec::new()
@@ -14543,7 +15144,7 @@ fn similar_photo_featureprints_for_ids_impl(
     });
 
     match mapped {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Ok(iter) => collect_rows(iter, "similar_photo_featureprints_for_ids"),
         Err(e) => {
             eprintln!("similar_photo_featureprints_for_ids: query {}", e);
             Vec::new()
@@ -14670,7 +15271,7 @@ fn completed_similar_photo_work_units_impl(
     });
 
     match mapped {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Ok(iter) => collect_rows(iter, "completed_similar_photo_work_units"),
         Err(e) => {
             eprintln!("completed_similar_photo_work_units: query {}", e);
             Vec::new()
@@ -14791,7 +15392,7 @@ fn completed_similar_photo_unit_checkpoints_impl(
     });
 
     match mapped {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Ok(iter) => collect_rows(iter, "completed_similar_photo_unit_checkpoints"),
         Err(e) => {
             eprintln!("completed_similar_photo_unit_checkpoints: query {}", e);
             Vec::new()
@@ -14965,7 +15566,7 @@ fn similar_photo_candidates_missing_neighborhood_impl(
     );
 
     match mapped {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Ok(iter) => collect_rows(iter, "similar_photo_candidates_missing_neighborhood"),
         Err(e) => {
             eprintln!("similar_photo_candidates_missing_neighborhood: query {}", e);
             Vec::new()
@@ -15319,7 +15920,7 @@ pub async fn similar_photo_stack_summaries_for_ids(
     });
 
     match mapped {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Ok(iter) => collect_rows(iter, "similar_photo_stack_summaries_for_ids"),
         Err(e) => {
             eprintln!("similar_photo_stack_summaries_for_ids: query {}", e);
             Vec::new()
@@ -15422,7 +16023,7 @@ fn similar_photo_stack_members_for_ids_impl(
 
     match mapped {
         Ok(iter) => {
-            let members = iter.filter_map(|r| r.ok()).collect::<Vec<_>>();
+            let members = collect_rows(iter, "similar_photo_stack_members_for_ids");
             if members.is_empty() {
                 fallback()
             } else {
@@ -15497,7 +16098,7 @@ pub async fn collection_labels() -> Vec<String> {
     });
 
     match mapped {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Ok(iter) => collect_rows(iter, "collection_labels"),
         Err(e) => {
             eprintln!("collection_labels: query {}", e);
             Vec::new()
@@ -15808,7 +16409,7 @@ pub async fn hidden_keywords_for_image(image_id: i64) -> Vec<KeywordRow> {
     });
 
     match mapped {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Ok(iter) => collect_rows(iter, "hidden_keywords_for_image"),
         Err(e) => {
             eprintln!("hidden_keywords_for_image: query {}", e);
             Vec::new()
@@ -16015,13 +16616,25 @@ pub async fn rename_keyword(target_path: Vec<String>, new_label: String) -> u64 
 
 /// Per-chunk merge result. `image_ids` is aligned to the INPUT order so the
 /// Swift keyword pass can attach keywords by id. On any row error the chunk is
-/// rolled back and a zeroed result is returned (inserted + updated == 0 on a
-/// non-empty input signals a failed chunk to the orchestrator).
+/// rolled back and a zeroed result is returned.
+///
+/// ⭐ Slice 7 / R-73: the rollback was always correct — what was missing was a
+/// CHANNEL to say it happened. `inserted + updated == 0` on a non-empty input
+/// was the only signal, and it is indistinguishable from "this chunk had
+/// nothing to add", so all four Swift callers detected it in a comment and
+/// skipped silently: an import that failed every row reported a clean zero-add
+/// with no error. `failed_rows` and `failure_message` are that channel,
+/// appended LAST (no hand-written Swift file constructs this dictionary).
+///
+/// `failed_rows` is the CHUNK's length, not 1 — the whole chunk rolled back,
+/// so every record in it was un-merged, whichever row tripped.
 #[derive(Debug, Clone)]
 pub struct MergeChunkResult {
     pub inserted: u64,
     pub updated: u64,
     pub image_ids: Vec<i64>,
+    pub failed_rows: u64,
+    pub failure_message: Option<String>,
 }
 
 /// The merge INSERT (Lightroom / Apple-Photos / copy-import), hoisted to a
@@ -16075,13 +16688,20 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
         inserted: 0,
         updated: 0,
         image_ids: Vec::with_capacity(records.len()),
+        failed_rows: 0,
+        failure_message: None,
     };
     if records.is_empty() {
         return out;
     }
 
     if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
-        eprintln!("merge_records_into: begin failed: {}", e);
+        // Slice 7 / R-73: a BEGIN failure returns before any row is attempted,
+        // so the whole chunk is un-merged and `failed_rows` is its length.
+        let message = format!("merge_records_into: begin failed: {}", e);
+        eprintln!("{}", message);
+        out.failed_rows = records.len() as u64;
+        out.failure_message = Some(message);
         return out;
     }
 
@@ -16222,26 +16842,33 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
                 out.image_ids.push(id);
             }
             Err(e) => {
-                eprintln!(
-                    "merge_records_into: row failed for {}: {}",
-                    record.file_path, e
-                );
+                let message = format!("{}: {}", record.file_path, e);
+                eprintln!("merge_records_into: row failed for {}", message);
                 let _ = conn.execute_batch("ROLLBACK;");
+                // ⚠️ The WHOLE chunk rolled back, so the count is the chunk's
+                // length, not 1 — every record in it was un-merged, whichever
+                // row tripped. Do NOT "fix" this to 1.
                 return MergeChunkResult {
                     inserted: 0,
                     updated: 0,
                     image_ids: Vec::new(),
+                    failed_rows: records.len() as u64,
+                    failure_message: Some(message),
                 };
             }
         }
     }
 
     if let Err(e) = conn.execute_batch("COMMIT;") {
-        eprintln!("merge_records_into: commit failed: {}", e);
+        // Slice 7 / R-73: a COMMIT failure un-merges the whole chunk too.
+        let message = format!("merge_records_into: commit failed: {}", e);
+        eprintln!("{}", message);
         return MergeChunkResult {
             inserted: 0,
             updated: 0,
             image_ids: Vec::new(),
+            failed_rows: records.len() as u64,
+            failure_message: Some(message),
         };
     }
     out
@@ -16257,17 +16884,24 @@ pub async fn merge_lightroom_records(records: Vec<ImageMetadata>) -> MergeChunkR
             inserted: 0,
             updated: 0,
             image_ids: Vec::new(),
+            failed_rows: 0,
+            failure_message: None,
         };
     }
     let catalogue = CATALOGUE.lock().unwrap();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
-            eprintln!("merge_lightroom_records: catalogue not initialized");
+            // Slice 7 / R-73: nothing was merged, so the caller is told so
+            // rather than reading a clean zero-add.
+            let message = "merge_lightroom_records: catalogue not initialized".to_string();
+            eprintln!("{}", message);
             return MergeChunkResult {
                 inserted: 0,
                 updated: 0,
                 image_ids: Vec::new(),
+                failed_rows: records.len() as u64,
+                failure_message: Some(message),
             };
         }
     };
@@ -16302,17 +16936,27 @@ pub struct LightroomVideoRecord {
 /// `videos` table. The result's `image_ids` holds the VIDEO-row ids (aligned to
 /// input) — the field name is shared for one `MergeChunkResult` shape.
 fn merge_videos_into(conn: &Connection, records: &[LightroomVideoRecord]) -> MergeChunkResult {
+    // ⚠️ Slice 7 / R-73, W1: this path is WRITE-DEAD (`merge_lightroom_videos`
+    // has no Swift caller — verified). Its behaviour is unchanged; the two new
+    // fields are filled honestly rather than hard-zeroed, because a zeroed
+    // failure count sitting on a rollback path is exactly the lie R-73 is
+    // about.
     let mut out = MergeChunkResult {
         inserted: 0,
         updated: 0,
         image_ids: Vec::with_capacity(records.len()),
+        failed_rows: 0,
+        failure_message: None,
     };
     if records.is_empty() {
         return out;
     }
 
     if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
-        eprintln!("merge_videos_into: begin failed: {}", e);
+        let message = format!("merge_videos_into: begin failed: {}", e);
+        eprintln!("{}", message);
+        out.failed_rows = records.len() as u64;
+        out.failure_message = Some(message);
         return out;
     }
 
@@ -16399,26 +17043,29 @@ fn merge_videos_into(conn: &Connection, records: &[LightroomVideoRecord]) -> Mer
                 out.image_ids.push(id);
             }
             Err(e) => {
-                eprintln!(
-                    "merge_videos_into: row failed for {}: {}",
-                    record.file_path, e
-                );
+                let message = format!("{}: {}", record.file_path, e);
+                eprintln!("merge_videos_into: row failed for {}", message);
                 let _ = conn.execute_batch("ROLLBACK;");
                 return MergeChunkResult {
                     inserted: 0,
                     updated: 0,
                     image_ids: Vec::new(),
+                    failed_rows: records.len() as u64,
+                    failure_message: Some(message),
                 };
             }
         }
     }
 
     if let Err(e) = conn.execute_batch("COMMIT;") {
-        eprintln!("merge_videos_into: commit failed: {}", e);
+        let message = format!("merge_videos_into: commit failed: {}", e);
+        eprintln!("{}", message);
         return MergeChunkResult {
             inserted: 0,
             updated: 0,
             image_ids: Vec::new(),
+            failed_rows: records.len() as u64,
+            failure_message: Some(message),
         };
     }
     out
@@ -16432,17 +17079,22 @@ pub async fn merge_lightroom_videos(records: Vec<LightroomVideoRecord>) -> Merge
             inserted: 0,
             updated: 0,
             image_ids: Vec::new(),
+            failed_rows: 0,
+            failure_message: None,
         };
     }
     let catalogue = CATALOGUE.lock().unwrap();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
-            eprintln!("merge_lightroom_videos: catalogue not initialized");
+            let message = "merge_lightroom_videos: catalogue not initialized".to_string();
+            eprintln!("{}", message);
             return MergeChunkResult {
                 inserted: 0,
                 updated: 0,
                 image_ids: Vec::new(),
+                failed_rows: records.len() as u64,
+                failure_message: Some(message),
             };
         }
     };
@@ -16688,11 +17340,11 @@ fn table_columns(conn: &Connection, database: &str, table: &str) -> Result<Vec<S
     let mut stmt = conn
         .prepare(&sql)
         .map_err(|e| format!("column introspection prepare failed: {}", e))?;
-    let names = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|e| format!("column introspection failed: {}", e))?
-        .filter_map(Result::ok)
-        .collect::<Vec<_>>();
+    let names = collect_rows(
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("column introspection failed: {}", e))?,
+        "table_columns",
+    );
     if names.is_empty() {
         return Err(format!(
             "no columns found for {}.main.{}",
@@ -16850,11 +17502,11 @@ fn merge_catalogue_sql_inner(
                  WHERE image_id IN (SELECT new_id FROM plmerge_map WHERE NOT is_new)",
             )
             .map_err(|e| format!("replaced-face census prepare failed: {}", e))?;
-        replaced_live_face_ids = stmt
-            .query_map([], |row| row.get::<_, i64>(0))
-            .map_err(|e| format!("replaced-face census failed: {}", e))?
-            .filter_map(Result::ok)
-            .collect();
+        replaced_live_face_ids = collect_rows(
+            stmt.query_map([], |row| row.get::<_, i64>(0))
+                .map_err(|e| format!("replaced-face census failed: {}", e))?,
+            "merge_catalogue.replaced_face_census",
+        );
         drop(stmt);
 
         conn.execute_batch(
@@ -17095,8 +17747,8 @@ fn merge_catalogue_sql_inner(
              FROM plface_obs_map fm JOIN face_observation f ON f.id = fm.new_id",
         )
         .map_err(|e| format!("merged-face readback prepare failed: {}", e))?;
-    let merged_faces = stmt
-        .query_map([], |row| {
+    let merged_faces = collect_rows(
+        stmt.query_map([], |row| {
             Ok(MergedFaceRef {
                 old_id: row.get::<_, i64>(0)?,
                 new_id: row.get::<_, i64>(1)?,
@@ -17105,9 +17757,9 @@ fn merge_catalogue_sql_inner(
                 face_index: row.get::<_, i64>(4)?.max(0) as u32,
             })
         })
-        .map_err(|e| format!("merged-face readback failed: {}", e))?
-        .filter_map(Result::ok)
-        .collect::<Vec<_>>();
+        .map_err(|e| format!("merged-face readback failed: {}", e))?,
+        "merge_catalogue.merged_face_readback",
+    );
     drop(stmt);
 
     conn.execute_batch("COMMIT;")
@@ -17149,7 +17801,9 @@ async fn copy_face_embeddings_for_merge(
     // Replaced observations are gone from DuckDB — their vectors must not
     // linger as neighbor-slot pollution in the live store.
     if !replaced_live_face_ids.is_empty() {
-        if let Ok(table) = open_face_embedding_table().await {
+        if let Ok(FaceEmbeddingTableState::Present(table)) =
+            open_face_embedding_table_for_read("merge vector cleanup").await
+        {
             for chunk in replaced_live_face_ids.chunks(500) {
                 let filter = format!(
                     "face_observation_id IN ({})",
@@ -19350,8 +20004,14 @@ mod focus_analysis_queue_tests {
         conn
     }
 
-    fn candidate_ids(rows: Vec<FocusAnalysisCandidate>) -> Vec<i64> {
-        rows.into_iter().map(|row| row.id).collect()
+    fn candidate_ids(page: FocusAnalysisCandidatePage) -> Vec<i64> {
+        // Slice 7 / R-31: the work set now carries its own dropped-row count.
+        // These fixtures are all well-formed, so any drop here is a defect.
+        assert_eq!(
+            page.dropped_rows, 0,
+            "the focus-queue fixtures must not drop rows"
+        );
+        page.candidates.into_iter().map(|row| row.id).collect()
     }
 
     #[test]
@@ -19414,7 +20074,9 @@ mod focus_analysis_queue_tests {
             focus_analysis_candidate_count_impl(&conn, "v2", "run-1", Some(&ids)),
             0
         );
-        assert!(focus_analysis_candidates_impl(&conn, 500, "v2", "run-1", Some(&ids)).is_empty());
+        assert!(focus_analysis_candidates_impl(&conn, 500, "v2", "run-1", Some(&ids))
+            .candidates
+            .is_empty());
     }
 
     #[test]
@@ -24664,7 +25326,7 @@ fn directory_sync_states_impl(conn: &Connection) -> Vec<DirectorySyncState> {
     });
 
     match mapped {
-        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Ok(iter) => collect_rows(iter, "directory_sync_states"),
         Err(e) => {
             eprintln!("directory_sync_states: query {}", e);
             Vec::new()
@@ -25344,6 +26006,1274 @@ pub async fn get_external_source_id(image_id: i64) -> Option<String> {
     )
     .ok()
     .flatten()
+}
+
+// ============================================================================
+// Apple shared-album cleanup (LATENT-DEFECT SWEEP, SLICE N-2, 2026-09-18)
+//
+// Slice N-1 stopped NEW shared-album rows arriving at the reader. This is the
+// other half: the rows earlier imports already created. Photos stores an iCloud
+// Shared Album asset with `ZDIRECTORY = "<scope id>/<album id>"` and keeps its
+// bytes under `scopes/cloudsharing/…`, never under `originals/`, so the path the
+// reader built for one — `originals/<scope>/<album>/<UUID>.JPG` — points at a
+// directory that does not exist: no thumbnail ever, Intelligent Culling stamping
+// it `unreadable` and re-queueing it on EVERY run, and the Apple Libraries node's
+// one menu item offering a multi-hour download that can never succeed.
+//
+// TWO read-only queries, and nothing else. The delete itself reuses the existing
+// TRANSACTED `remove_images_by_ids` — `remove_images_for_filters` is a single
+// un-transacted statement (R-76) and must not be used for this.
+// ============================================================================
+
+/// The rows one Apple Photos library's `originals/` tree holds whose directory
+/// under `originals/` has MORE THAN ONE component — the observable shape of an
+/// iCloud Shared Album asset. `image_ids` and `file_paths` are INDEX-ALIGNED
+/// (one ordered query produces both). Mirrors the UDL
+/// `AppleSharedAlbumCleanupTargets`.
+///
+/// ⚠️ FAILURE DIRECTION IS EMPTY: on a refusal or a query error `ok` is false,
+/// both lists are empty and `error_message` is set. A selection that feeds a
+/// DELETE must fail toward "found nothing", never toward "found everything".
+pub struct AppleSharedAlbumCleanupTargets {
+    pub ok: bool,
+    pub image_ids: Vec<i64>,
+    pub file_paths: Vec<String>,
+    pub error_message: Option<String>,
+}
+
+/// The Q-36 dependent guard's answer: how many rows in each dependent table the
+/// given image ids carry, and WHICH of those ids carry any. Mirrors the UDL
+/// `AppleSharedAlbumDependentCensus`.
+///
+/// ⚠️ FAIL-CLOSED: `ok == false` means the census could not be performed and the
+/// caller must delete NOTHING. An empty `encumbered_image_ids` is only meaningful
+/// when `ok` is true — reading it without testing `ok` turns a failed census into
+/// a full delete, which is the single most dangerous inversion in this slice.
+pub struct AppleSharedAlbumDependentCensus {
+    pub ok: bool,
+    pub keyword_rows: u64,
+    pub face_observation_rows: u64,
+    pub person_face_assignment_rows: u64,
+    pub face_cluster_member_rows: u64,
+    pub similar_photo_group_member_rows: u64,
+    pub similar_photo_featureprint_rows: u64,
+    pub queued_vector_deletes: u64,
+    pub encumbered_image_ids: Vec<i64>,
+    pub error_message: Option<String>,
+}
+
+/// (table, the columns that reference `images.id`). Enumerated from the DDL and
+/// verified by execution (V2 §L2-01 §5). ⭐ ONE const drives BOTH the per-table
+/// counts and the encumbered-id union, so a table added to one and forgotten in
+/// the other is impossible.
+///
+/// ⚠️ `operation_log_entry` is deliberately NOT here — it has no `image_id`
+/// column at all (the earlier register entry was wrong). The two
+/// `similar_photo_*_unit` tables are not here either: they carry range MARKERS
+/// keyed by a content hash over the candidate window, so a changed corpus yields
+/// a different key and they heal themselves. `directory_sync_state` self-heals in
+/// `update_directory_sync_states_impl`'s prune; `analysis_jobs` holds transient
+/// cursors.
+///
+/// `similar_photo_group_member.representative_id` is in the list on purpose: a
+/// row that is the REPRESENTATIVE of a stack containing surviving photos is a
+/// genuine dependency, and deleting it would strand the group.
+const APPLE_CLEANUP_DEPENDENT_TABLES: &[(&str, &[&str])] = &[
+    ("keyword", &["image_id"]),
+    ("face_observation", &["image_id", "analyzed_image_id"]),
+    ("person_face_assignment", &["image_id", "analyzed_image_id"]),
+    ("face_cluster_member", &["image_id", "analyzed_image_id"]),
+    ("similar_photo_group_member", &["image_id", "representative_id"]),
+    ("similar_photo_featureprint", &["image_id"]),
+];
+
+/// Build a safe `<column> IN (...)` predicate from i64 ids — the `id_in_list`
+/// idiom (S68) generalized to a named column, because the census asks the same
+/// question of `image_id`, `analyzed_image_id` and `representative_id`. The ids
+/// are integers, so direct interpolation carries no injection surface, and
+/// `column` is never caller-supplied: it comes from
+/// `APPLE_CLEANUP_DEPENDENT_TABLES`. `None` for an empty slice — the caller MUST
+/// short-circuit, since `IN ()` is a syntax error.
+///
+/// ⛔ Deliberately a THIRD helper rather than a refactor of `id_in_list`
+/// (`fn id_in_list`) or `image_id_in_list`: both have other callers and the S173
+/// drift test pins hand-copied SQL. W1 — proportionate.
+fn column_id_in_list(column: &str, ids: &[i64]) -> Option<String> {
+    if ids.is_empty() {
+        return None;
+    }
+    let joined = ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("{} IN ({})", column, joined))
+}
+
+/// Body of `apple_shared_album_cleanup_targets` against an explicit connection
+/// (the impl/wrapper pattern, so the tests run on a real migrated catalogue file).
+///
+/// ⭐ PATH SHAPE, deliberately. No hard-coded scope id (`268820780` is machine-
+/// and account-specific), no bulk `external_source_id` projection (the only
+/// reader on the FFI surface is single-row BY DESIGN — S87 kept it off the hot
+/// @MainActor `ImageRecord` lift), and no re-derivation of Apple's private
+/// layout. It is the same discriminator N-1 mounted at the reader, expressed over
+/// the path the reader WROTE.
+///
+/// ⭐ `length(?2)` is computed IN SQL, never in Rust. DuckDB's `length` /
+/// `substring` count CHARACTERS; Rust's `str::len()` counts BYTES. A library path
+/// with one non-ASCII character would make a Rust-computed offset wrong and
+/// silently mis-select. `?1` and `?2` are the SAME prefix bound twice,
+/// deliberately, so the statement never depends on how duckdb-rs handles a reused
+/// numbered placeholder.
+///
+/// ⭐ `starts_with`, not `LIKE`: `LIKE` has a wildcard vocabulary and this app has
+/// already been bitten once by reading a `LIKE` pattern over a path as a literal
+/// test (S153/S168, where a volume named `Peg_RAWmain` also swept `PegXRAWmain`).
+/// `starts_with` has no wildcards at all. ⛔ No regexp — the four functions used
+/// here all already appear in shipped product SQL, so they add no extension
+/// surface (R-14 / slice E0).
+fn apple_shared_album_cleanup_targets_impl(
+    conn: &Connection,
+    originals_prefix: &str,
+) -> AppleSharedAlbumCleanupTargets {
+    let refused = |message: String| AppleSharedAlbumCleanupTargets {
+        ok: false,
+        image_ids: Vec::new(),
+        file_paths: Vec::new(),
+        error_message: Some(message),
+    };
+
+    // ⭐ THE REFUSAL GUARD IS LOAD-BEARING, NOT DECORATION. An empty prefix makes
+    // `starts_with(file_path, '')` true for every row and the predicate degrades
+    // to "any path with two or more slashes" — i.e. most of the catalogue, feeding
+    // a DELETE. This is `remove_images_for_filters`'s empty-predicate refusal
+    // doctrine ("we never want a future caller change to silently produce
+    // DELETE FROM images") applied one step earlier, at the SELECTION.
+    if originals_prefix.is_empty() {
+        return refused(
+            "apple_shared_album_cleanup_targets refused: empty originals prefix".to_string(),
+        );
+    }
+    if !originals_prefix.ends_with("/originals/") {
+        return refused(format!(
+            "apple_shared_album_cleanup_targets refused: prefix does not end with \
+             '/originals/' ({})",
+            originals_prefix
+        ));
+    }
+    if !originals_prefix.contains(".photoslibrary/") {
+        return refused(format!(
+            "apple_shared_album_cleanup_targets refused: prefix is not inside a \
+             '.photoslibrary/' package ({})",
+            originals_prefix
+        ));
+    }
+
+    // Anchoring at `originals/` is also what keeps the rest of the package out:
+    // `database/`, `resources/derivatives/…` and `scopes/…` all have
+    // multi-component paths inside the same library and none of them can match,
+    // because the prefix pins the tree.
+    //
+    // ORDER BY id — the two returned sequences must be index-aligned, and one
+    // ordered query is what makes that true by construction.
+    let sql = "\
+        WITH rel AS (
+            SELECT id,
+                   file_path,
+                   substring(file_path, length(?2) + 1) AS tail
+            FROM images
+            WHERE starts_with(file_path, ?1)
+        )
+        SELECT id, file_path
+        FROM rel
+        WHERE instr(tail, '/') > 0
+          AND instr(substring(tail, instr(tail, '/') + 1), '/') > 0
+        ORDER BY id";
+
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(e) => {
+            return refused(format!(
+                "apple_shared_album_cleanup_targets: prepare failed: {}",
+                e
+            ));
+        }
+    };
+
+    let rows = match stmt.query_map(params![originals_prefix, originals_prefix], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            return refused(format!(
+                "apple_shared_album_cleanup_targets: query failed: {}",
+                e
+            ));
+        }
+    };
+
+    let mut image_ids = Vec::new();
+    let mut file_paths = Vec::new();
+    for row in rows {
+        match row {
+            Ok((id, path)) => {
+                image_ids.push(id);
+                file_paths.push(path);
+            }
+            Err(e) => {
+                // A row that will not decode means the returned pair of sequences
+                // can no longer be trusted to be aligned. Refuse the whole answer
+                // rather than hand back a partial one that feeds a DELETE.
+                return refused(format!(
+                    "apple_shared_album_cleanup_targets: row decode failed: {}",
+                    e
+                ));
+            }
+        }
+    }
+
+    AppleSharedAlbumCleanupTargets {
+        ok: true,
+        image_ids,
+        file_paths,
+        error_message: None,
+    }
+}
+
+/// Body of `apple_shared_album_dependent_census` against an explicit connection.
+///
+/// ⭐ FAIL-CLOSED. Any prepare/query error abandons the whole census: `ok` false,
+/// every count 0, the encumbered list empty, `error_message` set. The Swift caller
+/// tests `ok` BEFORE it reads the keep-list (gate check G-N2-4 locks that order).
+fn apple_shared_album_dependent_census_impl(
+    conn: &Connection,
+    ids: &[i64],
+) -> AppleSharedAlbumDependentCensus {
+    let failed = |message: String| AppleSharedAlbumDependentCensus {
+        ok: false,
+        keyword_rows: 0,
+        face_observation_rows: 0,
+        person_face_assignment_rows: 0,
+        face_cluster_member_rows: 0,
+        similar_photo_group_member_rows: 0,
+        similar_photo_featureprint_rows: 0,
+        queued_vector_deletes: 0,
+        encumbered_image_ids: Vec::new(),
+        error_message: Some(message),
+    };
+
+    // An empty candidate set is a legitimate, successful "nothing to weigh".
+    if ids.is_empty() {
+        return AppleSharedAlbumDependentCensus {
+            ok: true,
+            keyword_rows: 0,
+            face_observation_rows: 0,
+            person_face_assignment_rows: 0,
+            face_cluster_member_rows: 0,
+            similar_photo_group_member_rows: 0,
+            similar_photo_featureprint_rows: 0,
+            queued_vector_deletes: 0,
+            encumbered_image_ids: Vec::new(),
+            error_message: None,
+        };
+    }
+
+    // Per-table totals, index-aligned with APPLE_CLEANUP_DEPENDENT_TABLES, plus
+    // the encumbered-id union built from the SAME (table, columns) pairs.
+    let mut counts = vec![0u64; APPLE_CLEANUP_DEPENDENT_TABLES.len()];
+    let mut encumbered: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    let mut queued_vector_deletes: u64 = 0;
+
+    // The same chunk size `remove_images_by_ids_impl` deletes at.
+    for chunk in ids.chunks(500) {
+        for (index, (table, columns)) in APPLE_CLEANUP_DEPENDENT_TABLES.iter().enumerate() {
+            let predicates: Vec<String> = columns
+                .iter()
+                .filter_map(|column| column_id_in_list(column, chunk))
+                .collect();
+            if predicates.len() != columns.len() {
+                return failed(format!(
+                    "apple_shared_album_dependent_census: could not build the id predicate \
+                     for {}",
+                    table
+                ));
+            }
+            let where_clause = predicates.join(" OR ");
+
+            let count_sql = format!("SELECT COUNT(*) FROM {} WHERE {}", table, where_clause);
+            match conn.query_row(&count_sql, [], |row| row.get::<_, i64>(0)) {
+                Ok(n) => counts[index] += n.max(0) as u64,
+                Err(e) => {
+                    return failed(format!(
+                        "apple_shared_album_dependent_census: counting {} failed: {}",
+                        table, e
+                    ));
+                }
+            }
+
+            // ONE union over every (table, column) pair — the keep-list and the
+            // counts come from the same const, so they cannot disagree.
+            let arms: Vec<String> = columns
+                .iter()
+                .map(|column| {
+                    format!(
+                        "SELECT {} AS id FROM {} WHERE {}",
+                        column,
+                        table,
+                        column_id_in_list(column, chunk).unwrap_or_else(|| "FALSE".to_string())
+                    )
+                })
+                .collect();
+            let union_sql = format!(
+                "SELECT DISTINCT id FROM ({}) ORDER BY id",
+                arms.join(" UNION ALL ")
+            );
+            let mut stmt = match conn.prepare(&union_sql) {
+                Ok(s) => s,
+                Err(e) => {
+                    return failed(format!(
+                        "apple_shared_album_dependent_census: preparing the {} union failed: {}",
+                        table, e
+                    ));
+                }
+            };
+            let rows = match stmt.query_map([], |row| row.get::<_, i64>(0)) {
+                Ok(r) => r,
+                Err(e) => {
+                    return failed(format!(
+                        "apple_shared_album_dependent_census: reading the {} union failed: {}",
+                        table, e
+                    ));
+                }
+            };
+            for row in rows {
+                match row {
+                    Ok(id) => {
+                        encumbered.insert(id);
+                    }
+                    Err(e) => {
+                        return failed(format!(
+                            "apple_shared_album_dependent_census: decoding the {} union \
+                             failed: {}",
+                            table, e
+                        ));
+                    }
+                }
+            }
+        }
+
+        // ⭐ The vector queue is the seventh number and is a JOIN, not a column
+        // reference: `face_vector_pending_delete` is keyed by
+        // `face_observation_id`. It is reported for honesty, and because the guard
+        // refuses every row that has a `face_observation`, it must be 0 for
+        // anything actually deleted — which is the proof that this removal cannot
+        // leak a LanceDB vector.
+        let (Some(by_image), Some(by_analyzed)) = (
+            column_id_in_list("fo.image_id", chunk),
+            column_id_in_list("fo.analyzed_image_id", chunk),
+        ) else {
+            return failed(
+                "apple_shared_album_dependent_census: could not build the vector-queue \
+                 id predicate"
+                    .to_string(),
+            );
+        };
+        let queue_sql = format!(
+            "SELECT COUNT(*) FROM face_vector_pending_delete q \
+             JOIN face_observation fo ON fo.id = q.face_observation_id \
+             WHERE {} OR {}",
+            by_image, by_analyzed
+        );
+        match conn.query_row(&queue_sql, [], |row| row.get::<_, i64>(0)) {
+            Ok(n) => queued_vector_deletes += n.max(0) as u64,
+            Err(e) => {
+                return failed(format!(
+                    "apple_shared_album_dependent_census: counting the queued vector \
+                     deletes failed: {}",
+                    e
+                ));
+            }
+        }
+    }
+
+    AppleSharedAlbumDependentCensus {
+        ok: true,
+        keyword_rows: counts[0],
+        face_observation_rows: counts[1],
+        person_face_assignment_rows: counts[2],
+        face_cluster_member_rows: counts[3],
+        similar_photo_group_member_rows: counts[4],
+        similar_photo_featureprint_rows: counts[5],
+        queued_vector_deletes,
+        encumbered_image_ids: encumbered.into_iter().collect(),
+        error_message: None,
+    }
+}
+
+/// SLICE N-2 — every catalogued row under ONE Apple Photos library's
+/// `originals/` tree whose directory under `originals/` has MORE THAN ONE
+/// component. Read-only.
+///
+/// `originals_prefix` is `<library>/originals/`, built by the caller from the
+/// SAME two path components the reader uses. The call is REFUSED (`ok = false`,
+/// empty lists, `error_message` set) unless the prefix is non-empty, ends with
+/// `/originals/` and contains `.photoslibrary/`.
+pub async fn apple_shared_album_cleanup_targets(
+    originals_prefix: String,
+) -> AppleSharedAlbumCleanupTargets {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return AppleSharedAlbumCleanupTargets {
+                ok: false,
+                image_ids: Vec::new(),
+                file_paths: Vec::new(),
+                error_message: Some("Catalogue not initialized".to_string()),
+            };
+        }
+    };
+    let result = apple_shared_album_cleanup_targets_impl(conn, &originals_prefix);
+    if let Some(message) = result.error_message.as_deref() {
+        eprintln!("{}", message);
+    }
+    result
+}
+
+/// SLICE N-2 — the Q-36 dependent guard: how many keyword / face / similar-photo
+/// rows the given image ids carry, and WHICH ids carry any. Read-only.
+///
+/// ⚠️ FAIL-CLOSED — `ok = false` means the census could not be performed and the
+/// caller must delete NOTHING; an empty encumbered list is only meaningful when
+/// `ok` is true.
+pub async fn apple_shared_album_dependent_census(
+    image_ids: Vec<i64>,
+) -> AppleSharedAlbumDependentCensus {
+    let catalogue = CATALOGUE.lock().unwrap();
+    let conn = match catalogue.as_ref() {
+        Some(c) => c,
+        None => {
+            eprintln!("Catalogue not initialized");
+            return AppleSharedAlbumDependentCensus {
+                ok: false,
+                keyword_rows: 0,
+                face_observation_rows: 0,
+                person_face_assignment_rows: 0,
+                face_cluster_member_rows: 0,
+                similar_photo_group_member_rows: 0,
+                similar_photo_featureprint_rows: 0,
+                queued_vector_deletes: 0,
+                encumbered_image_ids: Vec::new(),
+                error_message: Some("Catalogue not initialized".to_string()),
+            };
+        }
+    };
+    let result = apple_shared_album_dependent_census_impl(conn, &image_ids);
+    if let Some(message) = result.error_message.as_deref() {
+        eprintln!("{}", message);
+    }
+    result
+}
+
+/// ⭐⭐ ENGINE TESTS NEVER FETCH — a STANDING RULE, added after an incident in this
+/// slice's own fix round.
+///
+/// A mutation that removes `apply_extension_autoload_policy` turns autoload AND
+/// autoinstall back ON. The first ICU-catalogued symbol a test then runs makes the
+/// engine **download `icu.duckdb_extension` over the network into
+/// `~/.duckdb/extensions/v<version>/<platform>/`** — real network I/O, into the
+/// developer's home directory, from `cargo test`. That is exactly what happened:
+/// the E3 mutation re-created that file twice on this machine, the second time
+/// minutes after Richard had deleted it. Discipline is not a fix for this; the
+/// fetch has to be impossible.
+///
+/// So every test connection is fenced BEFORE it can run such a statement:
+/// `extension_directory` is redirected into a per-process temp directory, and BOTH
+/// repository overrides — `custom_extension_repository` and the autoload-specific
+/// `autoinstall_extension_repository` — are pointed at a local path that does not
+/// exist. An autoinstall attempt then fails locally and immediately, having
+/// written nothing outside the temp directory.
+///
+/// ⚠️ This is a FENCE, not the guard under test. E0-T1's discriminator still
+/// separates a guarded connection (an instant local `Catalog Error` naming the
+/// extension) from an unguarded one (which now fails on the unreachable local
+/// repository instead of succeeding after a download).
+///
+/// ⚠️ It FAILS LOUDLY, unlike production's deliberately fail-open policy: a test
+/// connection that could not be fenced is the precise condition that caused the
+/// incident, so it must stop the test rather than proceed quietly.
+///
+/// ⚠️ ACCEPTED RESIDUE, recorded rather than claimed away (review round 2, N4):
+/// the fence is applied AFTER `open_and_migrate_catalogue` returns, so under a
+/// mutation that removes the production guard the schema batch, the `SELECT
+/// version()` probe, the S173 `directory_path` repair and the index drops all run
+/// on that connection UNFENCED. Nothing among them can trigger a fetch — V5
+/// audited all 411 SQL literals in this file and every identifier resolves to
+/// `core_functions` — and a guard-removed run left `~/.duckdb` byte-identical, so
+/// the claim holds. But it holds by that AUDIT, exactly as the ~40 unfenced
+/// `open_in_memory` test sites do, not by construction. Closing it needs a
+/// `#[cfg(test)]` hook inside `open_and_migrate_catalogue` (the S179
+/// `FocusApplyProbe` precedent), which would move production source; slice K is
+/// building a migration probe seam there and is the right place to carry it.
+#[cfg(test)]
+fn fence_connection_against_extension_fetches(conn: &Connection) {
+    let fence_dir =
+        std::env::temp_dir().join(format!("plcore-test-extensions-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&fence_dir);
+    // A path that deliberately does not exist, so an install attempt resolves
+    // locally and fails without touching the network.
+    let repository = fence_dir.join("no-repo");
+
+    for statement in [
+        format!("SET extension_directory = '{}';", fence_dir.display()),
+        format!(
+            "SET custom_extension_repository = '{}';",
+            repository.display()
+        ),
+        format!(
+            "SET autoinstall_extension_repository = '{}';",
+            repository.display()
+        ),
+    ] {
+        conn.execute_batch(&statement).unwrap_or_else(|e| {
+            panic!(
+                "could not fence this test connection away from the real extension directory \
+                 ({}): {} — refusing to run a test that could download an extension into the \
+                 developer's home directory",
+                statement, e
+            )
+        });
+    }
+}
+
+#[cfg(test)]
+mod apple_shared_album_cleanup_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A fresh REAL catalogue file in the temp dir, opened through the exact
+    /// `open_and_migrate_catalogue` path production uses — so the queries below
+    /// are tested against the true schema, not a hand-rolled fixture.
+    fn fresh_catalogue(tag: &str) -> (std::path::PathBuf, Connection) {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "plcore-apple-cleanup-test-{}-{}-{}.db",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+        let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH — see the helper's own note.
+        fence_connection_against_extension_fetches(&conn);
+        (path, conn)
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+    }
+
+    fn insert_image(conn: &Connection, file_path: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO images (file_path, file_size, file_name, created_timestamp, \
+             modified_timestamp) VALUES (?1, 0, ?2, 0, 0)",
+            params![
+                file_path,
+                file_path.rsplit('/').next().unwrap_or(file_path)
+            ],
+        )
+        .expect("insert image");
+        conn.query_row(
+            "SELECT id FROM images WHERE file_path = ?1",
+            params![file_path],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("image id")
+    }
+
+    fn image_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM images", [], |row| row.get::<_, i64>(0))
+            .expect("image count")
+    }
+
+    const LIBRARY_PREFIX: &str = "/Users/x/Pictures/Photos Library.photoslibrary/originals/";
+
+    /// T1 — the shape query hits exactly the multi-component rows and nothing
+    /// else, and the two returned sequences are index-aligned.
+    #[test]
+    fn shape_query_selects_only_multi_component_directories_under_originals() {
+        let (path, conn) = fresh_catalogue("t1");
+
+        // (path, selected?)
+        let rows: Vec<(String, bool)> = vec![
+            // 1-4: ordinary single-component buckets. The two-character and the
+            // NON-HEX buckets are the guard rail: the rule is SHAPE, not length
+            // and not hex.
+            (format!("{}4/AAA.jpeg", LIBRARY_PREFIX), false),
+            (format!("{}f/BBB.heic", LIBRARY_PREFIX), false),
+            (format!("{}0A/CCC.jpg", LIBRARY_PREFIX), false),
+            (format!("{}Z/DDD.jpg", LIBRARY_PREFIX), false),
+            // 5-6: the shared-album shape.
+            (
+                format!("{}268820780/FS-aaa/EEE.JPG", LIBRARY_PREFIX),
+                true,
+            ),
+            (
+                format!("{}268820780/FS-bbb/FFF.JPG", LIBRARY_PREFIX),
+                true,
+            ),
+            // 7: the rule's reach, stated deliberately rather than by accident.
+            (format!("{}4/sub/GGG.jpg", LIBRARY_PREFIX), true),
+            // 8: a control row in ANOTHER .photoslibrary.
+            (
+                "/Users/x/Pictures/Other Library.photoslibrary/originals/268820780/FS-ccc/HHH.JPG"
+                    .to_string(),
+                false,
+            ),
+            // 9: a NON-APPLE path with many slashes AND the literal substring
+            // `originals/`.
+            (
+                "/Volumes/Peg_RAWmain/2026/03_march/14/originals/a/b/c/III.NEF".to_string(),
+                false,
+            ),
+            // 10-11: inside the same library, outside originals/.
+            (
+                "/Users/x/Pictures/Photos Library.photoslibrary/resources/derivatives/9/JJJ.jpeg"
+                    .to_string(),
+                false,
+            ),
+            (
+                "/Users/x/Pictures/Photos Library.photoslibrary/database/Photos.sqlite-wal"
+                    .to_string(),
+                false,
+            ),
+        ];
+
+        let mut expected_ids = Vec::new();
+        let mut expected_paths = Vec::new();
+        for (file_path, selected) in &rows {
+            let id = insert_image(&conn, file_path);
+            if *selected {
+                expected_ids.push(id);
+                expected_paths.push(file_path.clone());
+            }
+        }
+
+        let targets = apple_shared_album_cleanup_targets_impl(&conn, LIBRARY_PREFIX);
+        assert!(targets.ok, "error: {:?}", targets.error_message);
+        assert_eq!(
+            targets.image_ids, expected_ids,
+            "the selected id set is not exactly the multi-component rows"
+        );
+        assert_eq!(
+            targets.file_paths, expected_paths,
+            "file_paths must be INDEX-ALIGNED with image_ids"
+        );
+        assert_eq!(targets.image_ids.len(), targets.file_paths.len());
+
+        cleanup(&path);
+    }
+
+    /// T2 — a non-ASCII library path. ⭐ The `length()`-in-SQL proof: DuckDB
+    /// counts CHARACTERS and Rust counts BYTES, so a Rust-computed byte offset
+    /// selects the wrong substring here and this test goes red.
+    ///
+    /// ⚠️ THE LIBRARY NAME IS LOAD-BEARING AND THE DRIFT MUST BE BIG ENOUGH.
+    /// A byte offset is always ≥ the character offset, so the tail starts LATE
+    /// and can only ever LOSE slashes — which means the mutation is only visible
+    /// once the drift eats past the tail's FIRST separator. The shared-album
+    /// tail here is `268820780/FS-xyz/…`, so the drift must exceed 10 characters
+    /// or a byte-offset implementation still returns the right answer and the
+    /// test passes vacuously (it did, on a one-character drift, until the
+    /// mutation ledger caught it). `写真ライブラリ` is seven 3-byte characters —
+    /// drift 14 — plus the `é`, so the tail loses its scope-id component and the
+    /// row drops out of the selection.
+    #[test]
+    fn shape_query_is_character_correct_on_a_non_ascii_prefix() {
+        let (path, conn) = fresh_catalogue("t2");
+        let prefix = "/Users/josé/Pictures/写真ライブラリ.photoslibrary/originals/";
+
+        let ordinary = format!("{}7/ORDINARIA.jpeg", prefix);
+        let shared = format!("{}268820780/FS-xyz/COMPARTIDA.JPG", prefix);
+        insert_image(&conn, &ordinary);
+        let shared_id = insert_image(&conn, &shared);
+
+        let targets = apple_shared_album_cleanup_targets_impl(&conn, prefix);
+        assert!(targets.ok, "error: {:?}", targets.error_message);
+        assert_eq!(
+            targets.image_ids,
+            vec![shared_id],
+            "a byte-based offset mis-selects on a prefix with a non-ASCII character"
+        );
+        assert_eq!(targets.file_paths, vec![shared]);
+
+        cleanup(&path);
+    }
+
+    /// T3 — `%` and `_` in the library path are LITERAL. `starts_with` has no
+    /// wildcard vocabulary; the decoy pins that it stays that way.
+    #[test]
+    fn shape_query_treats_wildcard_characters_in_the_prefix_as_literal() {
+        let (path, conn) = fresh_catalogue("t3");
+        let prefix = "/Volumes/Peg_RAWmain/My 100%_Photos.photoslibrary/originals/";
+
+        let target = format!("{}268820780/FS-y/J.JPG", prefix);
+        let target_id = insert_image(&conn, &target);
+        // Matches `My 100%_Photos…` under LIKE (`%` = any run, `_` = any char)
+        // but not under starts_with.
+        let decoy = "/Volumes/Peg_RAWmain/My 100XPhotos.photoslibrary/originals/\
+                     268820780/FS-x/K.JPG";
+        insert_image(&conn, decoy);
+
+        let targets = apple_shared_album_cleanup_targets_impl(&conn, prefix);
+        assert!(targets.ok, "error: {:?}", targets.error_message);
+        assert_eq!(
+            targets.image_ids,
+            vec![target_id],
+            "the wildcard decoy was selected — the prefix test is not literal"
+        );
+
+        cleanup(&path);
+    }
+
+    /// T4 — the three refusals, and the catalogue still holds every row.
+    #[test]
+    fn shape_query_refuses_a_degenerate_prefix_and_touches_nothing() {
+        let (path, conn) = fresh_catalogue("t4");
+        insert_image(&conn, &format!("{}4/AAA.jpeg", LIBRARY_PREFIX));
+        insert_image(&conn, &format!("{}268820780/FS-a/BBB.JPG", LIBRARY_PREFIX));
+        insert_image(&conn, "/Volumes/Stuff/originals/a/b/C.jpg");
+        let before = image_count(&conn);
+
+        for refused in [
+            "",
+            "/Users/x/Pictures/Photos Library.photoslibrary/",
+            "/Volumes/Stuff/originals/",
+        ] {
+            let targets = apple_shared_album_cleanup_targets_impl(&conn, refused);
+            assert!(!targets.ok, "prefix {:?} was not refused", refused);
+            assert!(targets.image_ids.is_empty(), "prefix {:?}", refused);
+            assert!(targets.file_paths.is_empty(), "prefix {:?}", refused);
+            assert!(
+                targets
+                    .error_message
+                    .as_deref()
+                    .map(|m| !m.is_empty())
+                    .unwrap_or(false),
+                "prefix {:?} was refused without an error message",
+                refused
+            );
+        }
+
+        assert_eq!(image_count(&conn), before, "a refusal removed rows");
+        cleanup(&path);
+    }
+
+    /// T5 — the census counts every dependent table, through the TWIN and
+    /// REPRESENTATIVE columns a naive census misses, and names exactly the
+    /// encumbered id.
+    ///
+    /// ⚠️ EVERY TABLE GETS A DISTINCT COUNT (review 1, L3). The Rust side maps
+    /// `counts[0..5]` onto the seven struct fields POSITIONALLY from
+    /// `APPLE_CLEANUP_DEPENDENT_TABLES`; with every count seeded at 1 a reorder of
+    /// that const was invisible to the whole suite. The counts below are
+    /// 1 / 2 / 3 / 4 / 5 / 6 in const order, so a swapped pair fails by name.
+    #[test]
+    fn census_counts_every_dependent_table_including_the_twin_columns() {
+        let (path, conn) = fresh_catalogue("t5");
+        let candidate_a = insert_image(&conn, &format!("{}268820780/FS-a/A.JPG", LIBRARY_PREFIX));
+        let candidate_b = insert_image(&conn, &format!("{}268820780/FS-b/B.JPG", LIBRARY_PREFIX));
+        // An ordinary photo, so every twin/representative column below points at
+        // a NON-candidate through its `image_id` and at candidate A only through
+        // the column the census must not forget.
+        let other = insert_image(&conn, &format!("{}4/OTHER.jpeg", LIBRARY_PREFIX));
+
+        conn.execute(
+            "INSERT INTO keyword (image_id, label, path) VALUES (?1, 'x', 'x')",
+            params![candidate_a],
+        )
+        .expect("keyword row");
+
+        // face_observation: TWO rows, both reaching candidate A only through the
+        // `analyzed_image_id` twin.
+        for face_index in 0 .. 2 {
+            conn.execute(
+                "INSERT INTO face_observation (image_id, analyzed_image_id, face_index, \
+                 algorithm_version, analysis_run_id, bounding_box_x, bounding_box_y, \
+                 bounding_box_width, bounding_box_height) \
+                 VALUES (?1, ?2, ?3, 'test-v1', 'test-run', 0.1, 0.1, 0.5, 0.5)",
+                params![other, candidate_a, face_index],
+            )
+            .expect("face observation");
+        }
+        let face_ids: Vec<i64> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM face_observation WHERE analyzed_image_id = ?1 ORDER BY id",
+                )
+                .expect("face id statement");
+            let rows = stmt
+                .query_map(params![candidate_a], |row| row.get::<_, i64>(0))
+                .expect("face ids");
+            rows.map(|r| r.expect("face id")).collect()
+        };
+        assert_eq!(face_ids.len(), 2);
+
+        conn.execute(
+            "INSERT INTO person (display_name, normalized_name) VALUES ('Someone', 'someone')",
+            [],
+        )
+        .expect("person");
+        let person_id: i64 = conn
+            .query_row("SELECT id FROM person LIMIT 1", [], |row| row.get(0))
+            .expect("person id");
+
+        // person_face_assignment: THREE rows. Its PK is `face_observation_id`, so
+        // they carry synthetic ids — nothing in this schema enforces the reference,
+        // and the census reads only `image_id` / `analyzed_image_id`.
+        for n in 0 .. 3 {
+            conn.execute(
+                "INSERT INTO person_face_assignment (face_observation_id, person_id, image_id, \
+                 analyzed_image_id, face_index, assignment_source) \
+                 VALUES (?1, ?2, ?3, ?4, 0, 'test')",
+                params![900_001_i64 + n, person_id, other, candidate_a],
+            )
+            .expect("person face assignment");
+        }
+
+        // face_cluster_member: FOUR rows (PK is (run_id, face_observation_id)).
+        for n in 0 .. 4 {
+            conn.execute(
+                "INSERT INTO face_cluster_member (run_id, cluster_id, face_observation_id, \
+                 image_id, analyzed_image_id, face_index, member_rank, cluster_size) \
+                 VALUES ('run-1', 1, ?1, ?2, ?3, 0, 0, 1)",
+                params![900_011_i64 + n, other, candidate_a],
+            )
+            .expect("face cluster member");
+        }
+
+        // similar_photo_group_member: FIVE rows. Its PK is `image_id`, so each
+        // needs its own ordinary photo, all pointing at candidate A as their
+        // REPRESENTATIVE — the column a naive census forgets.
+        for n in 0 .. 5 {
+            let member = insert_image(&conn, &format!("{}4/MEMBER-{}.jpeg", LIBRARY_PREFIX, n));
+            conn.execute(
+                "INSERT INTO similar_photo_group_member (image_id, group_id, representative_id, \
+                 member_rank, algorithm_version, threshold) VALUES (?1, 1, ?2, 1, 'v4', 8.5)",
+                params![member, candidate_a],
+            )
+            .expect("similar group member");
+        }
+
+        // similar_photo_featureprint: SIX rows (PK is (image_id, algorithm_version)).
+        for n in 0 .. 6 {
+            conn.execute(
+                "INSERT INTO similar_photo_featureprint (image_id, algorithm_version, \
+                 source_stamp, featureprint_blob) VALUES (?1, ?2, 'stamp', ?3)",
+                params![candidate_a, format!("v{}", n), vec![1u8, 2, 3]],
+            )
+            .expect("featureprint");
+        }
+
+        // The vector queue is a JOIN through face_observation, not a positional
+        // field — both real face rows are enqueued.
+        for face_id in &face_ids {
+            conn.execute(
+                "INSERT INTO face_vector_pending_delete (face_observation_id) VALUES (?1)",
+                params![face_id],
+            )
+            .expect("queued vector delete");
+        }
+
+        let census =
+            apple_shared_album_dependent_census_impl(&conn, &[candidate_a, candidate_b]);
+        assert!(census.ok, "error: {:?}", census.error_message);
+        assert_eq!(census.keyword_rows, 1, "keyword — const position 0");
+        assert_eq!(
+            census.face_observation_rows, 2,
+            "face_observation (the analyzed_image_id twin) — const position 1"
+        );
+        assert_eq!(
+            census.person_face_assignment_rows, 3,
+            "person_face_assignment (the analyzed_image_id twin) — const position 2"
+        );
+        assert_eq!(
+            census.face_cluster_member_rows, 4,
+            "face_cluster_member (the analyzed_image_id twin) — const position 3"
+        );
+        assert_eq!(
+            census.similar_photo_group_member_rows, 5,
+            "similar_photo_group_member (the representative_id column) — const position 4"
+        );
+        assert_eq!(
+            census.similar_photo_featureprint_rows, 6,
+            "similar_photo_featureprint — const position 5"
+        );
+        assert_eq!(census.queued_vector_deletes, 2, "the vector-queue JOIN");
+        assert_eq!(
+            census.encumbered_image_ids,
+            vec![candidate_a],
+            "candidate B carries nothing and must not be kept"
+        );
+
+        cleanup(&path);
+    }
+
+    /// T6 — FAIL-CLOSED. A census that cannot be performed reports `ok = false`,
+    /// zero counts and an EMPTY keep-list, which the Swift side must never read
+    /// as "nothing to keep, delete everything".
+    #[test]
+    fn census_fails_closed_when_a_dependent_table_cannot_be_read() {
+        let (path, conn) = fresh_catalogue("t6");
+        let candidate = insert_image(&conn, &format!("{}268820780/FS-a/A.JPG", LIBRARY_PREFIX));
+        conn.execute(
+            "INSERT INTO keyword (image_id, label, path) VALUES (?1, 'x', 'x')",
+            params![candidate],
+        )
+        .expect("keyword row");
+
+        conn.execute_batch("DROP TABLE keyword;")
+            .expect("drop keyword table");
+
+        let census = apple_shared_album_dependent_census_impl(&conn, &[candidate]);
+        assert!(!census.ok, "a failed census reported success");
+        assert_eq!(census.keyword_rows, 0);
+        assert_eq!(census.face_observation_rows, 0);
+        assert_eq!(census.person_face_assignment_rows, 0);
+        assert_eq!(census.face_cluster_member_rows, 0);
+        assert_eq!(census.similar_photo_group_member_rows, 0);
+        assert_eq!(census.similar_photo_featureprint_rows, 0);
+        assert_eq!(census.queued_vector_deletes, 0);
+        assert!(census.encumbered_image_ids.is_empty());
+        assert!(census
+            .error_message
+            .as_deref()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false));
+
+        cleanup(&path);
+    }
+
+    /// T7 — chunking. 1,100 candidate ids with encumbered ids in the FIRST and
+    /// the THIRD chunk: a loop that stops after chunk 1 loses the second, and one
+    /// that overwrites instead of accumulating loses the first.
+    #[test]
+    fn census_accumulates_across_every_chunk() {
+        let (path, conn) = fresh_catalogue("t7");
+        // The census reads only the dependent tables, so the ids need no image
+        // rows; the two that matter get keyword rows.
+        let ids: Vec<i64> = (1..=1100).collect();
+        for encumbered in [3i64, 1050] {
+            conn.execute(
+                "INSERT INTO keyword (image_id, label, path) VALUES (?1, 'x', 'x')",
+                params![encumbered],
+            )
+            .expect("keyword row");
+        }
+
+        let census = apple_shared_album_dependent_census_impl(&conn, &ids);
+        assert!(census.ok, "error: {:?}", census.error_message);
+        assert_eq!(census.keyword_rows, 2);
+        assert_eq!(
+            census.encumbered_image_ids,
+            vec![3, 1050],
+            "the chunk loop must accumulate across all three chunks"
+        );
+
+        cleanup(&path);
+    }
+
+    /// T8 — the delete this slice uses is the TRANSACTED by-ids path, it refuses
+    /// an empty list, and it spans chunks correctly.
+    #[test]
+    fn remove_images_by_ids_refuses_an_empty_list_and_spans_chunks() {
+        let (path, conn) = fresh_catalogue("t8");
+        let mut ids = Vec::new();
+        for n in 0..600 {
+            ids.push(insert_image(&conn, &format!("{}268820780/FS-a/{}.JPG", LIBRARY_PREFIX, n)));
+        }
+        let survivor = insert_image(&conn, &format!("{}4/KEEP.jpeg", LIBRARY_PREFIX));
+        let before = image_count(&conn);
+
+        assert_eq!(
+            remove_images_by_ids_impl(&conn, &[]),
+            0,
+            "an empty id list must never mean all ids"
+        );
+        assert_eq!(image_count(&conn), before, "the empty-list call removed rows");
+
+        let doomed: Vec<i64> = ids.iter().take(501).copied().collect();
+        assert_eq!(
+            remove_images_by_ids_impl(&conn, &doomed),
+            501,
+            "the two-chunk delete did not remove every id"
+        );
+        assert_eq!(image_count(&conn), before - 501);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM images WHERE id = ?1",
+                params![survivor],
+                |row| row.get::<_, i64>(0)
+            )
+            .expect("survivor count"),
+            1,
+            "an unrelated row was removed"
+        );
+
+        cleanup(&path);
+    }
+}
+
+#[cfg(test)]
+mod extension_autoload_policy_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// ⭐ Every fixture opens through `open_and_migrate_catalogue` — the real
+    /// production function — which is what makes mutation E3 (delete the call
+    /// site) turn these tests red. A test that called the helper directly would
+    /// keep passing with production unguarded, which is the definition of
+    /// decoration.
+    fn fresh_catalogue(tag: &str) -> (std::path::PathBuf, Connection) {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "plcore-extension-autoload-test-{}-{}-{}.db",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+        let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+        // ⭐⭐ ENGINE TESTS NEVER FETCH. Load-bearing HERE above all: the mutations
+        // in this module's ledger deliberately remove the guard, which is the one
+        // condition under which the engine will go and download ICU.
+        fence_connection_against_extension_fetches(&conn);
+        (path, conn)
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+    }
+
+    /// ⭐ The fence's own pin. Dropping any of the three statements from
+    /// `fence_connection_against_extension_fetches` turns this red, and a red here
+    /// means a `cargo test` run could write into `~/.duckdb/extensions/`.
+    #[test]
+    fn test_connections_are_fenced_away_from_the_real_extension_directory() {
+        let (path, conn) = fresh_catalogue("fence");
+
+        let read = |setting: &str| -> String {
+            conn.query_row(
+                &format!("SELECT current_setting('{}')::VARCHAR", setting),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|e| panic!("reading {} failed: {}", setting, e))
+        };
+
+        let directory = read("extension_directory");
+        assert!(
+            !directory.is_empty(),
+            "extension_directory is unset on a test connection, so an autoinstall would write              into ~/.duckdb/extensions/"
+        );
+        assert!(
+            !directory.contains("/.duckdb"),
+            "extension_directory points at the real user extension store ({})",
+            directory
+        );
+
+        for setting in ["custom_extension_repository", "autoinstall_extension_repository"] {
+            let repository = read(setting);
+            assert!(
+                !repository.is_empty(),
+                "{} is unset, so an autoinstall would reach the default HTTP endpoint",
+                setting
+            );
+            assert!(
+                !repository.starts_with("http"),
+                "{} is an HTTP endpoint ({}); a test must never be able to fetch",
+                setting,
+                repository
+            );
+            assert!(
+                !std::path::Path::new(&repository).exists(),
+                "{} resolves to a path that EXISTS ({}); it must be a dead local path so an                  install attempt fails immediately",
+                setting,
+                repository
+            );
+        }
+
+        cleanup(&path);
+    }
+
+    /// E0-T1 — the guarded path fails LOCALLY, IMMEDIATELY, and says which
+    /// extension it wanted.
+    ///
+    /// ⚠️ THE DISCRIMINATOR IS THE ERROR TEXT, NOT THE TIMING — corrected in
+    /// review round 2 (N3), and MEASURED, not argued. In the shipping sandbox an
+    /// unguarded connection pays the engine's own 100 + 400 ms retry sleep before
+    /// failing (508-514 ms, V5). But this test runs behind
+    /// `fence_connection_against_extension_fetches`, which points the repository
+    /// at a dead LOCAL path — so an unguarded install fails immediately too (the
+    /// reviewer instrumented it at **948 µs**) and the timing bound passes under
+    /// every one of mutations E1-E4. What still separates the two states is the
+    /// error the engine produces: guarded, an instant `Catalog Error` naming
+    /// `icu`; unguarded, an `Extension Autoloading Error … Failed to install local
+    /// extension`. Both assertions below are therefore load-bearing, and the
+    /// timing bound is now a guarantee about the GUARDED path — that it stays
+    /// local and fast — rather than the thing that tells the two apart.
+    ///
+    /// ⚠️ This supersedes the register §9 slice-2 mutation-proof "delete one SET →
+    /// the timing assertion fails at ~0.5 s": true outside the fence, not inside
+    /// it. The replacement sentence is in the slice's implementation report.
+    #[test]
+    fn an_icu_symbol_fails_locally_and_immediately() {
+        let (path, conn) = fresh_catalogue("e0t1");
+
+        // Warm the connection so the first-statement cost is not in the
+        // measurement.
+        let _: i64 = conn
+            .query_row("SELECT 1", [], |row| row.get(0))
+            .expect("warm-up");
+
+        // ⚠️ DECODE NOTHING — review 1, M2. An earlier draft decoded the column as
+        // a `String`, and on a machine where
+        // `~/.duckdb/extensions/v1.5.5/osx_arm64/icu.duckdb_extension` is already
+        // cached (the UNGUARDED engine downloads it the first time anyone runs
+        // this query without the policy — which is exactly what this slice's own
+        // mutation runs did), an unguarded connection SUCCEEDS. The `String`
+        // decode then turned that success into an `Invalid column type Date32`
+        // Err, so the `unexpectedly SUCCEEDED` branch, the `Catalog Error`
+        // assertion and the `<10 ms` timing assertion — the brief's stated
+        // discriminator — were all unreachable, and the mutation went red for the
+        // wrong reason. With `|_| Ok(())` a resolved ICU reaches the panic below,
+        // which is the correct shape of the red wherever the extension is cached
+        // or the repository is reachable; the timing assertion is what bites where
+        // the install is denied (the shipping sandbox).
+        let started = Instant::now();
+        let outcome: Result<(), _> = conn.query_row("SELECT current_date", [], |_| Ok(()));
+        let elapsed = started.elapsed();
+
+        let error = match outcome {
+            Ok(()) => panic!(
+                "SELECT current_date unexpectedly SUCCEEDED — the two SETs are not being \
+                 applied. With autoload off the engine must not resolve `current_date` even \
+                 when a local ICU extension is cached in ~/.duckdb/extensions."
+            ),
+            Err(e) => e.to_string(),
+        };
+
+        assert!(
+            error.to_lowercase().contains("icu"),
+            "the error does not name the extension, so it is not the local catalog error this \
+             guard produces: {}",
+            error
+        );
+        // ⭐ NOT "softer" any more (review round 2, N3): inside the fence this is
+        // the assertion that separates a guarded connection from an unguarded one,
+        // because an unguarded install now fails locally rather than succeeding or
+        // stalling. An `Extension Autoloading Error` here means the SETs are gone.
+        assert!(
+            error.contains("Catalog Error"),
+            "expected a local `Catalog Error`; got `{}` — if this is an Extension Autoloading \
+             Error the two SETs are not being applied",
+            error
+        );
+        // ⚠️ 100 ms, not the 10 ms this test first carried. The bound exists to
+        // tell a LOCAL catalog error from one that went looking for the network,
+        // and the network path's floor is the engine's OWN retry sleep —
+        // 100 + 400 = 500 ms, deterministic — so 100 ms is still a 5x margin and
+        // cannot be reached by the network path. 10 ms was not a margin against a
+        // loaded machine: an unrelated mutation run measured 10.99 ms while an
+        // Xcode build shared the box and failed this assertion for a reason that
+        // had nothing to do with the guard. A check that fails for the wrong
+        // reason is the same defect class as one that passes for the wrong reason.
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "took {:?} — the two SETs are not being applied (the engine's own autoinstall retry \
+             sleep is 100 + 400 ms, so anything near half a second means the statement went \
+             looking for the network)",
+            elapsed
+        );
+
+        cleanup(&path);
+    }
+
+    /// E0-T1b — BOTH settings are off on a connection from the production path.
+    ///
+    /// ⚠️ This assertion exists because the mutation ledger proved the behavioural
+    /// test cannot see the second one: with `autoload_known_extensions = false`
+    /// the engine never reaches the autoinstall step, so deleting
+    /// `SET autoinstall_known_extensions = false` left E0-T1 GREEN. That setting
+    /// is defence-in-depth — it still governs an explicit `LOAD`, and it is what
+    /// keeps a future re-enabling of autoload from silently restoring the network
+    /// attempt — so it gets a pin that can actually fail.
+    #[test]
+    fn both_extension_settings_are_off_on_a_production_connection() {
+        let (path, conn) = fresh_catalogue("e0t1b");
+
+        for setting in ["autoinstall_known_extensions", "autoload_known_extensions"] {
+            let value: String = conn
+                .query_row(
+                    &format!("SELECT current_setting('{}')::VARCHAR", setting),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|e| panic!("reading {} failed: {}", setting, e));
+            assert_eq!(
+                value, "false",
+                "{} is `{}` on a connection opened through open_and_migrate_catalogue; the \
+                 first SQL naming an ICU/parquet/json symbol would go looking for the network \
+                 from inside a network-denied sandbox",
+                setting, value
+            );
+        }
+
+        cleanup(&path);
+    }
+
+    /// E0-T2 — the control half: the shapes the product ACTUALLY uses still
+    /// succeed, so the guard is not a regression. The third statement is the
+    /// exact shape of the live `epoch(indexed_timestamp)` projection and its eight
+    /// siblings, which bind the CORE overload because `indexed_timestamp` is
+    /// declared `TIMESTAMP`.
+    #[test]
+    fn the_shapes_the_product_uses_still_succeed() {
+        let (path, conn) = fresh_catalogue("e0t2");
+
+        for statement in [
+            "SELECT CURRENT_TIMESTAMP",
+            "SELECT now()",
+            "SELECT epoch(CAST(CURRENT_TIMESTAMP AS TIMESTAMP))",
+        ] {
+            let mut stmt = conn
+                .prepare(statement)
+                .unwrap_or_else(|e| panic!("`{}` failed to prepare: {}", statement, e));
+            let mut rows = stmt
+                .query([])
+                .unwrap_or_else(|e| panic!("`{}` failed to run: {}", statement, e));
+            assert!(
+                rows.next()
+                    .unwrap_or_else(|e| panic!("`{}` failed to step: {}", statement, e))
+                    .is_some(),
+                "`{}` returned no row",
+                statement
+            );
+        }
+
+        cleanup(&path);
+    }
 }
 
 #[cfg(test)]
@@ -27914,5 +29844,1076 @@ mod directory_exact_tests
             &build_destination_family_predicate(sample, "RSW_0001.NEF"),
             &format!("'{}'", sample),
         );
+    }
+}
+
+
+// ===========================================================================
+// Slice 7 / cluster H — swallowed failures (2026-09-19)
+// ===========================================================================
+//
+// Every fixture here is opened through `open_and_migrate_catalogue`, never a
+// hand-rolled table: a test that calls a helper directly keeps passing after
+// the production call site is deleted, which is the definition of decoration.
+#[cfg(test)]
+mod swallowed_failure_tests
+{
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// The global CATALOGUE / CATALOGUE_PATH pair is process-wide, so the
+    /// tests that must exercise a real FFI entry point (which resolves the
+    /// vector store from CATALOGUE_PATH) take this lock for their duration.
+    static GLOBAL_CATALOGUE_LOCK: Mutex<()> = Mutex::new(());
+
+    struct Fixture
+    {
+        dir: std::path::PathBuf,
+        catalogue: std::path::PathBuf,
+    }
+
+    impl Fixture
+    {
+        fn vectors(&self) -> std::path::PathBuf
+        {
+            self.dir.join("vectors.lancedb")
+        }
+    }
+
+    impl Drop for Fixture
+    {
+        fn drop(&mut self)
+        {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A fresh REAL catalogue file in its own directory, opened through the
+    /// exact `open_and_migrate_catalogue` path production uses. The directory
+    /// matters: `face_embedding_store_uri()` puts `vectors.lancedb` beside the
+    /// catalogue, so the fixtures below control the store by controlling it.
+    fn fresh_catalogue(tag: &str) -> (Fixture, Connection)
+    {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "plcore-slice7-{}-{}-{}",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        let catalogue = dir.join("catalogue.db");
+        let conn = open_and_migrate_catalogue(&catalogue).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH — see the helper's own note.
+        fence_connection_against_extension_fetches(&conn);
+        (Fixture { dir, catalogue }, conn)
+    }
+
+    fn install_global_catalogue(fixture: &Fixture, conn: Connection)
+    {
+        *CATALOGUE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(conn);
+        *CATALOGUE_PATH
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fixture.catalogue.clone());
+    }
+
+    fn clear_global_catalogue()
+    {
+        *CATALOGUE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *CATALOGUE_PATH
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    fn insert_image(conn: &Connection, file_path: &str) -> i64
+    {
+        conn.execute(
+            "INSERT INTO images (file_path, file_size, file_name, file_stem, image_kind, \
+             created_timestamp, modified_timestamp, is_video) \
+             VALUES (?1, 10, ?2, ?2, 'jpeg', 0, 0, FALSE)",
+            params![file_path, file_path.rsplit('/').next().unwrap_or(file_path)],
+        )
+        .expect("insert image");
+        conn.query_row(
+            "SELECT id FROM images WHERE file_path = ?1",
+            params![file_path],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("image id")
+    }
+
+    /// One face observation. `created_at_null` writes an explicit NULL into a
+    /// column the DDL declares nullable (`created_at TIMESTAMP DEFAULT
+    /// CURRENT_TIMESTAMP`) but which the work-set query reads as a non-`Option`
+    /// `String` — R-31's exact shape, reachable by any path that does not take
+    /// the default.
+    fn insert_face_observation(
+        conn: &Connection,
+        image_id: i64,
+        face_index: i64,
+        algorithm_version: &str,
+        created_at_null: bool,
+    )
+    {
+        let created_at = if created_at_null
+        {
+            "NULL".to_string()
+        }
+        else
+        {
+            "CURRENT_TIMESTAMP".to_string()
+        };
+        conn.execute(
+            &format!(
+                "INSERT INTO face_observation (
+                     image_id, analyzed_image_id, face_index, algorithm_version,
+                     analysis_run_id, bounding_box_x, bounding_box_y,
+                     bounding_box_width, bounding_box_height, created_at
+                 ) VALUES (?1, ?1, ?2, ?3, 'run-1', 0.1, 0.1, 0.2, 0.2, {})",
+                created_at
+            ),
+            params![image_id, face_index, algorithm_version],
+        )
+        .expect("insert face observation");
+    }
+
+    fn image_metadata(file_path: &str) -> ImageMetadata
+    {
+        ImageMetadata
+        {
+            file_path: file_path.to_string(),
+            file_size: 1000,
+            file_name: file_path.rsplit('/').next().unwrap_or(file_path).to_string(),
+            file_extension: Some("nef".to_string()),
+            created_timestamp: 1_700_000_000,
+            modified_timestamp: 1_700_000_000,
+            camera_make: None,
+            camera_model: None,
+            lens_model: None,
+            focal_length: None,
+            aperture: None,
+            shutter_speed: None,
+            iso: None,
+            capture_datetime: None,
+            pixel_width: None,
+            pixel_height: None,
+            color_space: None,
+            bit_depth: None,
+            gps_latitude: None,
+            gps_longitude: None,
+            gps_altitude: None,
+            copyright: None,
+            creator: None,
+            description: None,
+            rating: None,
+            flag: None,
+            color_label: None,
+            rotation: None,
+            is_video: false,
+            duration_seconds: None,
+            frame_rate: None,
+            video_kind: None,
+            video_codec: None,
+            video_bitrate: None,
+            color_primaries: None,
+            color_transfer: None,
+            color_matrix: None,
+            color_range: None,
+            dv_profile: None,
+            has_audio: None,
+            audio_codec: None,
+            audio_channels: None,
+            audio_sample_rate: None,
+            audio_bitrate: None,
+            live_photo_id: None,
+            external_source_id: None,
+        }
+    }
+
+    fn census_count(report: &DroppedRowReport, site: &str) -> u64
+    {
+        report
+            .site_names
+            .iter()
+            .position(|name| name == site)
+            .map(|index| report.site_counts[index])
+            .unwrap_or(0)
+    }
+
+    // ------------------------------------------------------------------
+    // T1 — the collector counts a row that failed to deserialize.
+    // ------------------------------------------------------------------
+    #[test]
+    fn collect_rows_counted_counts_a_row_that_failed_to_deserialize()
+    {
+        let (fixture, conn) = fresh_catalogue("t1");
+
+        // Control: three well-formed rows, nothing dropped.
+        let mut good = conn
+            .prepare("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
+            .expect("prepare control");
+        let (kept, dropped) = collect_rows_counted(
+            good.query_map([], |row| row.get::<_, i64>(0))
+                .expect("control query"),
+            "__slice7_test_control",
+        );
+        assert_eq!(kept.len(), 3, "the control must keep every row");
+        assert_eq!(dropped, 0, "the control must drop nothing");
+        drop(good);
+
+        // A NULL read into a non-`Option` i64 is exactly what a migration
+        // manufactures between "add the column" and "backfill it".
+        let mut bad = conn
+            .prepare("SELECT CAST(NULL AS BIGINT)")
+            .expect("prepare null row");
+        let (kept, dropped) = collect_rows_counted(
+            bad.query_map([], |row| row.get::<_, i64>(0))
+                .expect("null query"),
+            "__slice7_test_t1",
+        );
+        assert!(kept.is_empty(), "the undeserialisable row must not be kept");
+        assert_eq!(dropped, 1, "the undeserialisable row must be COUNTED");
+        drop(bad);
+
+        // …and it must have reached the census, not just the return value.
+        let report = futures::executor::block_on(dropped_row_report());
+        assert_eq!(census_count(&report, "__slice7_test_t1"), 1);
+        assert_eq!(census_count(&report, "__slice7_test_control"), 0);
+
+        drop(fixture);
+    }
+
+    // ------------------------------------------------------------------
+    // T2 — the census is cumulative, per-site, and NEVER drains.
+    // ------------------------------------------------------------------
+    #[test]
+    fn dropped_row_census_is_cumulative_per_site_and_never_drains()
+    {
+        let (fixture, conn) = fresh_catalogue("t2");
+
+        let before = futures::executor::block_on(dropped_row_report());
+        let alpha_before = census_count(&before, "__slice7_test_alpha");
+        let beta_before = census_count(&before, "__slice7_test_beta");
+        let total_before = before.total_dropped;
+
+        let mut stmt = conn
+            .prepare("SELECT CAST(NULL AS BIGINT) UNION ALL SELECT CAST(NULL AS BIGINT)")
+            .expect("prepare");
+        let (_, dropped) = collect_rows_counted(
+            stmt.query_map([], |row| row.get::<_, i64>(0))
+                .expect("query"),
+            "__slice7_test_alpha",
+        );
+        assert_eq!(dropped, 2);
+        let (_, dropped) = collect_rows_counted(
+            stmt.query_map([], |row| row.get::<_, i64>(0))
+                .expect("query"),
+            "__slice7_test_beta",
+        );
+        assert_eq!(dropped, 2);
+        drop(stmt);
+
+        // Two sites, both present, each carrying its OWN count.
+        let first = futures::executor::block_on(dropped_row_report());
+        assert_eq!(
+            census_count(&first, "__slice7_test_alpha") - alpha_before,
+            2,
+            "the alpha delta must equal the drops in between"
+        );
+        assert_eq!(
+            census_count(&first, "__slice7_test_beta") - beta_before,
+            2,
+            "the beta delta must equal the drops in between"
+        );
+        assert!(first.total_dropped >= total_before + 4);
+        assert_eq!(
+            first.site_names.len(),
+            first.site_counts.len(),
+            "site_names and site_counts are index-aligned"
+        );
+
+        // ⭐ NOT DRAINING: a second reader sees exactly the same numbers, so
+        // two readers can never steal each other's counts.
+        let second = futures::executor::block_on(dropped_row_report());
+        assert_eq!(
+            census_count(&second, "__slice7_test_alpha"),
+            census_count(&first, "__slice7_test_alpha"),
+            "reading the census must not reset it"
+        );
+        assert_eq!(
+            census_count(&second, "__slice7_test_beta"),
+            census_count(&first, "__slice7_test_beta")
+        );
+
+        drop(fixture);
+    }
+
+    // ------------------------------------------------------------------
+    // T3 — the culling work-set carrier.
+    //
+    // ⚠️ HONEST DISPOSITION: a per-row drop CANNOT be provoked through the
+    // production candidates query on today's schema. It reads exactly `id`,
+    // `file_path` and `file_size`, and the DDL declares `id INTEGER PRIMARY
+    // KEY`, `file_path TEXT NOT NULL UNIQUE`, `file_size BIGINT NOT NULL` —
+    // no NULL is reachable and no type mismatch is expressible. A rigged
+    // fixture would prove nothing, so this pins the CARRIER PLUMBING instead:
+    // the page's candidates must equal the legacy twin's output exactly, and
+    // its count must be an honest zero. The count's propagation is pinned for
+    // real by `face_embedding_missing_observation_page_counts_a_row_it_could_not_read`,
+    // whose query DOES read a nullable column non-optionally.
+    // ------------------------------------------------------------------
+    #[test]
+    fn focus_analysis_candidate_page_carries_a_count_and_matches_the_legacy_twin()
+    {
+        let _guard = GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (fixture, conn) = fresh_catalogue("t3");
+        for name in ["a", "b", "c"]
+        {
+            insert_image(&conn, &format!("/p/{}.jpg", name));
+        }
+        install_global_catalogue(&fixture, conn);
+
+        let page = futures::executor::block_on(focus_analysis_candidate_page(
+            500,
+            "v7".to_string(),
+            "run-1".to_string(),
+        ));
+        let legacy = futures::executor::block_on(focus_analysis_candidates(
+            500,
+            "v7".to_string(),
+            "run-1".to_string(),
+        ));
+
+        assert_eq!(page.candidates.len(), 3, "every seeded still is a candidate");
+        assert_eq!(page.dropped_rows, 0, "a sound fixture drops nothing");
+        assert_eq!(
+            page.candidates
+                .iter()
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>(),
+            legacy.iter().map(|candidate| candidate.id).collect::<Vec<_>>(),
+            "the page and the legacy twin must return the same work set"
+        );
+        assert_eq!(
+            page.candidates
+                .iter()
+                .map(|candidate| candidate.file_path.clone())
+                .collect::<Vec<_>>(),
+            legacy
+                .iter()
+                .map(|candidate| candidate.file_path.clone())
+                .collect::<Vec<_>>()
+        );
+
+        let scoped_ids: Vec<i64> = page.candidates.iter().map(|c| c.id).take(2).collect();
+        let scoped = futures::executor::block_on(focus_analysis_candidate_page_for_ids(
+            scoped_ids.clone(),
+            500,
+            "v7".to_string(),
+            "run-1".to_string(),
+        ));
+        assert_eq!(
+            scoped
+                .candidates
+                .iter()
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>(),
+            scoped_ids
+        );
+        assert_eq!(scoped.dropped_rows, 0);
+
+        clear_global_catalogue();
+        drop(fixture);
+    }
+
+    // ------------------------------------------------------------------
+    // T3b — a work-set page reports an EXACT per-call dropped-row count.
+    // ------------------------------------------------------------------
+    #[test]
+    fn face_embedding_missing_observation_page_counts_a_row_it_could_not_read()
+    {
+        let _guard = GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (fixture, conn) = fresh_catalogue("t3b");
+        let image_id = insert_image(&conn, "/p/faces.jpg");
+        insert_face_observation(&conn, image_id, 0, "v6", false);
+        insert_face_observation(&conn, image_id, 1, "v6", true);
+        install_global_catalogue(&fixture, conn);
+
+        let page = futures::executor::block_on(face_embedding_missing_observation_page(
+            "v6".to_string(),
+            "model-1".to_string(),
+            "prep-1".to_string(),
+            0,
+        ));
+
+        assert!(page.store_ok, "a never-built store is not a failure");
+        assert_eq!(
+            page.dropped_rows, 1,
+            "the row whose created_at is NULL must be COUNTED, not vanished"
+        );
+        assert_eq!(
+            page.observations.len(),
+            1,
+            "the sound row must still be returned"
+        );
+        assert_eq!(page.observations[0].face_index, 0);
+
+        clear_global_catalogue();
+        drop(fixture);
+    }
+
+    // ------------------------------------------------------------------
+    // T4 — an UNREADABLE store is a failure; a NEVER-BUILT one is an empty
+    // answer. ⭐ Separating these two IS R-08's fix.
+    // ------------------------------------------------------------------
+    #[test]
+    fn an_unreadable_face_store_fails_and_a_never_built_one_answers_empty()
+    {
+        let _guard = GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // (a) `vectors.lancedb` is a regular FILE, which cannot be opened as a
+        // store. Nothing is deleted; this is the drive script's own recipe.
+        let (fixture, conn) = fresh_catalogue("t4a");
+        std::fs::write(fixture.vectors(), b"not a vector store").expect("write bad store");
+        install_global_catalogue(&fixture, conn);
+
+        let unreadable = futures::executor::block_on(face_embedding_search_checked(
+            vec![1],
+            Vec::new(),
+            "model-1".to_string(),
+            "prep-1".to_string(),
+            0.55,
+            50,
+        ));
+        assert!(
+            !unreadable.ok,
+            "a store that cannot be READ must not answer ok"
+        );
+        assert!(
+            unreadable
+                .error_message
+                .as_deref()
+                .map(|message| !message.is_empty())
+                .unwrap_or(false),
+            "an unreadable store must name its reason"
+        );
+        assert!(unreadable.matches.is_empty());
+
+        let unreadable_vector = futures::executor::block_on(face_embedding_search_vector_checked(
+            vec![0.1, 0.2, 0.3],
+            Vec::new(),
+            "model-1".to_string(),
+            "prep-1".to_string(),
+            0.55,
+            50,
+        ));
+        assert!(!unreadable_vector.ok, "the drawn-region search too");
+        assert!(unreadable_vector.error_message.is_some());
+        assert!(unreadable_vector.matches.is_empty());
+
+        clear_global_catalogue();
+        drop(fixture);
+
+        // (b) the index has simply never been built — no store at all.
+        let (fixture, conn) = fresh_catalogue("t4b");
+        install_global_catalogue(&fixture, conn);
+
+        let never_built = futures::executor::block_on(face_embedding_search_checked(
+            vec![1],
+            Vec::new(),
+            "model-1".to_string(),
+            "prep-1".to_string(),
+            0.55,
+            50,
+        ));
+        assert!(
+            never_built.ok,
+            "a never-built index is an honest EMPTY answer, not a failure"
+        );
+        assert!(never_built.error_message.is_none());
+        assert!(never_built.matches.is_empty());
+
+        clear_global_catalogue();
+        drop(fixture);
+
+        // (b2) the store directory exists and CONNECTS, but holds no
+        // `face_embeddings` table — the same benign case reached through the
+        // classifier rather than through the missing-path shortcut.
+        let (fixture, conn) = fresh_catalogue("t4b2");
+        std::fs::create_dir_all(fixture.vectors()).expect("empty store directory");
+        install_global_catalogue(&fixture, conn);
+
+        let empty_store = futures::executor::block_on(face_embedding_search_checked(
+            vec![1],
+            Vec::new(),
+            "model-1".to_string(),
+            "prep-1".to_string(),
+            0.55,
+            50,
+        ));
+        assert!(
+            empty_store.ok,
+            "a connectable store with no face table is still 'never built'"
+        );
+        assert!(empty_store.error_message.is_none());
+        assert!(empty_store.matches.is_empty());
+
+        clear_global_catalogue();
+        drop(fixture);
+
+        // (c) the store OPENS but its `face_embeddings` table has an
+        // incompatible schema — V8's named producer, "a LanceDB/Arrow format
+        // mismatch after an upgrade". This is the arm the old
+        // `count_rows(...).unwrap_or(0)` turned into a silent zero: the one
+        // failure path that left no record at all, not even on stderr.
+        let (fixture, conn) = fresh_catalogue("t4c");
+        let uri = fixture.vectors().to_string_lossy().to_string();
+        FACE_EMBEDDING_RUNTIME.block_on(async {
+            let database = lancedb::connect(&uri).execute().await.expect("connect");
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "unrelated",
+                DataType::Int64,
+                false,
+            )]));
+            database
+                .create_empty_table(FACE_EMBEDDING_TABLE, schema)
+                .execute()
+                .await
+                .expect("create mismatched table");
+        });
+        install_global_catalogue(&fixture, conn);
+
+        let mismatched = futures::executor::block_on(face_embedding_search_checked(
+            vec![1],
+            Vec::new(),
+            "model-1".to_string(),
+            "prep-1".to_string(),
+            0.55,
+            50,
+        ));
+        assert!(
+            !mismatched.ok,
+            "a store whose schema cannot answer the query is a FAILURE, not zero matches"
+        );
+        assert!(mismatched.error_message.is_some());
+        assert!(mismatched.matches.is_empty());
+
+        clear_global_catalogue();
+        drop(fixture);
+    }
+
+    // ------------------------------------------------------------------
+    // T5 — the benign/real classifier, pinned in BOTH directions.
+    // ------------------------------------------------------------------
+    #[test]
+    fn face_embedding_store_classifier_pins_table_not_found()
+    {
+        // The benign direction: LanceDB's TYPED TableNotFound, and nothing
+        // else, means "the index has never been built".
+        let benign = classify_face_embedding_open_error(
+            lancedb::Error::TableNotFound
+            {
+                name: FACE_EMBEDDING_TABLE.to_string(),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "test fixture",
+                )),
+            },
+            "test",
+        );
+        assert!(
+            matches!(benign, Ok(FaceEmbeddingTableState::NeverBuilt)),
+            "a table-not-found must classify as never-built"
+        );
+
+        // The real direction: any OTHER LanceDB error stays a failure.
+        let real = classify_face_embedding_open_error(
+            lancedb::Error::InvalidInput
+            {
+                message: "slice7-marker".to_string(),
+            },
+            "test",
+        );
+        match real
+        {
+            Err(message) => assert!(
+                message.contains("slice7-marker"),
+                "a real failure must carry its reason: {}",
+                message
+            ),
+            _ => panic!("a real LanceDB failure must NOT classify as never-built"),
+        }
+
+        // ⭐ The vendor contract itself: on THIS LanceDB version, opening a
+        // missing table really does produce `TableNotFound`. A version bump
+        // that renames or removes the variant stops this crate COMPILING,
+        // which is louder than any error-text pin could be.
+        let (fixture, _conn) = fresh_catalogue("t5");
+        let store = fixture.vectors();
+        std::fs::create_dir_all(&store).expect("empty store directory");
+        let uri = store.to_string_lossy().to_string();
+        let observed = FACE_EMBEDDING_RUNTIME.block_on(async {
+            let database = lancedb::connect(&uri).execute().await.expect("connect");
+            database.open_table(FACE_EMBEDDING_TABLE).execute().await
+        });
+        match observed
+        {
+            Err(lancedb::Error::TableNotFound { .. }) => {}
+            Err(other) => panic!(
+                "LanceDB no longer reports a missing table as TableNotFound: {:?}",
+                other
+            ),
+            Ok(_) => panic!("an empty store must not yield a face_embeddings table"),
+        }
+
+        // …and the production opener agrees with the classifier end to end.
+        let state = FACE_EMBEDDING_RUNTIME
+            .block_on(open_face_embedding_table_at_uri(&uri, "test"));
+        assert!(matches!(state, Ok(FaceEmbeddingTableState::NeverBuilt)));
+
+        drop(fixture);
+    }
+
+    // ------------------------------------------------------------------
+    // T6 — an unreadable store gives an EMPTY work set, never "everything is
+    // missing".
+    // ------------------------------------------------------------------
+    #[test]
+    fn face_embedding_work_set_reports_an_unreadable_store_with_an_empty_list()
+    {
+        let _guard = GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (fixture, conn) = fresh_catalogue("t6");
+        let image_id = insert_image(&conn, "/p/faces.jpg");
+        insert_face_observation(&conn, image_id, 0, "v6", false);
+        insert_face_observation(&conn, image_id, 1, "v6", false);
+        std::fs::write(fixture.vectors(), b"not a vector store").expect("write bad store");
+        install_global_catalogue(&fixture, conn);
+
+        let page = futures::executor::block_on(face_embedding_missing_observation_page(
+            "v6".to_string(),
+            "model-1".to_string(),
+            "prep-1".to_string(),
+            0,
+        ));
+
+        assert!(!page.store_ok, "an unreadable store must be reported");
+        assert!(
+            page.store_error
+                .as_deref()
+                .map(|message| !message.is_empty())
+                .unwrap_or(false),
+            "and it must name its reason"
+        );
+        assert!(
+            page.observations.is_empty(),
+            "⛔ never 'everything is missing' — that would re-embed the catalogue"
+        );
+
+        clear_global_catalogue();
+        drop(fixture);
+    }
+
+    // ------------------------------------------------------------------
+    // T7 — the menu state carries the store's reachability.
+    // ------------------------------------------------------------------
+    #[test]
+    fn face_recognition_menu_states_flag_an_unreadable_store()
+    {
+        let _guard = GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let (fixture, conn) = fresh_catalogue("t7a");
+        let image_id = insert_image(&conn, "/p/faces.jpg");
+        insert_face_observation(&conn, image_id, 0, "v6", false);
+        std::fs::write(fixture.vectors(), b"not a vector store").expect("write bad store");
+        install_global_catalogue(&fixture, conn);
+
+        let states = futures::executor::block_on(face_recognition_menu_states(
+            vec![image_id],
+            "v6".to_string(),
+            "model-1".to_string(),
+            "prep-1".to_string(),
+        ));
+        assert_eq!(states.len(), 1);
+        assert!(
+            states[0].store_unavailable,
+            "an unreadable store must be flagged, so the menu does not offer \
+             'Build Face Recognition Index' for an already-indexed catalogue"
+        );
+        assert_eq!(states[0].indexed_face_count, 0);
+        assert_eq!(states[0].face_observation_count, 1);
+
+        clear_global_catalogue();
+        drop(fixture);
+
+        // A healthy, never-built store is NOT flagged.
+        let (fixture, conn) = fresh_catalogue("t7b");
+        let image_id = insert_image(&conn, "/p/faces.jpg");
+        insert_face_observation(&conn, image_id, 0, "v6", false);
+        install_global_catalogue(&fixture, conn);
+
+        let states = futures::executor::block_on(face_recognition_menu_states(
+            vec![image_id],
+            "v6".to_string(),
+            "model-1".to_string(),
+            "prep-1".to_string(),
+        ));
+        assert_eq!(states.len(), 1);
+        assert!(
+            !states[0].store_unavailable,
+            "a never-built index must not read as an unreadable store"
+        );
+        assert_eq!(states[0].indexed_face_count, 0);
+
+        clear_global_catalogue();
+        drop(fixture);
+    }
+
+    // ------------------------------------------------------------------
+    // T8 — a rolled-back merge chunk reports its failed-row count.
+    // ------------------------------------------------------------------
+    #[test]
+    fn merge_chunk_reports_the_rolled_back_row_count_and_names_the_file()
+    {
+        let (fixture, conn) = fresh_catalogue("t8");
+
+        // Control: a clean chunk.
+        let clean = merge_records_into(&conn, &[image_metadata("/p/clean.nef")]);
+        assert_eq!(clean.inserted, 1);
+        assert_eq!(clean.failed_rows, 0, "a clean chunk fails nothing");
+        assert!(clean.failure_message.is_none());
+
+        // A genuine per-row bind failure from ordinary record data: `iso` is
+        // `Option<u32>` on the wire and `INTEGER` (INT32) in the catalogue, so
+        // an EXIF ISO above 2^31-1 cannot be bound. The WHOLE chunk rolls back.
+        let mut bad = image_metadata("/p/bad.nef");
+        bad.iso = Some(u32::MAX);
+        let chunk = vec![image_metadata("/p/good.nef"), bad];
+        let failed = merge_records_into(&conn, &chunk);
+
+        assert_eq!(failed.inserted, 0);
+        assert_eq!(failed.updated, 0);
+        assert!(failed.image_ids.is_empty());
+        assert_eq!(
+            failed.failed_rows,
+            chunk.len() as u64,
+            "the WHOLE chunk rolled back, so the count is the chunk's length"
+        );
+        let message = failed.failure_message.expect("a failed chunk names its cause");
+        assert!(
+            message.contains("/p/bad.nef"),
+            "the message must name the failing file_path: {}",
+            message
+        );
+
+        // …and the rollback really happened: the good row is not in the table.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM images WHERE file_path IN ('/p/good.nef', '/p/bad.nef')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(count, 0, "a rolled-back chunk leaves no rows behind");
+
+        drop(fixture);
+    }
+
+    /// Blank every comment and string-literal BODY, preserving byte length so
+    /// offsets stay aligned with the original. This is what makes the site
+    /// lock below unsatisfiable by a `//` comment, a `/* … */` span, or a
+    /// string literal that merely contains the locked text — the
+    /// `Spikes/ApplePhotosEligibilityGate/` stripping discipline, in Rust.
+    fn blank_comments_and_string_bodies(source: &str) -> Vec<u8>
+    {
+        let bytes = source.as_bytes();
+        let mut out = bytes.to_vec();
+        let mut index = 0usize;
+
+        while index < bytes.len()
+        {
+            // Line comment.
+            if bytes[index] == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'/'
+            {
+                while index < bytes.len() && bytes[index] != b'\n'
+                {
+                    out[index] = b' ';
+                    index += 1;
+                }
+                continue;
+            }
+
+            // Block comment (nesting is legal in Rust).
+            if bytes[index] == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*'
+            {
+                let mut depth = 1usize;
+                out[index] = b' ';
+                out[index + 1] = b' ';
+                index += 2;
+                while index < bytes.len() && depth > 0
+                {
+                    if bytes[index] == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*'
+                    {
+                        depth += 1;
+                        out[index] = b' ';
+                        out[index + 1] = b' ';
+                        index += 2;
+                        continue;
+                    }
+                    if bytes[index] == b'*' && index + 1 < bytes.len() && bytes[index + 1] == b'/'
+                    {
+                        depth -= 1;
+                        out[index] = b' ';
+                        out[index + 1] = b' ';
+                        index += 2;
+                        continue;
+                    }
+                    if bytes[index] != b'\n'
+                    {
+                        out[index] = b' ';
+                    }
+                    index += 1;
+                }
+                continue;
+            }
+
+            // Raw string: r, r#, r##, … followed by a quote.
+            if bytes[index] == b'r'
+            {
+                let mut hashes = 0usize;
+                let mut probe = index + 1;
+                while probe < bytes.len() && bytes[probe] == b'#'
+                {
+                    hashes += 1;
+                    probe += 1;
+                }
+                if probe < bytes.len() && bytes[probe] == b'"'
+                {
+                    index = probe + 1;
+                    'raw: while index < bytes.len()
+                    {
+                        if bytes[index] == b'"'
+                        {
+                            let mut seen = 0usize;
+                            while seen < hashes
+                                && index + 1 + seen < bytes.len()
+                                && bytes[index + 1 + seen] == b'#'
+                            {
+                                seen += 1;
+                            }
+                            if seen == hashes
+                            {
+                                index += 1 + hashes;
+                                break 'raw;
+                            }
+                        }
+                        if bytes[index] != b'\n'
+                        {
+                            out[index] = b' ';
+                        }
+                        index += 1;
+                    }
+                    continue;
+                }
+            }
+
+            // Ordinary string literal.
+            if bytes[index] == b'"'
+            {
+                index += 1;
+                while index < bytes.len()
+                {
+                    if bytes[index] == b'\\'
+                    {
+                        out[index] = b' ';
+                        if index + 1 < bytes.len()
+                        {
+                            out[index + 1] = b' ';
+                        }
+                        index += 2;
+                        continue;
+                    }
+                    if bytes[index] == b'"'
+                    {
+                        index += 1;
+                        break;
+                    }
+                    if bytes[index] != b'\n'
+                    {
+                        out[index] = b' ';
+                    }
+                    index += 1;
+                }
+                continue;
+            }
+
+            index += 1;
+        }
+
+        out
+    }
+
+    // ------------------------------------------------------------------
+    // T9 — SITE COVERAGE. Every product row-drop goes through the collector.
+    //
+    // A partial pass re-creates the class, so this scans the crate's own
+    // source over comment- and string-stripped bytes: outside `#[cfg(test)]`
+    // modules, no `filter_map(...)` argument may discard a `Result`. The
+    // argument span is found by REAL paren matching, so a multi-line closure
+    // cannot slip past. The needles are assembled at run time and the scan
+    // skips test modules, so this test's own source cannot satisfy it; the
+    // legitimate `filter_map`s in product code (SQL-fragment builders and one
+    // id→state lookup) discard no Result and so are invisible to it.
+    // ------------------------------------------------------------------
+    #[test]
+    fn every_product_row_drop_goes_through_the_collector()
+    {
+        let source = include_str!("lib.rs");
+        let stripped = blank_comments_and_string_bodies(source);
+        assert_eq!(stripped.len(), source.len(), "the stripper must not resize");
+
+        // Byte offset of the first character of each line, and the product
+        // region as a set of [start, end) byte ranges.
+        let mut product_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut in_test_module = false;
+        let mut pending_cfg_test = false;
+        let mut offset = 0usize;
+        let mut region_start = 0usize;
+
+        for line in source.split('\n')
+        {
+            let line_start = offset;
+            offset += line.len() + 1;
+
+            if in_test_module
+            {
+                if line == "}"
+                {
+                    in_test_module = false;
+                    region_start = offset;
+                }
+                continue;
+            }
+
+            if line.trim() == "#[cfg(test)]"
+            {
+                pending_cfg_test = true;
+                continue;
+            }
+
+            if pending_cfg_test
+            {
+                pending_cfg_test = false;
+                if (line.starts_with("mod ") || line.starts_with("pub mod "))
+                    && !line.trim_end().ends_with(';')
+                {
+                    // `mod x {` (or Allman's brace on the next line) opens a
+                    // span that ends at the next column-0 `}`.
+                    product_ranges.push((region_start, line_start));
+                    in_test_module = true;
+                }
+            }
+        }
+        if !in_test_module
+        {
+            product_ranges.push((region_start, source.len()));
+        }
+
+        let map_needle = ["filter", "_map("].concat();
+        let ok_needle = [".ok", "()"].concat();
+        let result_ok_needle = ["Result::", "ok"].concat();
+
+        let mut occurrences = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+
+        for (start, end) in &product_ranges
+        {
+            let region = &stripped[*start..*end];
+            let mut cursor = 0usize;
+            while let Some(found) = find_bytes(region, map_needle.as_bytes(), cursor)
+            {
+                occurrences += 1;
+                let open = found + map_needle.len() - 1; // the '(' itself
+                let mut depth = 0i32;
+                let mut close = open;
+                while close < region.len()
+                {
+                    match region[close]
+                    {
+                        b'(' => depth += 1,
+                        b')' =>
+                        {
+                            depth -= 1;
+                            if depth == 0
+                            {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    close += 1;
+                }
+                assert!(
+                    depth == 0 && close < region.len(),
+                    "unbalanced parentheses while extracting a filter_map argument"
+                );
+
+                let argument = String::from_utf8_lossy(&region[open..=close]).to_string();
+                assert!(
+                    !argument.is_empty(),
+                    "an empty extraction must never pass silently"
+                );
+                if argument.contains(&ok_needle) || argument.contains(&result_ok_needle)
+                {
+                    let line_number = source[..*start + found].matches('\n').count() + 1;
+                    offenders.push(format!("lib.rs:{}: {}", line_number, argument.trim()));
+                }
+                cursor = close + 1;
+            }
+        }
+
+        // The scan must not be vacuous: if it finds NOTHING at all it has read
+        // the wrong bytes, and an empty scan would "pass" for free.
+        assert!(
+            occurrences >= 4,
+            "the site scan found only {} filter_map site(s) in the product \
+             region — it is not reading the crate",
+            occurrences
+        );
+
+        assert!(
+            offenders.is_empty(),
+            "every product row drop must go through collect_rows / \
+             collect_rows_counted, but these do not:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize>
+    {
+        if needle.is_empty() || from >= haystack.len()
+        {
+            return None;
+        }
+        haystack[from..]
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .map(|position| from + position)
     }
 }
