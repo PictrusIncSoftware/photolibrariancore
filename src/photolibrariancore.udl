@@ -495,6 +495,14 @@ namespace photolibrariancore {
     // Face embedding vector store. Vectors live in LanceDB beside the
     // catalogue, keyed by face_observation.id plus model/preprocessing versions
     // so future alignment/model migrations can coexist or regenerate safely.
+    //
+    // ⚠️ LEGACY shape — use face_embedding_missing_observation_page. Slice 7
+    // fix round 1 (HIGH-1): when the work set cannot be built this twin returns
+    // the FULL candidate set, restoring the pre-slice failure direction so an
+    // unreadable vector store surfaces downstream instead of reading as
+    // "nothing to do". ⛔ That interim must not be removed before
+    // FaceRecognitionIndexBuilder.swift is repointed at the page function and
+    // gated on storeOk / droppedRows (lane H-Swift-B).
     [Async]
     sequence<FaceObservationRecord> face_embedding_missing_observations(
         string algorithm_version,
@@ -1045,10 +1053,11 @@ namespace photolibrariancore {
     FocusAnalysisCandidatePage focus_analysis_candidate_page_for_ids(sequence<i64> ids, u32 limit, string algorithm_version, string analysis_run_id);
 
     // R-31 + R-08 — the faces still needing an embedding, plus the dropped-row
-    // count AND the vector store's own reachability. store_ok = false means the
-    // store could not be READ, which is distinct from an index that was never
-    // built (store_ok = true with an empty list). ⛔ On store_ok = false the
-    // list is EMPTY, never "everything is missing".
+    // count AND the reachability of the work set's two halves. store_ok = false
+    // means the WORK SET COULD NOT BE BUILT — the vector store or the catalogue
+    // could not be read — and store_error names which; that is distinct from an
+    // index that was never built (store_ok = true with an empty list). ⛔ On
+    // store_ok = false the list is EMPTY, never "everything is missing".
     // Supersedes face_embedding_missing_observations.
     [Async]
     FaceObservationWorkSet face_embedding_missing_observation_page(
@@ -1971,6 +1980,13 @@ dictionary AppleSharedAlbumDependentCensus {
 // R-31 — the cumulative dropped-row census. site_names and site_counts are
 // INDEX-ALIGNED. The numbers are cumulative since the process started and are
 // NOT drained by a read, so a caller takes a DELTA over its own window.
+// ⚠️ total_dropped is the SUM of site_counts, and not every site counts ROWS:
+// a site whose name ends `.query_failed` counts failed QUERIES, not rows, each
+// of which lost an UNKNOWN number of rows. total_dropped is therefore a plain
+// sum in MIXED UNITS — neither a lower nor an upper bound (a failed query whose
+// result set would have been empty adds +1 while zero rows were lost). Build
+// user-facing wording from site_names + site_counts, never from total_dropped
+// alone.
 dictionary DroppedRowReport {
     u64 total_dropped;
     sequence<string> site_names;
@@ -1980,15 +1996,26 @@ dictionary DroppedRowReport {
 // R-31 — a page of Intelligent Culling candidates plus the EXACT number of
 // rows the catalogue could not deserialize while building it. dropped_rows > 0
 // means this work set is short, so the run must not report itself complete.
+//
+// query_ok = false (fix round 1) means the work set could not be BUILT at all
+// — the catalogue was not initialised, or the query failed to prepare or run —
+// so the answer is UNKNOWN, not empty. ⛔ A caller must never present
+// query_ok = false as "nothing needed analysis". query_error names the reason.
+// Both fields are appended LAST with defaults so existing construction sites
+// compile untouched (S65).
 dictionary FocusAnalysisCandidatePage {
     sequence<FocusAnalysisCandidate> candidates;
     u64 dropped_rows;
+    boolean query_ok = true;
+    string? query_error = null;
 };
 
 // R-31 + R-08 — the face-index work set, with everything the caller needs to
-// tell an EMPTY answer from an UNKNOWN one. store_ok = false means the vector
-// store could not be READ; observations is then EMPTY (never "everything is
-// missing", which would re-embed the whole catalogue).
+// tell an EMPTY answer from an UNKNOWN one. store_ok = false means the WORK
+// SET COULD NOT BE BUILT — the vector store or the catalogue could not be read
+// — and store_error says which; observations is then EMPTY (never "everything
+// is missing", which would re-embed the whole catalogue). An index that was
+// never built is store_ok = true with an empty list.
 dictionary FaceObservationWorkSet {
     sequence<FaceObservationRecord> observations;
     u64 dropped_rows;

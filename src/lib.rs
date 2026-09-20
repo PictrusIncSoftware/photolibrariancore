@@ -140,6 +140,19 @@ fn collect_rows<T>(rows: impl Iterator<Item = duckdb::Result<T>>, site: &'static
 /// cumulative since this process started, so a caller that wants "how many
 /// during MY operation" reads this at the start and at the end of its window
 /// and takes the difference.
+///
+/// ⚠️ FIX ROUND 4 (review LOW-R4-1) — **`total_dropped` is the SUM of
+/// `site_counts`, and not every site counts rows.** A site whose name ends
+/// `.query_failed` counts **failed QUERIES**, each of which lost an UNKNOWN
+/// number of rows (fix round 3 / LOW-R3-3: censusing such a failure as "1
+/// row" was the fiction that named it). ⚠️ Slice K, carrying H's round-5
+/// correction: `total_dropped` is therefore **a plain sum in MIXED UNITS —
+/// neither a lower nor an upper bound**. "Lower bound" was not provable: a
+/// failed query whose result set would have been EMPTY adds +1 while zero rows
+/// were lost. So **a user-facing number must be built from
+/// `site_names` + `site_counts`, never from `total_dropped` alone**, and a
+/// `.query_failed` site is worded as "a query failed; some rows may be
+/// missing", never as a row count.
 #[derive(Debug, Clone)]
 pub struct DroppedRowReport
 {
@@ -155,6 +168,12 @@ pub struct DroppedRowReport
 /// therefore a WINDOW measurement, not an attribution — another operation
 /// running at the same time is counted in it, which is why the user-facing
 /// wording says "while … was running" rather than "caused by".
+///
+/// ⚠️ The accumulator below sums EVERY site into `total_dropped`, including
+/// the `*.query_failed` sites that count failed queries rather than rows —
+/// see `DroppedRowReport`'s own note. It is deliberately a plain sum: a
+/// sentinel count would saturate it, and a second field cannot be added
+/// without moving the `.udl`.
 pub async fn dropped_row_report() -> DroppedRowReport
 {
     let census = DROPPED_ROW_CENSUS
@@ -2056,6 +2075,79 @@ pub(crate) fn apply_extension_autoload_policy(conn: &Connection) {
     }
 }
 
+/// ⭐ Slice K / R-43 — the migration seam, on the `FocusApplyProbe` precedent
+/// (search `struct FocusApplyProbe`): a plain parameter, no global static and
+/// no `cfg!(test)` branch in production code.
+///
+/// WHY IT EXISTS. `CREATE INDEX IF NOT EXISTS idx_images_directory_path` sits
+/// INSIDE the `Ok` arm of the S173 `directory_path` repair, so a failed repair
+/// leaves the marker absent and the next launch retries. Before this seam that
+/// arm was argued, never executed: both existing tests
+/// (`directory_exact_tests`) simulate the pre-repair state by dropping the
+/// index AFTER a successful repair. A refactor that hoists the `CREATE INDEX`
+/// out of the `Ok` arm passed every test while permanently recording a
+/// migration that did not happen.
+///
+/// ⭐ THE KNOB SUBSTITUTES THE SQL; IT DOES NOT FAKE THE ERROR. The test hands
+/// the repair a deliberately invalid statement, so the `Err` is produced by the
+/// ENGINE on the real `conn.execute` call. A synthesised `Err` would prove only
+/// that our own `if` works.
+///
+/// Production never constructs one: outside `cfg(test)` the referent type is
+/// uninhabited, so `MigrationProbeRef` can only ever be `None`.
+#[cfg(test)]
+struct MigrationProbe
+{
+    /// When `Some`, the `directory_path` repair runs THIS statement instead of
+    /// `directory_path_backfill_sql()`.
+    forced_repair_sql: Option<String>,
+}
+
+#[cfg(test)]
+type MigrationProbeRef<'a> = Option<&'a MigrationProbe>;
+
+/// Uninhabited outside tests: every production call site passes `None` and no
+/// other value can exist.
+#[cfg(not(test))]
+type MigrationProbeRef<'a> = Option<&'a std::convert::Infallible>;
+
+#[cfg(test)]
+fn forced_repair_sql(probe: MigrationProbeRef<'_>) -> Option<String>
+{
+    probe.and_then(|probe| probe.forced_repair_sql.clone())
+}
+
+#[cfg(not(test))]
+fn forced_repair_sql(_probe: MigrationProbeRef<'_>) -> Option<String>
+{
+    None
+}
+
+/// ⭐ Slice K — ENGINE TESTS NEVER FETCH, closed at the one place that could
+/// not be reached from outside.
+///
+/// `fence_connection_against_extension_fetches`' own doc block recorded the
+/// hole this closes: every test fixture fenced its connection only AFTER
+/// `open_and_migrate_catalogue` had returned, so the `SELECT version()` probe,
+/// the 765-line schema batch, the S173 repair and the S179 index drops all ran
+/// UNFENCED. The claim that none of them can trigger a download held by an
+/// audit of all 411 SQL literals, not by construction. It now holds by
+/// construction: under `cfg(test)` the fence is applied to this connection
+/// before any of those statements runs.
+///
+/// A no-op in production — the referent is a free function that compiles to
+/// nothing outside tests, so the shipped launch path is byte-unchanged.
+#[cfg(test)]
+fn fence_migration_connection(conn: &Connection)
+{
+    fence_connection_against_extension_fetches(conn);
+}
+
+#[cfg(not(test))]
+fn fence_migration_connection(_conn: &Connection)
+{
+}
+
 /// Open a catalogue database file and run the FULL schema-creation +
 /// migration pass on it (CREATE TABLE IF NOT EXISTS + ALTER ... IF NOT
 /// EXISTS + backfills + CHECKPOINT), returning the open connection.
@@ -2066,7 +2158,19 @@ pub(crate) fn apply_extension_autoload_policy(conn: &Connection) {
 /// about historical schemas. This helper NEVER touches the CATALOGUE /
 /// CATALOGUE_PATH globals; initialize_catalogue is the only caller that
 /// stores its result there.
-fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
+///
+/// ⭐ Slice K / R-43 — this is the one-argument DELEGATING form. Every existing
+/// caller (production and test) keeps its call site unchanged; only a test that
+/// needs the migration probe reaches for `_with_probe`.
+fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection>
+{
+    open_and_migrate_catalogue_with_probe(path, None)
+}
+
+fn open_and_migrate_catalogue_with_probe(
+    path: &std::path::Path,
+    probe: MigrationProbeRef<'_>,
+) -> Option<Connection> {
     // Open or create the database
     // DuckDB's bundled feature ensures the database engine is statically linked
     // (no system library dependency — required for App Store sandboxing)
@@ -2083,6 +2187,12 @@ fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
     // ONE production `Connection::open` in the crate; `initialize_catalogue` and
     // the additive restore's backup open both come through here.
     apply_extension_autoload_policy(&conn);
+
+    // ⭐ Slice K — the test-only extension fence, applied BEFORE the version
+    // probe, the schema batch, the S173 repair and the S179 index drops, so no
+    // statement this function runs can reach a real extension repository. A
+    // no-op outside `cfg(test)`; see `fence_migration_connection`.
+    fence_migration_connection(&conn);
 
     // EXPERIMENT 3: Query DuckDB version to confirm bundled library is being used
     match conn.query_row("SELECT version()", [], |row| row.get::<_, String>(0)) {
@@ -2961,7 +3071,11 @@ fn open_and_migrate_catalogue(path: &std::path::Path) -> Option<Connection> {
     };
 
     if !directory_index_present {
-        match conn.execute(&directory_path_backfill_sql(), []) {
+        // ⭐ Slice K / R-43 — the ONE line the seam adds. Production always takes
+        // the `unwrap_or_else`: `forced_repair_sql` is the `#[cfg(not(test))]`
+        // twin that returns `None`, and its argument type is uninhabited.
+        let repair_sql = forced_repair_sql(probe).unwrap_or_else(directory_path_backfill_sql);
+        match conn.execute(&repair_sql, []) {
             Ok(changed) => {
                 eprintln!(
                     "[migration] directory_path repaired (NULL or divergent): {} rows",
@@ -7708,12 +7822,12 @@ pub async fn expand_collapse_group_ids(ids: Vec<i64>) -> Vec<i64> {
         }
     };
 
-    let mut result: Vec<i64> = Vec::new();
-    for row_result in rows {
-        if let Ok(id) = row_result {
-            result.push(id);
-        }
-    }
+    // ⭐ Slice 7 fix round 1 — a 44th product row-drop site, in a shape the
+    // round-1 enumeration could not see because it is not a `filter_map`:
+    // `for row_result in rows { if let Ok(id) = row_result { … } }` discards a
+    // per-row `Err` exactly as `filter_map(|r| r.ok())` does. It is now
+    // counted like every other site, and T9's Lock D pins the shape.
+    let result = collect_rows(rows, "expand_collapse_group_ids");
 
     if result.is_empty() {
         ids
@@ -10118,11 +10232,35 @@ fn focus_analysis_scope_predicate(ids: &[i64]) -> Option<String> {
 ///
 /// ⚠️ A work set with `dropped_rows > 0` is NEVER complete — the caller must
 /// not report "nothing needed analysis".
+///
+/// ⭐ FIX ROUND 1 (MEDIUM-1 of the review, applied here as MEDIUM-2): the
+/// carrier had NO failure channel, so a work set that could not be BUILT —
+/// catalogue not initialised, a prepare failure, a query failure — was
+/// indistinguishable from an empty queue and re-created the "already up to
+/// date" lie on the culling half. `query_ok = false` says the answer is
+/// UNKNOWN, not empty; `query_error` names the reason. Both fields are
+/// appended LAST with `.udl` defaults (S65), and Rust constructs this
+/// dictionary while Swift only reads it, so no Swift construction site exists
+/// to break.
 #[derive(Debug, Clone)]
 pub struct FocusAnalysisCandidatePage
 {
     pub candidates: Vec<FocusAnalysisCandidate>,
     pub dropped_rows: u64,
+    pub query_ok: bool,
+    pub query_error: Option<String>,
+}
+
+/// The work set could not be built. ⛔ Never present this as "nothing to do".
+fn focus_analysis_candidate_page_failure(message: String) -> FocusAnalysisCandidatePage
+{
+    FocusAnalysisCandidatePage
+    {
+        candidates: Vec::new(),
+        dropped_rows: 0,
+        query_ok: false,
+        query_error: Some(message),
+    }
 }
 
 fn focus_analysis_candidates_impl(
@@ -10132,15 +10270,20 @@ fn focus_analysis_candidates_impl(
     analysis_run_id: &str,
     scoped_ids: Option<&[i64]>,
 ) -> FocusAnalysisCandidatePage {
-    let empty = FocusAnalysisCandidatePage
+    // ⚠️ An EMPTY explicit selection is a legitimate empty queue ("Empty
+    // selection means empty queue"), NOT a failure — so this one arm keeps
+    // `query_ok = true`. Every arm below it is a failure and clears the flag.
+    let empty_queue = FocusAnalysisCandidatePage
     {
         candidates: Vec::new(),
         dropped_rows: 0,
+        query_ok: true,
+        query_error: None,
     };
     let scope_filter = match scoped_ids {
         Some(ids) => match focus_analysis_scope_predicate(ids) {
             Some(filter) => Some(filter),
-            None => return empty,
+            None => return empty_queue,
         },
         None => None,
     };
@@ -10157,8 +10300,9 @@ fn focus_analysis_candidates_impl(
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("focus_analysis_candidates: prepare {}", e);
-            return empty;
+            let message = format!("focus_analysis_candidates: prepare {}", e);
+            eprintln!("{}", message);
+            return focus_analysis_candidate_page_failure(message);
         }
     };
 
@@ -10182,11 +10326,14 @@ fn focus_analysis_candidates_impl(
             {
                 candidates,
                 dropped_rows,
+                query_ok: true,
+                query_error: None,
             }
         }
         Err(e) => {
-            eprintln!("focus_analysis_candidates: query {}", e);
-            empty
+            let message = format!("focus_analysis_candidates: query {}", e);
+            eprintln!("{}", message);
+            focus_analysis_candidate_page_failure(message)
         }
     }
 }
@@ -10246,12 +10393,9 @@ pub async fn focus_analysis_candidate_page(
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
-            eprintln!("Catalogue not initialized");
-            return FocusAnalysisCandidatePage
-            {
-                candidates: Vec::new(),
-                dropped_rows: 0,
-            };
+            let message = "focus_analysis_candidate_page: catalogue not initialized";
+            eprintln!("{}", message);
+            return focus_analysis_candidate_page_failure(message.to_string());
         }
     };
 
@@ -10284,12 +10428,9 @@ pub async fn focus_analysis_candidate_page_for_ids(
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
-            eprintln!("Catalogue not initialized");
-            return FocusAnalysisCandidatePage
-            {
-                candidates: Vec::new(),
-                dropped_rows: 0,
-            };
+            let message = "focus_analysis_candidate_page_for_ids: catalogue not initialized";
+            eprintln!("{}", message);
+            return focus_analysis_candidate_page_failure(message.to_string());
         }
     };
 
@@ -12031,8 +12172,17 @@ pub async fn face_recognition_menu_states(
 ///
 /// `dropped_rows > 0` means the catalogue could not deserialize some rows, so
 /// the set is short and the index may be incomplete. `store_ok = false` means
-/// the vector store could not be READ (R-08) — distinct from an index that was
-/// never built, which is `store_ok = true` with an empty list.
+/// the WORK SET COULD NOT BE BUILT — either the vector store or the catalogue
+/// could not be read (R-08); `store_error` names which. That is distinct from
+/// an index that was never built, which is `store_ok = true` with an empty
+/// list.
+///
+/// ⚠️ Fix round 1 (MEDIUM-1): the catalogue-side prepare/query failures used to
+/// answer `store_ok = true, dropped_rows = 0, observations = []` — a carrier
+/// that says "the store is fine and there is no work", which re-created the
+/// very "already up to date" lie this slice exists to make impossible. The
+/// ruled Swift rule keys on `storeOk == false || droppedRows > 0`, so a
+/// catalogue failure MUST clear `store_ok`.
 ///
 /// ⛔ On `store_ok = false` the observation list is EMPTY, never "everything is
 /// missing": the latter would make the builder re-embed the whole catalogue.
@@ -12045,25 +12195,90 @@ pub struct FaceObservationWorkSet
     pub store_error: Option<String>,
 }
 
+/// The CATALOGUE half of the face-index work set, separated out in fix round 1
+/// so both the page and its legacy twin read the same rows through one code
+/// path (HIGH-1 + MEDIUM-1).
+struct FaceObservationCandidates
+{
+    observations: Vec<FaceObservationRecord>,
+    dropped_rows: u64,
+    /// `Some` when the CATALOGUE could not be read. A catalogue failure is not
+    /// an empty queue, and the caller must never present it as one.
+    catalogue_error: Option<String>,
+}
+
+/// The catalogue half of the work set could not be read. ⛔ Never present this
+/// as "nothing to do".
+///
+/// ⚠️ All THREE catalogue-failure arms below build their carrier here, so the
+/// "a failure is not an empty queue" decision lives at ONE point rather than
+/// three. That matters because only the `prepare` arm is reachable from a
+/// fixture on today's schema — the `query_map` arm needs a runtime execution
+/// failure this SQL cannot produce — so a single construction point is what
+/// keeps the unreachable arm honest.
+fn face_observation_candidates_failure(message: String) -> FaceObservationCandidates
+{
+    FaceObservationCandidates
+    {
+        observations: Vec::new(),
+        dropped_rows: 0,
+        catalogue_error: Some(message),
+    }
+}
+
 /// Return face observations that do not yet have a LanceDB embedding for the
 /// requested model/preprocessing pair. `limit == 0` means no limit.
 ///
 /// ⚠️ Slice 7: LEGACY shape, kept so nothing breaks while the Swift halves are
 /// sequenced. It discards the dropped-row count AND the store's reachability.
 /// New callers use `face_embedding_missing_observation_page`.
+///
+/// ⭐ FIX ROUND 1 — HIGH-1, and this is an INTERIM that must not be deleted
+/// before `FaceRecognitionIndexBuilder.swift`'s `storeOk` gate lands (lane
+/// H-Swift-B, brief §3.12). This twin is still wired at
+/// `FaceRecognitionIndexBuilder.swift:414`, whose `guard !observations.isEmpty`
+/// reports *"Face recognition index is already up to date."* — so as first
+/// built, an UNREADABLE `vectors.lancedb` made the builder claim success on a
+/// catalogue whose index it could not read, which is QUIETER than the product
+/// was before this slice (core `2bc221e:12183-12192` returned every observation
+/// on a store failure, the builder ran, and its LanceDB writes failed loudly).
+/// Until the Swift gate lands, a store failure restores exactly that pre-slice
+/// direction: the full candidate set, so the failure surfaces where it always
+/// did. The NEW page keeps the ruled EMPTY-list contract untouched.
 pub async fn face_embedding_missing_observations(
     algorithm_version: String,
     model_version: String,
     preprocessing_version: String,
     limit: u32,
 ) -> Vec<FaceObservationRecord> {
-    face_embedding_missing_observation_page(
-        algorithm_version,
+    let page = face_embedding_missing_observation_page(
+        algorithm_version.clone(),
         model_version,
         preprocessing_version,
         limit,
     )
-    .await
+    .await;
+
+    if page.store_ok
+    {
+        return page.observations;
+    }
+
+    // Pre-slice failure direction: with no readable store, NOTHING is known to
+    // be embedded, so every observation is a candidate. On a CATALOGUE failure
+    // this re-query fails too and yields the empty list — which is also exactly
+    // what the pre-slice code did. One path, both answers honest.
+    eprintln!(
+        "face_embedding_missing_observations: the work set could not be built \
+         ({}); returning the full candidate set so the failure surfaces \
+         downstream (slice 7 fix round 1, HIGH-1 interim)",
+        page.store_error.as_deref().unwrap_or("no reason given")
+    );
+    face_embedding_observation_candidates(
+        &algorithm_version,
+        limit,
+        &std::collections::HashSet::new(),
+    )
     .observations
 }
 
@@ -12104,19 +12319,44 @@ pub async fn face_embedding_missing_observation_page(
         }
     };
 
+    let built = face_embedding_observation_candidates(&algorithm_version, limit, &embedded_ids);
+
+    match built.catalogue_error
+    {
+        // MEDIUM-1: the work set could not be BUILT. `store_ok = false` is the
+        // channel the ruled Swift rule reads, and `store_error` says which half
+        // failed.
+        Some(message) => FaceObservationWorkSet
+        {
+            observations: Vec::new(),
+            dropped_rows: built.dropped_rows,
+            store_ok: false,
+            store_error: Some(message),
+        },
+        None => FaceObservationWorkSet
+        {
+            observations: built.observations,
+            dropped_rows: built.dropped_rows,
+            store_ok: true,
+            store_error: None,
+        },
+    }
+}
+
+/// Read the canonical face observations for `algorithm_version` and drop the
+/// ones already embedded. `limit == 0` means no limit.
+fn face_embedding_observation_candidates(
+    algorithm_version: &str,
+    limit: u32,
+    embedded_ids: &std::collections::HashSet<i64>,
+) -> FaceObservationCandidates {
     let catalogue = CATALOGUE.lock().unwrap();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
             let message = "face_embedding_missing_observations: catalogue not initialized";
             eprintln!("{}", message);
-            return FaceObservationWorkSet
-            {
-                observations: Vec::new(),
-                dropped_rows: 0,
-                store_ok: false,
-                store_error: Some(message.to_string()),
-            };
+            return face_observation_candidates_failure(message.to_string());
         }
     };
 
@@ -12164,13 +12404,7 @@ pub async fn face_embedding_missing_observation_page(
         Err(e) => {
             let message = format!("face_embedding_missing_observations: prepare {}", e);
             eprintln!("{}", message);
-            return FaceObservationWorkSet
-            {
-                observations: Vec::new(),
-                dropped_rows: 0,
-                store_ok: true,
-                store_error: Some(message),
-            };
+            return face_observation_candidates_failure(message);
         }
     };
 
@@ -12211,13 +12445,7 @@ pub async fn face_embedding_missing_observation_page(
         Err(e) => {
             let message = format!("face_embedding_missing_observations: query {}", e);
             eprintln!("{}", message);
-            return FaceObservationWorkSet
-            {
-                observations: Vec::new(),
-                dropped_rows: 0,
-                store_ok: true,
-                store_error: Some(message),
-            };
+            return face_observation_candidates_failure(message);
         }
     };
 
@@ -12235,12 +12463,11 @@ pub async fn face_embedding_missing_observation_page(
         .take(max_count)
         .collect();
 
-    FaceObservationWorkSet
+    FaceObservationCandidates
     {
         observations,
         dropped_rows,
-        store_ok: true,
-        store_error: None,
+        catalogue_error: None,
     }
 }
 
@@ -14455,10 +14682,142 @@ async fn delete_face_vectors_by_observation_ids(
     (if failed { 0 } else { doomed.len() as u64 }, failed)
 }
 
+/// The face observations whose rows are TWINS of a canonical row — item 7c's
+/// doomed set. The second value is FALSE when the census could not be
+/// performed at all.
+///
+/// ⭐ FIX ROUND 2 (review MEDIUM-R2-1). Both `if let Ok` arms here used to have
+/// NO `else` — not even an `eprintln!` — so a transient prepare/query failure
+/// (schema drift, the S124 256-fd exhaustion burst, a catalogue connection
+/// fault) left the doomed list EMPTY. Phase 2 then deleted nothing and
+/// returned `vector_delete_failed = false`, and
+/// `FaceRecognitionIndexBuilder.swift:405-412` latched
+/// `canonicalFaceEmbeddingCleanupDone = true` **PERMANENTLY**: the ~17k twin
+/// vectors are never deleted, the one-shot migration never runs again, and no
+/// record of the failure exists anywhere in the product.
+///
+/// ⛔ An UN-PERFORMED census is not an EMPTY census. The failure is recorded in
+/// the dropped-row census (per Q-17 stdout is not a record, and this one has a
+/// permanent consequence), and the caller fails CLOSED so the Swift one-shot
+/// flag cannot latch.
+/// ⭐ FIX ROUND 3 (review MEDIUM-R3-1) — the seam that reaches the twin
+/// census's PER-ROW failure path for real.
+///
+/// `face_observation.id` is `INTEGER PRIMARY KEY`, so on today's schema no NULL
+/// and no type mismatch is expressible through that `SELECT` — the same
+/// disposition as the `query_map` arm. Unlike that arm the consequence is
+/// PERMANENT (a per-row drop used to report a completed census, and the Swift
+/// one-shot flag latched forever), so this path is pinned by an EXECUTED test
+/// rather than by source alone: the probe points the row read at a column that
+/// does not exist, which is exactly the per-row `Err` shape.
+///
+/// The S179 `FocusApplyProbe` discipline: private, parameter-threaded, no
+/// global statics, and outside `cfg(test)` the referent type is UNINHABITED, so
+/// the production call site provably passes `None` and the release build
+/// carries no dead code.
+#[cfg(test)]
+struct TwinCensusRowProbe
+{
+    /// The column the row closure reads. Anything but 0 is an
+    /// `Invalid column index` per-row `Err`.
+    column: usize,
+}
+
+#[cfg(test)]
+impl TwinCensusRowProbe
+{
+    fn failing_every_row() -> Self
+    {
+        Self { column: 7 }
+    }
+}
+
+#[cfg(test)]
+type TwinCensusRowProbeRef<'a> = Option<&'a TwinCensusRowProbe>;
+
+/// Uninhabited outside tests: the production call site passes `None` and no
+/// other value can exist.
+#[cfg(not(test))]
+type TwinCensusRowProbeRef<'a> = Option<&'a std::convert::Infallible>;
+
+#[cfg(test)]
+fn twin_census_row_column(probe: TwinCensusRowProbeRef<'_>) -> usize
+{
+    probe.map(|probe| probe.column).unwrap_or(0)
+}
+
+#[cfg(not(test))]
+fn twin_census_row_column(_probe: TwinCensusRowProbeRef<'_>) -> usize
+{
+    0
+}
+
+fn face_embedding_twin_observation_ids(
+    conn: &Connection,
+    probe: TwinCensusRowProbeRef<'_>,
+) -> (Vec<i64>, bool)
+{
+    const SITE: &str = "canonicalize_face_embeddings.doomed_ids";
+
+    // ⭐ FIX ROUND 3 (review LOW-R3-3). A whole-query failure loses an UNKNOWN
+    // number of rows. Censusing it as "1" at SITE made it indistinguishable
+    // from one real dropped row, in the very record Q-17 says is the durable
+    // one. It gets its OWN site instead, whose name says what the number
+    // counts: FAILED QUERIES, not rows. ⚠️ A sentinel count was rejected —
+    // `dropped_row_report` SUMS site_counts into `total_dropped`, so
+    // `u64::MAX` would saturate the whole report. No `.udl` change: a site is
+    // just a name, and the carrier is `sequence<string>` + `sequence<u64>`.
+    const QUERY_FAILED_SITE: &str = "canonicalize_face_embeddings.doomed_ids.query_failed";
+
+    let mut stmt = match conn
+        .prepare("SELECT id FROM face_observation WHERE image_id <> analyzed_image_id")
+    {
+        Ok(stmt) => stmt,
+        Err(e) =>
+        {
+            eprintln!("{}: prepare {} (row count lost: unknown)", SITE, e);
+            record_dropped_rows(QUERY_FAILED_SITE, 1);
+            return (Vec::new(), false);
+        }
+    };
+
+    let column = twin_census_row_column(probe);
+    let rows = match stmt.query_map([], move |row| row.get::<_, i64>(column))
+    {
+        Ok(rows) => rows,
+        Err(e) =>
+        {
+            eprintln!("{}: query {} (row count lost: unknown)", SITE, e);
+            record_dropped_rows(QUERY_FAILED_SITE, 1);
+            return (Vec::new(), false);
+        }
+    };
+
+    // ⛔ FIX ROUND 3 (review MEDIUM-R3-1). This is the THIRD failure path, and
+    // it is the one shape R-31 is actually about. `collect_rows` censuses a
+    // per-row `Err` and returns the SHORT list; reporting `true` here meant
+    // `!db_ok || !census_ok` never fired, `vector_delete_failed` came back
+    // false, and `FaceRecognitionIndexBuilder.swift:407-409` latched the
+    // one-shot flag PERMANENTLY with twin vectors still in the store. A census
+    // that lost rows did not complete: three failure paths, ONE rule.
+    let (ids, dropped) = collect_rows_counted(rows, SITE);
+    (ids, dropped == 0)
+}
+
 pub async fn canonicalize_face_embeddings() -> CanonicalizeFaceEmbeddingsResult {
+    // The ONLY production call: the probe type is uninhabited outside tests.
+    canonicalize_face_embeddings_probed(None).await
+}
+
+/// ⭐ FIX ROUND 3 (review MEDIUM-R3-1). Split out so the per-ROW census
+/// failure can be driven END TO END — the fail-closed branch below is what
+/// stops the Swift one-shot flag, and a source lock cannot prove it fires.
+async fn canonicalize_face_embeddings_probed(
+    probe: TwinCensusRowProbeRef<'_>,
+) -> CanonicalizeFaceEmbeddingsResult {
     // Phase 1 — the DuckDB re-key, under the catalogue lock (sync, committed
     // before any vector is touched). The doomed-id census rides the same lock.
-    let (reassigned, duplicates_removed, doomed, db_ok) = {
+    let (reassigned, duplicates_removed, doomed, db_ok, census_ok) = {
         let catalogue = CATALOGUE.lock().unwrap();
         let conn = match catalogue.as_ref() {
             Some(c) => c,
@@ -14473,23 +14832,20 @@ pub async fn canonicalize_face_embeddings() -> CanonicalizeFaceEmbeddingsResult 
             }
         };
         let (reassigned, duplicates_removed, ok) = canonicalize_face_assignments_impl(conn);
-        let doomed = if ok {
-            let mut ids = Vec::new();
-            if let Ok(mut stmt) = conn
-                .prepare("SELECT id FROM face_observation WHERE image_id <> analyzed_image_id")
-            {
-                if let Ok(rows) = stmt.query_map([], |row| row.get::<_, i64>(0)) {
-                    ids = collect_rows(rows, "canonicalize_face_embeddings.doomed_ids");
-                }
-            }
-            ids
+        let (doomed, census_ok) = if ok {
+            face_embedding_twin_observation_ids(conn, probe)
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
-        (reassigned, duplicates_removed, doomed, ok)
+        (reassigned, duplicates_removed, doomed, ok, census_ok)
     };
 
-    if !db_ok {
+    // ⛔ FAIL CLOSED (fix round 2, MEDIUM-R2-1). A census that could not be
+    // PERFORMED must not read as "there is nothing to delete": the Swift
+    // caller sets its one-shot `canonicalFaceEmbeddingCleanupDone` flag only
+    // when `vector_delete_failed` is false, so reporting success here would
+    // retire a migration that never ran.
+    if !db_ok || !census_ok {
         return CanonicalizeFaceEmbeddingsResult {
             reassigned,
             duplicates_removed,
@@ -26505,18 +26861,25 @@ pub async fn apple_shared_album_dependent_census(
 /// connection that could not be fenced is the precise condition that caused the
 /// incident, so it must stop the test rather than proceed quietly.
 ///
-/// ⚠️ ACCEPTED RESIDUE, recorded rather than claimed away (review round 2, N4):
-/// the fence is applied AFTER `open_and_migrate_catalogue` returns, so under a
-/// mutation that removes the production guard the schema batch, the `SELECT
-/// version()` probe, the S173 `directory_path` repair and the index drops all run
-/// on that connection UNFENCED. Nothing among them can trigger a fetch — V5
-/// audited all 411 SQL literals in this file and every identifier resolves to
-/// `core_functions` — and a guard-removed run left `~/.duckdb` byte-identical, so
-/// the claim holds. But it holds by that AUDIT, exactly as the ~40 unfenced
-/// `open_in_memory` test sites do, not by construction. Closing it needs a
-/// `#[cfg(test)]` hook inside `open_and_migrate_catalogue` (the S179
-/// `FocusApplyProbe` precedent), which would move production source; slice K is
-/// building a migration probe seam there and is the right place to carry it.
+/// ⭐ THE RESIDUE THIS BLOCK USED TO RECORD IS CLOSED (slice K, 2026-09-20).
+/// It was: the fence was applied only AFTER `open_and_migrate_catalogue`
+/// returned, so the schema batch, the `SELECT version()` probe, the S173
+/// `directory_path` repair and the S179 index drops all ran on that connection
+/// UNFENCED, and the "none of them can fetch" claim rested on V5's AUDIT of all
+/// 411 SQL literals in this file rather than on construction. Slice K carried
+/// the `#[cfg(test)]` hook the residue asked for: `fence_migration_connection`
+/// (`:2143-2157`, a no-op outside `cfg(test)`) is called inside
+/// `open_and_migrate_catalogue_with_probe` at `:2181`, immediately after
+/// `apply_extension_autoload_policy` and BEFORE any of those statements runs.
+/// It is pinned positively by
+/// `schema_upgrade_fixture_tests::a_connection_from_the_production_open_path_is_already_fenced`
+/// and mutation-proved (K's M13).
+///
+/// ⚠️ STILL OWED BY HAND: a test that opens a catalogue OUTSIDE
+/// `open_and_migrate_catalogue` — a raw `Connection::open` (K's historical
+/// fixture replay) or one of the ~40 `open_in_memory` sites — must still call
+/// `fence_connection_against_extension_fetches` itself. Only the production
+/// open path fences on its own.
 #[cfg(test)]
 fn fence_connection_against_extension_fetches(conn: &Connection) {
     let fence_dir =
@@ -29849,6 +30212,1165 @@ mod directory_exact_tests
 
 
 // ===========================================================================
+// Slice K / cluster K — schema-upgrade fixtures (S183, 2026-09-20)
+// ===========================================================================
+//
+// R-41 (no fixture exercised ANY earlier schema version through the current
+// open path) · R-43 (the S173 failed-repair arm was argued, never executed) ·
+// R-42 / R-60 / R-82 / R-96 (fresh-vs-upgraded schema divergences, PINNED here
+// as an asserted allow-list rather than converged — see the list's own notes).
+//
+// ⭐ WHAT THIS MODULE BUYS. The catalogue open path is one 765-line
+// `execute_batch`. A single failing statement aborts the batch,
+// `open_and_migrate_catalogue` returns `None`, and the app reports an EMPTY
+// LIBRARY on every existing catalogue (S93). Until this module, the assumption
+// that the CREATE batch's statement ORDER and its ALTER set are complete for
+// every historical state was measured by NOTHING: every other fixture in this
+// crate starts from a CURRENT-schema catalogue that the current code just
+// created.
+//
+// ⭐ HOW THE FIXTURES ARE MADE, and why they are not `.db` files. Each fixture
+// is the schema batch of a historical commit, extracted VERBATIM and checked in
+// as inert `.sql` under `src/schema_fixtures/` (see that directory's
+// README.md for the per-file provenance command). A `.db` written today would
+// carry TODAY's storage version and would therefore test nothing about an old
+// catalogue, and the engine's `[VERSION_NUMBER_LOWER, VERSION_NUMBER_UPPER]`
+// window makes every checked-in binary unopenable at one engine bump.
+//
+// ⛔ THE FIXTURES ARE FROZEN ARTIFACTS. Never edit one to make a test pass when
+// the current schema changes — that deletes the pin. A new schema state gets a
+// NEW file.
+#[cfg(test)]
+mod schema_upgrade_fixture_tests
+{
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// One allowed fresh-vs-upgraded difference, with the reason it is allowed.
+    /// ⭐ The list is ASSERTED IN BOTH DIRECTIONS (see `assert_column_shapes`):
+    /// a divergence that is not on it FAILS, and an entry on it that is not
+    /// observed FAILS. A stale entry is a lie about the code.
+    struct AllowedDivergence
+    {
+        table: &'static str,
+        column: &'static str,
+        register_entry: &'static str,
+        /// ⭐ The divergence AS MEASURED against the bundled engine (v1.5.5), in
+        /// `ColumnShape::describe()`'s form. Asserted exactly, so a listed
+        /// column that starts diverging in a DIFFERENT way is a new finding
+        /// rather than something the old entry quietly absorbs.
+        /// `"<absent>"` means the column is not there at all.
+        expected_fresh: &'static str,
+        expected_upgraded: &'static str,
+        reason: &'static str,
+    }
+
+    /// ⭐ The ONLY allow-list in this module, and it belongs to the ARCHIVAL
+    /// genesis fixture alone. Every reachable vintage (V1…V6) upgrades to a
+    /// four-tuple set IDENTICAL to fresh — measured, not assumed — so their
+    /// assertion (e) is absolute and has no list to rot.
+    ///
+    /// Blast radius of all four: ZERO. Q-27 — no pre-2026-07-03 catalogue can
+    /// reach this binary (S114 renamed the bundle ID, S127 was a fresh-catalogue
+    /// production baseline, and the only other inbound path is a backup, which
+    /// did not exist until S111 on 2026-07-03).
+    const GENESIS_ALLOW_LIST: [AllowedDivergence; 4] = [
+        AllowedDivergence
+        {
+            table: "images",
+            column: "file_size",
+            register_entry: "R-96",
+            expected_fresh: "images.file_size BIGINT nullable=false default=<none>",
+            expected_upgraded: "images.file_size INTEGER nullable=false default=<none>",
+            reason: "BIGINT fresh, INTEGER upgraded. Commit 14e9810 (2026-05-08) \
+                     edited the CREATE body only; there is no ALTER ... ALTER COLUMN \
+                     ... TYPE idiom anywhere in this crate (0 hits), so the type \
+                     change never reached an existing catalogue. The third instance \
+                     of the class (with R-60 and R-82) and the FIRST that a \
+                     (name, nullable, default) triple would miss — which is why the \
+                     comparison tuple carries data_type.",
+        },
+        AllowedDivergence
+        {
+            table: "images",
+            column: "id",
+            register_entry: "R-82",
+            expected_fresh: "images.id INTEGER nullable=false default=nextval('images_id_seq')",
+            expected_upgraded: "images.id INTEGER nullable=false default=<none>",
+            reason: "DEFAULT nextval('images_id_seq') fresh, no default upgraded. \
+                     The default arrived at 1e1bd01 (2026-05-06), two days after the \
+                     table. There is no ALTER COLUMN ... SET DEFAULT idiom anywhere \
+                     in this crate (0 hits), and adding one would put an expression \
+                     default on the launch path.",
+        },
+        AllowedDivergence
+        {
+            table: "images",
+            column: "is_video",
+            register_entry: "R-42",
+            expected_fresh: "images.is_video BOOLEAN nullable=false default=CAST('f' AS BOOLEAN)",
+            expected_upgraded: "images.is_video BOOLEAN nullable=true default=<none>",
+            reason: "BOOLEAN NOT NULL DEFAULT FALSE in the CREATE body, bare BOOLEAN \
+                     through the ALTER. ⛔ The bare ALTER is CORRECT: `ALTER ... ADD \
+                     COLUMN ... DEFAULT <expr>` is the S62 WAL wedge, forbidden by \
+                     CLAUDE.md's standing DuckDB rules — converging it would rebuild \
+                     a bug this project already shipped once. NOT user-visible: no \
+                     production read distinguishes NULL from FALSE here (both \
+                     `collection` and `color` are read only under `= TRUE`), and all \
+                     nine production INSERT INTO keyword sites name `origin`.",
+        },
+        AllowedDivergence
+        {
+            table: "images",
+            column: "rotation",
+            register_entry: "R-60",
+            expected_fresh: "images.rotation INTEGER nullable=true default=0",
+            expected_upgraded: "<absent>",
+            reason: "Present fresh (INTEGER default 0), ABSENT upgraded. It entered \
+                     the CREATE body at 08d7c0b (2026-05-10), six days after the \
+                     table was born, and `CREATE TABLE IF NOT EXISTS` cannot add a \
+                     column to an existing table. No ALTER was ever written — the \
+                     only such gap among the 39 other late `images` columns. PINNED, \
+                     not fixed: the register's own disposition, and the two-statement \
+                     fix would create a NEW R-42-class attribute divergence for zero \
+                     user-visible gain.",
+        },
+    ];
+
+    /// One historical schema state: the schema batch of `commit`, stored
+    /// VERBATIM in `src/schema_fixtures/<commit>.sql`.
+    struct Vintage
+    {
+        tag: &'static str,
+        commit: &'static str,
+        date: &'static str,
+        ddl: &'static str,
+        /// Non-empty for GENESIS only.
+        allowed: &'static [AllowedDivergence],
+        /// `true` for the vintage whose DDL is byte-identical to the working
+        /// tree's — the identity control. Exactly one vintage carries it.
+        is_identity_control: bool,
+    }
+
+    /// ⭐ THE REACHABLE WINDOW OPENS ON 2026-07-03, derived from the record and
+    /// not from guesswork: backups — the only inbound path for an old catalogue
+    /// — did not exist until S111 (8193d5d, 2026-07-03) and restore gates
+    /// `manifest.formatVersion <= 1`; Q-27 bounds everything earlier to zero.
+    ///
+    /// Fingerprinting every commit that touched the schema batch collapses the
+    /// window into SIX distinct states, V1…V6, of which V6 is the working tree.
+    /// GENESIS is archival and is kept for one reason, stated at its entry.
+    ///
+    /// ⚠️ The DDL state of V1 originates at a9300ac (2026-06-25); 8193d5d is the
+    /// S111 commit that first made such a catalogue reachable, and its lib.rs
+    /// carries that same batch byte-for-byte. The fixture is named for 8193d5d
+    /// because that is the earliest vintage a BACKUP can hold.
+    const VINTAGES: [Vintage; 7] = [
+        Vintage
+        {
+            tag: "V1",
+            commit: "8193d5d",
+            date: "2026-07-03",
+            ddl: include_str!("schema_fixtures/8193d5d.sql"),
+            allowed: &[],
+            is_identity_control: false,
+        },
+        Vintage
+        {
+            tag: "V2",
+            commit: "3c5895b",
+            date: "2026-07-04",
+            ddl: include_str!("schema_fixtures/3c5895b.sql"),
+            allowed: &[],
+            is_identity_control: false,
+        },
+        Vintage
+        {
+            tag: "V3",
+            commit: "68f88f9",
+            date: "2026-07-20",
+            ddl: include_str!("schema_fixtures/68f88f9.sql"),
+            allowed: &[],
+            is_identity_control: false,
+        },
+        Vintage
+        {
+            tag: "V4",
+            commit: "ee9640c",
+            date: "2026-07-21",
+            ddl: include_str!("schema_fixtures/ee9640c.sql"),
+            allowed: &[],
+            is_identity_control: false,
+        },
+        Vintage
+        {
+            tag: "V5",
+            commit: "b8ea0a6",
+            date: "2026-08-06",
+            ddl: include_str!("schema_fixtures/b8ea0a6.sql"),
+            allowed: &[],
+            is_identity_control: false,
+        },
+        Vintage
+        {
+            tag: "V6",
+            commit: "2bc221e",
+            date: "2026-09-18",
+            ddl: include_str!("schema_fixtures/2bc221e.sql"),
+            allowed: &[],
+            is_identity_control: true,
+        },
+        // ⭐ GENESIS is not archaeology. All seven current `images` indexes are
+        // over genesis-era columns and every REACHABLE vintage already carries
+        // every column the batch touches, so no reachable fixture can be made to
+        // fail assertion (a) by the S93 mutation. Genesis has 1 table instead of
+        // 19 and 29 `images` columns instead of 69 — 40 columns and 18 tables
+        // arrive through the migration — which is what gives the S93 mutation
+        // something to break. THIS is why it is kept.
+        Vintage
+        {
+            tag: "GENESIS",
+            commit: "b3f9998",
+            date: "2026-05-04",
+            ddl: include_str!("schema_fixtures/b3f9998.sql"),
+            allowed: &GENESIS_ALLOW_LIST,
+            is_identity_control: false,
+        },
+    ];
+
+    /// ⭐ VACUITY GUARD. A comparison of two empty sets is the definition of
+    /// decoration (the S157 SceneMaskGate lesson). Truncating `VINTAGES`, or
+    /// letting a fixture be skipped, must turn a test RED — never green.
+    const EXPECTED_VINTAGE_COUNT: usize = 7;
+
+    /// ⭐ VACUITY GUARD. The fresh reference catalogue carried 259 product
+    /// columns when this was written; a floor well under it catches "the
+    /// reference query returned nothing" without rotting on the next column.
+    const FRESH_TUPLE_FLOOR: usize = 200;
+
+    /// The `(table_name, column_name, data_type, is_nullable, column_default)`
+    /// tuple assertion (e) compares. ⚠️ `data_type` is load-bearing: R-96 is
+    /// invisible to a (name, nullable, default) triple.
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct ColumnShape
+    {
+        table: String,
+        column: String,
+        data_type: String,
+        is_nullable: bool,
+        column_default: Option<String>,
+    }
+
+    impl ColumnShape
+    {
+        fn key(&self) -> (String, String)
+        {
+            (self.table.clone(), self.column.clone())
+        }
+
+        fn describe(&self) -> String
+        {
+            format!(
+                "{}.{} {} nullable={} default={}",
+                self.table,
+                self.column,
+                self.data_type,
+                self.is_nullable,
+                self.column_default.as_deref().unwrap_or("<none>")
+            )
+        }
+    }
+
+    fn vintage(tag: &str) -> &'static Vintage
+    {
+        VINTAGES
+            .iter()
+            .find(|v| v.tag == tag)
+            .unwrap_or_else(|| panic!("no vintage named {} in VINTAGES", tag))
+    }
+
+    fn fixture_path(tag: &str) -> std::path::PathBuf
+    {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "plcore-schema-upgrade-test-{}-{}-{}.db",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+        path
+    }
+
+    fn cleanup(path: &std::path::Path)
+    {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+    }
+
+    /// A CURRENT-schema catalogue, through the production path — the reference
+    /// side of assertion (e) and the live side of the merge tests.
+    fn fresh_catalogue(tag: &str) -> (std::path::PathBuf, Connection)
+    {
+        let path = fixture_path(tag);
+        let conn = open_and_migrate_catalogue(&path).expect("fresh reference catalogue");
+        (path, conn)
+    }
+
+    /// One seeded row, in the column set GENESIS can express. ⚠️ `id` is
+    /// explicit because genesis's `id INTEGER PRIMARY KEY` has NO default —
+    /// that IS R-82, seen from the writing side.
+    struct SeedRow
+    {
+        id: i64,
+        file_path: &'static str,
+        file_size: i64,
+        file_name: &'static str,
+        created_timestamp: i64,
+        modified_timestamp: i64,
+        rating: i64,
+    }
+
+    const SEED_ROWS: [SeedRow; 2] = [
+        SeedRow
+        {
+            id: 4001,
+            file_path: "/photos/vintage/one.NEF",
+            file_size: 1234,
+            file_name: "one.NEF",
+            created_timestamp: 1_700_000_000,
+            modified_timestamp: 1_700_000_001,
+            rating: 3,
+        },
+        SeedRow
+        {
+            id: 4002,
+            file_path: "/photos/vintage/two.JPG",
+            file_size: 5678,
+            file_name: "two.JPG",
+            created_timestamp: 1_700_000_100,
+            modified_timestamp: 1_700_000_101,
+            rating: 5,
+        },
+    ];
+
+    fn seed(conn: &Connection, row: &SeedRow)
+    {
+        conn.execute(
+            "INSERT INTO images (id, file_path, file_size, file_name, created_timestamp, \
+             modified_timestamp, rating) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                row.id,
+                row.file_path,
+                row.file_size,
+                row.file_name,
+                row.created_timestamp,
+                row.modified_timestamp,
+                row.rating
+            ],
+        )
+        .unwrap_or_else(|e| panic!("seeding {} failed: {}", row.file_path, e));
+    }
+
+    /// Build the OLD catalogue file: replay the vintage's DDL on a raw
+    /// `Connection::open`, seed the rows, CHECKPOINT, close.
+    ///
+    /// ⭐ A fixture whose DDL will not replay FAILS the test — it is never
+    /// skipped and never `continue`d past. That is the difference between a pin
+    /// and a decoration.
+    fn build_old_catalogue(v: &Vintage, rows: &[SeedRow]) -> std::path::PathBuf
+    {
+        let path = fixture_path(v.tag);
+        let old = Connection::open(&path)
+            .unwrap_or_else(|e| panic!("{} ({}): could not create the fixture file: {}", v.tag, v.commit, e));
+        // ⭐ ENGINE TESTS NEVER FETCH — this connection is opened raw, outside
+        // `open_and_migrate_catalogue`, so it is fenced here by hand.
+        fence_connection_against_extension_fetches(&old);
+        old.execute_batch(v.ddl).unwrap_or_else(|e| {
+            panic!(
+                "{} ({}, {}): the historical schema batch from \
+                 src/schema_fixtures/{}.sql FAILED to replay: {}",
+                v.tag, v.commit, v.date, v.commit, e
+            )
+        });
+        for row in rows
+        {
+            seed(&old, row);
+        }
+        old.execute_batch("CHECKPOINT;")
+            .unwrap_or_else(|e| panic!("{}: CHECKPOINT failed: {}", v.tag, e));
+        drop(old);
+        path
+    }
+
+    /// The four-tuple set of one catalogue.
+    ///
+    /// ⚠️ THE JOIN TO `duckdb_tables()` IS LOAD-BEARING: DuckDB's own system
+    /// views live in `main` too and would otherwise pollute the set by ~150
+    /// rows, which would make the comparison compare mostly the engine with
+    /// itself.
+    fn column_shapes(conn: &Connection, what: &str) -> Vec<ColumnShape>
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT t.table_name, c.column_name, c.data_type, c.is_nullable, \
+                 c.column_default \
+                 FROM duckdb_columns() c \
+                 JOIN duckdb_tables() t ON c.table_oid = t.table_oid \
+                 WHERE t.schema_name = 'main' \
+                 ORDER BY t.table_name, c.column_name",
+            )
+            .unwrap_or_else(|e| panic!("{}: preparing the four-tuple query failed: {}", what, e));
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ColumnShape
+                {
+                    table: row.get::<_, String>(0)?,
+                    column: row.get::<_, String>(1)?,
+                    data_type: row.get::<_, String>(2)?,
+                    is_nullable: row.get::<_, bool>(3)?,
+                    column_default: row.get::<_, Option<String>>(4)?,
+                })
+            })
+            .unwrap_or_else(|e| panic!("{}: the four-tuple query failed: {}", what, e));
+        let (mut shapes, dropped) =
+            collect_rows_counted(rows, "schema_upgrade_fixture_tests.column_shapes");
+        // ⭐ In PRODUCT a dropped row is censused and the caller carries on; in a
+        // COMPARISON it would silently shrink one side of a set equality, so
+        // here it is fatal.
+        assert_eq!(
+            dropped, 0,
+            "{}: the four-tuple query dropped {} row(s); the comparison below would \
+             have been made against a short set",
+            what, dropped
+        );
+        shapes.sort();
+        shapes
+    }
+
+    fn index_present(conn: &Connection, index_name: &str) -> bool
+    {
+        index_row_count(conn, index_name) > 0
+    }
+
+    fn index_row_count(conn: &Connection, index_name: &str) -> i64
+    {
+        conn.query_row(
+            "SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = ?1",
+            params![index_name],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or_else(|e| panic!("duckdb_indexes() probe for {} failed: {}", index_name, e))
+    }
+
+    /// Rows whose stored `directory_path` is NULL or differs from the canonical
+    /// derivation — the count the S173 repair drives to zero. Same shape as
+    /// `directory_exact_tests::divergent_row_count`, kept local because that
+    /// module's helpers are private to it.
+    fn divergent_row_count(conn: &Connection) -> i64
+    {
+        conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM images WHERE directory_path IS NULL OR directory_path <> {}",
+                canonical_directory_path_sql("file_path")
+            ),
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("divergence count")
+    }
+
+    /// Assertions (a) … (e) of the slice, for one vintage.
+    fn assert_vintage_upgrades(v: &Vintage)
+    {
+        let old_path = build_old_catalogue(v, &SEED_ROWS);
+
+        // --- (a) THE S93 PIN. A failing statement anywhere in the batch aborts
+        // --- it and this is `None` — which in the product is an empty library
+        // --- on every existing catalogue, or a silently failed additive restore.
+        let upgraded = open_and_migrate_catalogue(&old_path).unwrap_or_else(|| {
+            panic!(
+                "⭐ ASSERTION (a) FAILED for {} ({}, {}): open_and_migrate_catalogue \
+                 returned None. The schema batch aborted on this historical \
+                 catalogue — in the product this is an EMPTY LIBRARY on every \
+                 existing catalogue (S93), or an additive restore that silently \
+                 does nothing. Run with --nocapture: the engine's error is on \
+                 stderr above.",
+                v.tag, v.commit, v.date
+            )
+        });
+
+        // --- (b) every seeded row still readable, with its values intact.
+        for row in SEED_ROWS.iter()
+        {
+            let found: (i64, String, i64, i64, i64) = upgraded
+                .query_row(
+                    "SELECT file_size, file_name, created_timestamp, modified_timestamp, \
+                     rating FROM images WHERE file_path = ?1",
+                    params![row.file_path],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "ASSERTION (b) FAILED for {}: the seeded row {} is not readable \
+                         after the migration ({})",
+                        v.tag, row.file_path, e
+                    )
+                });
+            assert_eq!(
+                found,
+                (
+                    row.file_size,
+                    row.file_name.to_string(),
+                    row.created_timestamp,
+                    row.modified_timestamp,
+                    row.rating
+                ),
+                "ASSERTION (b) FAILED for {}: the migration changed the values of {}",
+                v.tag,
+                row.file_path
+            );
+        }
+
+        // --- (c) the S173 marker is present and directory_path has converged.
+        assert!(
+            index_present(&upgraded, "idx_images_directory_path"),
+            "ASSERTION (c) FAILED for {}: idx_images_directory_path — the S173 \
+             migration marker — is ABSENT after the upgrade, so the repair did not \
+             complete and every per-directory FFI answers from an unrepaired key \
+             space",
+            v.tag
+        );
+        assert_eq!(
+            divergent_row_count(&upgraded),
+            0,
+            "ASSERTION (c) FAILED for {}: directory_path is still divergent after the \
+             upgrade, yet the marker was recorded",
+            v.tag
+        );
+
+        // --- (d) none of the S179-retired focus/face indexes survives.
+        for retired in FOCUS_WRITEBACK_RETIRED_INDEXES
+        {
+            assert!(
+                !index_present(&upgraded, retired),
+                "ASSERTION (d) FAILED for {}: the retired index {} is present after the \
+                 upgrade, so every focus-analysis writeback UPDATE on this catalogue \
+                 takes the delete+insert branch S179 retired",
+                v.tag,
+                retired
+            );
+        }
+
+        // --- (e) the four-tuple set, fresh vs upgraded.
+        let (fresh_path, fresh) = fresh_catalogue(&format!("fresh-for-{}", v.tag));
+        assert_column_shapes(v, &fresh, &upgraded);
+
+        drop(upgraded);
+        drop(fresh);
+        cleanup(&old_path);
+        cleanup(&fresh_path);
+    }
+
+    /// Assertion (e), plus the two assertions ON the allow-list itself.
+    fn assert_column_shapes(v: &Vintage, fresh: &Connection, upgraded: &Connection)
+    {
+        let fresh_shapes = column_shapes(fresh, "fresh");
+        let upgraded_shapes = column_shapes(upgraded, v.tag);
+
+        // ⭐ VACUITY GUARD. Two empty sets compare equal.
+        assert!(
+            fresh_shapes.len() >= FRESH_TUPLE_FLOOR,
+            "VACUITY GUARD FAILED: the fresh reference catalogue produced only {} \
+             column tuples (floor {}). The four-tuple query is not reading the \
+             catalogue, so every comparison below is decoration.",
+            fresh_shapes.len(),
+            FRESH_TUPLE_FLOOR
+        );
+
+        let fresh_set: std::collections::BTreeSet<ColumnShape> =
+            fresh_shapes.iter().cloned().collect();
+        let upgraded_set: std::collections::BTreeSet<ColumnShape> =
+            upgraded_shapes.iter().cloned().collect();
+
+        let only_fresh: Vec<&ColumnShape> = fresh_set.difference(&upgraded_set).collect();
+        let only_upgraded: Vec<&ColumnShape> = upgraded_set.difference(&fresh_set).collect();
+
+        // ⭐ Keyed by (table, column), but carrying the OBSERVED pair of shapes —
+        // so an allow-list entry is matched on the divergence it actually
+        // describes, not merely on the column's name. A divergence that CHANGES
+        // SHAPE on a listed column is a new finding and must not be absorbed by
+        // the old entry.
+        let describe_side = |side: &Vec<&ColumnShape>, key: &(String, String)| -> String {
+            side.iter()
+                .find(|s| s.key() == *key)
+                .map(|s| s.describe())
+                .unwrap_or_else(|| "<absent>".to_string())
+        };
+        let mut diverged: std::collections::BTreeMap<(String, String), (String, String)> =
+            std::collections::BTreeMap::new();
+        for shape in only_fresh.iter().chain(only_upgraded.iter())
+        {
+            let key = shape.key();
+            let pair = (
+                describe_side(&only_fresh, &key),
+                describe_side(&only_upgraded, &key),
+            );
+            diverged.insert(key, pair);
+        }
+
+        // The measured numbers, on stderr so `--nocapture` shows what the
+        // comparison actually compared. A reviewer reads these rather than
+        // trusting that the query returned anything.
+        eprintln!(
+            "[K-1] {} ({}, {}): fresh = {} column tuples, upgraded = {}, diverged = {}",
+            v.tag,
+            v.commit,
+            v.date,
+            fresh_shapes.len(),
+            upgraded_shapes.len(),
+            diverged.len()
+        );
+
+        // Allow-list assertion 1 — a divergence that is NOT on the list FAILS.
+        // For V1…V6 the list is EMPTY, so this is `upgraded == fresh`, absolute.
+        for (key, (fresh_side, upgraded_side)) in diverged.iter()
+        {
+            let entry = v
+                .allowed
+                .iter()
+                .find(|a| a.table == key.0 && a.column == key.1);
+            let entry = entry.unwrap_or_else(|| {
+                panic!(
+                    "⭐ ASSERTION (e) FAILED for {} ({}, {}): {}.{} differs between a \
+                     FRESH catalogue and one UPGRADED from this vintage, and it is not \
+                     on this fixture's allow-list.\n  fresh:    {}\n  upgraded: {}\n\
+                     This is a NEW instance of the R-60 / R-82 / R-96 class (a \
+                     CREATE-body edit that never reached an existing catalogue). It is \
+                     a FINDING — do not add it to the allow-list to make this green.",
+                    v.tag, v.commit, v.date, key.0, key.1, fresh_side, upgraded_side
+                )
+            });
+
+            // ⭐ …and the entry must describe THIS divergence. An entry matched
+            // only by column name would absorb a brand-new defect on a column
+            // that already carries an old one.
+            assert_eq!(
+                (fresh_side.as_str(), upgraded_side.as_str()),
+                (entry.expected_fresh, entry.expected_upgraded),
+                "⭐ ALLOW-LIST SHAPE CHANGED for {} ({}): {}.{} still diverges, but NOT \
+                 in the way the allow-list records. The entry ({}) describes a \
+                 different divergence, so this is a NEW finding wearing an old entry's \
+                 name — do not update the entry to match.",
+                v.tag,
+                v.commit,
+                key.0,
+                key.1,
+                entry.register_entry
+            );
+        }
+
+        // Allow-list assertion 2 — an entry that is NOT observed FAILS. A stale
+        // entry is a lie about the code.
+        for entry in v.allowed.iter()
+        {
+            assert!(
+                diverged.contains_key(&(entry.table.to_string(), entry.column.to_string())),
+                "⭐ ALLOW-LIST STALE for {}: {}.{} ({}) is listed as an allowed \
+                 fresh-vs-upgraded divergence but does NOT diverge. Either the gap was \
+                 closed — in which case DELETE this entry and its register row — or the \
+                 comparison stopped seeing it. Reason on file: {}",
+                v.tag,
+                entry.table,
+                entry.column,
+                entry.register_entry,
+                entry.reason
+            );
+        }
+
+        if v.is_identity_control
+        {
+            assert!(
+                diverged.is_empty(),
+                "⭐ THE IDENTITY CONTROL FAILED. {} ({}) is the working tree's own \
+                 schema batch, so an upgrade from it must be a no-op and produce ZERO \
+                 divergence. {} column(s) diverged, which means the COMPARISON is \
+                 broken, not the migration — every other green assertion (e) in this \
+                 module is therefore meaningless until this is fixed.",
+                v.tag,
+                v.commit,
+                diverged.len()
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // K-1 — the vintage sweep. One test per vintage so a failure names it.
+    // -----------------------------------------------------------------------
+
+    /// ⭐ VACUITY GUARD, and the reason each test below looks its vintage up BY
+    /// TAG: truncating `VINTAGES`, or dropping one entry, turns this red AND
+    /// turns that vintage's own test red.
+    #[test]
+    fn the_vintage_set_is_the_expected_size_and_has_exactly_one_identity_control()
+    {
+        assert!(
+            !VINTAGES.is_empty(),
+            "VACUITY GUARD FAILED: the vintage set is EMPTY, so every test in this \
+             module would pass having tested nothing"
+        );
+        assert_eq!(
+            VINTAGES.len(),
+            EXPECTED_VINTAGE_COUNT,
+            "the vintage set holds {} fixtures, not the expected {}. A schema state was \
+             added or removed without updating EXPECTED_VINTAGE_COUNT and the per-vintage \
+             tests below.",
+            VINTAGES.len(),
+            EXPECTED_VINTAGE_COUNT
+        );
+        assert_eq!(
+            VINTAGES.iter().filter(|v| v.is_identity_control).count(),
+            1,
+            "exactly one vintage must be the identity control (the working tree's own \
+             schema batch); without it a green sweep proves nothing about the comparison"
+        );
+        for tag in ["V1", "V2", "V3", "V4", "V5", "V6", "GENESIS"]
+        {
+            let v = vintage(tag);
+            assert!(
+                !v.ddl.trim().is_empty(),
+                "VACUITY GUARD FAILED: fixture {} ({}) is EMPTY — src/schema_fixtures/{}.sql \
+                 did not survive the extraction",
+                tag,
+                v.commit,
+                v.commit
+            );
+        }
+    }
+
+    /// ⭐ ENGINE TESTS NEVER FETCH — the positive pin for the hole slice K was
+    /// asked to close. `fence_connection_against_extension_fetches`' doc block
+    /// recorded that every fixture fenced its connection only AFTER
+    /// `open_and_migrate_catalogue` had returned, so the version probe, the
+    /// schema batch, the S173 repair and the S179 drops all ran unfenced and the
+    /// "nothing among them can fetch" claim rested on an audit of 411 SQL
+    /// literals. It now rests on this assertion: a connection handed back by the
+    /// production open path is ALREADY fenced, before it is touched.
+    ///
+    /// Deleting `fence_migration_connection(&conn)` from
+    /// `open_and_migrate_catalogue_with_probe` turns this red.
+    #[test]
+    fn a_connection_from_the_production_open_path_is_already_fenced()
+    {
+        let path = fixture_path("fence-inside-migration");
+        let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+
+        let read = |setting: &str| -> String {
+            conn.query_row(
+                &format!("SELECT current_setting('{}')::VARCHAR", setting),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|e| panic!("reading {} failed: {}", setting, e))
+        };
+
+        let directory = read("extension_directory");
+        assert!(
+            !directory.is_empty() && !directory.contains("/.duckdb"),
+            "⭐ extension_directory is {:?} on a connection straight out of \
+             open_and_migrate_catalogue. The schema batch, SELECT version(), the \
+             S173 repair and the S179 index drops therefore run with the REAL user \
+             extension store in scope, and a `cargo test` run can download an \
+             extension into ~/.duckdb/extensions/ — the S181 incident, verbatim.",
+            directory
+        );
+        for setting in ["custom_extension_repository", "autoinstall_extension_repository"]
+        {
+            let repository = read(setting);
+            assert!(
+                !repository.is_empty() && !repository.starts_with("http"),
+                "{} is {:?} on a connection straight out of open_and_migrate_catalogue; \
+                 it must be a dead LOCAL path so an install attempt fails immediately",
+                setting,
+                repository
+            );
+        }
+
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn v1_2026_07_03_the_first_reachable_vintage_upgrades_to_the_current_schema()
+    {
+        assert_vintage_upgrades(vintage("V1"));
+    }
+
+    #[test]
+    fn v2_2026_07_04_upgrades_to_the_current_schema()
+    {
+        assert_vintage_upgrades(vintage("V2"));
+    }
+
+    #[test]
+    fn v3_2026_07_20_upgrades_to_the_current_schema()
+    {
+        assert_vintage_upgrades(vintage("V3"));
+    }
+
+    #[test]
+    fn v4_2026_07_21_upgrades_to_the_current_schema()
+    {
+        assert_vintage_upgrades(vintage("V4"));
+    }
+
+    #[test]
+    fn v5_2026_08_06_upgrades_to_the_current_schema()
+    {
+        assert_vintage_upgrades(vintage("V5"));
+    }
+
+    /// K-2 — THE IDENTITY CONTROL. V6 is the working tree's own schema batch, so
+    /// its upgrade must produce ZERO divergence. This is the assertion that
+    /// proves a green K-1 means something rather than that the comparison is
+    /// broken.
+    #[test]
+    fn v6_the_identity_control_upgrades_to_a_byte_identical_schema()
+    {
+        let v = vintage("V6");
+        assert!(
+            v.is_identity_control,
+            "V6 must be flagged as the identity control"
+        );
+        assert_vintage_upgrades(v);
+    }
+
+    /// ⭐ The archival fixture, and the ONLY one that can fail assertion (a)
+    /// under the S93 mutation: 1 table instead of 19, 29 `images` columns
+    /// instead of 69.
+    #[test]
+    fn genesis_2026_05_04_upgrades_with_exactly_the_four_allowed_divergences()
+    {
+        assert_vintage_upgrades(vintage("GENESIS"));
+    }
+
+    // -----------------------------------------------------------------------
+    // K-3 / K-4 / K-5 — R-43, the S173 failed-repair arm, EXECUTED.
+    // -----------------------------------------------------------------------
+
+    /// A statement the ENGINE rejects. ⭐ The probe SUBSTITUTES the SQL; it does
+    /// not fake the error — so the `Err` the repair sees is produced by
+    /// `conn.execute` on a real statement, not synthesised around it.
+    fn engine_rejected_repair_sql() -> String
+    {
+        "UPDATE images SET directory_path = pl_no_such_function(file_path)".to_string()
+    }
+
+    /// A catalogue in the PRE-S173 state: divergent/NULL `directory_path` rows
+    /// and no marker index.
+    fn catalogue_needing_repair(tag: &str) -> std::path::PathBuf
+    {
+        let path = fixture_path(tag);
+        {
+            let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+            conn.execute(
+                "INSERT INTO images (file_path, file_size, file_name, directory_path, \
+                 created_timestamp, modified_timestamp) \
+                 VALUES ('/photos/broken/a.NEF', 1, 'a.NEF', NULL, 0, 0)",
+                [],
+            )
+            .expect("NULL directory_path row");
+            conn.execute(
+                "INSERT INTO images (file_path, file_size, file_name, directory_path, \
+                 created_timestamp, modified_timestamp) \
+                 VALUES ('/photos/broken/b.NEF', 1, 'b.NEF', '/stale/elsewhere', 0, 0)",
+                [],
+            )
+            .expect("divergent directory_path row");
+            // Back to the pre-S173 state: the marker is what gates the repair.
+            conn.execute_batch("DROP INDEX IF EXISTS idx_images_directory_path;")
+                .expect("drop the S173 marker");
+            conn.execute_batch("CHECKPOINT;").expect("checkpoint");
+        }
+        path
+    }
+
+    /// K-R43-1 — ⭐ THE SLICE'S WHOLE REASON TO EXIST. A repair that FAILS must
+    /// leave the marker ABSENT (so the next launch retries) and must NOT fail
+    /// the open (log-and-continue).
+    ///
+    /// Hoisting `CREATE INDEX idx_images_directory_path` out of the repair's
+    /// `Ok` arm passes every other test in this crate while permanently
+    /// recording a migration that did not happen. This test is the one that
+    /// goes red.
+    #[test]
+    fn a_failed_directory_path_repair_leaves_the_marker_absent_and_the_open_succeeds()
+    {
+        let path = catalogue_needing_repair("r43-forced-failure");
+
+        let probe = MigrationProbe
+        {
+            forced_repair_sql: Some(engine_rejected_repair_sql()),
+        };
+        let conn = open_and_migrate_catalogue_with_probe(&path, Some(&probe))
+            .expect("a FAILED directory_path repair must not fail the catalogue open");
+
+        assert!(
+            !index_present(&conn, "idx_images_directory_path"),
+            "⭐ R-43: the S173 marker is PRESENT after a repair that FAILED. The \
+             catalogue is now permanently recorded as migrated while directory_path \
+             is still divergent, so DIRECTORY_EXACT_PREDICATE answers the wrong set \
+             for every per-directory FFI, forever. The CREATE INDEX must stay inside \
+             the repair's Ok arm."
+        );
+        assert!(
+            divergent_row_count(&conn) > 0,
+            "the forced repair was expected to leave the divergent rows untouched; if \
+             this is 0 the probe did not substitute the statement and the test proves \
+             nothing"
+        );
+
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// K-R43-2 — the NEXT unforced open re-arms and completes.
+    #[test]
+    fn the_next_open_after_a_failed_repair_re_arms_and_completes_it()
+    {
+        let path = catalogue_needing_repair("r43-rearm");
+
+        {
+            let probe = MigrationProbe
+            {
+                forced_repair_sql: Some(engine_rejected_repair_sql()),
+            };
+            let failed = open_and_migrate_catalogue_with_probe(&path, Some(&probe))
+                .expect("open with the forced failure");
+            assert!(!index_present(&failed, "idx_images_directory_path"));
+            drop(failed);
+        }
+
+        let conn = open_and_migrate_catalogue(&path).expect("the retry open");
+        assert!(
+            index_present(&conn, "idx_images_directory_path"),
+            "R-43: the retry after a failed repair did not create the marker, so the \
+             repair is stuck"
+        );
+        assert_eq!(
+            divergent_row_count(&conn),
+            0,
+            "R-43: the retry created the marker without converging directory_path"
+        );
+
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// K-R43-3 — a SUCCEEDED repair creates the marker EXACTLY ONCE, and the
+    /// marker really does gate the repair on every later open.
+    #[test]
+    fn a_succeeded_repair_creates_the_marker_exactly_once_and_then_gates_itself()
+    {
+        let path = catalogue_needing_repair("r43-exactly-once");
+
+        {
+            let first = open_and_migrate_catalogue(&path).expect("first open repairs");
+            assert!(index_present(&first, "idx_images_directory_path"));
+            assert_eq!(divergent_row_count(&first), 0);
+            drop(first);
+        }
+
+        let second = open_and_migrate_catalogue(&path).expect("second open");
+        assert!(index_present(&second, "idx_images_directory_path"));
+        assert_eq!(divergent_row_count(&second), 0);
+        assert_eq!(
+            index_row_count(&second, "idx_images_directory_path"),
+            1,
+            "duckdb_indexes() holds more than one idx_images_directory_path row, so the \
+             marker was created more than once"
+        );
+
+        // ⭐ The "exactly once" half, proved by BEHAVIOUR rather than by counting
+        // log lines: with the marker present the repair must not run again, so a
+        // freshly divergent row SURVIVES the next open.
+        second
+            .execute(
+                "INSERT INTO images (file_path, file_size, file_name, directory_path, \
+                 created_timestamp, modified_timestamp) \
+                 VALUES ('/photos/broken/c.NEF', 1, 'c.NEF', '/stale/again', 0, 0)",
+                [],
+            )
+            .expect("a new divergent row");
+        second.execute_batch("CHECKPOINT;").expect("checkpoint");
+        drop(second);
+
+        let third = open_and_migrate_catalogue(&path).expect("third open");
+        assert!(index_present(&third, "idx_images_directory_path"));
+        assert_eq!(
+            divergent_row_count(&third),
+            1,
+            "the marker is present, so the S173 repair must NOT have run again; a \
+             divergence introduced after the migration was silently rewritten, which \
+             means every launch is paying for the repair"
+        );
+
+        drop(third);
+        cleanup(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // K-6 / K-7 — the Restore ▸ additive-merge arm: R-41's PRODUCTION path.
+    // -----------------------------------------------------------------------
+
+    /// Reproduce, in order, the two steps `merge_catalogue_from_backup` performs
+    /// with a backup of unknown vintage. ⛔ Not `merge_catalogue_from_backup`
+    /// itself: it takes the CATALOGUE global lock and is `pub async`;
+    /// `merge_catalogue_sql` is the seam the four existing `backup_restore_tests`
+    /// already use, and step 1 is the piece those tests do not exercise.
+    fn merge_a_vintage_backup(
+        v: &Vintage,
+        rows: &[SeedRow],
+        live: &Connection,
+    ) -> (std::path::PathBuf, MergeSummary)
+    {
+        let backup_path = build_old_catalogue(v, rows);
+
+        // Step 1 — exactly what production does with a backup of unknown vintage.
+        {
+            let migrated = open_and_migrate_catalogue(&backup_path).unwrap_or_else(|| {
+                panic!(
+                    "Restore ▸ additive merge: a {} ({}) backup could not be migrated, so \
+                     the restore would silently do nothing",
+                    v.tag, v.commit
+                )
+            });
+            drop(migrated);
+        }
+
+        // Step 2 — the SQL half, on the live catalogue.
+        let (summary, _faces, _replaced) = merge_catalogue_sql(
+            live,
+            backup_path.to_string_lossy().as_ref(),
+            MergeCollisionPolicy::CurrentWins,
+        )
+        .unwrap_or_else(|e| panic!("merging an upgraded {} backup failed: {}", v.tag, e));
+
+        (backup_path, summary)
+    }
+
+    /// K-6 — V1, the first reachable vintage, through Restore ▸ additive merge.
+    #[test]
+    fn a_v1_backup_migrates_and_merges_through_the_restore_path()
+    {
+        let (live_path, live) = fresh_catalogue("merge-v1-live");
+        // The collision: live already holds the first seeded path.
+        live.execute(
+            "INSERT INTO images (file_path, file_size, file_name, created_timestamp, \
+             modified_timestamp, rating) VALUES (?1, 99, 'one.NEF', 1, 1, 1)",
+            params![SEED_ROWS[0].file_path],
+        )
+        .expect("live collision row");
+
+        let (backup_path, summary) = merge_a_vintage_backup(vintage("V1"), &SEED_ROWS, &live);
+
+        assert!(
+            summary.succeeded,
+            "the merge from a V1 backup reported failure: {}",
+            summary.message
+        );
+        assert_eq!(
+            summary.images_added, 1,
+            "exactly the one non-colliding backup row should have been added"
+        );
+        assert_eq!(summary.images_kept_current, 1);
+
+        let (size, name, rating): (i64, String, i64) = live
+            .query_row(
+                "SELECT file_size, file_name, rating FROM images WHERE file_path = ?1",
+                params![SEED_ROWS[1].file_path],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .expect("the merged row must be readable in the live catalogue");
+        assert_eq!(
+            (size, name, rating),
+            (
+                SEED_ROWS[1].file_size,
+                SEED_ROWS[1].file_name.to_string(),
+                SEED_ROWS[1].rating
+            ),
+            "the merged row's values did not survive the migrate-then-merge"
+        );
+
+        drop(live);
+        cleanup(&live_path);
+        cleanup(&backup_path);
+    }
+
+    /// K-7 — ⭐ GENESIS through the merge. The migrated backup is a strict
+    /// SUBSET of live (it lacks `rotation` — R-60), so `shared_table_columns`
+    /// legitimately omits a column. The merge must succeed ANYWAY. This is the
+    /// assertion that catches a future change assuming the two schemas are
+    /// equal.
+    #[test]
+    fn a_genesis_backup_merges_even_though_its_images_table_lacks_a_live_column()
+    {
+        let (live_path, live) = fresh_catalogue("merge-genesis-live");
+
+        let (backup_path, summary) =
+            merge_a_vintage_backup(vintage("GENESIS"), &SEED_ROWS, &live);
+
+        assert!(
+            summary.succeeded,
+            "⭐ the additive merge FAILED on a backup whose images table is a strict \
+             SUBSET of live (genesis lacks `rotation`). shared_table_columns exists to \
+             make this work: {}",
+            summary.message
+        );
+        assert_eq!(
+            summary.images_added, 2,
+            "both genesis rows should have been added to an empty live catalogue"
+        );
+
+        for row in SEED_ROWS.iter()
+        {
+            let rating: i64 = live
+                .query_row(
+                    "SELECT rating FROM images WHERE file_path = ?1",
+                    params![row.file_path],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or_else(|e| {
+                    panic!("the merged genesis row {} is missing: {}", row.file_path, e)
+                });
+            assert_eq!(rating, row.rating);
+        }
+
+        drop(live);
+        cleanup(&live_path);
+        cleanup(&backup_path);
+    }
+}
+
+
+// ===========================================================================
 // Slice 7 / cluster H — swallowed failures (2026-09-19)
 // ===========================================================================
 //
@@ -30164,10 +31686,14 @@ mod swallowed_failure_tests
     // KEY`, `file_path TEXT NOT NULL UNIQUE`, `file_size BIGINT NOT NULL` —
     // no NULL is reachable and no type mismatch is expressible. A rigged
     // fixture would prove nothing, so this pins the CARRIER PLUMBING instead:
-    // the page's candidates must equal the legacy twin's output exactly, and
-    // its count must be an honest zero. The count's propagation is pinned for
-    // real by `face_embedding_missing_observation_page_counts_a_row_it_could_not_read`,
-    // whose query DOES read a nullable column non-optionally.
+    // the page must return the catalogue's OWN rows (an independent
+    // expectation — fix round 1, review LOW-1), its count must be an honest
+    // zero, and the legacy twin must still delegate to it exactly. The
+    // count's propagation is pinned for real by
+    // `face_embedding_missing_observation_page_counts_a_row_it_could_not_read`,
+    // whose query DOES read a nullable column non-optionally; the FAILURE
+    // channel is pinned by
+    // `a_culling_work_set_that_could_not_be_built_is_not_an_empty_queue`.
     // ------------------------------------------------------------------
     #[test]
     fn focus_analysis_candidate_page_carries_a_count_and_matches_the_legacy_twin()
@@ -30195,13 +31721,45 @@ mod swallowed_failure_tests
 
         assert_eq!(page.candidates.len(), 3, "every seeded still is a candidate");
         assert_eq!(page.dropped_rows, 0, "a sound fixture drops nothing");
+        assert!(page.query_ok, "a sound work set is a complete answer");
+        assert_eq!(page.query_error, None);
+
+        // ⭐ FIX ROUND 1 (review LOW-1). Round 1 compared the page against
+        // the legacy twin only — and the twin IS `page.candidates`, so any
+        // change to the page moved both sides together and the assertion
+        // pinned nothing but the delegation. The expectation is now
+        // INDEPENDENT: the ids and paths the fixture itself holds, read
+        // through their own query.
+        let expected: Vec<(i64, String)> = {
+            let catalogue = CATALOGUE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let conn = catalogue.as_ref().expect("fixture catalogue");
+            let mut stmt = conn
+                .prepare("SELECT id, file_path FROM images ORDER BY id")
+                .expect("expectation query");
+            let rows = stmt
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+                .expect("expectation rows");
+            collect_rows(rows, "t3_expectation")
+        };
+        assert_eq!(expected.len(), 3, "the fixture holds exactly three rows");
+        assert_eq!(
+            page.candidates
+                .iter()
+                .map(|candidate| (candidate.id, candidate.file_path.clone()))
+                .collect::<Vec<_>>(),
+            expected,
+            "the page must return the catalogue's own rows, in id order"
+        );
+
         assert_eq!(
             page.candidates
                 .iter()
                 .map(|candidate| candidate.id)
                 .collect::<Vec<_>>(),
             legacy.iter().map(|candidate| candidate.id).collect::<Vec<_>>(),
-            "the page and the legacy twin must return the same work set"
+            "…and the legacy twin must still delegate to it exactly"
         );
         assert_eq!(
             page.candidates
@@ -30635,6 +32193,645 @@ mod swallowed_failure_tests
         drop(fixture);
     }
 
+    // ------------------------------------------------------------------
+    // T10 — FIX ROUND 1 / HIGH-1. The still-wired LEGACY twin must never
+    // answer "nothing to do" for a store it could not read.
+    //
+    // `FaceRecognitionIndexBuilder.swift:414` still calls this twin, and its
+    // `guard !observations.isEmpty` reports *"Face recognition index is
+    // already up to date."* — so an empty answer here is a claim of success
+    // on a catalogue whose index cannot be read. Pre-slice (core
+    // `2bc221e:12183-12192`) a store failure returned EVERY observation, the
+    // builder ran, and its LanceDB writes failed loudly. This pins that
+    // direction until H-Swift-B's `storeOk` gate lands.
+    // ------------------------------------------------------------------
+    #[test]
+    fn the_legacy_face_work_set_twin_never_answers_empty_for_an_unreadable_store()
+    {
+        let _guard = GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (fixture, conn) = fresh_catalogue("t10");
+        let image_id = insert_image(&conn, "/p/faces.jpg");
+        insert_face_observation(&conn, image_id, 0, "v6", false);
+        insert_face_observation(&conn, image_id, 1, "v6", false);
+        // A regular FILE at the store path cannot be opened as a store.
+        // Nothing is deleted; this is the drive script's own recipe.
+        std::fs::write(fixture.vectors(), b"not a vector store").expect("write bad store");
+        install_global_catalogue(&fixture, conn);
+
+        let legacy = futures::executor::block_on(face_embedding_missing_observations(
+            "v6".to_string(),
+            "model-1".to_string(),
+            "prep-1".to_string(),
+            0,
+        ));
+        assert_eq!(
+            legacy.len(),
+            2,
+            "⛔ an unreadable store must NOT read as an up-to-date index through \
+             the legacy twin — it returned {} observation(s)",
+            legacy.len()
+        );
+
+        // …and the NEW page keeps the ruled empty-list contract untouched.
+        let page = futures::executor::block_on(face_embedding_missing_observation_page(
+            "v6".to_string(),
+            "model-1".to_string(),
+            "prep-1".to_string(),
+            0,
+        ));
+        assert!(!page.store_ok);
+        assert!(
+            page.observations.is_empty(),
+            "the page must still answer EMPTY — never 'everything is missing'"
+        );
+
+        clear_global_catalogue();
+        drop(fixture);
+    }
+
+    // ------------------------------------------------------------------
+    // T11 — FIX ROUND 1 / MEDIUM-1. A CATALOGUE failure must be
+    // distinguishable from an empty queue on the wire.
+    //
+    // Round 1 answered `store_ok: true, dropped_rows: 0, observations: []`
+    // here — "the store is fine and there is no work" — which is exactly the
+    // "already up to date" lie re-created inside the slice's own new carrier.
+    // The ruled Swift rule keys on `storeOk == false || droppedRows > 0`.
+    // ------------------------------------------------------------------
+    #[test]
+    fn a_catalogue_failure_building_the_face_work_set_is_not_an_empty_queue()
+    {
+        let _guard = GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (fixture, conn) = fresh_catalogue("t11");
+        let image_id = insert_image(&conn, "/p/faces.jpg");
+        insert_face_observation(&conn, image_id, 0, "v6", false);
+        // The shape slice K exists to fixture: a catalogue the query cannot
+        // bind against (a pre-S97 catalogue, a restore from an older backup,
+        // any schema drift).
+        conn.execute_batch("DROP TABLE face_observation CASCADE")
+            .expect("drop face_observation");
+        install_global_catalogue(&fixture, conn);
+
+        let page = futures::executor::block_on(face_embedding_missing_observation_page(
+            "v6".to_string(),
+            "model-1".to_string(),
+            "prep-1".to_string(),
+            0,
+        ));
+
+        assert!(
+            !page.store_ok,
+            "⛔ a work set that could not be BUILT must not report store_ok"
+        );
+        let reason = page.store_error.clone().unwrap_or_default();
+        assert!(
+            reason.contains("face_observation"),
+            "the carrier must name the reason, got {:?}",
+            page.store_error
+        );
+        assert!(page.observations.is_empty());
+
+        // The legacy twin's re-query fails the same way and yields the empty
+        // list — which is exactly what the pre-slice code did on a catalogue
+        // failure, so nothing regressed there either.
+        let legacy = futures::executor::block_on(face_embedding_missing_observations(
+            "v6".to_string(),
+            "model-1".to_string(),
+            "prep-1".to_string(),
+            0,
+        ));
+        assert!(legacy.is_empty());
+
+        clear_global_catalogue();
+        drop(fixture);
+    }
+
+    // ------------------------------------------------------------------
+    // T12 — FIX ROUND 1 / MEDIUM-2. `FocusAnalysisCandidatePage` had NO
+    // failure channel, so a culling work set that could not be BUILT was
+    // indistinguishable from an empty queue — the same lie on the culling
+    // half. `query_ok` separates UNKNOWN from EMPTY.
+    //
+    // ⚠️ An EMPTY explicit selection is a legitimate empty queue and must
+    // stay `query_ok == true`; only failures clear the flag.
+    // ------------------------------------------------------------------
+    #[test]
+    fn a_culling_work_set_that_could_not_be_built_is_not_an_empty_queue()
+    {
+        let _guard = GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // (a) a healthy catalogue answers query_ok = true.
+        let (fixture, conn) = fresh_catalogue("t12");
+        insert_image(&conn, "/p/a.jpg");
+        install_global_catalogue(&fixture, conn);
+
+        let healthy = futures::executor::block_on(focus_analysis_candidate_page(
+            500,
+            "v7".to_string(),
+            "run-1".to_string(),
+        ));
+        assert!(healthy.query_ok, "a sound work set is complete");
+        assert_eq!(healthy.query_error, None);
+        assert_eq!(healthy.candidates.len(), 1);
+
+        // (b) an EMPTY explicit selection is an empty QUEUE, not a failure.
+        let empty_selection = futures::executor::block_on(focus_analysis_candidate_page_for_ids(
+            Vec::new(),
+            500,
+            "v7".to_string(),
+            "run-1".to_string(),
+        ));
+        assert!(
+            empty_selection.query_ok,
+            "an empty selection means an empty queue, which is a complete answer"
+        );
+        assert!(empty_selection.candidates.is_empty());
+
+        // (c) a PREPARE failure — the query cannot bind against this
+        // catalogue at all.
+        let bare = Connection::open_in_memory().expect("bare connection");
+        fence_connection_against_extension_fetches(&bare);
+        let unbindable = focus_analysis_candidates_impl(&bare, 500, "v7", "run-1", None);
+        assert!(
+            !unbindable.query_ok,
+            "⛔ a work set that could not be BUILT must not read as an empty queue"
+        );
+        assert!(
+            unbindable
+                .query_error
+                .as_deref()
+                .map(|message| message.contains("prepare"))
+                .unwrap_or(false),
+            "the carrier must name the reason, got {:?}",
+            unbindable.query_error
+        );
+        assert!(unbindable.candidates.is_empty());
+
+        // (d) the catalogue-not-initialised arms of BOTH entry points.
+        clear_global_catalogue();
+        let uninitialised = futures::executor::block_on(focus_analysis_candidate_page(
+            500,
+            "v7".to_string(),
+            "run-1".to_string(),
+        ));
+        assert!(!uninitialised.query_ok);
+        assert!(uninitialised.query_error.is_some());
+
+        let uninitialised_scoped =
+            futures::executor::block_on(focus_analysis_candidate_page_for_ids(
+                vec![1],
+                500,
+                "v7".to_string(),
+                "run-1".to_string(),
+            ));
+        assert!(!uninitialised_scoped.query_ok);
+        assert!(uninitialised_scoped.query_error.is_some());
+
+        drop(fixture);
+    }
+
+    // ------------------------------------------------------------------
+    // T13 — FIX ROUND 1. The 44th product row-drop site, in a shape the
+    // round-1 `filter_map`-only enumeration could not see:
+    // `for row_result in rows { if let Ok(id) = row_result { … } }` in
+    // `expand_collapse_group_ids`. It now goes through the collector like
+    // every other site.
+    //
+    // ⚠️ HONEST DISPOSITION, the same one T3 records: a per-row drop cannot
+    // be provoked through this query on today's schema — it reads exactly
+    // `images.id`, which is `INTEGER PRIMARY KEY`, so no NULL is reachable
+    // and no type mismatch is expressible. This test is therefore the
+    // BEHAVIOURAL control (the substitution returns the same ids and drops
+    // nothing); the SHAPE is pinned by T9's Lock A (the function must call
+    // the collector) and Lock D (no `for row { if let Ok(..) }` may return),
+    // both mutation-proved.
+    // ------------------------------------------------------------------
+    #[test]
+    fn the_collapse_group_expansion_goes_through_the_collector()
+    {
+        let _guard = GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (fixture, conn) = fresh_catalogue("t13");
+        let id = insert_image(&conn, "/p/a.jpg");
+        install_global_catalogue(&fixture, conn);
+
+        let before = census_count(
+            &futures::executor::block_on(dropped_row_report()),
+            "expand_collapse_group_ids",
+        );
+        let expanded = futures::executor::block_on(expand_collapse_group_ids(vec![id]));
+        assert!(
+            expanded.contains(&id),
+            "the sound row still comes back: {:?}",
+            expanded
+        );
+        let after = census_count(
+            &futures::executor::block_on(dropped_row_report()),
+            "expand_collapse_group_ids",
+        );
+        assert_eq!(after, before, "a sound fixture drops nothing");
+
+        clear_global_catalogue();
+        drop(fixture);
+    }
+
+    // ------------------------------------------------------------------
+    // T14 — FIX ROUND 2 / MEDIUM-R2-1. A twin census that could not be
+    // PERFORMED must fail CLOSED.
+    //
+    // `FaceRecognitionIndexBuilder.swift:405-412` sets the one-shot
+    // `canonicalFaceEmbeddingCleanupDone` flag whenever
+    // `vector_delete_failed` is false. Round 1's silent `if let Ok` arms left
+    // the doomed list empty on a transient prepare/query failure, Phase 2
+    // deleted nothing, the flag latched PERMANENTLY, and the ~17k twin
+    // vectors were never deleted — with no record anywhere.
+    // ------------------------------------------------------------------
+    #[test]
+    fn a_twin_census_that_could_not_run_reports_a_failure_and_deletes_nothing()
+    {
+        let _guard = GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // (a) the catalogue cannot answer the census at all.
+        let (fixture, conn) = fresh_catalogue("t14a");
+        let image_id = insert_image(&conn, "/p/faces.jpg");
+        insert_face_observation(&conn, image_id, 0, "v6", false);
+        conn.execute_batch("DROP TABLE face_observation CASCADE")
+            .expect("drop face_observation");
+        install_global_catalogue(&fixture, conn);
+
+        let before = census_count(
+            &futures::executor::block_on(dropped_row_report()),
+            "canonicalize_face_embeddings.doomed_ids",
+        );
+        let blind = futures::executor::block_on(canonicalize_face_embeddings());
+        assert!(
+            blind.vector_delete_failed,
+            "⛔ an UN-PERFORMED census must not read as 'nothing to delete' — \
+             the Swift one-shot flag would latch and the twin vectors would \
+             never be deleted"
+        );
+        assert_eq!(blind.vectors_deleted, 0);
+        let after = census_count(
+            &futures::executor::block_on(dropped_row_report()),
+            "canonicalize_face_embeddings.doomed_ids",
+        );
+        // ⚠️ HONEST DISPOSITION: dropping `face_observation` also fails the
+        // assignment re-key that runs FIRST, so this fixture exercises the
+        // `ok == false` arm and the census helper is never reached — the
+        // count is unchanged, and that is correct. Reaching the helper's own
+        // prepare/query arms needs a fixture where the re-key succeeds and
+        // the twin SELECT fails, which is not expressible against one table.
+        // The census write itself is therefore pinned only by the mutation
+        // ledger, not by a fixture.
+        assert!(after >= before, "the census never goes backwards");
+
+        clear_global_catalogue();
+        drop(fixture);
+
+        // (b) control: a healthy catalogue with no twins succeeds, so the
+        // Swift flag may latch exactly as it always did.
+        let (fixture, conn) = fresh_catalogue("t14b");
+        let image_id = insert_image(&conn, "/p/clean.jpg");
+        insert_face_observation(&conn, image_id, 0, "v6", false);
+        install_global_catalogue(&fixture, conn);
+
+        let healthy = futures::executor::block_on(canonicalize_face_embeddings());
+        assert!(
+            !healthy.vector_delete_failed,
+            "a sound census with nothing to delete is a SUCCESS"
+        );
+        assert_eq!(healthy.vectors_deleted, 0);
+
+        clear_global_catalogue();
+        drop(fixture);
+    }
+
+    // ------------------------------------------------------------------
+    // T15 — FIX ROUND 2 COMPLETION (§G2.5 item 4; the register's N8).
+    //
+    // T14 pins the fail-closed CONTRACT through the public entry point, but
+    // its fixture drops `face_observation`, which fails the assignment
+    // re-key that runs FIRST — so `canonicalize_face_embeddings` takes the
+    // `ok == false` arm and the census helper's OWN arms are never reached.
+    // The `record_dropped_rows` write that makes the failure durable (Q-17:
+    // stdout is not a record) was therefore pinned by NOTHING.
+    //
+    // ⭐ The helper's prepare arm IS reachable — directly, with a connection
+    // whose table is gone. The two things a fixture cannot reach (the
+    // `query_map` arm, and the caller's consumption of `census_ok`) are
+    // pinned by SOURCE LOCKS over comment- and literal-stripped,
+    // whitespace-normalised bytes, the T9 discipline.
+    //
+    // ⚠️ Calling a helper directly is decoration unless the production call
+    // site is pinned too — hence (d), and T14 for the contract.
+    // ------------------------------------------------------------------
+    #[test]
+    fn the_twin_census_records_a_failure_it_could_not_perform()
+    {
+        const SITE: &str = "canonicalize_face_embeddings.doomed_ids";
+        // ⭐ FIX ROUND 3 (LOW-R3-3): a whole-query failure censuses HERE, under
+        // a name whose number counts failed QUERIES — the rows it lost are an
+        // unknown count and are no longer reported as "1 dropped row".
+        const QUERY_FAILED_SITE: &str = "canonicalize_face_embeddings.doomed_ids.query_failed";
+
+        // The census is process-wide, and T14 reaches the same public entry
+        // point; take the same lock so the per-site DELTA below is exact.
+        let _guard = GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // (a) the PREPARE arm, reached for real: DuckDB binds and plans at
+        // prepare time, so a missing table surfaces there.
+        let (fixture, conn) = fresh_catalogue("t15a");
+        let image_id = insert_image(&conn, "/p/twin-census.jpg");
+        insert_face_observation(&conn, image_id, 0, "v6", false);
+        conn.execute_batch("DROP TABLE face_observation CASCADE")
+            .expect("drop face_observation");
+
+        let before = census_count(
+            &futures::executor::block_on(dropped_row_report()),
+            QUERY_FAILED_SITE,
+        );
+        let (ids, census_ok) = face_embedding_twin_observation_ids(&conn, None);
+        assert!(
+            ids.is_empty(),
+            "a census that could not run has no doomed ids to report"
+        );
+        assert!(
+            !census_ok,
+            "⛔ an UN-PERFORMED census must report FALSE — reporting true \
+             lets the caller retire a migration that never ran"
+        );
+        let after = census_count(
+            &futures::executor::block_on(dropped_row_report()),
+            QUERY_FAILED_SITE,
+        );
+        assert_eq!(
+            after,
+            before + 1,
+            "the failure must reach the CENSUS, not merely stderr — under \
+             Q-17 stdout is not a record, and this failure has a PERMANENT \
+             consequence (the Swift one-shot flag)"
+        );
+        drop(fixture);
+
+        // (b) control: a real twin row is found, the census records nothing.
+        let (fixture, conn) = fresh_catalogue("t15b");
+        insert_twin_observation(&conn, "/p/canonical.jpg", "/p/twin.jpg");
+
+        let report = futures::executor::block_on(dropped_row_report());
+        let before = (
+            census_count(&report, SITE),
+            census_count(&report, QUERY_FAILED_SITE),
+        );
+        let (ids, census_ok) = face_embedding_twin_observation_ids(&conn, None);
+        assert!(census_ok, "a census that RAN reports true");
+        assert_eq!(ids.len(), 1, "the one twin row is the doomed set");
+        let report = futures::executor::block_on(dropped_row_report());
+        let after = (
+            census_count(&report, SITE),
+            census_count(&report, QUERY_FAILED_SITE),
+        );
+        assert_eq!(after, before, "a census that ran counts nothing, at either site");
+        drop(fixture);
+
+        // Needles assembled at run time; the scan reads STRIPPED bytes, in
+        // which every string-literal body is blanked, so neither lock can be
+        // satisfied by its own text, a comment, or any literal.
+        let source = include_str!("lib.rs");
+        let stripped = blank_comments_and_string_bodies(source);
+        let declarations = function_declarations(source);
+        let body_of = |name: &str| -> Vec<u8> {
+            let needle = ["fn ", name, "("].concat();
+            let at = find_bytes(&stripped, needle.as_bytes(), 0).unwrap_or_else(|| {
+                panic!("the source lock cannot find `{}` — it is not reading the crate", name)
+            });
+            // `enclosing_function` answers for a position INSIDE the body,
+            // so step past the signature to the opening brace.
+            let mut open = at + needle.len();
+            while open < stripped.len() && stripped[open] != b'{'
+            {
+                open += 1;
+            }
+            let (found, body_start, body_end) =
+                enclosing_function(&stripped, &declarations, open + 1)
+                    .unwrap_or_else(|| panic!("could not locate the body of `{}`", name));
+            assert_eq!(found, name, "the lock matched the wrong function");
+            let (body, _) = normalise(&stripped, body_start, body_end);
+            assert!(!body.is_empty(), "an empty extraction must never pass silently");
+            body
+        };
+        let occurrences = |body: &[u8], needle: &[u8]| -> usize {
+            let mut count = 0usize;
+            let mut cursor = 0usize;
+            while let Some(found) = find_bytes(body, needle, cursor)
+            {
+                count += 1;
+                cursor = found + 1;
+            }
+            count
+        };
+
+        // (c) the QUERY arm: not reachable from any fixture on today's
+        // schema (this SELECT carries no runtime-failing expression, and a
+        // catalogue fault surfaces at prepare — arm (a)). BOTH arms must
+        // write the census, so deleting either one is red.
+        let census_body = body_of("face_embedding_twin_observation_ids");
+        let census_write = ["record_", "dropped_rows(QUERY_FAILED_SITE,1);"].concat();
+        assert_eq!(
+            occurrences(&census_body, census_write.as_bytes()),
+            2,
+            "BOTH failure arms of the twin census must record into the \
+             dropped-row census — a silent `if let Ok` is exactly the defect \
+             MEDIUM-R2-1 closed"
+        );
+        let fails_closed = ["return(Vec::new(),", "false);"].concat();
+        assert_eq!(
+            occurrences(&census_body, fails_closed.as_bytes()),
+            2,
+            "BOTH failure arms must report census_ok = FALSE"
+        );
+
+        // ⭐ FIX ROUND 3 (MEDIUM-R3-1), belt-and-braces beside T16's executed
+        // fixture: the THIRD path — a per-row `Err` — must fail closed too.
+        // `collect_rows` drops and censuses a bad row and returns the SHORT
+        // list, so the tail may not report an unconditional success.
+        let counted = ["collect_rows_", "counted(rows,SITE);"].concat();
+        assert!(
+            find_bytes(&census_body, counted.as_bytes(), 0).is_some(),
+            "the twin census must COUNT its per-row drops"
+        );
+        assert!(
+            find_bytes(&census_body, ["dropped", "==0)"].concat().as_bytes(), 0).is_some(),
+            "⛔ a census that lost rows did not complete — three failure \
+             paths, ONE rule"
+        );
+        let uncounted = ["collect_rows", "(rows,SITE)"].concat();
+        assert!(
+            find_bytes(&census_body, uncounted.as_bytes(), 0).is_none(),
+            "the uncounted collector cannot answer whether the census \
+             completed, so it must not be what this helper reports on"
+        );
+
+        // (d) the CALL SITE: the caller must consume the helper's answer and
+        // fail closed on it — otherwise the helper could go on answering
+        // correctly into a caller that ignores it. ⭐ FIX ROUND 3: T16 (b)
+        // now EXECUTES this branch for the per-ROW path; the lock stays for
+        // the prepare/query arms, which no fixture can reach (they need a
+        // catalogue where the re-key SUCCEEDS and the twin SELECT fails,
+        // which is not expressible against one table).
+        //
+        // The FFI entry is a pure delegator, so this also pins that
+        // production passes NO probe — belt and braces over the probe type
+        // being uninhabited outside `cfg(test)`.
+        let entry_body = body_of("canonicalize_face_embeddings");
+        let delegation = ["canonicalize_face_embeddings_", "probed(None)"].concat();
+        assert!(
+            find_bytes(&entry_body, delegation.as_bytes(), 0).is_some(),
+            "the FFI entry must delegate with NO probe"
+        );
+        let caller_body = body_of("canonicalize_face_embeddings_probed");
+        let binding = ["(doomed,", "census_ok)="].concat();
+        assert!(
+            find_bytes(&caller_body, binding.as_bytes(), 0).is_some(),
+            "the caller must bind the census's own success flag"
+        );
+        // ⚠️ FIX ROUND 3 (review LOW-R3-2). Both operand ORDERS are accepted,
+        // so an ordinary reordering is not a false alarm. What remains
+        // deliberately order- and shape-sensitive is a bigger refactor (an
+        // extracted `should_fail_closed()`, say): that goes RED. ⭐ That is
+        // the SAFE direction — a false POSITIVE, loud, on a clause whose
+        // silent loss re-opens MEDIUM-R2-1 in full — so a reader who meets
+        // this red should re-point the lock, not assume a regression.
+        let fail_closed_orders = [
+            ["if!db_ok", "||!census_ok"].concat(),
+            ["if!census_ok", "||!db_ok"].concat(),
+        ];
+        assert!(
+            fail_closed_orders
+                .iter()
+                .any(|needle| find_bytes(&caller_body, needle.as_bytes(), 0).is_some()),
+            "⛔ the caller must fail CLOSED on an un-performed census — \
+             dropping `|| !census_ok` re-opens MEDIUM-R2-1 in full, and no \
+             fixture can catch it"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // T16 — FIX ROUND 3 / MEDIUM-R3-1. The twin census's THIRD failure path:
+    // a PER-ROW `Err`.
+    //
+    // `collect_rows` censuses the bad row and returns the SHORT list, and the
+    // helper used to report `census_ok = true` anyway — so on the one shape
+    // R-31 is actually about, `!db_ok || !census_ok` never fired, Phase 2
+    // deleted a subset or nothing, `vector_delete_failed` came back FALSE, and
+    // `FaceRecognitionIndexBuilder.swift:407-409` latched
+    // `canonicalFaceEmbeddingCleanupDone` permanently with twin vectors still
+    // in the store. MEDIUM-R2-1's exact consequence, one path further in.
+    //
+    // ⚠️ Reachability, stated honestly: the trigger is NOT expressible through
+    // this `SELECT` on today's schema (`face_observation.id` is `INTEGER
+    // PRIMARY KEY` — no NULL, no type mismatch), the same disposition as the
+    // `query_map` arm. It is reached through the `TwinCensusRowProbe` seam
+    // (S179 `FocusApplyProbe` style) BECAUSE the consequence is permanent.
+    // ------------------------------------------------------------------
+    #[test]
+    fn a_per_row_failure_in_the_twin_census_fails_closed()
+    {
+        const SITE: &str = "canonicalize_face_embeddings.doomed_ids";
+
+        let _guard = GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let probe = TwinCensusRowProbe::failing_every_row();
+
+        // (a) the helper, with a real twin row it cannot READ.
+        let (fixture, conn) = fresh_catalogue("t16a");
+        insert_twin_observation(&conn, "/p/t16a-canonical.jpg", "/p/t16a-twin.jpg");
+
+        let before = census_count(&futures::executor::block_on(dropped_row_report()), SITE);
+        let (ids, census_ok) = face_embedding_twin_observation_ids(&conn, Some(&probe));
+        assert!(
+            ids.is_empty(),
+            "a row that could not be read is not in the doomed set — which is \
+             exactly why the caller must not act on the list"
+        );
+        assert!(
+            !census_ok,
+            "⛔ a census that LOST rows did not complete — reporting success \
+             here deletes a subset and retires the migration forever"
+        );
+        let after = census_count(&futures::executor::block_on(dropped_row_report()), SITE);
+        assert_eq!(after, before + 1, "the dropped row is censused, per row");
+        drop(fixture);
+
+        // (b) END TO END: the caller fails closed, so the Swift one-shot flag
+        // cannot latch. A source lock cannot prove this fires; this does.
+        let (fixture, conn) = fresh_catalogue("t16b");
+        insert_twin_observation(&conn, "/p/t16b-canonical.jpg", "/p/t16b-twin.jpg");
+        install_global_catalogue(&fixture, conn);
+
+        let blind = futures::executor::block_on(canonicalize_face_embeddings_probed(Some(&probe)));
+        assert!(
+            blind.vector_delete_failed,
+            "⛔ the ONLY channel that stops `canonicalFaceEmbeddingCleanupDone` \
+             from latching is vector_delete_failed — nothing in Swift reads the \
+             census"
+        );
+        assert_eq!(
+            blind.vectors_deleted, 0,
+            "nothing may be deleted on the strength of a census that lost rows"
+        );
+        clear_global_catalogue();
+        drop(fixture);
+
+        // (c) CONTROL, on the same fixture shape with the probe removed: the
+        // census reads its row, the run reports success. ⭐ The only
+        // difference between (b) and (c) is the per-row failure, so (b) is
+        // not vacuous. (Proving a vector is really DELETED needs a real
+        // `vectors.lancedb`; the reviewer's round-3 probe did that — here the
+        // store is absent, which `delete_face_vectors_by_observation_ids`
+        // treats as a successful no-op.)
+        let (fixture, conn) = fresh_catalogue("t16c");
+        insert_twin_observation(&conn, "/p/t16c-canonical.jpg", "/p/t16c-twin.jpg");
+        install_global_catalogue(&fixture, conn);
+
+        let healthy = futures::executor::block_on(canonicalize_face_embeddings());
+        assert!(
+            !healthy.vector_delete_failed,
+            "a census that read every row is a SUCCESS — the flag may latch"
+        );
+        clear_global_catalogue();
+        drop(fixture);
+    }
+
+    /// One face observation whose `image_id` differs from its
+    /// `analyzed_image_id` — the twin shape item 7c's census looks for.
+    fn insert_twin_observation(conn: &Connection, canonical_path: &str, twin_path: &str)
+    {
+        let canonical = insert_image(conn, canonical_path);
+        let twin = insert_image(conn, twin_path);
+        conn.execute(
+            "INSERT INTO face_observation (
+                 image_id, analyzed_image_id, face_index, algorithm_version,
+                 analysis_run_id, bounding_box_x, bounding_box_y,
+                 bounding_box_width, bounding_box_height, created_at
+             ) VALUES (?1, ?2, 0, 'v6', 'run-1', 0.1, 0.1, 0.2, 0.2, CURRENT_TIMESTAMP)",
+            params![twin, canonical],
+        )
+        .expect("insert twin face observation");
+    }
+
     /// Blank every comment and string-literal BODY, preserving byte length so
     /// offsets stay aligned with the original. This is what makes the site
     /// lock below unsatisfiable by a `//` comment, a `/* … */` span, or a
@@ -30763,145 +32960,1111 @@ mod swallowed_failure_tests
                 continue;
             }
 
+            // Character / byte-character literal: `'x'`, `b'"'`, `'\''`.
+            //
+            // ⭐ FIX ROUND 1 (review LOW-4). Round 1 had no arm here. It was
+            // harmless only because every quote-bearing char literal in the
+            // crate sat inside a `#[cfg(test)]` module — a single `b'"'`
+            // added to product code would have opened a PHANTOM string span
+            // and blanked real product bytes until the next `"`, hiding
+            // whatever lay between from every lock below.
+            if bytes[index] == b'\''
+            {
+                if let Some(end) = char_literal_end(bytes, index)
+                {
+                    let mut position = index + 1;
+                    while position < end
+                    {
+                        if bytes[position] != b'\n'
+                        {
+                            out[position] = b' ';
+                        }
+                        position += 1;
+                    }
+                    index = end + 1;
+                    continue;
+                }
+            }
+
             index += 1;
         }
 
         out
     }
 
-    // ------------------------------------------------------------------
-    // T9 — SITE COVERAGE. Every product row-drop goes through the collector.
-    //
-    // A partial pass re-creates the class, so this scans the crate's own
-    // source over comment- and string-stripped bytes: outside `#[cfg(test)]`
-    // modules, no `filter_map(...)` argument may discard a `Result`. The
-    // argument span is found by REAL paren matching, so a multi-line closure
-    // cannot slip past. The needles are assembled at run time and the scan
-    // skips test modules, so this test's own source cannot satisfy it; the
-    // legitimate `filter_map`s in product code (SQL-fragment builders and one
-    // id→state lookup) discard no Result and so are invisible to it.
-    // ------------------------------------------------------------------
-    #[test]
-    fn every_product_row_drop_goes_through_the_collector()
+    /// The index of the closing quote of a character literal that starts at
+    /// `start`, or `None` when that quote opens a lifetime (`'a`) or a loop
+    /// label (`'raw:`) instead. Bounded on the escape path, so a stray quote
+    /// can never run away over the rest of the file.
+    fn char_literal_end(bytes: &[u8], start: usize) -> Option<usize>
     {
-        let source = include_str!("lib.rs");
-        let stripped = blank_comments_and_string_bodies(source);
-        assert_eq!(stripped.len(), source.len(), "the stripper must not resize");
+        if start + 2 >= bytes.len()
+        {
+            return None;
+        }
+        if bytes[start + 1] == b'\\'
+        {
+            // `'\n'` · `'\''` · `'\u{1F}'` — the escaped character sits at
+            // start + 2, so the closing quote can only be at start + 3 or
+            // later, and never further than `'\u{10FFFF}'`.
+            let mut index = start + 3;
+            while index < bytes.len() && index <= start + 11
+            {
+                if bytes[index] == b'\''
+                {
+                    return Some(index);
+                }
+                index += 1;
+            }
+            return None;
+        }
+        if bytes[start + 2] == b'\''
+        {
+            return Some(start + 2);
+        }
+        None
+    }
 
-        // Byte offset of the first character of each line, and the product
-        // region as a set of [start, end) byte ranges.
-        let mut product_ranges: Vec<(usize, usize)> = Vec::new();
-        let mut in_test_module = false;
-        let mut pending_cfg_test = false;
-        let mut offset = 0usize;
+    /// The `[start, end)` byte ranges of `source` that are PRODUCT code:
+    /// everything outside every `#[cfg(test)]` item.
+    ///
+    /// ⭐ FIX ROUND 1 (review LOW-3). Round 1 excised only a `#[cfg(test)]`
+    /// **module**, leaving the `#[cfg(test)]` const / fn / struct / impl /
+    /// type items inside the scanned region. Over-inclusive is the safe
+    /// direction, but a future test helper written there with a legitimate
+    /// `filter_map(|r| r.ok())` would have failed T9 spuriously. Every
+    /// `#[cfg(test)]` item is now excised, module or not.
+    fn product_ranges(source: &str) -> Vec<(usize, usize)>
+    {
+        let stripped = blank_comments_and_string_bodies(source);
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
         let mut region_start = 0usize;
+        let mut offset = 0usize;
+        let mut pending_attribute: Option<usize> = None;
 
         for line in source.split('\n')
         {
             let line_start = offset;
             offset += line.len() + 1;
 
-            if in_test_module
+            if line_start < region_start
             {
-                if line == "}"
+                // Inside an item that has already been excised.
+                continue;
+            }
+
+            if let Some(attribute_start) = pending_attribute
+            {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with("#[") || trimmed.starts_with("//")
                 {
-                    in_test_module = false;
-                    region_start = offset;
+                    continue;
                 }
+                pending_attribute = None;
+                ranges.push((region_start, attribute_start));
+                region_start = end_of_item(&stripped, line_start);
                 continue;
             }
 
             if line.trim() == "#[cfg(test)]"
             {
-                pending_cfg_test = true;
+                pending_attribute = Some(line_start);
+            }
+        }
+
+        ranges.push((region_start, source.len()));
+        ranges.retain(|(start, end)| start < end);
+        ranges
+    }
+
+    /// One byte past the end of the item that starts at `from`: the `}` that
+    /// closes its body, or the first `;` at bracket depth zero when it has no
+    /// body. The depth test is what `const FOO: [&str; 18] = [ … ];` needs —
+    /// the `;` inside `[&str; 18]` is not the end of the item.
+    fn end_of_item(stripped: &[u8], from: usize) -> usize
+    {
+        let mut depth = 0i32;
+        let mut saw_body = false;
+        let mut index = from;
+        while index < stripped.len()
+        {
+            match stripped[index]
+            {
+                b'{' =>
+                {
+                    depth += 1;
+                    saw_body = true;
+                }
+                b'[' | b'(' => depth += 1,
+                b'}' | b']' | b')' =>
+                {
+                    depth -= 1;
+                    if depth == 0 && saw_body
+                    {
+                        return index + 1;
+                    }
+                }
+                b';' if depth == 0 => return index + 1,
+                _ => {}
+            }
+            index += 1;
+        }
+        stripped.len()
+    }
+
+    /// A whitespace-normalised copy of `stripped[start..end]`, plus a map from
+    /// each normalised byte back to its offset in the original source.
+    ///
+    /// ⭐ Matching on this is what makes `filter_map (`, `. ok ( )` and
+    /// `Err ( _ ) => None` indistinguishable from their tight forms — the
+    /// reviewer's P7 defeated round 1 with ONE space.
+    fn normalise(stripped: &[u8], start: usize, end: usize) -> (Vec<u8>, Vec<usize>)
+    {
+        let mut text = Vec::with_capacity(end - start);
+        let mut map = Vec::with_capacity(end - start);
+        for index in start..end
+        {
+            let byte = stripped[index];
+            if byte == b' ' || byte == b'\t' || byte == b'\n' || byte == b'\r'
+            {
                 continue;
             }
+            text.push(byte);
+            map.push(index);
+        }
+        (text, map)
+    }
 
-            if pending_cfg_test
+    /// Every line that declares a `fn`, as `(line start, name)`.
+    fn function_declarations(source: &str) -> Vec<(usize, String)>
+    {
+        let mut declarations = Vec::new();
+        let mut offset = 0usize;
+        for line in source.split('\n')
+        {
+            let line_start = offset;
+            offset += line.len() + 1;
+
+            let mut rest = line.trim_start();
+            loop
             {
-                pending_cfg_test = false;
-                if (line.starts_with("mod ") || line.starts_with("pub mod "))
-                    && !line.trim_end().ends_with(';')
+                let stripped_prefix = rest
+                    .strip_prefix("pub(crate) ")
+                    .or_else(|| rest.strip_prefix("pub(super) "))
+                    .or_else(|| rest.strip_prefix("pub "))
+                    .or_else(|| rest.strip_prefix("async "))
+                    .or_else(|| rest.strip_prefix("unsafe "))
+                    .or_else(|| rest.strip_prefix("extern "));
+                match stripped_prefix
                 {
-                    // `mod x {` (or Allman's brace on the next line) opens a
-                    // span that ends at the next column-0 `}`.
-                    product_ranges.push((region_start, line_start));
-                    in_test_module = true;
+                    Some(value) => rest = value,
+                    None => break,
+                }
+            }
+
+            if let Some(after) = rest.strip_prefix("fn ")
+            {
+                let name: String = after
+                    .chars()
+                    .take_while(|character| character.is_alphanumeric() || *character == '_')
+                    .collect();
+                if !name.is_empty()
+                {
+                    declarations.push((line_start, name));
                 }
             }
         }
-        if !in_test_module
+        declarations
+    }
+
+    /// The name and `[start, end)` body span of the function that encloses
+    /// `position`, found from the source's line structure and brace-matched on
+    /// the stripped bytes.
+    fn enclosing_function(
+        stripped: &[u8],
+        declarations: &[(usize, String)],
+        position: usize,
+    ) -> Option<(String, usize, usize)>
+    {
+        let mut candidate: Option<&(usize, String)> = None;
+        for declaration in declarations
         {
-            product_ranges.push((region_start, source.len()));
+            if declaration.0 <= position
+            {
+                candidate = Some(declaration);
+            }
+            else
+            {
+                break;
+            }
+        }
+        let (declaration_start, name) = candidate?;
+
+        let mut open = *declaration_start;
+        while open < stripped.len() && stripped[open] != b'{'
+        {
+            open += 1;
+        }
+        if open >= stripped.len()
+        {
+            return None;
         }
 
-        let map_needle = ["filter", "_map("].concat();
-        let ok_needle = [".ok", "()"].concat();
-        let result_ok_needle = ["Result::", "ok"].concat();
-
-        let mut occurrences = 0usize;
-        let mut offenders: Vec<String> = Vec::new();
-
-        for (start, end) in &product_ranges
+        let mut depth = 0i32;
+        let mut index = open;
+        while index < stripped.len()
         {
-            let region = &stripped[*start..*end];
-            let mut cursor = 0usize;
-            while let Some(found) = find_bytes(region, map_needle.as_bytes(), cursor)
+            match stripped[index]
             {
-                occurrences += 1;
-                let open = found + map_needle.len() - 1; // the '(' itself
-                let mut depth = 0i32;
-                let mut close = open;
-                while close < region.len()
+                b'{' => depth += 1,
+                b'}' =>
                 {
-                    match region[close]
+                    depth -= 1;
+                    if depth == 0
                     {
-                        b'(' => depth += 1,
-                        b')' =>
-                        {
-                            depth -= 1;
-                            if depth == 0
-                            {
-                                break;
-                            }
-                        }
-                        _ => {}
+                        break;
                     }
-                    close += 1;
                 }
-                assert!(
-                    depth == 0 && close < region.len(),
-                    "unbalanced parentheses while extracting a filter_map argument"
-                );
+                _ => {}
+            }
+            index += 1;
+        }
+        if index >= stripped.len() || position < open || position > index
+        {
+            return None;
+        }
+        Some((name.clone(), open, index + 1))
+    }
 
-                let argument = String::from_utf8_lossy(&region[open..=close]).to_string();
+    /// The index of the `)` that closes the `(` at `open`.
+    fn match_paren(text: &[u8], open: usize) -> Option<usize>
+    {
+        let mut depth = 0i32;
+        let mut index = open;
+        while index < text.len()
+        {
+            match text[index]
+            {
+                b'(' => depth += 1,
+                b')' =>
+                {
+                    depth -= 1;
+                    if depth == 0
+                    {
+                        return Some(index);
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        None
+    }
+
+    /// The index of the `}` that closes the `{` at `open`.
+    fn match_brace(text: &[u8], open: usize) -> Option<usize>
+    {
+        let mut depth = 0i32;
+        let mut index = open;
+        while index < text.len()
+        {
+            match text[index]
+            {
+                b'{' => depth += 1,
+                b'}' =>
+                {
+                    depth -= 1;
+                    if depth == 0
+                    {
+                        return Some(index);
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        None
+    }
+
+    /// Read the identifier that starts at `from`, with the index just past it.
+    fn read_ident(text: &[u8], from: usize) -> Option<(String, usize)>
+    {
+        let mut end = from;
+        while end < text.len() && (text[end].is_ascii_alphanumeric() || text[end] == b'_')
+        {
+            end += 1;
+        }
+        if end == from || text[from].is_ascii_digit()
+        {
+            return None;
+        }
+        Some((String::from_utf8_lossy(&text[from..end]).to_string(), end))
+    }
+
+    /// The argument span of every `collect_rows(` / `collect_rows_counted(`
+    /// call in `text`. A `query_map` that sits INSIDE one of these is consumed
+    /// inline — the tightest statement scope there is.
+    fn collector_argument_spans(text: &[u8]) -> Vec<(usize, usize)>
+    {
+        let needle = ["collect", "_rows"].concat();
+        let counted = ["_coun", "ted"].concat();
+        let mut spans = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(found) = find_bytes(text, needle.as_bytes(), cursor)
+        {
+            cursor = found + 1;
+            let mut after = found + needle.len();
+            if text[after..].starts_with(counted.as_bytes())
+            {
+                after += counted.len();
+            }
+            if text.get(after) != Some(&b'(')
+            {
+                continue;
+            }
+            if let Some(close) = match_paren(text, after)
+            {
+                spans.push((after + 1, close));
+            }
+        }
+        spans
+    }
+
+    /// Every identifier the row iterator produced at `site` can be known by:
+    /// its `let` binding, an `if let Ok(..)` binding, the `Ok(iter) =>` arm
+    /// that follows the call directly, and one level of `match <binding> {
+    /// Ok(iter) => …` re-binding.
+    fn row_iterator_bindings(
+        text: &[u8],
+        site: usize,
+        close: usize,
+        function: &[u8],
+    ) -> Vec<String>
+    {
+        fn push(name: String, names: &mut Vec<String>)
+        {
+            if !name.is_empty() && !names.contains(&name)
+            {
+                names.push(name);
+            }
+        }
+
+        let mut names: Vec<String> = Vec::new();
+
+        // Backward: the statement this call sits in.
+        let mut start = site;
+        while start > 0
+        {
+            let byte = text[start - 1];
+            if byte == b';' || byte == b'{' || byte == b'}'
+            {
+                break;
+            }
+            start -= 1;
+        }
+        let statement = &text[start..site];
+
+        let let_needle = ["le", "t"].concat();
+        let mut_needle = ["mu", "t"].concat();
+        let iflet_needle = ["ifletO", "k("].concat();
+        let ok_open = ["{Ok", "("].concat();
+
+        if statement.starts_with(let_needle.as_bytes())
+        {
+            let mut at = let_needle.len();
+            if statement[at..].starts_with(mut_needle.as_bytes())
+            {
+                at += mut_needle.len();
+            }
+            if let Some((name, end)) = read_ident(statement, at)
+            {
+                if statement.get(end) == Some(&b'=')
+                {
+                    push(name, &mut names);
+                }
+            }
+        }
+        else if statement.starts_with(iflet_needle.as_bytes())
+        {
+            if let Some((name, end)) = read_ident(statement, iflet_needle.len())
+            {
+                if statement[end..].starts_with(b")=")
+                {
+                    push(name, &mut names);
+                }
+            }
+        }
+
+        // Forward: `match stmt.query_map(…) { Ok(iter) => …` binds here.
+        if text[close + 1..].starts_with(ok_open.as_bytes())
+        {
+            if let Some((name, _)) = read_ident(text, close + 1 + ok_open.len())
+            {
+                push(name, &mut names);
+            }
+        }
+
+        // One level of re-binding: `let mapped = …; match mapped { Ok(iter) …`.
+        let match_needle = ["mat", "ch"].concat();
+        let already = names.len();
+        for index in 0..already
+        {
+            let pattern = format!("{}{}{}", match_needle, names[index], ok_open);
+            let mut cursor = 0usize;
+            while let Some(found) = find_bytes(function, pattern.as_bytes(), cursor)
+            {
+                cursor = found + 1;
+                if let Some((bound, _)) = read_ident(function, found + pattern.len())
+                {
+                    push(bound, &mut names);
+                }
+            }
+        }
+
+        names
+    }
+
+    /// Whether `function` hands `name` to the collector as its FIRST argument.
+    fn collector_called_on(function: &[u8], name: &str) -> bool
+    {
+        let needle = ["collect", "_rows"].concat();
+        let counted = ["_coun", "ted"].concat();
+        let mut cursor = 0usize;
+        while let Some(found) = find_bytes(function, needle.as_bytes(), cursor)
+        {
+            cursor = found + 1;
+            let mut after = found + needle.len();
+            if function[after..].starts_with(counted.as_bytes())
+            {
+                after += counted.len();
+            }
+            if function.get(after) != Some(&b'(')
+            {
+                continue;
+            }
+            if let Some((argument, end)) = read_ident(function, after + 1)
+            {
+                if argument == name && matches!(function.get(end), Some(b',') | Some(b')'))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// How far past a `query_map(...)` call the row-consumption expression is
+    /// allowed to reach, in NORMALISED bytes.
+    ///
+    /// ⚠️ Measured, not guessed, on the tree this lock ships with: the
+    /// furthest collector consumption sits 258 normalised bytes past its
+    /// call, and the NEAREST legitimate appearance of any banned shape after
+    /// a `query_map` is 339. 240 sits between them with ~99 bytes of margin,
+    /// and both ways of exceeding it fail LOUD rather than silent.
+    const CONSUMPTION_WINDOW: usize = 240;
+
+    /// Product functions whose `query_map` rows are deliberately NOT consumed
+    /// through the collector, each because it consumes them another way that
+    /// discards nothing: an explicit per-row `match { Ok(..) => …, Err(e) =>
+    /// eprintln!(…) }` arm, `?`-propagation, or a `Result`-propagating
+    /// `collect`. Verified one by one on Sep 19, 2026.
+    ///
+    /// ⭐ This list is the point of Lock A: a NEW `query_map` that drops rows
+    /// silently is red unless somebody deliberately adds its function here,
+    /// and a name that stops matching is red too, so the list cannot rot.
+    const ROW_COLLECTOR_EXEMPT: [&str; 18] = [
+        "execute_image_record_query",
+        "execute_file_path_projection_query",
+        "execute_image_record_projection_query",
+        "execute_id_projection_query",
+        "project_raw_jpeg_visible_ids_impl",
+        "focus_analysis_writeback_target_ids",
+        "focus_writeback_stamped_ids",
+        "focus_writeback_target_diagnostic",
+        "pending_face_vector_delete_ids_impl",
+        "get_distinct_date_strings",
+        "get_distinct_directory_paths",
+        "directory_image_counts",
+        "capture_day_image_counts",
+        "filter_uncatalogued_paths_impl",
+        "file_paths_in_directory_impl",
+        "find_counterpart_image_impl",
+        "apple_shared_album_cleanup_targets_impl",
+        "apple_shared_album_dependent_census_impl",
+    ];
+
+    struct RowDropScan
+    {
+        filter_map_sites: usize,
+        query_map_sites: usize,
+        exempt_seen: std::collections::BTreeSet<String>,
+        offenders: Vec<String>,
+    }
+
+    /// The whole T9 scan, as a pure function of a source string — which is
+    /// what lets `the_row_drop_scanner_flags_every_named_decoy_shape` run the
+    /// SAME code over a snippet carrying one decoy of each shape.
+    fn scan_result_discards(source: &str, exempt: &[&str]) -> RowDropScan
+    {
+        let stripped = blank_comments_and_string_bodies(source);
+        assert_eq!(stripped.len(), source.len(), "the stripper must not resize");
+        let declarations = function_declarations(source);
+
+        // Assembled at run time so this module's own source can never satisfy
+        // a lock by carrying its needle as a literal.
+        let filter_map_needle = ["filter", "_map("].concat();
+        let query_map_needle = ["query", "_map("].concat();
+        let row_loop_needle = ["{if", "letOk("].concat();
+        // ⚠️ `.unwrap()` is deliberately NOT here: the nearest legitimate
+        // occurrence after a product `query_map` is 161 normalised bytes away,
+        // inside the CONSUMPTION_WINDOW, so it would fire on sound code. The
+        // silent-truncation shape it belongs to (`take_while(|r| r.is_ok())
+        // .map(|r| r.unwrap())` — the reviewer's R2-N2) is caught by its two
+        // leading tokens instead, whose nearest legitimate occurrences are
+        // "never" and 901 bytes.
+        let shapes: Vec<String> = vec![
+            [".ok", "()"].concat(),
+            ["Result::", "ok"].concat(),
+            [".flat", "ten()"].concat(),
+            ["Err(", "_)"].concat(),
+            ["unwrap_or_", "default()"].concat(),
+            ["unwrap_", "or("].concat(),
+            ["take_", "while("].concat(),
+            ["is_", "ok()"].concat(),
+        ];
+
+        let mut scan = RowDropScan
+        {
+            filter_map_sites: 0,
+            query_map_sites: 0,
+            exempt_seen: std::collections::BTreeSet::new(),
+            offenders: Vec::new(),
+        };
+
+        let line_of = |position: usize| source[..position].matches('\n').count() + 1;
+
+        for (range_start, range_end) in product_ranges(source)
+        {
+            let (text, map) = normalise(&stripped, range_start, range_end);
+            let collector_spans = collector_argument_spans(&text);
+
+            // ── Lock B — no `filter_map` argument may discard a Result. ──
+            let mut cursor = 0usize;
+            while let Some(found) = find_bytes(&text, filter_map_needle.as_bytes(), cursor)
+            {
+                scan.filter_map_sites += 1;
+                let open = found + filter_map_needle.len() - 1;
+                let close = match_paren(&text, open)
+                    .expect("unbalanced parentheses while extracting a filter_map argument");
+                let argument = String::from_utf8_lossy(&text[open..=close]).to_string();
                 assert!(
                     !argument.is_empty(),
                     "an empty extraction must never pass silently"
                 );
-                if argument.contains(&ok_needle) || argument.contains(&result_ok_needle)
+                for shape in &shapes
                 {
-                    let line_number = source[..*start + found].matches('\n').count() + 1;
-                    offenders.push(format!("lib.rs:{}: {}", line_number, argument.trim()));
+                    if argument.contains(shape.as_str())
+                    {
+                        scan.offenders.push(format!(
+                            "line {}: filter_map discards a Result ({}): {}",
+                            line_of(map[found]),
+                            shape,
+                            argument
+                        ));
+                    }
                 }
                 cursor = close + 1;
             }
+
+            // ── Locks A and C — around every row iterator. ──
+            let mut cursor = 0usize;
+            while let Some(found) = find_bytes(&text, query_map_needle.as_bytes(), cursor)
+            {
+                scan.query_map_sites += 1;
+                let open = found + query_map_needle.len() - 1;
+                let close = match_paren(&text, open)
+                    .expect("unbalanced parentheses while extracting a query_map argument");
+
+                // Lock C — the consumption window.
+                let window_end = (close + 1 + CONSUMPTION_WINDOW).min(text.len());
+                let window = String::from_utf8_lossy(&text[close + 1..window_end]).to_string();
+                for shape in &shapes
+                {
+                    if window.contains(shape.as_str())
+                    {
+                        scan.offenders.push(format!(
+                            "line {}: a row iterator is consumed by a Result-discarding \
+                             shape ({})",
+                            line_of(map[found]),
+                            shape
+                        ));
+                    }
+                }
+
+                // Lock A — THIS iterator reaches the collector, or its
+                // function is a named exemption.
+                //
+                // ⭐ FIX ROUND 2 (review LOW-R2-1 #1). Round 1 asked only
+                // whether the enclosing function mentioned `collect_rows`
+                // ANYWHERE, so a function holding two row iterators — one
+                // collected, one dropped — satisfied it (the reviewer's
+                // R2-N1b, and MEDIUM-R2-1 living in production). The question
+                // is now STATEMENT-scoped: is this iterator the one handed to
+                // the collector?
+                let consumed_inline = collector_spans
+                    .iter()
+                    .any(|(start, end)| found >= *start && close < *end);
+                if !consumed_inline
+                {
+                    match enclosing_function(&stripped, &declarations, map[found])
+                    {
+                        Some((name, body_start, body_end)) =>
+                        {
+                            let (body, _) = normalise(&stripped, body_start, body_end);
+                            let bindings =
+                                row_iterator_bindings(&text, found, close, &body);
+                            let reaches_collector = bindings
+                                .iter()
+                                .any(|binding| collector_called_on(&body, binding));
+                            if !reaches_collector
+                            {
+                                if exempt.contains(&name.as_str())
+                                {
+                                    scan.exempt_seen.insert(name);
+                                }
+                                else
+                                {
+                                    scan.offenders.push(format!(
+                                        "line {}: this row iterator in `{}` is never \
+                                         handed to collect_rows / collect_rows_counted \
+                                         and is not a named exemption (bindings seen: \
+                                         {:?})",
+                                        line_of(map[found]),
+                                        name,
+                                        bindings
+                                    ));
+                                }
+                            }
+                        }
+                        None => scan.offenders.push(format!(
+                            "line {}: could not locate the function that encloses this \
+                             query_map — the scan is not reading what it thinks it is",
+                            line_of(map[found])
+                        )),
+                    }
+                }
+
+                cursor = close + 1;
+            }
+
+            // ── Lock D — `for row in rows { if let Ok(..) = row { … } }`. ──
+            //
+            // ⭐ The shape found LIVE in `expand_collapse_group_ids` during
+            // this fix round, which the round-1 `filter_map`-only scan could
+            // not see. An `if let Ok(` whose block has an `else` reports, so
+            // it is not a silent drop and is not flagged.
+            let mut cursor = 0usize;
+            while let Some(found) = find_bytes(&text, row_loop_needle.as_bytes(), cursor)
+            {
+                cursor = found + 1;
+
+                let mut back = found;
+                while back > 0
+                {
+                    let byte = text[back - 1];
+                    if byte == b';' || byte == b'}' || byte == b'{'
+                    {
+                        break;
+                    }
+                    back -= 1;
+                }
+                if !text[back..found].starts_with(b"for")
+                {
+                    continue;
+                }
+
+                let mut block_open = found + 1;
+                while block_open < text.len() && text[block_open] != b'{'
+                {
+                    block_open += 1;
+                }
+
+                // ⭐ FIX ROUND 2 (review LOW-R2-1 #2). Round 1 treated "an
+                // `else` follows the block" as "it reports", so an EMPTY
+                // `else { }` passed (the reviewer's R2-N1). The else must now
+                // carry a real report: a call into the collector or the
+                // census, a `return`, or `?` propagation.
+                let else_needle = ["el", "se"].concat();
+                let reporting_tokens: Vec<String> = vec![
+                    ["collect", "_rows"].concat(),
+                    ["record_", "dropped_rows"].concat(),
+                    ["ret", "urn"].concat(),
+                    "?".to_string(),
+                ];
+                let reports = match match_brace(&text, block_open)
+                {
+                    Some(block_close) =>
+                    {
+                        let else_at = block_close + 1;
+                        if text[else_at..].starts_with(else_needle.as_bytes())
+                        {
+                            let else_open = else_at + else_needle.len();
+                            match (text.get(else_open), match_brace(&text, else_open))
+                            {
+                                (Some(b'{'), Some(else_close)) =>
+                                {
+                                    let body = &text[else_open + 1..else_close];
+                                    reporting_tokens.iter().any(|token| {
+                                        find_bytes(body, token.as_bytes(), 0).is_some()
+                                    })
+                                }
+                                // `else if …`, or an else whose block cannot be
+                                // matched: not provably a report.
+                                _ => false,
+                            }
+                        }
+                        else
+                        {
+                            false
+                        }
+                    }
+                    None => false,
+                };
+                if !reports
+                {
+                    scan.offenders.push(format!(
+                        "line {}: a row loop discards a per-row Err with `if let Ok(` \
+                         and no else that reports (an EMPTY `else {{ }}` is not a \
+                         report — call the collector or the census, return, or \
+                         propagate with `?`)",
+                        line_of(map[found])
+                    ));
+                }
+            }
         }
+
+        scan
+    }
+
+    // ------------------------------------------------------------------
+    // T9 — SITE COVERAGE. Every product row drop goes through the collector,
+    // and no Result-discarding shape may sit where rows are consumed.
+    //
+    // ⭐ FIX ROUND 1 (review MEDIUM-3). As first built this was a THREE-SHAPE
+    // blacklist over `filter_map(`, and the reviewer restored a real silent
+    // drop at a real product site three ways while it stayed GREEN:
+    // `.flatten()` on an iterator of Results, `match r { Ok(v) => Some(v),
+    // Err(_) => None }`, and `filter_map (` with ONE space before the paren.
+    // It is now four locks over whitespace-NORMALISED, comment- and
+    // literal-stripped bytes — see `scan_result_discards`. The scan is a pure
+    // function of a source string, and `the_row_drop_scanner_flags_every_
+    // named_decoy_shape` runs the SAME code over a snippet carrying one decoy
+    // of each shape, so this lock is runtime-proved as well as source-locked.
+    // ------------------------------------------------------------------
+    #[test]
+    fn every_product_row_drop_goes_through_the_collector()
+    {
+        let source = include_str!("lib.rs");
+        let scan = scan_result_discards(source, &ROW_COLLECTOR_EXEMPT);
 
         // The scan must not be vacuous: if it finds NOTHING at all it has read
         // the wrong bytes, and an empty scan would "pass" for free.
         assert!(
-            occurrences >= 4,
+            scan.filter_map_sites >= 4,
             "the site scan found only {} filter_map site(s) in the product \
              region — it is not reading the crate",
-            occurrences
+            scan.filter_map_sites
+        );
+        assert!(
+            scan.query_map_sites >= 40,
+            "the site scan found only {} query_map site(s) in the product \
+             region — it is not reading the crate",
+            scan.query_map_sites
+        );
+
+        // A named exemption that no longer matches a real site is a stale
+        // pre-authorisation for a future row drop, so the list cannot rot.
+        let unseen: Vec<&str> = ROW_COLLECTOR_EXEMPT
+            .iter()
+            .copied()
+            .filter(|name| !scan.exempt_seen.contains(*name))
+            .collect();
+        assert!(
+            unseen.is_empty(),
+            "these ROW_COLLECTOR_EXEMPT entries matched no collector-less \
+             query_map site and must be removed:\n{}",
+            unseen.join("\n")
         );
 
         assert!(
-            offenders.is_empty(),
+            scan.offenders.is_empty(),
             "every product row drop must go through collect_rows / \
              collect_rows_counted, but these do not:\n{}",
-            offenders.join("\n")
+            scan.offenders.join("\n")
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // T9b — the RUNTIME TWIN. The scanner itself is exercised on a snippet
+    // carrying one decoy of every shape T9 claims to catch, including the
+    // three that defeated round 1 and the two that must NOT be flagged.
+    //
+    // ⭐ A source lock that is never run against a known-bad input is a
+    // claim, not a proof — this is the S181 "stripper + runtime twin" rule.
+    // ------------------------------------------------------------------
+    #[test]
+    fn the_row_drop_scanner_flags_every_named_decoy_shape()
+    {
+        // Assembled at run time: the decoys must not exist as literal text
+        // that the product scan could ever read.
+        let ok = [".ok", "()"].concat();
+        let flatten = [".flat", "ten()"].concat();
+
+        // Each snippet isolates ONE shape: every one but the last carries a
+        // `collect_rows` call, so Lock A cannot fire and the expected message
+        // proves which lock actually caught the decoy.
+        let must_flag: Vec<(&str, String, &str)> = vec![
+            (
+                "filter_map with .ok()",
+                format!(
+                    "fn a() {{ let r = s.query_map(p, f); let v = collect_rows(r, \"a\") \
+                     .filter_map(|x| x{}); }}",
+                    ok
+                ),
+                "filter_map discards a Result",
+            ),
+            (
+                "filter_map with ONE SPACE before the paren (the reviewer's P7)",
+                format!(
+                    "fn b() {{ let r = s.query_map(p, f); let v = collect_rows(r, \"b\") \
+                     .filter_map (|x| x{}); }}",
+                    ok
+                ),
+                "filter_map discards a Result",
+            ),
+            (
+                "filter_map with Result::ok",
+                "fn c() { let r = s.query_map(p, f); let v = collect_rows(r, \"c\") \
+                 .filter_map(Result::ok); }"
+                    .to_string(),
+                "filter_map discards a Result",
+            ),
+            (
+                ".flatten() on an iterator of Results (the reviewer's P5)",
+                format!(
+                    "fn d() {{ let r = s.query_map(p, f){}.collect(); \
+                     let v = collect_rows(r, \"d\"); }}",
+                    flatten
+                ),
+                "Result-discarding shape",
+            ),
+            (
+                "match r { Ok(v) => Some(v), Err(_) => None } (the reviewer's P6)",
+                "fn e() { let r = s.query_map(p, f).filter_map(|x| match x { \
+                 Ok(v) => Some(v), Err(_) => None }); let v = collect_rows(r, \"e\"); }"
+                    .to_string(),
+                "filter_map discards a Result",
+            ),
+            (
+                "unwrap_or_default() on the row iterator",
+                "fn f() { let r = s.query_map(p, f).unwrap_or_default(); \
+                 let v = collect_rows(r, \"f\"); }"
+                    .to_string(),
+                "Result-discarding shape",
+            ),
+            (
+                "unwrap_or( on the row iterator",
+                "fn g() { let r = s.query_map(p, f).unwrap_or(empty); \
+                 let v = collect_rows(r, \"g\"); }"
+                    .to_string(),
+                "Result-discarding shape",
+            ),
+            (
+                "a row loop whose `if let Ok(` has no else",
+                "fn h() { let r = s.query_map(p, f); let v = collect_rows(r, \"h\"); \
+                 for row in r { if let Ok(v) = row { out.push(v); } } }"
+                    .to_string(),
+                "row loop discards a per-row Err",
+            ),
+            (
+                "a query_map site with no collector and no named exemption",
+                "fn i() { let r = s.query_map(p, f); for row in r { report(row); } }"
+                    .to_string(),
+                "is not a named exemption",
+            ),
+            (
+                // Without the stripper's char-literal arm (review LOW-4) the
+                // `\"` inside this byte literal opens a PHANTOM string span
+                // and blanks the rest of the snippet, so the real offender
+                // below it disappears and this case reports NOTHING.
+                "a decoy hidden behind a byte-character literal",
+                format!(
+                    "fn r() {{ let q = b'\"'; let rows = s.query_map(p, f); \
+                     let v = collect_rows(rows, \"r\").filter_map(|x| x{}); }}",
+                    ok
+                ),
+                "filter_map discards a Result",
+            ),
+            (
+                // Review R2-N1: round 1 treated ANY `else` as a report.
+                "a row loop whose `if let Ok(` has an EMPTY else",
+                "fn v() { let r = s.query_map(p, f); let c = collect_rows(r, \"v\"); \
+                 for row in c { if let Ok(y) = row { out.push(y); } else { } } }"
+                    .to_string(),
+                "row loop discards a per-row Err",
+            ),
+            (
+                // Review R2-N1b: the same shape in a function that calls the
+                // collector on a DIFFERENT iterator.
+                "an EMPTY else inside a function that calls collect_rows elsewhere",
+                "fn w() { let a = s.query_map(p, f); let c = collect_rows(a, \"w\"); \
+                 for row in c { if let Ok(y) = row { keep(y); } else { } } more(c); }"
+                    .to_string(),
+                "row loop discards a per-row Err",
+            ),
+            (
+                // Review R2-N2: silent truncation, outside round 1's needles.
+                "take_while(|r| r.is_ok()).map(|r| r.unwrap()) silent truncation",
+                "fn x() { let r = s.query_map(p, f).take_while(|r| r.is_ok()) \
+                 .map(|r| r.unwrap()); let c = collect_rows(r, \"x\"); }"
+                    .to_string(),
+                "Result-discarding shape",
+            ),
+            (
+                // ⭐ FIX ROUND 2 COMPLETION. R2-N2 above carries BOTH of the
+                // tokens added for it, so deleting either one on its own left
+                // the decoy still flagged by the other — a lock clause whose
+                // removal no test could detect. These two isolate them, so
+                // every shape in the list now has a decoy of its own and
+                // dropping ANY single shape is red.
+                "take_while( in isolation (no other banned token)",
+                "fn x2() { let r = s.query_map(p, f).take_while(|r| matches!(r, Ok(v))); \
+                 let c = collect_rows(r, \"x2\"); }"
+                    .to_string(),
+                "Result-discarding shape",
+            ),
+            (
+                "is_ok() in isolation (no other banned token)",
+                "fn x3() { let r = s.query_map(p, f).filter(|r| r.is_ok()) \
+                 .map(|r| r.unwrap()); let c = collect_rows(r, \"x3\"); }"
+                    .to_string(),
+                "Result-discarding shape",
+            ),
+            (
+                // Review LOW-R2-1 #1: Lock A is STATEMENT-scoped now — a
+                // function with two row iterators, only one of them collected.
+                "a second row iterator in a function that collects the first",
+                "fn y() { let a = s.query_map(p, f); let c = collect_rows(a, \"y\"); \
+                 let b = s.query_map(p, f); for row in b { keep(row); } }"
+                    .to_string(),
+                "never handed to collect_rows",
+            ),
+        ];
+
+        for (label, snippet, expected) in &must_flag
+        {
+            let scan = scan_result_discards(snippet, &[]);
+            assert!(
+                scan.offenders.iter().any(|offender| offender.contains(expected)),
+                "the scanner must flag {} with a message containing {:?}, but it \
+                 reported:\n{}\nsnippet: {}",
+                label,
+                expected,
+                scan.offenders.join("\n"),
+                snippet
+            );
+        }
+
+        // …and must NOT flag these.
+        let must_pass: Vec<(&str, String)> = vec![
+            (
+                "an ordinary collector site",
+                "fn j() { let r = s.query_map(p, f); let v = collect_rows(r, \"j\"); }"
+                    .to_string(),
+            ),
+            (
+                // ⚠️ Fix round 2: the else must now carry a REAL report — a
+                // call into the collector or the census, a `return`, or `?`.
+                "a row loop whose `if let Ok(` HAS an else that reports",
+                "fn k() { let r = s.query_map(p, f); let v = collect_rows(r, \"k\"); \
+                 for row in r { if let Ok(v) = row { out.push(v); } \
+                 else { record_dropped_rows(\"k\", 1); } } }"
+                    .to_string(),
+            ),
+            (
+                "the banned shapes inside a // comment",
+                format!(
+                    "fn l() {{ let r = s.query_map(p, f); // r.filter_map(|x| x{})\n\
+                     let v = collect_rows(r, \"l\"); }}",
+                    ok
+                ),
+            ),
+            (
+                "the banned shapes inside a /* block comment */",
+                format!(
+                    "fn m() {{ let r = s.query_map(p, f); /* r.filter_map(|x| x{}) */ \
+                     let v = collect_rows(r, \"m\"); }}",
+                    ok
+                ),
+            ),
+            (
+                "the banned shapes inside a string literal",
+                format!(
+                    "fn n() {{ let r = s.query_map(p, f); let d = \"r.filter_map(|x| x{})\"; \
+                     let v = collect_rows(r, \"n\"); }}",
+                    ok
+                ),
+            ),
+            (
+                "an Option flatten far from any row iterator",
+                format!(
+                    "fn o() {{ let v = [a, b].into_iter(){}.collect(); }}",
+                    flatten
+                ),
+            ),
+            (
+                "a NAMED exemption",
+                "fn p() { let r = s.query_map(p, f); for row in r { report(row); } }"
+                    .to_string(),
+            ),
+            (
+                // Review LOW-3: a `#[cfg(test)]` ITEM — not just a module —
+                // is excised, so a test helper written there with a
+                // legitimate `filter_map(|r| r.ok())` cannot fail T9
+                // spuriously.
+                "a legitimate row drop inside a #[cfg(test)] FUNCTION",
+                format!(
+                    "fn s() {{ let v = collect_rows(rows, \"s\"); }}\n\
+                     #[cfg(test)]\n\
+                     fn t() {{ let r = s.query_map(p, f); \
+                     let v = r.filter_map(|x| x{}); }}\n\
+                     fn u() {{ let v = 1; }}\n",
+                    ok
+                ),
+            ),
+        ];
+
+        for (label, snippet) in &must_pass
+        {
+            let exempt: [&str; 1] = ["p"];
+            let scan = scan_result_discards(snippet, &exempt);
+            assert!(
+                scan.offenders.is_empty(),
+                "the scanner must NOT flag {}, but it reported:\n{}\nsnippet: {}",
+                label,
+                scan.offenders.join("\n"),
+                snippet
+            );
+        }
+
+        // An empty extraction must fail loudly, never pass vacuously.
+        let empty = scan_result_discards("fn q() { }", &[]);
+        assert_eq!(empty.filter_map_sites, 0);
+        assert_eq!(empty.query_map_sites, 0);
+        assert!(
+            empty.offenders.is_empty(),
+            "a source with no row iterator has nothing to flag — the VACUITY \
+             guard lives in the product test, which asserts real site counts"
         );
     }
 

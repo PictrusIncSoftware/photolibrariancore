@@ -2522,12 +2522,16 @@ public func FfiConverterTypeFocusAnalysisCandidate_lower(_ value: FocusAnalysisC
 public struct FocusAnalysisCandidatePage: Equatable, Hashable {
     public var candidates: [FocusAnalysisCandidate]
     public var droppedRows: UInt64
+    public var queryOk: Bool
+    public var queryError: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(candidates: [FocusAnalysisCandidate], droppedRows: UInt64) {
+    public init(candidates: [FocusAnalysisCandidate], droppedRows: UInt64, queryOk: Bool = true, queryError: String? = nil) {
         self.candidates = candidates
         self.droppedRows = droppedRows
+        self.queryOk = queryOk
+        self.queryError = queryError
     }
 
     
@@ -2547,13 +2551,17 @@ public struct FfiConverterTypeFocusAnalysisCandidatePage: FfiConverterRustBuffer
         return
             try FocusAnalysisCandidatePage(
                 candidates: FfiConverterSequenceTypeFocusAnalysisCandidate.read(from: &buf), 
-                droppedRows: FfiConverterUInt64.read(from: &buf)
+                droppedRows: FfiConverterUInt64.read(from: &buf), 
+                queryOk: FfiConverterBool.read(from: &buf), 
+                queryError: FfiConverterOptionString.read(from: &buf)
         )
     }
 
     public static func write(_ value: FocusAnalysisCandidatePage, into buf: inout [UInt8]) {
         FfiConverterSequenceTypeFocusAnalysisCandidate.write(value.candidates, into: &buf)
         FfiConverterUInt64.write(value.droppedRows, into: &buf)
+        FfiConverterBool.write(value.queryOk, into: &buf)
+        FfiConverterOptionString.write(value.queryError, into: &buf)
     }
 }
 
