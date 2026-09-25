@@ -2123,20 +2123,29 @@ fn forced_repair_sql(_probe: MigrationProbeRef<'_>) -> Option<String>
     None
 }
 
-/// ⭐ Slice K — ENGINE TESTS NEVER FETCH, closed at the one place that could
-/// not be reached from outside.
+/// ⭐ Slice K — ENGINE TESTS NEVER FETCH, closed **for test builds** at the one
+/// place that could not be reached from outside.
 ///
 /// `fence_connection_against_extension_fetches`' own doc block recorded the
 /// hole this closes: every test fixture fenced its connection only AFTER
 /// `open_and_migrate_catalogue` had returned, so the `SELECT version()` probe,
 /// the 765-line schema batch, the S173 repair and the S179 index drops all ran
-/// UNFENCED. The claim that none of them can trigger a download held by an
-/// audit of all 411 SQL literals, not by construction. It now holds by
-/// construction: under `cfg(test)` the fence is applied to this connection
-/// before any of those statements runs.
+/// UNFENCED under `cargo test`. What now holds BY CONSTRUCTION is exactly one
+/// thing: a `cargo test` run can no longer reach a real extension repository
+/// from inside the open path, so the S181 incident cannot recur from the
+/// harness.
 ///
-/// A no-op in production — the referent is a free function that compiles to
-/// nothing outside tests, so the shipped launch path is byte-unchanged.
+/// ⚠️ **PRODUCTION IS UNCHANGED** — the `#[cfg(not(test))]` twin immediately
+/// below has an EMPTY body. In the shipped app those same statements are
+/// guarded only by `apply_extension_autoload_policy` (search it), which is
+/// **FAIL-OPEN by design**: its own doc block records that a settings failure
+/// is logged and the open continues. If either `SET` ever fails in production
+/// the migration statements run with autoload ON and this fence contributes
+/// nothing. ⛔ The production argument is therefore STILL V5's audit of all 411
+/// SQL literals in this file — it has NOT been replaced. Do not relax that
+/// fail-open handling, and do not drop the audit caution, on the strength of
+/// this fence: that would reintroduce the S181 class in the one build where no
+/// fence exists (reviewer round 1, finding K-F2).
 #[cfg(test)]
 fn fence_migration_connection(conn: &Connection)
 {
@@ -2188,10 +2197,13 @@ fn open_and_migrate_catalogue_with_probe(
     // the additive restore's backup open both come through here.
     apply_extension_autoload_policy(&conn);
 
-    // ⭐ Slice K — the test-only extension fence, applied BEFORE the version
+    // ⭐ Slice K — the TEST-ONLY extension fence, applied BEFORE the version
     // probe, the schema batch, the S173 repair and the S179 index drops, so no
-    // statement this function runs can reach a real extension repository. A
-    // no-op outside `cfg(test)`; see `fence_migration_connection`.
+    // statement this function runs can reach a real extension repository under
+    // `cargo test`. ⚠️ It is an EMPTY body outside `cfg(test)`: in the shipped
+    // app the guard for those same statements remains the fail-open
+    // `apply_extension_autoload_policy` call above, backed by V5's audit of the
+    // 411 SQL literals. See `fence_migration_connection`.
     fence_migration_connection(&conn);
 
     // EXPERIMENT 3: Query DuckDB version to confirm bundled library is being used
@@ -26861,19 +26873,28 @@ pub async fn apple_shared_album_dependent_census(
 /// connection that could not be fenced is the precise condition that caused the
 /// incident, so it must stop the test rather than proceed quietly.
 ///
-/// ⭐ THE RESIDUE THIS BLOCK USED TO RECORD IS CLOSED (slice K, 2026-09-20).
+/// ⭐ THE RESIDUE THIS BLOCK USED TO RECORD IS CLOSED **FOR TEST BUILDS** (slice
+/// K, 2026-09-20; narrowed in fix round 1, 2026-09-25, on finding K-F2).
 /// It was: the fence was applied only AFTER `open_and_migrate_catalogue`
 /// returned, so the schema batch, the `SELECT version()` probe, the S173
 /// `directory_path` repair and the S179 index drops all ran on that connection
 /// UNFENCED, and the "none of them can fetch" claim rested on V5's AUDIT of all
 /// 411 SQL literals in this file rather than on construction. Slice K carried
 /// the `#[cfg(test)]` hook the residue asked for: `fence_migration_connection`
-/// (`:2143-2157`, a no-op outside `cfg(test)`) is called inside
-/// `open_and_migrate_catalogue_with_probe` at `:2181`, immediately after
+/// (search that name — a no-op outside `cfg(test)`) is called inside
+/// `open_and_migrate_catalogue_with_probe`, immediately after
 /// `apply_extension_autoload_policy` and BEFORE any of those statements runs.
 /// It is pinned positively by
 /// `schema_upgrade_fixture_tests::a_connection_from_the_production_open_path_is_already_fenced`
 /// and mutation-proved (K's M13).
+///
+/// ⚠️ WHAT THAT DOES **NOT** BUY: `fence_migration_connection`'s
+/// `#[cfg(not(test))]` twin has an EMPTY body, so the closure is a property of
+/// `cargo test` and of nothing else. In the SHIPPED app those same migration
+/// statements are guarded only by `apply_extension_autoload_policy`, which is
+/// FAIL-OPEN by design, so **V5's audit of the 411 literals is still the whole
+/// of the production argument** and must not be retired on the strength of this
+/// fence.
 ///
 /// ⚠️ STILL OWED BY HAND: a test that opens a catalogue OUTSIDE
 /// `open_and_migrate_catalogue` — a raw `Connection::open` (K's historical
@@ -30267,15 +30288,29 @@ mod schema_upgrade_fixture_tests
         reason: &'static str,
     }
 
-    /// ⭐ The ONLY allow-list in this module, and it belongs to the ARCHIVAL
-    /// genesis fixture alone. Every reachable vintage (V1…V6) upgrades to a
-    /// four-tuple set IDENTICAL to fresh — measured, not assumed — so their
-    /// assertion (e) is absolute and has no list to rot.
+    /// ⭐ The genesis fixture's allow-list. Every FIXTURE-MODELLED BIRTH STATE in
+    /// the reachable window (V1…V6) upgrades to a four-tuple set IDENTICAL to
+    /// fresh — measured, not assumed — so their assertion (e) is absolute and has
+    /// no list to rot. This list and `TIER3_4599235_ALLOW_LIST` are the only two
+    /// in this module.
     ///
-    /// Blast radius of all four: ZERO. Q-27 — no pre-2026-07-03 catalogue can
-    /// reach this binary (S114 renamed the bundle ID, S127 was a fresh-catalogue
-    /// production baseline, and the only other inbound path is a backup, which
-    /// did not exist until S111 on 2026-07-03).
+    /// ⚠️ NARROWED in fix round 1 (2026-09-25, reviewer finding K-F1). This block
+    /// used to claim "blast radius of all four: ZERO — no pre-2026-07-03
+    /// catalogue can reach this binary". **That does not follow.** Backups do
+    /// begin at S111 (2026-07-03), but a backup ZIP *taken* in the 2026-07-03 →
+    /// 2026-07-22 window — after backups existed, before S127's fresh-catalogue
+    /// baseline — holds a catalogue whose tables were **CREATED** in May or June
+    /// 2026. Restore ▸ additive merge can therefore hand this binary a
+    /// genesis-era catalogue, and whether such an archive exists on Richard's
+    /// disk is Q-29, still unanswered. These four are **Restore-reachable**.
+    ///
+    /// ⭐ What bounds the risk is MEASUREMENT, not unreachability. Reviewer round
+    /// 1 drove all **32** distinct historical batch states through this same
+    /// production open path on the bundled 1.5.5: **every one opens `Some`, keeps
+    /// its seeded rows with values intact, gets the S173 marker and converges
+    /// `directory_path`** — so there is no live data-loss defect anywhere in the
+    /// history, only these column-attribute divergences. Each entry's own
+    /// `reason` carries its consequence; do not read a blanket "harmless" here.
     const GENESIS_ALLOW_LIST: [AllowedDivergence; 4] = [
         AllowedDivergence
         {
@@ -30316,7 +30351,13 @@ mod schema_upgrade_fixture_tests
                      through the ALTER. ⛔ The bare ALTER is CORRECT: `ALTER ... ADD \
                      COLUMN ... DEFAULT <expr>` is the S62 WAL wedge, forbidden by \
                      CLAUDE.md's standing DuckDB rules — converging it would rebuild \
-                     a bug this project already shipped once. NOT user-visible: no \
+                     a bug this project already shipped once. REACHABLE through a \
+                     Restore of a 2026-07-03...07-22 archive (see the block above and \
+                     TIER3-4599235, where this same column diverges on a catalogue \
+                     born 2026-06-01) and HARMLESS because the batch BACKFILLS THE \
+                     VALUES: `UPDATE images SET is_video = FALSE WHERE is_video IS \
+                     NULL` runs immediately after the bare ALTER, so only the column \
+                     attributes diverge and never the data. Also not user-visible: no \
                      production read distinguishes NULL from FALSE here (both \
                      `collection` and `color` are read only under `= TRUE`), and all \
                      nine production INSERT INTO keyword sites name `origin`.",
@@ -30339,6 +30380,98 @@ mod schema_upgrade_fixture_tests
         },
     ];
 
+    /// ⭐ TIER 3 — R-42's five columns, on a catalogue BORN 2026-06-01, which is
+    /// the shape a real 2026-07-03…07-22 backup ZIP actually holds (added in fix
+    /// round 1, 2026-09-25, on reviewer finding K-F1).
+    ///
+    /// All 32 distinct historical batch states were driven through the production
+    /// open path — by the reviewer in round 1 and again independently in fix round
+    /// 1 (2026-09-25, bundled 1.5.5). **21** of them diverge: **18** in R-42's
+    /// columns and nothing else (2026-05-10 … 2026-06-20), and **3**
+    /// (2026-05-04/06/08) that additionally show R-60 `images.rotation`, R-82
+    /// `images.id` and R-96 `images.file_size` — which is what GENESIS models.
+    /// Divergence ends at 2026-06-22 (`326314c`). ⚠️ The review's §2 K-F1 text says
+    /// **13**; the re-measurement says 21/18 and is the number recorded here.
+    /// `4599235` (2026-06-01, the commit that introduced the `keyword` table) is
+    /// the strongest single choice because it shows **all five at once**.
+    /// It also gives the module its first fixture with a JUNE-BORN `keyword` table:
+    /// nullable `origin`, no default, `keyword` present but pre-`collection`/
+    /// `color`/`is_video` — the state the `UPDATE keyword SET origin = 1 …` backfill
+    /// and the deliberate `idx_keyword_origin`-after-the-backfill ordering (S93)
+    /// exist to protect, and which no other fixture models (genesis has no
+    /// `keyword` table at all, V1…V6 all have a converged one).
+    ///
+    /// ⭐ ALL FIVE ARE HARMLESS, and for a better reason than "unreachable": the
+    /// batch pairs each bare ALTER with a VALUE BACKFILL, so only the column
+    /// attributes ever diverge and never the data. The five statements, in the
+    /// batch above — `UPDATE images SET is_video = FALSE WHERE is_video IS NULL`,
+    /// `UPDATE keyword SET collection = FALSE WHERE collection IS NULL`,
+    /// `UPDATE keyword SET color = FALSE WHERE color IS NULL`,
+    /// `UPDATE keyword SET origin = 1 WHERE origin IS NULL`, and the
+    /// `UPDATE keyword SET is_video = …` that reads the flag off `images`. V10's
+    /// "all nine INSERT sites name `origin`" argument covers NEW rows; **the
+    /// backfill is what covers the OLD ones.**
+    ///
+    /// ⛔ The bare ALTERs are CORRECT — `ALTER … ADD COLUMN … DEFAULT <expr>` is
+    /// the S62 WAL wedge. Do not converge these shapes.
+    const TIER3_4599235_ALLOW_LIST: [AllowedDivergence; 5] = [
+        AllowedDivergence
+        {
+            table: "images",
+            column: "is_video",
+            register_entry: "R-42",
+            expected_fresh: "images.is_video BOOLEAN nullable=false default=CAST('f' AS BOOLEAN)",
+            expected_upgraded: "images.is_video BOOLEAN nullable=true default=<none>",
+            reason: "Backfilled by `UPDATE images SET is_video = FALSE WHERE \
+                     is_video IS NULL`; attributes only.",
+        },
+        AllowedDivergence
+        {
+            table: "keyword",
+            column: "collection",
+            register_entry: "R-42",
+            expected_fresh: "keyword.collection BOOLEAN nullable=false default=CAST('f' AS BOOLEAN)",
+            expected_upgraded: "keyword.collection BOOLEAN nullable=true default=<none>",
+            reason: "Backfilled by `UPDATE keyword SET collection = FALSE WHERE \
+                     collection IS NULL`; and every production read is under \
+                     `= TRUE`, where NULL and FALSE are indistinguishable.",
+        },
+        AllowedDivergence
+        {
+            table: "keyword",
+            column: "color",
+            register_entry: "R-42",
+            expected_fresh: "keyword.color BOOLEAN nullable=false default=CAST('f' AS BOOLEAN)",
+            expected_upgraded: "keyword.color BOOLEAN nullable=true default=<none>",
+            reason: "Backfilled by `UPDATE keyword SET color = FALSE WHERE color IS \
+                     NULL`; read only under `= TRUE`.",
+        },
+        AllowedDivergence
+        {
+            table: "keyword",
+            column: "is_video",
+            register_entry: "R-42",
+            expected_fresh: "keyword.is_video BOOLEAN nullable=false default=CAST('f' AS BOOLEAN)",
+            expected_upgraded: "keyword.is_video BOOLEAN nullable=true default=<none>",
+            reason: "Backfilled from the referenced image by the `UPDATE keyword SET \
+                     is_video = …` statement in the batch (the S89 denormalised \
+                     copy); attributes only.",
+        },
+        AllowedDivergence
+        {
+            table: "keyword",
+            column: "origin",
+            register_entry: "R-42",
+            expected_fresh: "keyword.origin INTEGER nullable=false default=1",
+            expected_upgraded: "keyword.origin INTEGER nullable=true default=<none>",
+            reason: "NOT NULL DEFAULT 1 fresh, nullable with no default upgraded. \
+                     Backfilled by `UPDATE keyword SET origin = 1 WHERE origin IS \
+                     NULL`, which runs BEFORE `idx_keyword_origin` is created — that \
+                     ordering is the S93 fix and this fixture is the only one that \
+                     models a catalogue where it matters.",
+        },
+    ];
+
     /// One historical schema state: the schema batch of `commit`, stored
     /// VERBATIM in `src/schema_fixtures/<commit>.sql`.
     struct Vintage
@@ -30354,20 +30487,29 @@ mod schema_upgrade_fixture_tests
         is_identity_control: bool,
     }
 
-    /// ⭐ THE REACHABLE WINDOW OPENS ON 2026-07-03, derived from the record and
-    /// not from guesswork: backups — the only inbound path for an old catalogue
-    /// — did not exist until S111 (8193d5d, 2026-07-03) and restore gates
-    /// `manifest.formatVersion <= 1`; Q-27 bounds everything earlier to zero.
+    /// ⭐ THE FIXTURE SET, derived from the record and not from guesswork:
+    /// backups — the only inbound path for an old catalogue — did not exist until
+    /// S111 (8193d5d, 2026-07-03) and restore gates `manifest.formatVersion <= 1`;
+    /// the launch path cannot see anything older (S114 renamed the bundle ID,
+    /// S127 was a fresh-catalogue baseline). Fingerprinting every commit that
+    /// touched the schema batch collapses the post-2026-07-03 window into SIX
+    /// distinct states, V1…V6, of which V6 is the working tree.
     ///
-    /// Fingerprinting every commit that touched the schema batch collapses the
-    /// window into SIX distinct states, V1…V6, of which V6 is the working tree.
-    /// GENESIS is archival and is kept for one reason, stated at its entry.
+    /// ⚠️ NARROWED in fix round 1 (2026-09-25, reviewer finding K-F1). ⛔ The old
+    /// wording, "the reachable window OPENS on 2026-07-03", does **not** follow
+    /// and is gone. **2026-07-03 is when a backup could first be TAKEN, not the
+    /// earliest schema a backup can HOLD.** A ZIP taken in the 2026-07-03 →
+    /// 2026-07-22 window — after S111 began backups, before S127's
+    /// fresh-catalogue baseline — contains a catalogue whose tables were CREATED
+    /// in May or June 2026. V1…V6 each model a catalogue *born* at their state;
+    /// none models a June-born catalogue migrated forward, which is the shape a
+    /// real archive of that window actually has. ⇒ TIER3-4599235 and GENESIS.
     ///
     /// ⚠️ The DDL state of V1 originates at a9300ac (2026-06-25); 8193d5d is the
-    /// S111 commit that first made such a catalogue reachable, and its lib.rs
-    /// carries that same batch byte-for-byte. The fixture is named for 8193d5d
-    /// because that is the earliest vintage a BACKUP can hold.
-    const VINTAGES: [Vintage; 7] = [
+    /// S111 commit at which such a catalogue first became BACKUP-able, and its
+    /// lib.rs carries that same batch byte-for-byte. The fixture is named for
+    /// 8193d5d because that is the earliest vintage a backup can be NAMED for.
+    const VINTAGES: [Vintage; 8] = [
         Vintage
         {
             tag: "V1",
@@ -30422,13 +30564,43 @@ mod schema_upgrade_fixture_tests
             allowed: &[],
             is_identity_control: true,
         },
-        // ⭐ GENESIS is not archaeology. All seven current `images` indexes are
-        // over genesis-era columns and every REACHABLE vintage already carries
-        // every column the batch touches, so no reachable fixture can be made to
-        // fail assertion (a) by the S93 mutation. Genesis has 1 table instead of
-        // 19 and 29 `images` columns instead of 69 — 40 columns and 18 tables
-        // arrive through the migration — which is what gives the S93 mutation
-        // something to break. THIS is why it is kept.
+        // ⭐ TIER 3 — a catalogue BORN 2026-06-01, which is the shape a real
+        // 2026-07-03…07-22 backup ZIP holds (fix round 1, reviewer finding K-F1).
+        // It is the first fixture with a JUNE-BORN `keyword` table — nullable
+        // `origin` with no default, and no `collection`/`color`/`is_video` — the
+        // state the batch's value backfills and its backfill-before-
+        // `idx_keyword_origin` ordering exist to protect. Genesis has no
+        // `keyword` table at all and V1…V6 all have a converged one, so without
+        // this fixture that state is modelled by NOTHING. Its allow-list is
+        // exactly R-42's five columns.
+        Vintage
+        {
+            tag: "TIER3-4599235",
+            commit: "4599235",
+            date: "2026-06-01",
+            ddl: include_str!("schema_fixtures/4599235.sql"),
+            allowed: &TIER3_4599235_ALLOW_LIST,
+            is_identity_control: false,
+        },
+        // ⭐ GENESIS IS NOT ARCHIVAL — it is the EXTREME INSTANCE of the
+        // Restore-reachable class (a 2026-07-03…07-22 ZIP can hold a catalogue
+        // born this early) and the BROADEST pin on assertion (a): 1 table
+        // instead of 19 and 29 `images` columns instead of 69, so 40 columns and
+        // 18 tables arrive through the migration.
+        //
+        // MEASURED, three times on the same mutation: the S93 shape (a
+        // `CREATE INDEX` hoisted above the `ALTER` that adds its column, over
+        // `images.is_video`) turns (a) RED on GENESIS and GREEN on V1…V6 — K's
+        // M1, re-proved independently as the reviewer's M-B, and again as fix
+        // round 1's T1. ⚠️ Fix round 1 CORRECTS the old "the ONLY fixture that
+        // can fail (a)" claim: T1 is red on GENESIS **and** on TIER3-4599235,
+        // because that fixture lacks `images.is_video` too. Genesis is still the
+        // only fixture that can catch an S93 shape over a column or table that
+        // arrived between 2026-05-04 and 2026-06-01.
+        //
+        // ⛔ DO NOT DELETE IT: deleting it removes the broadest pin of this whole
+        // slice, and the "archival" framing that used to invite exactly that has
+        // been withdrawn (reviewer finding K-F1).
         Vintage
         {
             tag: "GENESIS",
@@ -30443,7 +30615,13 @@ mod schema_upgrade_fixture_tests
     /// ⭐ VACUITY GUARD. A comparison of two empty sets is the definition of
     /// decoration (the S157 SceneMaskGate lesson). Truncating `VINTAGES`, or
     /// letting a fixture be skipped, must turn a test RED — never green.
-    const EXPECTED_VINTAGE_COUNT: usize = 7;
+    ///
+    /// ⚠️ This constant is **blind to the case that matters** — a schema edit that
+    /// ships with no new fixture (reviewer finding K-F3). It fires only when a
+    /// `VINTAGES` row is added or removed without updating it. The detector for a
+    /// moved schema batch is
+    /// `the_identity_control_fixture_is_byte_identical_to_the_in_tree_schema_batch`.
+    const EXPECTED_VINTAGE_COUNT: usize = 8;
 
     /// ⭐ VACUITY GUARD. The fresh reference catalogue carried 259 product
     /// columns when this was written; a floor well under it catches "the
@@ -30945,7 +31123,7 @@ mod schema_upgrade_fixture_tests
             "exactly one vintage must be the identity control (the working tree's own \
              schema batch); without it a green sweep proves nothing about the comparison"
         );
-        for tag in ["V1", "V2", "V3", "V4", "V5", "V6", "GENESIS"]
+        for tag in ["V1", "V2", "V3", "V4", "V5", "V6", "TIER3-4599235", "GENESIS"]
         {
             let v = vintage(tag);
             assert!(
@@ -30960,13 +31138,21 @@ mod schema_upgrade_fixture_tests
     }
 
     /// ⭐ ENGINE TESTS NEVER FETCH — the positive pin for the hole slice K was
-    /// asked to close. `fence_connection_against_extension_fetches`' doc block
-    /// recorded that every fixture fenced its connection only AFTER
+    /// asked to close, **in test builds only**.
+    /// `fence_connection_against_extension_fetches`' doc block recorded that
+    /// every fixture fenced its connection only AFTER
     /// `open_and_migrate_catalogue` had returned, so the version probe, the
-    /// schema batch, the S173 repair and the S179 drops all ran unfenced and the
-    /// "nothing among them can fetch" claim rested on an audit of 411 SQL
-    /// literals. It now rests on this assertion: a connection handed back by the
-    /// production open path is ALREADY fenced, before it is touched.
+    /// schema batch, the S173 repair and the S179 drops all ran unfenced under
+    /// `cargo test`. What this asserts is exactly that and no more: a connection
+    /// handed back by the production open path is ALREADY fenced when a TEST
+    /// receives it, so a `cargo test` run cannot download into
+    /// `~/.duckdb/extensions/` from inside the open path.
+    ///
+    /// ⚠️ It asserts nothing about the SHIPPED app. `fence_migration_connection`'s
+    /// `#[cfg(not(test))]` twin is empty; there the guard is still the FAIL-OPEN
+    /// `apply_extension_autoload_policy`, and the statements' own inability to
+    /// trigger an autoload still rests on V5's audit of the 411 SQL literals
+    /// (reviewer finding K-F2).
     ///
     /// Deleting `fence_migration_connection(&conn)` from
     /// `open_and_migrate_catalogue_with_probe` turns this red.
@@ -31056,13 +31242,117 @@ mod schema_upgrade_fixture_tests
         assert_vintage_upgrades(v);
     }
 
-    /// ⭐ The archival fixture, and the ONLY one that can fail assertion (a)
-    /// under the S93 mutation: 1 table instead of 19, 29 `images` columns
-    /// instead of 69.
+    /// ⭐ TIER 3 — the shape a real 2026-07-03…07-22 backup ZIP holds: a
+    /// catalogue BORN 2026-06-01 and migrated forward, with a June-born `keyword`
+    /// table. Asserts R-42's five columns diverge in exactly the measured way and
+    /// nothing else does. Added in fix round 1 on reviewer finding K-F1.
+    #[test]
+    fn tier3_2026_06_01_a_june_born_catalogue_upgrades_with_exactly_r42s_five_divergences()
+    {
+        assert_vintage_upgrades(vintage("TIER3-4599235"));
+    }
+
+    /// ⭐ The EXTREME instance of the Restore-reachable class — not an archival
+    /// curiosity — and the BROADEST pin on assertion (a): 1 table instead of 19,
+    /// 29 `images` columns instead of 69. (Fix round 1's T1 shows TIER3-4599235
+    /// also catches the S93 shape over `images.is_video`; genesis alone reaches
+    /// the columns and tables that arrived before 2026-06-01.)
+    /// ⛔ Do not delete this fixture.
     #[test]
     fn genesis_2026_05_04_upgrades_with_exactly_the_four_allowed_divergences()
     {
         assert_vintage_upgrades(vintage("GENESIS"));
+    }
+
+    /// ⭐ K-F3 — THE DETECTOR FOR "THE SCHEMA MOVED AND NO FIXTURE WAS ADDED".
+    ///
+    /// Nothing else in this module asserts that the `is_identity_control` fixture
+    /// IS the in-tree schema batch. Reviewer round 1 executed the gap: applying a
+    /// *correct* future schema edit — a new column in the `images` CREATE body
+    /// PLUS its matching `ALTER TABLE images ADD COLUMN IF NOT EXISTS`, i.e.
+    /// exactly what a well-behaved author does next — left every test in this
+    /// module GREEN while V6 silently became just another stale vintage still
+    /// wearing the flag. `EXPECTED_VINTAGE_COUNT` cannot help: it fires only when
+    /// a `VINTAGES` row is added or removed, so it is structurally blind to a
+    /// schema edit that ships with no new fixture. The module would then have NO
+    /// identity control, which is the one assertion that makes every other green
+    /// assertion (e) here mean anything, and the current schema state would be
+    /// pinned by no fixture at all.
+    ///
+    /// The extraction deliberately mirrors the README's provenance recipe (first
+    /// line whose trim is `let schema = r#"`, then up to the line whose trim is
+    /// the closing raw-string delimiter), so this assertion and the recipe that
+    /// produced every `.sql` file here cut at the same two boundaries.
+    #[test]
+    fn the_identity_control_fixture_is_byte_identical_to_the_in_tree_schema_batch()
+    {
+        const THIS_FILE: &str = include_str!("lib.rs");
+        // Built by concatenation so this line is not itself a start marker.
+        let start_marker: String = format!("let schema = r{}\"", '#');
+        let end_marker: String = format!("\"{};", '#');
+
+        let mut batch = String::new();
+        let mut inside = false;
+        let mut saw_start = false;
+        for line in THIS_FILE.lines()
+        {
+            if !saw_start
+            {
+                if line.trim() == start_marker
+                {
+                    saw_start = true;
+                    inside = true;
+                }
+                continue;
+            }
+            if inside
+            {
+                if line.trim() == end_marker
+                {
+                    inside = false;
+                    break;
+                }
+                batch.push_str(line);
+                batch.push('\n');
+            }
+        }
+
+        assert!(
+            saw_start,
+            "could not find the schema batch's opening raw-string line in lib.rs; the \
+             extraction boundary moved and this detector is now blind"
+        );
+        assert!(
+            !inside,
+            "found the schema batch's opening line but never its closing delimiter; the \
+             extraction boundary moved and this detector is now blind"
+        );
+        assert!(
+            batch.len() > 10_000,
+            "the extracted schema batch is only {} bytes, which cannot be the real \
+             765-line batch — the extraction boundary moved and this detector is now \
+             blind",
+            batch.len()
+        );
+
+        let control = VINTAGES
+            .iter()
+            .find(|v| v.is_identity_control)
+            .expect("exactly one vintage must carry is_identity_control");
+
+        assert_eq!(
+            batch, control.ddl,
+            "⭐ THE IDENTITY CONTROL IS STALE. The in-tree schema batch no longer \
+             matches src/schema_fixtures/{}.sql, so this module has NO identity \
+             control and the CURRENT schema state is pinned by no fixture — every \
+             other green assertion (e) here is meaningless until this is fixed. Four \
+             things are needed, and ⛔ editing the frozen fixture is NOT one of them: \
+             (1) extract the new batch into a new src/schema_fixtures/<sha>.sql by \
+             the README's provenance recipe, (2) add a VINTAGES row for it carrying \
+             is_identity_control, (3) bump EXPECTED_VINTAGE_COUNT and add its \
+             #[test], (4) clear is_identity_control on {}.",
+            control.commit, control.tag
+        );
     }
 
     // -----------------------------------------------------------------------
