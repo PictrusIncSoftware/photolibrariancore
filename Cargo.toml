@@ -26,3 +26,30 @@ once_cell = "1.20"
 
 [build-dependencies]
 uniffi = { version = "0.31", features = ["build"] }
+
+# Sep 26, 2026 (Xcode 27 / macOS 27): never strip build scripts or proc-macros.
+# The release profile strips debuginfo by default; rustc 1.95 does it with its
+# bundled rust-objcopy, which leaves a proc-macro dylib linked by Xcode 27's ld
+# with a LINKEDIT string pool that is not 8-byte aligned. macOS 27's dyld
+# refuses to load it ("mis-aligned LINKEDIT string pool") and rustc reports
+# E0463 "can't find crate for `zerofrom_derive`". Without this, every release
+# build into an EMPTY target/ fails (cargo clean, a fresh clone, a new
+# proc-macro dependency). build-override governs build scripts, proc-macros and
+# their dependencies ONLY - never the shipped libphotolibrariancore.a, whose
+# code is unchanged (its bytes re-hash once). See PhotoLibrarian's
+# Docs/BUILD-Rust-Core-Xcode-Linkage.md, section "Sep 26, 2026".
+[profile.release.build-override]
+strip = "none"
+
+# Sep 27, 2026 (slice F, R-07; ruling 21): the FFI panic boundary in
+# src/lib.rs (`ffi_panic_boundary`) catches a Rust panic with catch_unwind and
+# reports it through the failing call's own result - and under
+# panic = "abort" catch_unwind catches NOTHING. "unwind" is already cargo's
+# release default; this line makes it a decision, so a later profile edit
+# cannot silently defeat the boundary. src/lib.rs also refuses to COMPILE
+# under "abort" (`#[cfg(panic = "abort")] compile_error!`). Nothing else
+# belongs in this table: no lto, codegen-units, opt-level or strip (the S174
+# __eh_frame ruling stands). A separate table from
+# [profile.release.build-override] above, deliberately.
+[profile.release]
+panic = "unwind"

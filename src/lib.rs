@@ -42,6 +42,309 @@ static CATALOGUE_PATH: once_cell::sync::Lazy<Arc<Mutex<Option<PathBuf>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(None)));
 
 // ===========================================================================
+// Slice F (2026-09-27) — the panic boundary: R-07 · R-25 · R-26 · R-69
+// ===========================================================================
+//
+// Three layers, each honest about a different thing:
+//
+//   L1  every acquisition of the two global mutexes goes through
+//       `lock_catalogue()` / `lock_catalogue_path()`, which RECOVER a poisoned
+//       lock instead of panicking (R-26, R-69);
+//   L2  the face Tokio runtime is built fallibly and never poisons itself
+//       (R-25 — `face_embedding_runtime`, beside the runtime's slot);
+//   L3  `ffi_panic_boundary` catches a panic at the FFI entry points whose
+//       answer can honestly say "this failed", and reports it there (R-07).
+//
+// ⭐ Why: the .udl declares zero `[Throws=]`, so every generated Swift call
+// site is `try!`. uniffi 0.31.1 already catch_unwinds every call and lowers a
+// panic to CALL_UNEXPECTED_ERROR; `try!` then turns that into a process kill
+// (exit 133, SIGTRAP). Layer 3 is the only way a panic reaches Swift as an
+// ANSWER, and `[Throws=]` stays rejected (Richard, Sep 27, 2026: ruling 22).
+//
+// ⛔ R-07 is NARROWED, not closed. A panic inside an exported function whose
+// answer is a bare count or list still ends the process (ruling 23): catching
+// it there could only invent an empty answer that looks like a real one. The
+// boundary has an edge, and that is where it is.
+//
+// ⚠️ Five legacy list-returning twins sit on the caught side of that edge by
+// DELEGATION, not by design: each returns its wrapped twin's list, so a panic
+// caught inside the twin reaches it as an EMPTY list — `focus_analysis_candidates`
+// and `focus_analysis_candidates_for_ids` (no photos to analyse),
+// `face_embedding_search` and `face_embedding_search_vector` (no matches) — or,
+// for `face_embedding_missing_observations`, as its "every observation"
+// fallback (a re-read that itself runs outside any boundary). None of the five
+// has a Swift caller; they retire at the sweep's closeout.
+
+// ⭐ Layer 3 needs `panic = "unwind"`: under `abort`, `catch_unwind` catches
+// nothing. `Cargo.toml` declares it for release; this turns ANY route to an
+// abort-strategy build of the core into a compile error rather than a shipped
+// boundary that silently catches nothing. `cargo test` ignores a profile's
+// `panic` key, so no cargo test can pin this — the compile error is the pin.
+#[cfg(panic = "abort")]
+compile_error!(
+    "photolibrariancore must be built with panic = \"unwind\": the FFI panic \
+     boundary (slice F, R-07) relies on catch_unwind, which catches nothing under \
+     panic = \"abort\" (see Cargo.toml [profile.release])"
+);
+
+/// Census site for a RECOVERED catalogue lock (L1). It ends `.query_failed`
+/// because what a panic under the guard lost is an OPERATION, never a counted
+/// row — `DroppedRowReport`'s documented rule — so every census reader words it
+/// "a lookup failed; some records may be missing", never as a row count.
+const CATALOGUE_LOCK_RECOVERED_SITE: &str = "catalogue_lock.poison_recovered.query_failed";
+
+/// The same, for the catalogue-PATH lock.
+const CATALOGUE_PATH_LOCK_RECOVERED_SITE: &str =
+    "catalogue_path_lock.poison_recovered.query_failed";
+
+/// Slice F / R-26 + R-69 — acquire the global catalogue lock WITHOUT panicking.
+///
+/// `std::sync::Mutex` poisons when a guard is dropped during an unwind, and a
+/// panic under any of the 137 acquisition sites would otherwise make every
+/// later acquisition panic for the rest of the process — which, with zero
+/// `[Throws=]` in the .udl, is every catalogue entry point dead (R-07).
+/// Recovering the inner value is the doctrine `record_dropped_rows` already
+/// applies to the dropped-row census, for the same stated reason.
+///
+/// ⭐ A recovered guard is HEALED before it is handed out (brief §A-1). Every
+/// transaction in this crate is a raw `BEGIN TRANSACTION;` — there is no RAII
+/// transaction to roll back on drop — so a panic between BEGIN and COMMIT
+/// leaves the connection INSIDE an open transaction. Handing that out would
+/// show the next caller the panicked operation's uncommitted rows, fail its
+/// own BEGIN, and then fail everything with "transaction is aborted" (measured
+/// on the bundled 1.5.5). So the recovery issues ONE best-effort `ROLLBACK;`
+/// (on a clean connection it errors harmlessly, and the log line prints that
+/// error rather than guessing at it), writes ONE census entry, and CLEARS the
+/// poison.
+///
+/// ⭐ Why CLEAR the poison — the real reason is census honesty. A std mutex
+/// stays poisoned until cleared, so without the clear EVERY later acquisition
+/// for the rest of the session would take this arm again: another rollback,
+/// another log line, and another `catalogue_lock.poison_recovered.query_failed`
+/// census record. Intelligent Culling reports census growth during its run as
+/// "N catalogue lookups failed while Intelligent Culling was running", so every
+/// later catalogue call would be counted as a failed lookup and every later
+/// culling run would raise a false `catalogue_rows_dropped` warning. Clearing
+/// hides nothing: a SECOND panic under the guard re-poisons the lock (std sets
+/// the flag when a guard drops during a panic) and is recovered — rolled back,
+/// censused, cleared — again. And no transaction here spans two lock
+/// acquisitions (each `BEGIN` has its `COMMIT`/`ROLLBACK` in the same body,
+/// under one guard), so this one-shot rollback cannot meet a healthy
+/// transaction today; should one ever span two acquisitions, it is the clear
+/// that stops the rollback from running again at every later acquisition and
+/// landing on it.
+///
+/// ⚠️ What makes the recovered value sound, checked site by site: the mutex
+/// guards nothing but the `Option<Connection>`; every acquisition re-reads it
+/// and re-prepares its statements (duckdb-rs resets a `Statement` on drop);
+/// the temp tables a panicked operation can leave behind are either created
+/// inside its transaction (so the rollback removes them) or replaced/dropped
+/// by the next run of the same operation (`CREATE OR REPLACE TEMP TABLE
+/// pl_removal_*`, the merge's leading `DROP TABLE IF EXISTS` + `DETACH`); and
+/// the two session settings the crate changes mid-operation are restored by an
+/// RAII guard's `Drop`, which runs during the unwind. Nothing behind this lock
+/// is a cache of derived state.
+fn lock_catalogue() -> std::sync::MutexGuard<'static, Option<Connection>>
+{
+    let guard = match CATALOGUE.lock()
+    {
+        Ok(guard) => guard,
+        Err(poisoned) =>
+        {
+            let guard = poisoned.into_inner();
+            // Fix round 1, F-7: the log line says what ROLLBACK actually
+            // returned. An error USUALLY means no transaction was open (the
+            // panic came outside one), but an invalidated database fails it
+            // too, so the error is printed, never guessed at.
+            let rollback = match guard.as_ref()
+            {
+                Some(conn) => match conn.execute_batch("ROLLBACK;")
+                {
+                    Ok(()) => "the transaction it left open was rolled back".to_string(),
+                    Err(error) => format!(
+                        "ROLLBACK returned an error, usually because no transaction was open: {}",
+                        error
+                    ),
+                },
+                None => "the catalogue is not open, so there was nothing to roll back".to_string(),
+            };
+            eprintln!(
+                "lock_catalogue: recovered the catalogue lock after a panic under it ({})",
+                rollback
+            );
+            record_dropped_rows(CATALOGUE_LOCK_RECOVERED_SITE, 1);
+            CATALOGUE.clear_poison();
+            guard
+        }
+    };
+    ffi_panic_probe("lock_catalogue");
+    guard
+}
+
+/// Slice F / R-26 — the catalogue-PATH lock, acquired without panicking. It
+/// guards an `Option<PathBuf>`, which a panic cannot leave half-written (the
+/// only writer, `initialize_catalogue`, assigns it whole), so recovery needs no
+/// healing beyond the census entry and clearing the poison.
+fn lock_catalogue_path() -> std::sync::MutexGuard<'static, Option<PathBuf>>
+{
+    match CATALOGUE_PATH.lock()
+    {
+        Ok(guard) => guard,
+        Err(poisoned) =>
+        {
+            eprintln!(
+                "lock_catalogue_path: recovered the catalogue-path lock after a panic under it"
+            );
+            record_dropped_rows(CATALOGUE_PATH_LOCK_RECOVERED_SITE, 1);
+            CATALOGUE_PATH.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Slice F / R-07 — the panic boundary.
+///
+/// uniffi 0.31.1 ALREADY catch_unwinds on both the sync and async paths and
+/// lowers a panic to CALL_UNEXPECTED_ERROR (V6 §2, read in the registry and
+/// executed). What it cannot do is give the panic a place to GO: with zero
+/// `[Throws=]` in the .udl the lowered error lands in `try!` and the process
+/// dies (exit 133, SIGTRAP, demonstrated under -O and unoptimised).
+///
+/// So the boundary is drawn HERE, on our side, and only at the 21 exported
+/// functions whose return type can honestly say "this failed" — the list in
+/// `Spikes/FfiPanicBoundaryGate/README.md`, locked by that gate. A function
+/// returning a bare sequence or a u64 is NOT wrapped: catching its panic could
+/// only return an invented empty answer, which is precisely the
+/// swallowed-failure class slice 7 closed.
+///
+/// ⭐ Order inside a wrapped body: this `catch_unwind` is the OUTER layer and
+/// the poison-safe lock the INNER one, so a panic under the guard cannot poison
+/// anything for good (L1 heals it at the next acquisition) and is reported to
+/// Swift (here).
+///
+/// ⚠️ `AssertUnwindSafe` is taken HERE, once: `MutexGuard` and duckdb's
+/// `Connection` are `!UnwindSafe`, so an `UnwindSafe` bound on `body` would only
+/// move the same assertion to 21 call sites. It is honest because the only
+/// state a body can leave behind in a usable form is the catalogue connection,
+/// and L1 rolls that back before anyone else can reach it.
+///
+/// On a caught panic the message is recovered from the payload, logged, and
+/// written to the dropped-row census under `site` (Q-17: stdout is not a
+/// record) — every site ends `.query_failed`, the census's unit for "an
+/// operation failed and lost an unknown number of rows" — then handed to
+/// `on_panic`, which builds the function's OWN failure answer.
+///
+/// ⛔ Not a retry: `body` runs exactly once and `on_panic` at most once.
+fn ffi_panic_boundary<T>(
+    site: &'static str,
+    body: impl FnOnce() -> T,
+    on_panic: impl FnOnce(String) -> T,
+) -> T
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body))
+    {
+        Ok(value) => value,
+        Err(payload) =>
+        {
+            let message = panic_payload_text(payload.as_ref());
+            eprintln!("{}: a panic was caught at the FFI boundary: {}", site, message);
+            record_dropped_rows(site, 1);
+            on_panic(message)
+        }
+    }
+}
+
+/// The text of a panic payload: `panic!` carries a `&'static str` or a
+/// `String`; anything else is reported as "unknown panic".
+fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String
+{
+    if let Some(text) = payload.downcast_ref::<&str>()
+    {
+        return (*text).to_string();
+    }
+    if let Some(text) = payload.downcast_ref::<String>()
+    {
+        return text.clone();
+    }
+    "unknown panic".to_string()
+}
+
+/// The sentence a caught panic becomes in a carrier's user-facing message
+/// (ruling 17, W1-1: "a panic inside an operation that can report failure
+/// reports it instead of killing the app"; the brief's own example reads
+/// "PhotoLibrarian hit an internal error and could not read the catalogue").
+/// `could_not` is a verb phrase; the panic's own text follows for diagnosis.
+fn ffi_panic_report(could_not: &str, panic: &str) -> String
+{
+    format!(
+        "PhotoLibrarian hit an internal error and could not {}. ({})",
+        could_not, panic
+    )
+}
+
+// Slice F test seam — a panic INSIDE a wrapped body, at a probe point: under
+// the catalogue lock (`lock_catalogue`) or in the face-runtime accessor
+// (`face_embedding_runtime`) — R-26/R-69's exact shapes. Two arms, both TEST
+// builds only:
+//
+//   • `FFI_PANIC_PROBE_COUNTDOWN` — THIS thread only: 0 is disarmed, `n`
+//     panics at the n-th probe point the thread reaches. A thread-local, not a
+//     parameter, because the FFI signature IS the wire and cannot carry a
+//     probe; not a process-global, so parallel tests cannot trip each other.
+//   • `FACE_WORKER_LOCK_PANIC_ARMED` — the NEXT `lock_catalogue()` on a
+//     face-runtime WORKER panics with the guard held: the spawned-task panic
+//     R-26 and R-69 describe. Scoped by thread name, so only a face task — and
+//     only while a test holds the shared global-catalogue lock — can reach it.
+#[cfg(test)]
+thread_local!
+{
+    static FFI_PANIC_PROBE_COUNTDOWN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+static FACE_WORKER_LOCK_PANIC_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn ffi_panic_probe(point: &'static str)
+{
+    let fire_here = FFI_PANIC_PROBE_COUNTDOWN.with(|countdown| match countdown.get()
+    {
+        0 => false,
+        1 =>
+        {
+            countdown.set(0);
+            true
+        }
+        remaining =>
+        {
+            countdown.set(remaining - 1);
+            false
+        }
+    });
+    if fire_here
+    {
+        panic!("slice F test: an injected panic at {}", point);
+    }
+    if point == "lock_catalogue"
+        && std::thread::current()
+            .name()
+            .is_some_and(|name| name.starts_with("photolibrarian-face-embeddings"))
+        && FACE_WORKER_LOCK_PANIC_ARMED.swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        panic!("slice F test: an injected panic under the catalogue lock on a face-runtime worker");
+    }
+}
+
+/// Production twin of the test seam: EMPTY. Only a test can arm a probe, and
+/// the state it reads does not exist outside `cfg(test)`.
+#[cfg(not(test))]
+#[inline(always)]
+fn ffi_panic_probe(_point: &'static str)
+{
+}
+
+// ===========================================================================
 // Slice 7 / R-31 (2026-09-19) — the dropped-row collector and its census
 // ===========================================================================
 //
@@ -2025,10 +2328,10 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
     // Store the connection in the global state
     // This connection will be reused by all subsequent catalogue operations
     // Mutex ensures thread-safe access when called from multiple Swift async tasks
-    let mut catalogue = CATALOGUE.lock().unwrap();
+    let mut catalogue = lock_catalogue();
     *catalogue = Some(conn);
 
-    let mut stored_path = CATALOGUE_PATH.lock().unwrap();
+    let mut stored_path = lock_catalogue_path();
     *stored_path = Some(path);
 
     true
@@ -2882,6 +3185,54 @@ fn open_and_migrate_catalogue_with_probe(
         CREATE OR REPLACE VIEW keyword_visible AS
             SELECT * FROM keyword WHERE status = 1;
 
+        -- === Removal tombstone (slice B, Sep 26, 2026; R-01 / Q-04) ===
+        -- A catalogue removal keeps what the user AUTHORED and gives it back
+        -- when the SAME file returns to its path through an import (Richard's ruling,
+        -- Sep 18 item-4 ruling 1, widened by Q-04 and rulings 9-12): every
+        -- keyword row of the removed photo, and the four curation columns that
+        -- live on images itself. images.id is a sequence default, so a re-added
+        -- file always gets a NEW id and no dependent table carries a path;
+        -- keyword rows left behind by a bare DELETE could never be joined back.
+        -- These two tables are written in the removal's own transaction, keyed
+        -- by file_path (UNIQUE on images), and consumed by the re-attach.
+        --
+        -- CREATE-time only: no ALTER, no migration key, no marker index. Both a
+        -- fresh and an upgraded catalogue run this same batch, so the two gain
+        -- identical tables (slice K's assertion (e) stays allow-list-free).
+        -- INSERT/DELETE-only by design — nothing ever UPDATEs them, so the S179
+        -- class (an UPDATE on an indexed column reported through the
+        -- delete+insert branch) cannot reach them. keyword.is_video is NOT
+        -- stored: the re-attach takes it from the live re-added row (S70).
+        -- file_size + capture_datetime identify the removed PHOTOGRAPH (fix
+        -- rounds 1-2; the one rule is removal_same_file_sql: the capture date
+        -- decides, the size only for undated files): the work never goes to a
+        -- different photograph that later takes the path.
+        CREATE TABLE IF NOT EXISTS removed_image_tombstone (
+            file_path         TEXT PRIMARY KEY,
+            file_size         BIGINT,
+            capture_datetime  TEXT,
+            rating            INTEGER,
+            flag              TEXT,
+            color_label       TEXT,
+            rotation          INTEGER,
+            removed_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS removed_image_tombstone_keyword (
+            file_path   TEXT NOT NULL,
+            label       TEXT NOT NULL,
+            path        TEXT NOT NULL,
+            status      INTEGER NOT NULL,
+            origin      INTEGER NOT NULL,
+            created_at  TIMESTAMP,
+            hidden_at   TIMESTAMP,
+            collection  BOOLEAN NOT NULL,
+            color       BOOLEAN NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_removed_tombstone_keyword_path
+            ON removed_image_tombstone_keyword(file_path);
+
         -- === Videos (Lightroom import; Docs/DESIGN-Lightroom-Catalog-Import.md §8) ===
         -- Video assets live in their OWN table, NOT in `images` (video is not an
         -- ImageKind). Catalog-only for v1: metadata + curation. Poster-frame
@@ -3678,7 +4029,7 @@ fn push_ingest_row_params(record: &ImageMetadata, out: &mut Vec<Value>)
 pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
     // Acquire lock on global catalogue connection
     // Known limitation: All concurrent calls serialize on this lock
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -3687,6 +4038,20 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
         }
     };
 
+    ingest_metadata_impl(conn, &metadata, None)
+}
+
+/// Body of `ingest_metadata` against an explicit connection (the impl/wrapper
+/// pattern — ⭐ slice B's tests drive the real scan insert through it on
+/// temp-file catalogues). The INSERT SQL, `build_ingest_insert_sql` and
+/// `push_ingest_row_params` are byte-unchanged; the statement now carries
+/// `RETURNING file_path` so the call knows EXACTLY which rows it inserted.
+fn ingest_metadata_impl(
+    conn: &Connection,
+    metadata: &[ImageMetadata],
+    probe: RemovalProbeRef<'_>,
+) -> u32
+{
     if metadata.is_empty()
     {
         return 0;
@@ -3694,10 +4059,14 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
 
     let mut inserted_count = 0u32;
 
+    // ⭐ Slice B — one cheap read per call: when no removal has left a
+    // tombstone (the common case), the per-chunk re-attach is skipped entirely.
+    let reattach_enabled = removal_tombstones_exist(conn);
+
     // One statement per batch instead of one per row. The SQL text for a
     // full-size chunk is built once and reused across chunks; only a trailing
     // partial chunk needs its own string.
-    let full_chunk_sql = build_ingest_insert_sql(INGEST_MULTI_ROW_CHUNK);
+    let full_chunk_sql = ingest_insert_returning_sql(INGEST_MULTI_ROW_CHUNK);
 
     for chunk in metadata.chunks(INGEST_MULTI_ROW_CHUNK)
     {
@@ -3708,7 +4077,7 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
         }
         else
         {
-            partial_chunk_sql = build_ingest_insert_sql(chunk.len());
+            partial_chunk_sql = ingest_insert_returning_sql(chunk.len());
             &partial_chunk_sql
         };
 
@@ -3718,13 +4087,21 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
             push_ingest_row_params(record, &mut values);
         }
 
-        // Ok(changed) is the number of rows actually inserted. INSERT OR IGNORE
+        // ⭐ Slice B: the paths THIS chunk inserted — the only rows its
+        // re-attach may touch (§A-1).
+        let mut inserted_paths: Vec<String> = Vec::new();
+
+        // The returned rows are the rows actually inserted. INSERT OR IGNORE
         // skips duplicates — both rows already in the table and duplicates
         // appearing within this same VALUES list — without failing the
         // statement, so this count stays exact and a re-scan stays safe.
-        match conn.execute(chunk_sql, params_from_iter(values.iter()))
+        match ingest_insert_returning_paths(conn, chunk_sql, &values)
         {
-            Ok(changed) => inserted_count += changed as u32,
+            Ok((paths, unreadable)) =>
+            {
+                inserted_count += (paths.len() as u64 + unreadable) as u32;
+                inserted_paths = paths;
+            }
 
             // FALLBACK — this is the original per-record path, preserved so the
             // batch statement cannot cost us the error isolation the old design
@@ -3738,16 +4115,20 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
                     batch_error
                 );
 
-                let single_row_sql = build_ingest_insert_sql(1);
+                let single_row_sql = ingest_insert_returning_sql(1);
 
                 for record in chunk
                 {
                     let mut row_values: Vec<Value> = Vec::with_capacity(INGEST_PARAMS_PER_ROW);
                     push_ingest_row_params(record, &mut row_values);
 
-                    match conn.execute(&single_row_sql, params_from_iter(row_values.iter()))
+                    match ingest_insert_returning_paths(conn, &single_row_sql, &row_values)
                     {
-                        Ok(changed) => inserted_count += changed as u32,
+                        Ok((paths, unreadable)) =>
+                        {
+                            inserted_count += (paths.len() as u64 + unreadable) as u32;
+                            inserted_paths.extend(paths);
+                        }
                         // Log error but continue processing remaining records.
                         Err(e) =>
                         {
@@ -3757,11 +4138,40 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
                 }
             }
         }
+
+        // ⭐ Slice B — a returning file gets its user-authored work back, once,
+        // after this chunk's insert (including after the per-record fallback).
+        if reattach_enabled
+        {
+            reattach_removal_tombstones_after_ingest(conn, &inserted_paths, probe);
+        }
     }
 
     // Return count of successfully inserted records
     // Note: This excludes skipped duplicates (which contribute 0)
     inserted_count
+}
+
+/// ⭐ Slice B — `build_ingest_insert_sql`, byte-unchanged, with
+/// `RETURNING file_path` appended. Probed on the bundled 1.5.5: an
+/// `INSERT OR IGNORE … RETURNING` returns ONLY the rows it inserted, never the
+/// ones it ignored (`ingest_returning_names_only_the_rows_it_inserted`).
+fn ingest_insert_returning_sql(row_count: usize) -> String
+{
+    format!("{} RETURNING file_path", build_ingest_insert_sql(row_count))
+}
+
+/// Run one ingest INSERT and return the paths it inserted, plus how many
+/// returned rows could not be read (counted as inserted, never re-attached).
+fn ingest_insert_returning_paths(
+    conn: &Connection,
+    sql: &str,
+    values: &[Value],
+) -> Result<(Vec<String>, u64), duckdb::Error>
+{
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params_from_iter(values.iter()), |row| row.get::<_, String>(0))?;
+    Ok(collect_rows_counted(rows, "ingest_metadata.inserted_paths"))
 }
 
 // === Editor-save catalogue refresh =========================================
@@ -4383,24 +4793,36 @@ pub async fn upsert_editor_saved_image(
     insert_if_missing: bool,
 ) -> EditorSavedImageCatalogueResult
 {
-    let database_outcome =
+    // ⭐ Slice F / R-07 — the panic boundary around the synchronous catalogue
+    // segment. A caught panic becomes the `Err(message)` arm below (status
+    // `Failed` + the reason); the awaited vector cleanup after it is
+    // `retry_pending_face_vector_deletes`, which carries its own boundary.
+    let database_outcome = match ffi_panic_boundary(
+        "upsert_editor_saved_image.panic.query_failed",
+        || -> Result<Result<EditorSavedImageDatabaseOutcome, String>, EditorSavedImageCatalogueResult>
     {
-        let catalogue = CATALOGUE.lock().unwrap();
+        let catalogue = lock_catalogue();
         let conn = match catalogue.as_ref()
         {
             Some(conn) => conn,
             None =>
             {
-                return EditorSavedImageCatalogueResult
+                return Err(EditorSavedImageCatalogueResult
                 {
                     status: EditorSavedImageCatalogueStatus::Failed,
                     image_id: None,
                     message: "Catalogue not initialized.".to_string(),
                     vector_cleanup_warning: None,
-                }
+                })
             }
         };
-        upsert_editor_saved_image_database(conn, &metadata, insert_if_missing)
+        Ok(upsert_editor_saved_image_database(conn, &metadata, insert_if_missing))
+    },
+        |panic| Ok(Err(ffi_panic_report("record the saved image in the catalogue", &panic))),
+    )
+    {
+        Ok(database_outcome) => database_outcome,
+        Err(not_initialized) => return not_initialized,
     };
 
     let database_outcome = match database_outcome
@@ -4469,7 +4891,7 @@ pub async fn get_image_count(
     media_type: MediaType,
 ) -> u64 {
     // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -5676,7 +6098,7 @@ pub async fn get_all_images(
     media_type: MediaType,
 ) -> Vec<ImageRecord> {
     // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -5741,7 +6163,7 @@ pub async fn image_records_with_same_basename(
     basename: String,
 ) -> Vec<ImageRecord>
 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref()
     {
         Some(conn) => conn,
@@ -5789,7 +6211,7 @@ pub async fn get_images_sorted(
     apply_raw_jpeg_collapse: bool,
 ) -> Vec<ImageRecord> {
     // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -5842,7 +6264,7 @@ pub async fn get_images_sorted(
 /// - false if catalogue not initialized, file not found, or query failed
 pub async fn update_image_rating(file_path: String, rating: u32) -> bool {
     // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -5897,7 +6319,7 @@ pub async fn update_image_rating(file_path: String, rating: u32) -> bool {
 ///   invalid non-null value was supplied
 pub async fn update_image_flag(file_path: String, flag: Option<String>) -> bool {
     // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -5998,7 +6420,13 @@ const RELOCATE_PREFIX_UPDATE_SQL: &str = "UPDATE images \
 /// execute the PRODUCTION text against a fixture catalogue instead of a copy
 /// that could drift from it.
 pub async fn relocate_file_path_prefix(old_prefix: String, new_prefix: String) -> RelocateResult {
-    let catalogue = CATALOGUE.lock().unwrap();
+    // ⭐ Slice F / R-07 — the panic boundary (`ffi_panic_boundary`): a panic in
+    // the body below is reported through `ok: false` + `message` instead of
+    // killing the app. The body keeps its pre-slice indentation on purpose:
+    // inside it the slice changed the lock token and nothing else.
+    ffi_panic_boundary("relocate_file_path_prefix.panic.query_failed", || -> RelocateResult
+    {
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -6067,6 +6495,13 @@ pub async fn relocate_file_path_prefix(old_prefix: String, new_prefix: String) -
         updated: changed,
         message: String::new(),
     }
+    },
+    |panic| RelocateResult
+    {
+        ok: false,
+        updated: 0,
+        message: ffi_panic_report("re-point these photos to their new location", &panic),
+    })
 }
 
 /// Update the color label for an image
@@ -6086,7 +6521,7 @@ pub async fn relocate_file_path_prefix(old_prefix: String, new_prefix: String) -
 ///   invalid non-null value was supplied
 pub async fn update_image_color_label(file_path: String, color_label: Option<String>) -> bool {
     // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -7106,7 +7541,7 @@ pub async fn query_images(
     apply_raw_jpeg_collapse: bool,
     media_type: MediaType,
 ) -> Vec<ImageRecord> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -7141,7 +7576,7 @@ pub async fn count_query_images(
     apply_raw_jpeg_collapse: bool,
     media_type: MediaType,
 ) -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -7183,7 +7618,7 @@ pub async fn query_images_gallery(
     similar_algorithm_version: String,
     media_type: MediaType,
 ) -> Vec<ImageRecord> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -7218,7 +7653,7 @@ pub async fn count_query_images_gallery(
     similar_algorithm_version: String,
     media_type: MediaType,
 ) -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -7261,7 +7696,7 @@ pub async fn query_images_scoped(
     apply_raw_jpeg_collapse: bool,
     media_type: MediaType,
 ) -> Vec<ImageRecord> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -7303,7 +7738,7 @@ pub async fn count_query_images_scoped(
     apply_raw_jpeg_collapse: bool,
     media_type: MediaType,
 ) -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -7349,7 +7784,7 @@ pub async fn query_images_scoped_gallery(
     similar_algorithm_version: String,
     media_type: MediaType,
 ) -> Vec<ImageRecord> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -7391,7 +7826,7 @@ pub async fn count_query_images_scoped_gallery(
     similar_algorithm_version: String,
     media_type: MediaType,
 ) -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -7594,7 +8029,7 @@ pub async fn query_image_ids(
     apply_raw_jpeg_collapse: bool,
     media_type: MediaType,
 ) -> Vec<i64> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -7629,7 +8064,7 @@ pub async fn query_image_ids_gallery(
     similar_algorithm_version: String,
     media_type: MediaType,
 ) -> Vec<i64> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -7660,7 +8095,7 @@ pub async fn get_images_by_ids(ids: Vec<i64>) -> Vec<ImageRecord> {
         None => return Vec::new(),
     };
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -7765,7 +8200,7 @@ pub async fn project_raw_jpeg_visible_ids(
     ids: Vec<i64>,
     apply_raw_jpeg_collapse: bool,
 ) -> Vec<i64> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -7796,7 +8231,7 @@ pub async fn expand_collapse_group_ids(ids: Vec<i64>) -> Vec<i64> {
         .collect::<Vec<_>>()
         .join(", ");
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -8077,7 +8512,7 @@ pub async fn assign_keyword_for_ids(ids: Vec<i64>, segments: Vec<String>) -> u64
         return 0;
     }
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -8122,7 +8557,7 @@ pub async fn remove_keyword_for_ids(ids: Vec<i64>, path: String) -> u64 {
         None => return 0,
     };
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -8157,7 +8592,7 @@ pub async fn restore_keyword_for_ids(ids: Vec<i64>, path: String) -> u64 {
         None => return 0,
     };
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -8242,7 +8677,7 @@ fn mirror_keyword_rows_across_pairs_impl(conn: &Connection) -> u64 {
 /// above. Called by the Lightroom sidecar pass (S67) after synthesizing the
 /// sidecar JPEG records; safe (and a no-op) any other time.
 pub async fn mirror_keyword_rows_across_pairs() -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -8327,7 +8762,7 @@ pub async fn copy_keyword_rows_for_image_pairs(
     source_ids: Vec<i64>,
     destination_ids: Vec<i64>,
 ) -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -8341,7 +8776,7 @@ pub async fn copy_keyword_rows_for_image_pairs(
 /// All ACTIVE keyword rows for one image, ordered by path (root->leaf within a
 /// branch). For the detail-panel reconstruction.
 pub async fn keywords_for_image(image_id: i64) -> Vec<KeywordRow> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -8427,7 +8862,7 @@ fn keyword_vocabulary_impl(conn: &Connection, origin: &str) -> Vec<KeywordNode> 
 /// The DISTINCT (label, path) keyword vocabulary over the active view — for the
 /// assignment-panel autocomplete and (future) tree browser. Ordered by path.
 pub async fn keyword_vocabulary() -> Vec<KeywordNode> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -8442,7 +8877,7 @@ pub async fn keyword_vocabulary() -> Vec<KeywordNode> {
 /// Provenance-filtered keyword vocabulary for Query Builder keyword predicates.
 /// `both` deliberately means all active keyword rows, not only origin == 3.
 pub async fn keyword_vocabulary_for_origin(origin: String) -> Vec<KeywordNode> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -8547,7 +8982,7 @@ pub async fn keyword_management_rows(
     include_collections: bool,
     include_orphaned: bool,
 ) -> Vec<KeywordManagementRow> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -8600,7 +9035,7 @@ fn delete_keyword_paths_impl(conn: &Connection, paths: &[String]) -> u64 {
 /// This is intentionally separate from remove_keyword_for_ids, which is the
 /// normal user-facing soft-hide operation.
 pub async fn delete_keyword_paths(paths: Vec<String>) -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -8618,7 +9053,7 @@ pub async fn delete_keyword_paths(paths: Vec<String>) -> u64 {
 /// dead collection's name still suggests itself. (The Collection TAB picker filters
 /// to `collection = TRUE` instead — a separate read, added with the tab.)
 pub async fn keyword_labels() -> Vec<String> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -8937,7 +9372,7 @@ pub async fn save_query(
     predicates: Vec<QueryPredicate>,
     connectors: Vec<Connector>,
 ) -> Option<SavedQueryInfo> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -8950,7 +9385,7 @@ pub async fn save_query(
 
 /// FFI: all saved queries (id + name), name-ordered, for the picker.
 pub async fn list_saved_queries() -> Vec<SavedQueryInfo> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -8963,7 +9398,7 @@ pub async fn list_saved_queries() -> Vec<SavedQueryInfo> {
 
 /// FFI: load a saved query back into builder arrays. None if id unknown.
 pub async fn load_saved_query(id: i64) -> Option<SavedQueryPayload> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -8976,7 +9411,7 @@ pub async fn load_saved_query(id: i64) -> Option<SavedQueryPayload> {
 
 /// FFI: delete a saved query. True if it existed.
 pub async fn delete_saved_query(id: i64) -> bool {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -9007,7 +9442,7 @@ pub async fn distinct_image_values(field: String) -> Vec<String> {
         }
     };
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -9066,7 +9501,7 @@ pub async fn distinct_numeric_values(field: String) -> Vec<f64> {
         }
     };
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -9462,7 +9897,7 @@ pub async fn create_analysis_job(
     analysis_run_id: String,
     total_candidate_count: u64,
 ) -> Option<AnalysisJob> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -9485,7 +9920,7 @@ pub async fn create_analysis_job(
 /// Return the newest non-terminal job for a kind, if any. Used by UI status
 /// checks and, later, by the helper to avoid double-owning foreground work.
 pub async fn active_analysis_job(job_kind: String) -> Option<AnalysisJob> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -9501,7 +9936,7 @@ pub async fn active_analysis_job(job_kind: String) -> Option<AnalysisJob> {
 /// status surface for background work; callers can filter by job kind for
 /// command-specific actions.
 pub async fn active_analysis_jobs() -> Vec<AnalysisJob> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -9524,7 +9959,7 @@ pub async fn update_analysis_job_progress(
     updated_delta: u64,
     total_candidate_count: Option<u64>,
 ) -> Option<AnalysisJob> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -9554,7 +9989,7 @@ pub async fn update_analysis_job_breadcrumb(
     current_file_path: Option<String>,
     timed_out: bool,
 ) -> Option<AnalysisJob> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -9569,7 +10004,7 @@ pub async fn update_analysis_job_breadcrumb(
 /// Mark a running/queued job as cancellation-requested. Workers should poll
 /// this row between chunks and finish as `cancelled` when teardown completes.
 pub async fn request_cancel_analysis_job(id: i64) -> bool {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -9587,7 +10022,7 @@ pub async fn finish_analysis_job(
     status: String,
     last_error: Option<String>,
 ) -> Option<AnalysisJob> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -9607,7 +10042,7 @@ pub async fn recover_interrupted_analysis_jobs(
     terminal_status: String,
     last_error: Option<String>,
 ) -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -9914,7 +10349,7 @@ fn clear_operation_log_impl(conn: &Connection) -> bool {
 /// Open one Operation Log run and return its id (None = log unavailable —
 /// the caller proceeds without logging, per the supplementary doctrine).
 pub async fn begin_operation_log(kind: String) -> Option<i64> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -9936,7 +10371,7 @@ pub async fn finish_operation_log(
     failed_count: u64,
     summary: Option<String>,
 ) -> bool {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -9963,7 +10398,7 @@ pub async fn append_operation_log_entries(
     run_id: i64,
     entries: Vec<OperationLogEntryInput>,
 ) -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -9977,7 +10412,7 @@ pub async fn append_operation_log_entries(
 
 /// Newest-first runs list for the View ▸ Logging window.
 pub async fn list_operation_logs(limit: u32) -> Vec<OperationLogRun> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -9997,7 +10432,7 @@ pub async fn operation_log_entries(
     limit: u32,
     offset: u32,
 ) -> Vec<OperationLogEntryRecord> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -10011,7 +10446,7 @@ pub async fn operation_log_entries(
 
 /// Clear History — empties both tables (the v1 retention story).
 pub async fn clear_operation_log() -> bool {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -10401,7 +10836,13 @@ pub async fn focus_analysis_candidate_page(
     algorithm_version: String,
     analysis_run_id: String,
 ) -> FocusAnalysisCandidatePage {
-    let catalogue = CATALOGUE.lock().unwrap();
+    // ⭐ Slice F / R-07 — the panic boundary (`ffi_panic_boundary`): a panic in
+    // the body below is reported through `query_ok: false` (UNKNOWN, never an empty queue) instead of
+    // killing the app. The body keeps its pre-slice indentation on purpose:
+    // inside it the slice changed the lock token and nothing else.
+    ffi_panic_boundary("focus_analysis_candidate_page.panic.query_failed", || -> FocusAnalysisCandidatePage
+    {
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -10412,6 +10853,11 @@ pub async fn focus_analysis_candidate_page(
     };
 
     focus_analysis_candidates_impl(conn, limit, &algorithm_version, &analysis_run_id, None)
+    },
+    |panic| focus_analysis_candidate_page_failure(ffi_panic_report(
+        "read the list of photos to analyse",
+        &panic,
+    )))
 }
 
 /// Return focus-analysis candidates intersected with an explicit image-id
@@ -10436,7 +10882,13 @@ pub async fn focus_analysis_candidate_page_for_ids(
     algorithm_version: String,
     analysis_run_id: String,
 ) -> FocusAnalysisCandidatePage {
-    let catalogue = CATALOGUE.lock().unwrap();
+    // ⭐ Slice F / R-07 — the panic boundary (`ffi_panic_boundary`): a panic in
+    // the body below is reported through `query_ok: false` (UNKNOWN, never an empty queue) instead of
+    // killing the app. The body keeps its pre-slice indentation on purpose:
+    // inside it the slice changed the lock token and nothing else.
+    ffi_panic_boundary("focus_analysis_candidate_page_for_ids.panic.query_failed", || -> FocusAnalysisCandidatePage
+    {
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -10453,6 +10905,11 @@ pub async fn focus_analysis_candidate_page_for_ids(
         &analysis_run_id,
         Some(&ids),
     )
+    },
+    |panic| focus_analysis_candidate_page_failure(ffi_panic_report(
+        "read the list of photos to analyse",
+        &panic,
+    )))
 }
 
 /// Count still-image rows whose focus analysis is missing or stale for the
@@ -10462,7 +10919,7 @@ pub async fn focus_analysis_candidate_count(
     algorithm_version: String,
     analysis_run_id: String,
 ) -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -10481,7 +10938,7 @@ pub async fn focus_analysis_candidate_count_for_ids(
     algorithm_version: String,
     analysis_run_id: String,
 ) -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -11885,11 +12342,18 @@ pub async fn update_focus_analysis_results(
     results: Vec<FocusAnalysisResult>,
 ) -> FocusAnalysisWritebackResult
 {
+    // ⭐ Slice F / R-07 — the panic boundary (`ffi_panic_boundary`): a panic in
+    // the body below is reported through `failure_stage` "catalogue" (an existing stage
+    // the Swift runner already reads as a failure) + `failed_reason` instead of
+    // killing the app. The body keeps its pre-slice indentation on purpose:
+    // inside it the slice changed the lock token and nothing else.
+    ffi_panic_boundary("update_focus_analysis_results.panic.query_failed", || -> FocusAnalysisWritebackResult
+    {
     if results.is_empty() {
         return successful_focus_analysis_writeback(0);
     }
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -11906,13 +12370,24 @@ pub async fn update_focus_analysis_results(
     };
 
     update_focus_analysis_results_impl(conn, results, None)
+    },
+    |panic| FocusAnalysisWritebackFailure::new(
+        FOCUS_WRITEBACK_STAGE_CATALOGUE,
+        format!(
+            "update_focus_analysis_results: {}",
+            ffi_panic_report("save these analysis results to the catalogue", &panic)
+        ),
+        None,
+        None,
+    )
+    .into_result())
 }
 
 /// Count durable face observations for the requested focus/enrichment algorithm
 /// version. This is intentionally scoped by version so old detection rows never
 /// leak into the current recognition/crop pipeline.
 pub async fn face_observation_count(algorithm_version: String) -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -11947,7 +12422,7 @@ pub async fn face_observations_for_image_ids(
         None => return Vec::new(),
     };
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -12071,10 +12546,18 @@ pub async fn face_recognition_menu_states(
     // On a read failure the states are still built — the catalogue half of the
     // answer is sound — but `store_unavailable` is set and every
     // `indexed_face_count` stays 0, so the caller can say the honest thing.
-    let stored = FACE_EMBEDDING_RUNTIME
-        .spawn(async move { stored_face_embeddings(&model_version, &preprocessing_version).await })
-        .await
-        .unwrap_or_else(|e| Err(format!("face_recognition_menu_states: embedding task {}", e)));
+    // ⭐ Slice F / R-25 — an unbuildable runtime reads as an unreadable store
+    // (`store_unavailable: true`, below), never as a crash.
+    let stored = match face_embedding_runtime(
+        "face_recognition_menu_states.face_runtime_unavailable.query_failed",
+    )
+    {
+        Ok(runtime) => runtime
+            .spawn(async move { stored_face_embeddings(&model_version, &preprocessing_version).await })
+            .await
+            .unwrap_or_else(|e| Err(format!("face_recognition_menu_states: embedding task {}", e))),
+        Err(message) => Err(format!("face_recognition_menu_states: {}", message)),
+    };
 
     let (embedded_pairs, store_unavailable) = match stored {
         Ok(records) => (
@@ -12090,7 +12573,7 @@ pub async fn face_recognition_menu_states(
         }
     };
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -12302,15 +12785,47 @@ pub async fn face_embedding_missing_observation_page(
     preprocessing_version: String,
     limit: u32,
 ) -> FaceObservationWorkSet {
-    let stored = FACE_EMBEDDING_RUNTIME
-        .spawn(async move { stored_face_embeddings(&model_version, &preprocessing_version).await })
-        .await
-        .unwrap_or_else(|e| {
+    // ⭐ Slice F — L2 + L3. The runtime is acquired fallibly (R-25) and the
+    // synchronous spawn sits inside the panic boundary (R-07); a panic INSIDE
+    // the spawned task is caught by tokio and reported by the JoinError arm, as
+    // before. ⚠️ Every error text built here begins with a prefix that
+    // `FaceIndexWorkSetOutcome.unreadableHalf` already classifies ("… embedding
+    // task" → the index half), which `Spikes/SwallowedFailuresSwiftBGate` L8
+    // pins — so a runtime that cannot start is reported as the index half.
+    let spawned = ffi_panic_boundary(
+        "face_embedding_missing_observation_page.panic.query_failed",
+        ||
+        {
+            face_embedding_runtime(
+                "face_embedding_missing_observation_page.face_runtime_unavailable.query_failed",
+            )
+            .map(|runtime|
+            {
+                runtime.spawn(async move
+                {
+                    stored_face_embeddings(&model_version, &preprocessing_version).await
+                })
+            })
+            .map_err(|message| format!(
+                "face_embedding_missing_observations: embedding task could not start: {}",
+                message
+            ))
+        },
+        |panic| Err(format!(
+            "face_embedding_missing_observations: embedding task could not start: {}",
+            ffi_panic_report("start reading the face index", &panic)
+        )),
+    );
+    let stored = match spawned
+    {
+        Ok(task) => task.await.unwrap_or_else(|e| {
             Err(format!(
                 "face_embedding_missing_observations: embedding task {}",
                 e
             ))
-        });
+        }),
+        Err(message) => Err(message),
+    };
 
     let embedded_ids = match stored {
         Ok(records) => records
@@ -12331,7 +12846,18 @@ pub async fn face_embedding_missing_observation_page(
         }
     };
 
-    let built = face_embedding_observation_candidates(&algorithm_version, limit, &embedded_ids);
+    // ⭐ Slice F / R-07 — the synchronous CATALOGUE half inside the boundary: a
+    // caught panic becomes the existing catalogue-failure answer (`store_ok:
+    // false`, an EMPTY list — never "everything is missing"), worded with the
+    // "… query" prefix the Swift classifier reads as the catalogue half.
+    let built = ffi_panic_boundary(
+        "face_embedding_missing_observation_page.panic.query_failed",
+        || face_embedding_observation_candidates(&algorithm_version, limit, &embedded_ids),
+        |panic| face_observation_candidates_failure(format!(
+            "face_embedding_missing_observations: query stopped by an internal error: {}",
+            panic
+        )),
+    );
 
     match built.catalogue_error
     {
@@ -12362,7 +12888,7 @@ fn face_embedding_observation_candidates(
     limit: u32,
     embedded_ids: &std::collections::HashSet<i64>,
 ) -> FaceObservationCandidates {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -12485,13 +13011,134 @@ fn face_embedding_observation_candidates(
 
 const FACE_EMBEDDING_TABLE: &str = "face_embeddings";
 
-static FACE_EMBEDDING_RUNTIME: once_cell::sync::Lazy<tokio::runtime::Runtime> =
-    once_cell::sync::Lazy::new(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("photolibrarian-face-embeddings")
-            .build()
-            .expect("create face embedding Tokio runtime")
+/// Slice F / R-25 — the face embedding runtime's slot.
+///
+/// ⭐ A `OnceCell`, never a `Lazy`. The pre-slice `Lazy::new(|| … .build()
+/// .expect(…))` was the only `.expect(` in the product crate, and via R-07 a
+/// failed build was a process kill. Worse, `Lazy` POISONS on a panicking
+/// initializer: every later touch panicked with "Lazy instance has previously
+/// been poisoned" — a message that no longer names the cause — so one failure
+/// took the face index, face search, Backup's counts and Restore's vector copy
+/// down for the rest of the session, and a relaunch could repeat it. A
+/// `Lazy<io::Result<_>>` would not panic but would cache the FIRST failure for
+/// the life of the process. `get_or_try_init` leaves the slot EMPTY after a
+/// failed build, so a later call tries again (ruling 18, W1-2).
+///
+/// ⛔ Product code never names this slot: every touch goes through
+/// `face_embedding_runtime`, and `Spikes/FfiPanicBoundaryGate` locks that.
+static FACE_EMBEDDING_RUNTIME_SLOT: once_cell::sync::OnceCell<tokio::runtime::Runtime> =
+    once_cell::sync::OnceCell::new();
+
+/// Build the face embedding runtime. `Builder::build()` returns `io::Result`
+/// and fails under fd exhaustion (tokio 1.52.2 `runtime/driver.rs:48/154` →
+/// `io/driver.rs:118-121`: kqueue, a waker and a registry clone, plus the
+/// signal self-pipe — V6 measured it failing under `ulimit -n 64` and `512`).
+fn build_face_embedding_runtime() -> std::io::Result<tokio::runtime::Runtime>
+{
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("photolibrarian-face-embeddings")
+        .build()
+}
+
+/// Fill `slot` from `build`, fallibly.
+///
+/// ⚠️ The `catch_unwind` is NOT decoration: tokio can also PANIC from inside
+/// `build()` — `runtime/builder.rs:1904` calls `launch.launch()` AFTER the
+/// driver's `?` (`:1861`), and the blocking pool answers thread exhaustion with
+/// `panic!("OS can't spawn worker thread: {e}")` (`runtime/blocking/pool.rs:
+/// 324-325`), re-read in the registry for this slice. That is the MORE likely
+/// arm: the runtime is built lazily while ~14 culling lanes, a thumbnail lane,
+/// DuckDB and LanceDB are already running. So both arms become an `Err`, and
+/// the slot stays empty either way.
+fn runtime_from_slot(
+    slot: &'static once_cell::sync::OnceCell<tokio::runtime::Runtime>,
+    build: fn() -> std::io::Result<tokio::runtime::Runtime>,
+) -> Result<&'static tokio::runtime::Runtime, String>
+{
+    slot.get_or_try_init(||
+    {
+        match std::panic::catch_unwind(build)
+        {
+            Ok(Ok(runtime)) => Ok(runtime),
+            Ok(Err(error)) => Err(format!("it could not be built ({})", error)),
+            Err(payload) => Err(format!(
+                "building it panicked ({})",
+                panic_payload_text(payload.as_ref())
+            )),
+        }
+    })
+}
+
+/// Slice F / R-25 — the face embedding runtime, fallibly.
+///
+/// `site` names the caller for the durable record: an unavailable runtime is
+/// logged AND written to the dropped-row census under `site` (Q-17 — stdout is
+/// not a record; every site ends `.query_failed`, the census's unit for "an
+/// operation failed"). Each caller then degrades in its OWN existing failure
+/// shape — `store_failed`, `ok: false`, `store_ok: false` + an EMPTY list,
+/// `FaceVectorDeleteRetryStatus::Failed`, `store_unavailable: true`,
+/// `vector_delete_failed: true` — or, for the five callers whose answer has no
+/// failure channel, today's degenerate answer (the H-Rust "no caller can
+/// present it" disposition; slice F does not widen their wire).
+fn face_embedding_runtime(site: &'static str) -> Result<&'static tokio::runtime::Runtime, String>
+{
+    ffi_panic_probe("face_embedding_runtime");
+    let (slot, build) = face_embedding_runtime_source();
+    runtime_from_slot(slot, build).map_err(|reason|
+    {
+        let message = format!("the face embedding runtime is unavailable: {}", reason);
+        eprintln!("{}: {}", site, message);
+        record_dropped_rows(site, 1);
+        message
+    })
+}
+
+/// Production: THE slot and THE builder. The test twin below can substitute a
+/// fresh slot and a failing builder for the calling thread only.
+#[cfg(not(test))]
+fn face_embedding_runtime_source() -> (
+    &'static once_cell::sync::OnceCell<tokio::runtime::Runtime>,
+    fn() -> std::io::Result<tokio::runtime::Runtime>,
+)
+{
+    (&FACE_EMBEDDING_RUNTIME_SLOT, build_face_embedding_runtime)
+}
+
+// Slice F test seam (R4/R5) — a substitute (slot, builder) pair for THIS thread
+// only. The FFI signatures cannot carry a probe, and a process-global would let
+// parallel tests see each other's broken runtime.
+#[cfg(test)]
+thread_local!
+{
+    static FACE_EMBEDDING_RUNTIME_OVERRIDE: std::cell::Cell<
+        Option<(
+            &'static once_cell::sync::OnceCell<tokio::runtime::Runtime>,
+            fn() -> std::io::Result<tokio::runtime::Runtime>,
+        )>,
+    > = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn face_embedding_runtime_source() -> (
+    &'static once_cell::sync::OnceCell<tokio::runtime::Runtime>,
+    fn() -> std::io::Result<tokio::runtime::Runtime>,
+)
+{
+    FACE_EMBEDDING_RUNTIME_OVERRIDE
+        .with(|entry| entry.get())
+        .unwrap_or((&FACE_EMBEDDING_RUNTIME_SLOT, build_face_embedding_runtime))
+}
+
+/// Test builds only: the pre-slice NAME, so the test modules that drive the
+/// runtime directly (`FACE_EMBEDDING_RUNTIME.block_on(…)`) compile unchanged.
+/// ⛔ There is no `FACE_EMBEDDING_RUNTIME` in a production build.
+#[cfg(test)]
+static FACE_EMBEDDING_RUNTIME: once_cell::sync::Lazy<&'static tokio::runtime::Runtime> =
+    once_cell::sync::Lazy::new(||
+    {
+        runtime_from_slot(&FACE_EMBEDDING_RUNTIME_SLOT, build_face_embedding_runtime)
+            .expect("test builds: the face embedding runtime")
     });
 
 /// Serializes durable pending-delete retries without holding a blocking mutex
@@ -12527,7 +13174,7 @@ fn face_embedding_schema(dimension: u32) -> SchemaRef {
 }
 
 fn face_embedding_store_uri() -> Option<String> {
-    let catalogue_path = CATALOGUE_PATH.lock().unwrap();
+    let catalogue_path = lock_catalogue_path();
     let path = catalogue_path.as_ref()?;
     let parent = path.parent()?;
     Some(parent.join("vectors.lancedb").to_string_lossy().to_string())
@@ -12728,18 +13375,38 @@ fn face_embedding_batch(
 pub async fn upsert_face_embeddings(
     records: Vec<FaceEmbeddingVectorRecord>,
 ) -> FaceEmbeddingStoreResult {
-    match FACE_EMBEDDING_RUNTIME
-        .spawn(upsert_face_embeddings_impl(records))
-        .await
-    {
-        Ok(result) => result,
-        Err(e) => FaceEmbeddingStoreResult {
-            requested_count: 0,
-            stored_count: 0,
-            total_count: 0,
-            status: "runtime_failed".to_string(),
-            message: format!("Face embedding runtime task failed: {}", e),
+    // ⭐ Slice F — every failure here reports the EXISTING `store_failed`
+    // status (ruling 20, W1-4), never a new string. Before this slice a
+    // JoinError reported `runtime_failed`, which the shipped Swift failed-set
+    // (`FaceRecognitionIndexBuilder.swift:345`) did not contain — so a store
+    // task that PANICKED read as success and cleared the resume flag (brief
+    // §A-2). H-Swift-B has since made the Swift side an allow-list; this keeps
+    // the core honest under either policy.
+    let store_failed = |message: String| FaceEmbeddingStoreResult {
+        requested_count: 0,
+        stored_count: 0,
+        total_count: 0,
+        status: "store_failed".to_string(),
+        message,
+    };
+    let spawned = ffi_panic_boundary(
+        "upsert_face_embeddings.panic.query_failed",
+        ||
+        {
+            face_embedding_runtime("upsert_face_embeddings.face_runtime_unavailable.query_failed")
+                .map(|runtime| runtime.spawn(upsert_face_embeddings_impl(records)))
+                .map_err(|message| format!("Face embeddings could not be stored: {}", message))
         },
+        |panic| Err(ffi_panic_report("store the face embeddings", &panic)),
+    );
+    match spawned
+    {
+        Ok(task) => match task.await
+        {
+            Ok(result) => result,
+            Err(e) => store_failed(format!("Face embedding runtime task failed: {}", e)),
+        },
+        Err(message) => store_failed(message),
     }
 }
 
@@ -12868,13 +13535,20 @@ async fn face_embedding_total_count() -> u64 {
 }
 
 pub async fn face_embedding_count(model_version: String, preprocessing_version: String) -> u64 {
-    FACE_EMBEDDING_RUNTIME
-        .spawn(face_embedding_count_impl(
-            model_version,
-            preprocessing_version,
-        ))
-        .await
-        .unwrap_or(0)
+    // Slice F / R-25 — no failure channel (a bare u64; ruling 23): an
+    // unbuildable runtime answers today's degenerate 0, and the accessor has
+    // already logged it and written it to the dropped-row census.
+    match face_embedding_runtime("face_embedding_count.face_runtime_unavailable.query_failed")
+    {
+        Ok(runtime) => runtime
+            .spawn(face_embedding_count_impl(
+                model_version,
+                preprocessing_version,
+            ))
+            .await
+            .unwrap_or(0),
+        Err(_unavailable) => 0,
+    }
 }
 
 async fn face_embedding_count_impl(model_version: String, preprocessing_version: String) -> u64 {
@@ -13040,14 +13714,23 @@ pub async fn face_embedding_nearest_neighbors(
     preprocessing_version: String,
     limit_per_face: u32,
 ) -> Vec<FaceEmbeddingNeighborRecord> {
-    FACE_EMBEDDING_RUNTIME
-        .spawn(face_embedding_nearest_neighbors_impl(
-            model_version,
-            preprocessing_version,
-            limit_per_face,
-        ))
-        .await
-        .unwrap_or_default()
+    // Slice F / R-25 — no failure channel (a bare list; ruling 23 — and no
+    // Swift caller): an unbuildable runtime answers today's empty list,
+    // logged and censused by the accessor.
+    match face_embedding_runtime(
+        "face_embedding_nearest_neighbors.face_runtime_unavailable.query_failed",
+    )
+    {
+        Ok(runtime) => runtime
+            .spawn(face_embedding_nearest_neighbors_impl(
+                model_version,
+                preprocessing_version,
+                limit_per_face,
+            ))
+            .await
+            .unwrap_or_default(),
+        Err(_unavailable) => Vec::new(),
+    }
 }
 
 async fn face_embedding_nearest_neighbors_impl(
@@ -13188,17 +13871,40 @@ pub async fn face_embedding_search_checked(
     threshold: f64,
     limit: u32,
 ) -> FaceEmbeddingSearchResult {
-    let outcome = FACE_EMBEDDING_RUNTIME
-        .spawn(face_embedding_search_impl(
-            seed_face_observation_ids,
-            candidate_image_ids,
-            model_version,
-            preprocessing_version,
-            threshold,
-            limit,
-        ))
-        .await
-        .unwrap_or_else(|e| Err(format!("face_embedding_search: task {}", e)));
+    // ⭐ Slice F — L2 + L3: the runtime is acquired fallibly and the synchronous
+    // spawn sits inside the panic boundary. A panic inside the spawned search —
+    // R-69's window, under the catalogue lock on a tokio worker — is caught by
+    // tokio and reported by the JoinError arm, and L1 heals the lock it
+    // poisoned at the next acquisition.
+    let spawned = ffi_panic_boundary(
+        "face_embedding_search_checked.panic.query_failed",
+        ||
+        {
+            face_embedding_runtime(
+                "face_embedding_search_checked.face_runtime_unavailable.query_failed",
+            )
+            .map(|runtime|
+            {
+                runtime.spawn(face_embedding_search_impl(
+                    seed_face_observation_ids,
+                    candidate_image_ids,
+                    model_version,
+                    preprocessing_version,
+                    threshold,
+                    limit,
+                ))
+            })
+            .map_err(|message| format!("face_embedding_search: {}", message))
+        },
+        |panic| Err(ffi_panic_report("search the face index", &panic)),
+    );
+    let outcome = match spawned
+    {
+        Ok(task) => task
+            .await
+            .unwrap_or_else(|e| Err(format!("face_embedding_search: task {}", e))),
+        Err(message) => Err(message),
+    };
 
     FaceEmbeddingSearchResult::from_search(outcome)
 }
@@ -13236,17 +13942,36 @@ pub async fn face_embedding_search_vector_checked(
     threshold: f64,
     limit: u32,
 ) -> FaceEmbeddingSearchResult {
-    let outcome = FACE_EMBEDDING_RUNTIME
-        .spawn(face_embedding_search_vector_impl(
-            seed_vector,
-            candidate_image_ids,
-            model_version,
-            preprocessing_version,
-            threshold,
-            limit,
-        ))
-        .await
-        .unwrap_or_else(|e| Err(format!("face_embedding_search_vector: task {}", e)));
+    // ⭐ Slice F — L2 + L3, exactly as `face_embedding_search_checked`.
+    let spawned = ffi_panic_boundary(
+        "face_embedding_search_vector_checked.panic.query_failed",
+        ||
+        {
+            face_embedding_runtime(
+                "face_embedding_search_vector_checked.face_runtime_unavailable.query_failed",
+            )
+            .map(|runtime|
+            {
+                runtime.spawn(face_embedding_search_vector_impl(
+                    seed_vector,
+                    candidate_image_ids,
+                    model_version,
+                    preprocessing_version,
+                    threshold,
+                    limit,
+                ))
+            })
+            .map_err(|message| format!("face_embedding_search_vector: {}", message))
+        },
+        |panic| Err(ffi_panic_report("search the face index", &panic)),
+    );
+    let outcome = match spawned
+    {
+        Ok(task) => task
+            .await
+            .unwrap_or_else(|e| Err(format!("face_embedding_search_vector: task {}", e))),
+        Err(message) => Err(message),
+    };
 
     FaceEmbeddingSearchResult::from_search(outcome)
 }
@@ -13264,7 +13989,7 @@ fn face_observation_pairs_for_ids(
     let Some(filter) = id_in_list(&id_vec) else {
         return std::collections::HashSet::new();
     };
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -13609,7 +14334,7 @@ pub async fn replace_face_cluster_run(
     run: FaceClusterRunRecord,
     members: Vec<FaceClusterMemberRecord>,
 ) -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -13669,7 +14394,7 @@ fn face_cluster_runs_impl(conn: &Connection, limit: u32) -> Vec<FaceClusterRunSu
 }
 
 pub async fn face_cluster_runs(limit: u32) -> Vec<FaceClusterRunSummary> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -13738,7 +14463,7 @@ fn face_cluster_members_impl(conn: &Connection, run_id: &str) -> Vec<FaceCluster
 }
 
 pub async fn face_cluster_members(run_id: String) -> Vec<FaceClusterMemberRecord> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -13888,7 +14613,7 @@ fn person_summaries_impl(conn: &Connection) -> Vec<PersonSummaryRecord> {
 }
 
 pub async fn person_summaries() -> Vec<PersonSummaryRecord> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -13962,7 +14687,7 @@ fn person_representative_faces_impl(conn: &Connection) -> Vec<PersonRepresentati
 }
 
 pub async fn person_representative_faces() -> Vec<PersonRepresentativeFaceRecord> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -14031,7 +14756,7 @@ fn person_assignments_for_face_observations_impl(
 pub async fn person_assignments_for_face_observations(
     face_observation_ids: Vec<i64>,
 ) -> Vec<PersonFaceAssignmentRecord> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -14111,7 +14836,7 @@ fn person_face_observation_ids_impl(conn: &Connection, person_id: i64) -> Vec<i6
 }
 
 pub async fn person_face_observation_ids(person_id: i64) -> Vec<i64> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -14416,7 +15141,7 @@ fn acknowledge_pending_face_vector_deletes_impl(
 
 fn pending_face_vector_delete_ids_from_catalogue() -> Result<Vec<i64>, String>
 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = catalogue
         .as_ref()
         .ok_or_else(|| "Catalogue not initialized.".to_string())?;
@@ -14425,7 +15150,7 @@ fn pending_face_vector_delete_ids_from_catalogue() -> Result<Vec<i64>, String>
 
 fn pending_face_vector_delete_count_from_catalogue() -> Result<u64, String>
 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = catalogue
         .as_ref()
         .ok_or_else(|| "Catalogue not initialized.".to_string())?;
@@ -14442,7 +15167,7 @@ fn acknowledge_pending_face_vector_deletes_from_catalogue(
         return Ok(0);
     }
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = catalogue
         .as_ref()
         .ok_or_else(|| "Catalogue not initialized.".to_string())?;
@@ -14636,12 +15361,40 @@ async fn retry_pending_face_vector_deletes_impl() -> FaceVectorDeleteRetryResult
 /// build, and immediately after an editor-refresh transaction commits.
 pub async fn retry_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
 {
-    match FACE_EMBEDDING_RUNTIME
-        .spawn(retry_pending_face_vector_deletes_impl())
-        .await
+    // ⭐ Slice F — L2 + L3. The runtime is acquired fallibly (R-25: an
+    // unavailable runtime reports the EXISTING `Failed` status, no new enum
+    // case) and the synchronous spawn sits inside the panic boundary (R-07).
+    let spawned = ffi_panic_boundary(
+        "retry_pending_face_vector_deletes.panic.query_failed",
+        ||
+        {
+            face_embedding_runtime(
+                "retry_pending_face_vector_deletes.face_runtime_unavailable.query_failed",
+            )
+            .map(|runtime| runtime.spawn(retry_pending_face_vector_deletes_impl()))
+            .map_err(|message| format!("Face-vector cleanup could not start: {}", message))
+        },
+        |panic| Err(ffi_panic_report("clean up the queued face vectors", &panic)),
+    );
+    let failure = match spawned
     {
-        Ok(result) => result,
-        Err(error) =>
+        Ok(task) => match task.await
+        {
+            Ok(result) => return result,
+            Err(error) => format!("Face-vector cleanup runtime failed: {}", error),
+        },
+        Err(message) => message,
+    };
+
+    // ⭐ R-26 — this arm is reached precisely when something went wrong, and a
+    // panic inside the spawned impl may have POISONED the catalogue lock on its
+    // way out. `pending_face_vector_delete_count_from_catalogue` acquires it
+    // through `lock_catalogue()`, which heals a poisoned lock instead of
+    // panicking, so the re-lock that used to kill the app is safe — and it runs
+    // inside the boundary too, so no panic of its own can escape.
+    ffi_panic_boundary(
+        "retry_pending_face_vector_deletes.panic.query_failed",
+        ||
         {
             let remaining_count = pending_face_vector_delete_count_from_catalogue().unwrap_or(0);
             FaceVectorDeleteRetryResult
@@ -14650,10 +15403,22 @@ pub async fn retry_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
                 pending_count: remaining_count,
                 acknowledged_count: 0,
                 remaining_count,
-                message: format!("Face-vector cleanup runtime failed: {}", error),
+                message: failure.clone(),
             }
-        }
-    }
+        },
+        |panic| FaceVectorDeleteRetryResult
+        {
+            status: FaceVectorDeleteRetryStatus::Failed,
+            pending_count: 0,
+            acknowledged_count: 0,
+            remaining_count: 0,
+            message: format!(
+                "{} {}",
+                failure,
+                ffi_panic_report("count the queued face vectors", &panic)
+            ),
+        },
+    )
 }
 
 /// Delete canonical-migration twin vectors from LanceDB. Unlike the historical
@@ -14830,7 +15595,7 @@ async fn canonicalize_face_embeddings_probed(
     // Phase 1 — the DuckDB re-key, under the catalogue lock (sync, committed
     // before any vector is touched). The doomed-id census rides the same lock.
     let (reassigned, duplicates_removed, doomed, db_ok, census_ok) = {
-        let catalogue = CATALOGUE.lock().unwrap();
+        let catalogue = lock_catalogue();
         let conn = match catalogue.as_ref() {
             Some(c) => c,
             None => {
@@ -14867,13 +15632,22 @@ async fn canonicalize_face_embeddings_probed(
     }
 
     // Phase 2 — the LanceDB delete on the embedding runtime, lock released.
-    let (vectors_deleted, vector_delete_failed) = FACE_EMBEDDING_RUNTIME
-        .spawn(delete_face_vectors_by_observation_ids(
-            doomed,
-            "canonicalize_face_embeddings",
-        ))
-        .await
-        .unwrap_or((0, true));
+    // ⭐ Slice F / R-25: an unbuildable runtime FAILS CLOSED — nothing is
+    // deleted and `vector_delete_failed` is true — so the Swift one-shot
+    // flag cannot latch and the migration retries at the next index build.
+    let (vectors_deleted, vector_delete_failed) = match face_embedding_runtime(
+        "canonicalize_face_embeddings.face_runtime_unavailable.query_failed",
+    )
+    {
+        Ok(runtime) => runtime
+            .spawn(delete_face_vectors_by_observation_ids(
+                doomed,
+                "canonicalize_face_embeddings",
+            ))
+            .await
+            .unwrap_or((0, true)),
+        Err(_unavailable) => (0, true),
+    };
 
     CanonicalizeFaceEmbeddingsResult {
         reassigned,
@@ -15016,7 +15790,13 @@ pub async fn assign_face_observations_to_person(
     face_observation_ids: Vec<i64>,
     person_name: String,
 ) -> PersonClusterAcceptResult {
-    let catalogue = CATALOGUE.lock().unwrap();
+    // ⭐ Slice F / R-07 — the panic boundary (`ffi_panic_boundary`): a panic in
+    // the body below is reported through the existing `failed` status + `message` instead of
+    // killing the app. The body keeps its pre-slice indentation on purpose:
+    // inside it the slice changed the lock token and nothing else.
+    ffi_panic_boundary("assign_face_observations_to_person.panic.query_failed", || -> PersonClusterAcceptResult
+    {
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -15026,6 +15806,8 @@ pub async fn assign_face_observations_to_person(
     };
 
     assign_face_observations_to_person_impl(conn, &face_observation_ids, &person_name)
+    },
+    |panic| person_accept_error("failed", &ffi_panic_report("save this person", &panic)))
 }
 
 fn assign_face_search_matches_to_person_impl(
@@ -15193,7 +15975,13 @@ pub async fn assign_face_search_matches_to_person(
     preprocessing_version: String,
     threshold: f64,
 ) -> PersonClusterAcceptResult {
-    let catalogue = CATALOGUE.lock().unwrap();
+    // ⭐ Slice F / R-07 — the panic boundary (`ffi_panic_boundary`): a panic in
+    // the body below is reported through the existing `failed` status + `message` instead of
+    // killing the app. The body keeps its pre-slice indentation on purpose:
+    // inside it the slice changed the lock token and nothing else.
+    ffi_panic_boundary("assign_face_search_matches_to_person.panic.query_failed", || -> PersonClusterAcceptResult
+    {
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -15210,6 +15998,8 @@ pub async fn assign_face_search_matches_to_person(
         &preprocessing_version,
         threshold,
     )
+    },
+    |panic| person_accept_error("failed", &ffi_panic_report("save the name", &panic)))
 }
 
 fn accept_face_cluster_as_person_impl(
@@ -15371,7 +16161,13 @@ pub async fn accept_face_cluster_as_person(
     cluster_id: i64,
     person_name: String,
 ) -> PersonClusterAcceptResult {
-    let catalogue = CATALOGUE.lock().unwrap();
+    // ⭐ Slice F / R-07 — the panic boundary (`ffi_panic_boundary`): a panic in
+    // the body below is reported through the existing `failed` status + `message` instead of
+    // killing the app. The body keeps its pre-slice indentation on purpose:
+    // inside it the slice changed the lock token and nothing else.
+    ffi_panic_boundary("accept_face_cluster_as_person.panic.query_failed", || -> PersonClusterAcceptResult
+    {
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -15381,6 +16177,8 @@ pub async fn accept_face_cluster_as_person(
     };
 
     accept_face_cluster_as_person_impl(conn, &run_id, cluster_id, &person_name)
+    },
+    |panic| person_accept_error("failed", &ffi_panic_report("save this person", &panic)))
 }
 
 fn similar_photo_candidates_impl(
@@ -15450,7 +16248,7 @@ fn similar_photo_candidates_impl(
 /// limited to stills whose current Intelligent Culling pass completed for the
 /// supplied algorithm version.
 pub async fn similar_photo_candidates(algorithm_version: String) -> Vec<SimilarPhotoCandidate> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -15468,7 +16266,7 @@ pub async fn similar_photo_candidates_for_ids(
     ids: Vec<i64>,
     algorithm_version: String,
 ) -> Vec<SimilarPhotoCandidate> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -15524,7 +16322,7 @@ pub async fn similar_photo_featureprints_for_ids(
     ids: Vec<i64>,
     algorithm_version: String,
 ) -> Vec<SimilarPhotoFeatureprint> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -15598,7 +16396,7 @@ pub async fn upsert_similar_photo_featureprints(
     entries: Vec<SimilarPhotoFeatureprint>,
     algorithm_version: String,
 ) -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -15651,7 +16449,7 @@ pub async fn completed_similar_photo_work_units(
     algorithm_version: String,
     scope_key: String,
 ) -> Vec<SimilarPhotoWorkUnit> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -15709,7 +16507,7 @@ pub async fn mark_similar_photo_work_unit_complete(
     scope_key: String,
     unit: SimilarPhotoWorkUnit,
 ) -> bool {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -15771,7 +16569,7 @@ fn completed_similar_photo_unit_checkpoints_impl(
 pub async fn completed_similar_photo_unit_checkpoints(
     algorithm_version: String,
 ) -> Vec<SimilarPhotoUnitCheckpoint> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -15824,7 +16622,7 @@ pub async fn mark_similar_photo_unit_checkpoint(
     algorithm_version: String,
     checkpoint: SimilarPhotoUnitCheckpoint,
 ) -> bool {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -15853,7 +16651,7 @@ fn prune_similar_photo_unit_checkpoints_impl(conn: &Connection, keep_algorithm_v
 }
 
 pub async fn prune_similar_photo_unit_checkpoints(keep_algorithm_version: String) -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -15947,7 +16745,7 @@ pub async fn similar_photo_candidates_missing_neighborhood(
     similar_algorithm_version: String,
     radius: u32,
 ) -> Vec<SimilarPhotoCandidate> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -16065,7 +16863,7 @@ pub async fn replace_similar_photo_groups(
     members: Vec<SimilarPhotoGroupMember>,
     algorithm_version: String,
 ) -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -16088,7 +16886,7 @@ pub async fn replace_similar_photo_groups_for_ids(
         return 0;
     }
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -16192,7 +16990,7 @@ pub async fn upsert_similar_photo_groups_for_ids(
     members: Vec<SimilarPhotoGroupMember>,
     algorithm_version: String,
 ) -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -16227,7 +17025,7 @@ pub async fn similar_photo_stack_summaries_for_ids(
         None => return Vec::new(),
     };
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -16413,7 +17211,7 @@ pub async fn similar_photo_stack_members_for_ids(
         return Vec::new();
     }
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -16441,7 +17239,7 @@ pub async fn similar_photo_stack_members_for_ids(
 /// (every `collection` switch flipped back FALSE) simply doesn't appear here;
 /// its label still re-suggests in the Add dialog and re-creates by name.
 pub async fn collection_labels() -> Vec<String> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -16505,7 +17303,7 @@ pub async fn add_images_to_collections(ids: Vec<i64>, labels: Vec<String>) -> u6
         return 0;
     }
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -16656,7 +17454,7 @@ fn assign_color_keyword_for_ids_impl(conn: &Connection, ids: &[i64], label: &str
 /// parallel to `collection`. The five STANDARD color names never come here
 /// (they live in `images.color_label`); the reader's SQL filters them out.
 pub async fn assign_color_keyword_for_ids(ids: Vec<i64>, label: String) -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -16701,7 +17499,7 @@ pub async fn remove_images_from_collections(ids: Vec<i64>, labels: Vec<String>) 
         return 0;
     }
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -16745,7 +17543,7 @@ pub async fn remove_images_from_collections(ids: Vec<i64>, labels: Vec<String>) 
 /// Hidden (removed) keyword rows for one image — the recovery surface. Reads the
 /// RAW table (not the view), newest-hidden first.
 pub async fn hidden_keywords_for_image(image_id: i64) -> Vec<KeywordRow> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -16820,7 +17618,7 @@ pub async fn reparent_keyword(source_path: Vec<String>, new_parent: Vec<String>)
     let suffix_start = (source_joined.chars().count() + 1) as i64;
     let new_parent_rows = keyword_materialized_rows(&new_parent);
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -16925,7 +17723,7 @@ pub async fn rename_keyword(target_path: Vec<String>, new_label: String) -> u64 
         )
     };
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -17062,6 +17860,10 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
     if records.is_empty() {
         return out;
     }
+
+    // ⭐ Slice B — the paths THIS chunk INSERTED (§A-1: `was_insert`); only
+    // these may take a removal tombstone's work back.
+    let mut inserted_paths: Vec<String> = Vec::new();
 
     if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
         // Slice 7 / R-73: a BEGIN failure returns before any row is attempted,
@@ -17204,6 +18006,7 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
             Ok((true, id)) => {
                 out.inserted += 1;
                 out.image_ids.push(id);
+                inserted_paths.push(record.file_path.clone());
             }
             Ok((false, id)) => {
                 out.updated += 1;
@@ -17227,6 +18030,35 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
         }
     }
 
+    // ⭐ Slice B — a removed photo that returns through a Lightroom / Apple /
+    // Copy-and-Import merge gets its user-authored work back, INSIDE this
+    // chunk's transaction. Only the INSERT arm can resurrect a removed path;
+    // the UPDATE arm reaches a live row, whose tombstone (if any) is stale and
+    // is deliberately neither applied nor consumed (§A-1, ruling 10). A
+    // re-attach failure un-merges the whole chunk, exactly like a row failure,
+    // so a tombstone is never consumed without its verified work.
+    if !inserted_paths.is_empty() && removal_tombstones_exist(conn) {
+        let reattached = removal_tombstone_matches(conn, &inserted_paths).and_then(|matched| {
+            if matched.is_empty() {
+                Ok(0)
+            } else {
+                reattach_removal_tombstones(conn, &matched, None)
+            }
+        });
+        if let Err(reason) = reattached {
+            let message = format!("merge_records_into: removal-tombstone re-attach failed: {}", reason);
+            eprintln!("{}", message);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return MergeChunkResult {
+                inserted: 0,
+                updated: 0,
+                image_ids: Vec::new(),
+                failed_rows: records.len() as u64,
+                failure_message: Some(message),
+            };
+        }
+    }
+
     if let Err(e) = conn.execute_batch("COMMIT;") {
         // Slice 7 / R-73: a COMMIT failure un-merges the whole chunk too.
         let message = format!("merge_records_into: commit failed: {}", e);
@@ -17247,6 +18079,15 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
 /// an exact superset of what LR provides (§10). Returns per-chunk stats + the
 /// resulting catalogue ids (aligned to input order) for the keyword pass.
 pub async fn merge_lightroom_records(records: Vec<ImageMetadata>) -> MergeChunkResult {
+    // Slice F: the chunk's size, taken BEFORE the boundary, so a caught panic
+    // reports every row of it as not merged (the whole chunk rolls back).
+    let chunk_len = records.len() as u64;
+    // ⭐ Slice F / R-07 — the panic boundary (`ffi_panic_boundary`): a panic in
+    // the body below is reported through `failed_rows` = the chunk + `failure_message` instead of
+    // killing the app. The body keeps its pre-slice indentation on purpose:
+    // inside it the slice changed the lock token and nothing else.
+    ffi_panic_boundary("merge_lightroom_records.panic.query_failed", || -> MergeChunkResult
+    {
     if records.is_empty() {
         return MergeChunkResult {
             inserted: 0,
@@ -17256,7 +18097,7 @@ pub async fn merge_lightroom_records(records: Vec<ImageMetadata>) -> MergeChunkR
             failure_message: None,
         };
     }
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -17274,6 +18115,18 @@ pub async fn merge_lightroom_records(records: Vec<ImageMetadata>) -> MergeChunkR
         }
     };
     merge_records_into(conn, &records)
+    },
+    |panic| MergeChunkResult
+    {
+        inserted: 0,
+        updated: 0,
+        image_ids: Vec::new(),
+        failed_rows: chunk_len,
+        failure_message: Some(ffi_panic_report(
+            "add this batch of photos to the catalogue",
+            &panic,
+        )),
+    })
 }
 
 /// One Lightroom-sourced VIDEO record (input to merge_lightroom_videos). No
@@ -17442,6 +18295,15 @@ fn merge_videos_into(conn: &Connection, records: &[LightroomVideoRecord]) -> Mer
 /// FFI entry: merge a chunk of Lightroom-sourced VIDEO records into the `videos`
 /// table (matched on file_path). Returns per-chunk stats + the video-row ids.
 pub async fn merge_lightroom_videos(records: Vec<LightroomVideoRecord>) -> MergeChunkResult {
+    // Slice F: the chunk's size, taken BEFORE the boundary, so a caught panic
+    // reports every row of it as not merged (the whole chunk rolls back).
+    let chunk_len = records.len() as u64;
+    // ⭐ Slice F / R-07 — the panic boundary (`ffi_panic_boundary`): a panic in
+    // the body below is reported through `failed_rows` = the chunk + `failure_message` instead of
+    // killing the app. The body keeps its pre-slice indentation on purpose:
+    // inside it the slice changed the lock token and nothing else.
+    ffi_panic_boundary("merge_lightroom_videos.panic.query_failed", || -> MergeChunkResult
+    {
     if records.is_empty() {
         return MergeChunkResult {
             inserted: 0,
@@ -17451,7 +18313,7 @@ pub async fn merge_lightroom_videos(records: Vec<LightroomVideoRecord>) -> Merge
             failure_message: None,
         };
     }
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -17467,6 +18329,18 @@ pub async fn merge_lightroom_videos(records: Vec<LightroomVideoRecord>) -> Merge
         }
     };
     merge_videos_into(conn, &records)
+    },
+    |panic| MergeChunkResult
+    {
+        inserted: 0,
+        updated: 0,
+        image_ids: Vec::new(),
+        failed_rows: chunk_len,
+        failure_message: Some(ffi_panic_report(
+            "add this batch of videos to the catalogue",
+            &panic,
+        )),
+    })
 }
 
 // ============================================================================
@@ -17490,7 +18364,7 @@ pub async fn merge_lightroom_videos(records: Vec<LightroomVideoRecord>) -> Merge
 /// captures one clean database file. The same statement the migration path
 /// already runs at startup.
 pub async fn checkpoint_catalogue() -> bool {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -17512,7 +18386,7 @@ pub async fn checkpoint_catalogue() -> bool {
 /// the lock is released.
 pub async fn backup_manifest_counts() -> BackupCounts {
     let (image_count, video_count, keyword_row_count, person_count, face_observation_count) = {
-        let catalogue = CATALOGUE.lock().unwrap();
+        let catalogue = lock_catalogue();
         match catalogue.as_ref() {
             Some(conn) => {
                 let one = |sql: &str| -> u64 {
@@ -17531,10 +18405,19 @@ pub async fn backup_manifest_counts() -> BackupCounts {
             None => (0, 0, 0, 0, 0),
         }
     };
-    let face_embedding_count = FACE_EMBEDDING_RUNTIME
-        .spawn(face_embedding_total_count())
-        .await
-        .unwrap_or(0);
+    // Slice F / R-25 — no failure channel on `BackupCounts`: an unbuildable
+    // runtime answers today's 0 for the manifest's vector count, logged and
+    // censused by the accessor.
+    let face_embedding_count = match face_embedding_runtime(
+        "backup_manifest_counts.face_runtime_unavailable.query_failed",
+    )
+    {
+        Ok(runtime) => runtime
+            .spawn(face_embedding_total_count())
+            .await
+            .unwrap_or(0),
+        Err(_unavailable) => 0,
+    };
     BackupCounts {
         image_count,
         video_count,
@@ -17554,7 +18437,7 @@ pub async fn count_merge_candidates(backup_db_path: String) -> MergeCounts {
         new_image_count: 0,
         colliding_image_count: 0,
     };
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -17652,45 +18535,83 @@ pub async fn merge_catalogue_from_backup(
     // the global connection). The merge SQL below then never reasons about
     // historical schemas. The connection is dropped before the read-only
     // attach.
+    // ⭐ Slice F / R-07 — steps 1 and 2 are this function's synchronous segment
+    // and run inside the panic boundary: a caught panic becomes `succeeded:
+    // false` + the reason. Step 3 is awaited on the face runtime, where tokio
+    // already catches a panic (the vector copy then reports 0). The two steps
+    // keep their pre-slice indentation on purpose.
+    let merged = ffi_panic_boundary(
+        "merge_catalogue_from_backup.panic.query_failed",
+        || -> Result<(MergeSummary, Vec<MergedFaceRef>, Vec<i64>), MergeSummary>
+    {
     {
         let migrated = open_and_migrate_catalogue(std::path::Path::new(&backup_db_path));
         match migrated {
             Some(conn) => drop(conn),
             None => {
-                return fail(
+                return Err(fail(
                     "The backup catalogue could not be opened or migrated.".to_string(),
-                )
+                ))
             }
         }
     }
 
     // Step 2: the SQL merge, under the global connection lock (DuckDB writes
     // stay serial; concurrent read FFIs simply queue on the mutex).
-    let (summary, merged_faces, replaced_live_face_ids) = {
-        let catalogue = CATALOGUE.lock().unwrap();
+    let parts = {
+        let catalogue = lock_catalogue();
         let conn = match catalogue.as_ref() {
             Some(c) => c,
-            None => return fail("Catalogue not initialized.".to_string()),
+            None => return Err(fail("Catalogue not initialized.".to_string())),
         };
         match merge_catalogue_sql(conn, &backup_db_path, policy) {
             Ok(parts) => parts,
-            Err(message) => return fail(message),
+            Err(message) => return Err(fail(message)),
         }
+    };
+    Ok(parts)
+    },
+        |panic| Err(fail(ffi_panic_report("merge the backup into the catalogue", &panic))),
+    );
+    let (summary, merged_faces, replaced_live_face_ids) = match merged
+    {
+        Ok(parts) => parts,
+        Err(failed) => return failed,
     };
 
     // Step 3: copy the LanceDB face vectors under the NEW face-observation
     // ids (outside the DuckDB lock, on the embedding runtime). A failure
     // here is non-fatal by design: the observations exist, so the next
     // Build Face Recognition Index heals the gap.
+    // ⭐ Slice F — the copy's synchronous START sits inside the boundary too,
+    // but a failure here leaves `succeeded` TRUE: the SQL merge above has
+    // already COMMITTED, so it copies 0 vectors (as above). An unbuildable
+    // runtime is logged and censused by the accessor (R-25), a panic by the
+    // boundary (R-07).
     let mut summary = summary;
-    summary.face_embeddings_copied = FACE_EMBEDDING_RUNTIME
-        .spawn(copy_face_embeddings_for_merge(
-            backup_vectors_path,
-            merged_faces,
-            replaced_live_face_ids,
-        ))
-        .await
-        .unwrap_or(0);
+    let spawned = ffi_panic_boundary(
+        "merge_catalogue_from_backup.panic.query_failed",
+        ||
+        {
+            face_embedding_runtime(
+                "merge_catalogue_from_backup.face_runtime_unavailable.query_failed",
+            )
+            .map(|runtime|
+            {
+                runtime.spawn(copy_face_embeddings_for_merge(
+                    backup_vectors_path,
+                    merged_faces,
+                    replaced_live_face_ids,
+                ))
+            })
+        },
+        |panic| Err(panic),
+    );
+    summary.face_embeddings_copied = match spawned
+    {
+        Ok(task) => task.await.unwrap_or(0),
+        Err(_not_copied) => 0,
+    };
     summary
 }
 
@@ -17886,6 +18807,10 @@ fn merge_catalogue_sql_inner(
              DELETE FROM keyword WHERE image_id IN \
                  (SELECT new_id FROM plmerge_map WHERE NOT is_new); \
              DELETE FROM similar_photo_group_member WHERE image_id IN \
+                 (SELECT new_id FROM plmerge_map WHERE NOT is_new); \
+             DELETE FROM face_cluster_member WHERE image_id IN \
+                 (SELECT new_id FROM plmerge_map WHERE NOT is_new); \
+             DELETE FROM similar_photo_featureprint WHERE image_id IN \
                  (SELECT new_id FROM plmerge_map WHERE NOT is_new);",
         )
         .map_err(|e| format!("backup-wins child cleanup failed: {}", e))?;
@@ -23202,7 +24127,7 @@ pub async fn update_flag_for_ids(ids: Vec<i64>, flag: Option<String>) -> u64 {
         None => return 0,
     };
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -23238,7 +24163,7 @@ pub async fn update_color_label_for_ids(ids: Vec<i64>, color_label: Option<Strin
         None => return 0,
     };
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -23271,7 +24196,7 @@ pub async fn update_rating_for_ids(ids: Vec<i64>, rating: u32) -> u64 {
         None => return 0,
     };
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -24189,68 +25114,2276 @@ mod folder_sync_tests {
         assert_eq!(rows[0].last_sync_mtime, 600);
     }
 
-    #[test]
-    fn remove_images_by_ids_explicit_rows_keyword_rows_survive() {
-        let conn = setup();
-        conn.execute_batch(
-            "INSERT INTO images VALUES
-                 (1, '/A/x.jpg', '/A'),
-                 (2, '/A/y.jpg', '/A'),
-                 (3, '/A/z.jpg', '/A');
-             INSERT INTO keyword (image_id, label, path) VALUES
-                 (1, 'Dogs', 'Dogs'),
-                 (2, 'Dogs', 'Dogs'),
-                 (3, 'Cats', 'Cats');",
-        )
-        .expect("seed");
+    // ⭐ Slice B (Sep 26, 2026): `remove_images_by_ids_explicit_rows_keyword_rows_survive`
+    // and `remove_images_by_ids_chunks_past_500` MOVED to
+    // `removal_tombstone_tests` (B1 and B12), onto real temp-FILE catalogues.
+    // The first pinned the defect itself — its "keyword rows are NEVER deleted
+    // (the S31/S65 doctrine)" is superseded by Q-04 — and this module's
+    // hand-rolled three-column `images` cannot carry the removal's schema.
+}
 
-        // Empty refusal: no ids must never mean \"all ids\".
-        assert_eq!(remove_images_by_ids_impl(&conn, &[]), 0);
-        let total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(total, 3, "refusal deleted nothing");
+// =====================================================================
+// ⭐ Slice B (Sep 26, 2026) — the removal tombstone's pin (R-01 · R-76 · R-77)
+//
+// Every fixture is a REAL temp-FILE catalogue opened through the production
+// `open_and_migrate_catalogue` (so the schema, the autoload policy and K's
+// migration path are all real) and fenced against extension fetches — ENGINE
+// TESTS NEVER FETCH. No hand-rolled schema anywhere in this module: a
+// hand-rolled `images` cannot carry the four scalars, and the slice would be
+// tested against a fiction.
+// =====================================================================
+#[cfg(test)]
+mod removal_tombstone_tests
+{
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-        // Remove two explicit rows.
-        assert_eq!(remove_images_by_ids_impl(&conn, &[1, 3]), 2);
-        let survivor: String = conn
-            .query_row("SELECT file_path FROM images", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(survivor, "/A/y.jpg");
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-        // Keyword rows are NEVER deleted (the S31/S65 doctrine): all three
-        // remain, the two orphans now invisible to every consumer (each joins
-        // through images.id).
-        let keyword_rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM keyword", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(keyword_rows, 3);
-
-        // Idempotent re-call on already-gone ids: zero rows, no error.
-        assert_eq!(remove_images_by_ids_impl(&conn, &[1, 3]), 0);
+    /// N-2's fixture shape, verbatim in spirit: a fresh REAL catalogue file.
+    fn fresh_catalogue(tag: &str) -> (std::path::PathBuf, Connection)
+    {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "plcore-removal-tombstone-test-{}-{}-{}.db",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+        let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH — see the helper's own note.
+        fence_connection_against_extension_fetches(&conn);
+        (path, conn)
     }
 
-    #[test]
-    fn remove_images_by_ids_chunks_past_500() {
-        let conn = setup();
-        if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
-            panic!("begin failed: {}", e);
-        }
-        for id in 1..=1_205i64 {
-            conn.execute(
-                "INSERT INTO images VALUES (?, ?, '/A')",
-                params![id, format!("/A/f{}.jpg", id)],
-            )
-            .expect("seed row");
-        }
-        conn.execute_batch("COMMIT;").expect("commit seed");
+    fn cleanup(path: &std::path::Path)
+    {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+    }
 
-        let ids: Vec<i64> = (1..=1_205).collect();
-        assert_eq!(remove_images_by_ids_impl(&conn, &ids), 1_205);
-        let total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(total, 0, "all three chunks executed");
+    fn count(conn: &Connection, sql: &str) -> i64
+    {
+        conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+            .unwrap_or_else(|e| panic!("{}: {}", sql, e))
+    }
+
+    fn count_for(conn: &Connection, sql: &str, value: &str) -> i64
+    {
+        conn.query_row(sql, params![value], |row| row.get::<_, i64>(0))
+            .unwrap_or_else(|e| panic!("{} [{}]: {}", sql, value, e))
+    }
+
+    /// ⭐ The fixture file's IDENTITY is `record()`'s — size 1234, no capture
+    /// date — so a row seeded here and re-added through `record()` is the SAME
+    /// file returning (B-F2). B14e varies the identity deliberately.
+    const FIXTURE_FILE_SIZE: i64 = 1234;
+
+    fn insert_image(conn: &Connection, file_path: &str) -> i64
+    {
+        conn.execute(
+            "INSERT INTO images (file_path, file_size, file_name, created_timestamp, \
+             modified_timestamp) VALUES (?1, ?2, ?3, 0, 0)",
+            params![file_path, FIXTURE_FILE_SIZE, file_path.rsplit('/').next().unwrap_or(file_path)],
+        )
+        .expect("insert image");
+        id_of(conn, file_path)
+    }
+
+    /// A row with an explicit identity (size, capture date).
+    fn insert_image_with_identity(conn: &Connection, file_path: &str, size: i64, capture: Option<&str>) -> i64
+    {
+        conn.execute(
+            "INSERT INTO images (file_path, file_size, file_name, created_timestamp, \
+             modified_timestamp, capture_datetime) VALUES (?1, ?2, ?3, 0, 0, ?4)",
+            params![file_path, size, file_path.rsplit('/').next().unwrap_or(file_path), capture],
+        )
+        .expect("insert image with identity");
+        id_of(conn, file_path)
+    }
+
+    /// `record()` with an explicit identity.
+    fn record_with_identity(file_path: &str, size: u64, capture: Option<&str>) -> ImageMetadata
+    {
+        let mut returning = record(file_path, false);
+        returning.file_size = size;
+        returning.capture_datetime = capture.map(|c| c.to_string());
+        returning
+    }
+
+    fn id_of(conn: &Connection, file_path: &str) -> i64
+    {
+        conn.query_row(
+            "SELECT id FROM images WHERE file_path = ?1",
+            params![file_path],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or_else(|e| panic!("id of {}: {}", file_path, e))
+    }
+
+    fn set_curation(
+        conn: &Connection,
+        image_id: i64,
+        rating: Option<i64>,
+        flag: Option<&str>,
+        color: Option<&str>,
+        rotation: i64,
+    )
+    {
+        conn.execute(
+            "UPDATE images SET rating = ?2, flag = ?3, color_label = ?4, rotation = ?5 WHERE id = ?1",
+            params![image_id, rating, flag, color, rotation],
+        )
+        .expect("set curation");
+    }
+
+    /// One keyword row with every switch explicit.
+    fn insert_keyword(
+        conn: &Connection,
+        image_id: i64,
+        path: &str,
+        status: i64,
+        origin: i64,
+        collection: bool,
+        color: bool,
+    )
+    {
+        let label = path.rsplit('\u{1F}').next().unwrap_or(path);
+        let hidden_at: Option<&str> = if status == 0 { Some("2026-01-02 03:04:05") } else { None };
+        conn.execute(
+            "INSERT INTO keyword (image_id, label, path, status, origin, hidden_at, collection, color) \
+             VALUES (?1, ?2, ?3, ?4, ?5, CAST(?6 AS TIMESTAMP), ?7, ?8)",
+            params![image_id, label, path, status, origin, hidden_at, collection, color],
+        )
+        .expect("insert keyword");
+    }
+
+    fn insert_face(conn: &Connection, image_id: i64, analyzed_image_id: i64, face_index: i64) -> i64
+    {
+        conn.execute(
+            "INSERT INTO face_observation (image_id, analyzed_image_id, face_index, \
+             algorithm_version, analysis_run_id, bounding_box_x, bounding_box_y, \
+             bounding_box_width, bounding_box_height) \
+             VALUES (?1, ?2, ?3, 'test-v1', 'test-run', 0.1, 0.1, 0.5, 0.5)",
+            params![image_id, analyzed_image_id, face_index],
+        )
+        .expect("insert face observation");
+        conn.query_row(
+            "SELECT id FROM face_observation WHERE image_id = ?1 AND face_index = ?2",
+            params![image_id, face_index],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("face id")
+    }
+
+    fn insert_person(conn: &Connection, name: &str) -> i64
+    {
+        conn.execute(
+            "INSERT INTO person (display_name, normalized_name) VALUES (?1, LOWER(?1))",
+            params![name],
+        )
+        .expect("insert person");
+        conn.query_row(
+            "SELECT id FROM person WHERE normalized_name = LOWER(?1)",
+            params![name],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("person id")
+    }
+
+    fn assign(conn: &Connection, face_id: i64, person_id: i64, image_id: i64)
+    {
+        conn.execute(
+            "INSERT INTO person_face_assignment (face_observation_id, person_id, image_id, \
+             analyzed_image_id, face_index, assignment_source) VALUES (?1, ?2, ?3, ?3, 0, 'test')",
+            params![face_id, person_id, image_id],
+        )
+        .expect("person face assignment");
+    }
+
+    fn insert_cluster_member(conn: &Connection, run_id: &str, face_id: i64, image_id: i64)
+    {
+        conn.execute(
+            "INSERT INTO face_cluster_run (run_id, face_algorithm_version, model_version, \
+             preprocessing_version, threshold, cluster_count, member_count) \
+             SELECT ?1, 'test-v1', 'm1', 'p1', 0.55, 1, 3 \
+             WHERE NOT EXISTS (SELECT 1 FROM face_cluster_run WHERE run_id = ?1)",
+            params![run_id],
+        )
+        .expect("cluster run");
+        conn.execute(
+            "INSERT INTO face_cluster_member (run_id, cluster_id, face_observation_id, image_id, \
+             analyzed_image_id, face_index, member_rank, cluster_size) \
+             VALUES (?1, 1, ?2, ?3, ?3, 0, 0, 3)",
+            params![run_id, face_id, image_id],
+        )
+        .expect("cluster member");
+    }
+
+    fn insert_similar_member(conn: &Connection, image_id: i64, group_id: i64, representative_id: i64)
+    {
+        conn.execute(
+            "INSERT INTO similar_photo_group_member (image_id, group_id, representative_id, \
+             member_rank, algorithm_version, threshold) VALUES (?1, ?2, ?3, 1, 'v4', 8.5)",
+            params![image_id, group_id, representative_id],
+        )
+        .expect("similar member");
+    }
+
+    /// ⭐ Ruling 13's fixture row: one membership with every column explicit,
+    /// `representative_id` = `group_id` as every writer stores it. Fits both
+    /// writers: the hand-made one (`PhotosView.createStackFromSelection`:
+    /// threshold 0, rank = position with the chosen representative at 0,
+    /// distance 0 for the representative and none for the rest) and the
+    /// automatic one (a real threshold and measured distances).
+    fn insert_membership(
+        conn: &Connection,
+        image_id: i64,
+        group_id: i64,
+        member_rank: i64,
+        distance: Option<f64>,
+        threshold: f64,
+    )
+    {
+        conn.execute(
+            "INSERT INTO similar_photo_group_member (image_id, group_id, representative_id, \
+             member_rank, distance_to_representative, algorithm_version, threshold) \
+             VALUES (?1, ?2, ?2, ?3, ?4, 'similar-featureprint-v4', ?5)",
+            params![image_id, group_id, member_rank, distance, threshold],
+        )
+        .expect("membership");
+    }
+
+    /// (image_id, group_id, representative_id, member_rank,
+    /// distance_to_representative, algorithm_version, threshold, created_at) —
+    /// the WHOLE membership row, so "unchanged" means unchanged in every column.
+    type MembershipRow = (i64, i64, i64, i64, Option<f64>, String, f64, Option<String>);
+
+    /// Every membership row, in image-id order.
+    fn memberships(conn: &Connection) -> Vec<MembershipRow>
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT image_id, group_id, representative_id, member_rank, \
+                 distance_to_representative, algorithm_version, threshold, \
+                 CAST(created_at AS VARCHAR) \
+                 FROM similar_photo_group_member ORDER BY image_id",
+            )
+            .expect("membership statement");
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<f64>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, f64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            })
+            .expect("memberships");
+        rows.map(|row| row.expect("membership row")).collect()
+    }
+
+    /// (image_id, group_id, representative_id) of every membership row, in
+    /// image-id order.
+    fn membership_keys(conn: &Connection) -> Vec<(i64, i64, i64)>
+    {
+        memberships(conn).into_iter().map(|row| (row.0, row.1, row.2)).collect()
+    }
+
+    /// The rows of `before` whose image is in `keep`, with group and
+    /// representative re-pointed to `group` when given — what ruling 13 says a
+    /// survivor's row becomes. Every other column must come through untouched.
+    fn expected_survivors(before: &[MembershipRow], keep: &[i64], group: Option<i64>) -> Vec<MembershipRow>
+    {
+        before
+            .iter()
+            .filter(|row| keep.contains(&row.0))
+            .map(|row|
+            {
+                let mut survivor = row.clone();
+                if let Some(group) = group
+                {
+                    survivor.1 = group;
+                    survivor.2 = group;
+                }
+                survivor
+            })
+            .collect()
+    }
+
+    /// What the production stack reader (the gallery's expand) returns for one
+    /// visible image: (image_id, group_id) of every member it would reveal.
+    fn stack_as_the_gallery_reads_it(conn: &Connection, image_id: i64) -> Vec<(i64, i64)>
+    {
+        let mut members: Vec<(i64, i64)> =
+            similar_photo_stack_members_for_ids_impl(conn, &[image_id], "similar-featureprint-v4")
+                .into_iter()
+                .map(|member| (member.image_id, member.group_id))
+                .collect();
+        members.sort_unstable();
+        members
+    }
+
+    fn insert_featureprint(conn: &Connection, image_id: i64)
+    {
+        conn.execute(
+            "INSERT INTO similar_photo_featureprint (image_id, algorithm_version, source_stamp, \
+             featureprint_blob) VALUES (?1, 'v4', 'stamp', ?2)",
+            params![image_id, vec![1u8, 2, 3]],
+        )
+        .expect("featureprint");
+    }
+
+    fn insert_checkpoint(conn: &Connection, key: &str)
+    {
+        conn.execute(
+            "INSERT INTO similar_photo_unit_checkpoint (algorithm_version, unit_key, \
+             start_image_id, end_image_id, anchor_count, member_count) VALUES ('v4', ?1, 1, 2, 2, 2)",
+            params![key],
+        )
+        .expect("checkpoint");
+    }
+
+    /// A minimal scan record (the ingest_batching_tests shape).
+    fn record(file_path: &str, is_video: bool) -> ImageMetadata
+    {
+        ImageMetadata
+        {
+            file_path: file_path.to_string(),
+            file_size: 1234,
+            file_name: file_path.rsplit('/').next().unwrap_or(file_path).to_string(),
+            file_extension: Some(if is_video { "mov" } else { "jpg" }.to_string()),
+            created_timestamp: 1_700_000_000,
+            modified_timestamp: 1_700_000_001,
+            camera_make: None,
+            camera_model: None,
+            lens_model: None,
+            focal_length: None,
+            aperture: None,
+            shutter_speed: None,
+            iso: None,
+            capture_datetime: None,
+            pixel_width: None,
+            pixel_height: None,
+            color_space: None,
+            bit_depth: None,
+            gps_latitude: None,
+            gps_longitude: None,
+            gps_altitude: None,
+            copyright: None,
+            creator: None,
+            description: None,
+            rating: None,
+            flag: None,
+            color_label: None,
+            rotation: None,
+            is_video,
+            duration_seconds: None,
+            frame_rate: None,
+            video_kind: None,
+            video_codec: None,
+            video_bitrate: None,
+            color_primaries: None,
+            color_transfer: None,
+            color_matrix: None,
+            color_range: None,
+            dv_profile: None,
+            has_audio: None,
+            audio_codec: None,
+            audio_channels: None,
+            audio_sample_rate: None,
+            audio_bitrate: None,
+            live_photo_id: None,
+            external_source_id: None,
+        }
+    }
+
+    /// (label, path, status, origin, collection, color, created_at, hidden_at,
+    /// is_video) of every keyword row on one image, in path order.
+    type KeywordShape = (String, String, i64, i64, bool, bool, Option<String>, Option<String>, bool);
+
+    fn keyword_shapes(conn: &Connection, image_id: i64) -> Vec<KeywordShape>
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT label, path, status, origin, collection, color, \
+                 CAST(created_at AS VARCHAR), CAST(hidden_at AS VARCHAR), is_video \
+                 FROM keyword WHERE image_id = ?1 ORDER BY path",
+            )
+            .expect("keyword shape statement");
+        let rows = stmt
+            .query_map(params![image_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, bool>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, bool>(8)?,
+                ))
+            })
+            .expect("keyword shapes");
+        rows.map(|row| row.expect("keyword shape row")).collect()
+    }
+
+    fn curation(conn: &Connection, file_path: &str) -> (Option<i64>, Option<String>, Option<String>, Option<i64>)
+    {
+        conn.query_row(
+            "SELECT rating, flag, color_label, rotation FROM images WHERE file_path = ?1",
+            params![file_path],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap_or_else(|e| panic!("curation of {}: {}", file_path, e))
+    }
+
+    fn tombstones_for(conn: &Connection, file_path: &str) -> (i64, i64)
+    {
+        (
+            count_for(conn, "SELECT COUNT(*) FROM removed_image_tombstone WHERE file_path = ?1", file_path),
+            count_for(
+                conn,
+                "SELECT COUNT(*) FROM removed_image_tombstone_keyword WHERE file_path = ?1",
+                file_path,
+            ),
+        )
+    }
+
+    /// ⭐ V2's orphan census, as named checks: every dependent column that
+    /// points at `images.id`, and the cluster member's face reference.
+    fn orphan_census(conn: &Connection) -> Vec<(&'static str, i64)>
+    {
+        let checks: [(&'static str, &'static str); 11] = [
+            ("keyword.image_id", "SELECT COUNT(*) FROM keyword x WHERE NOT EXISTS (SELECT 1 FROM images i WHERE i.id = x.image_id)"),
+            ("person_face_assignment.image_id", "SELECT COUNT(*) FROM person_face_assignment x WHERE NOT EXISTS (SELECT 1 FROM images i WHERE i.id = x.image_id)"),
+            ("person_face_assignment.analyzed_image_id", "SELECT COUNT(*) FROM person_face_assignment x WHERE NOT EXISTS (SELECT 1 FROM images i WHERE i.id = x.analyzed_image_id)"),
+            ("face_observation.image_id", "SELECT COUNT(*) FROM face_observation x WHERE NOT EXISTS (SELECT 1 FROM images i WHERE i.id = x.image_id)"),
+            ("face_observation.analyzed_image_id", "SELECT COUNT(*) FROM face_observation x WHERE NOT EXISTS (SELECT 1 FROM images i WHERE i.id = x.analyzed_image_id)"),
+            ("face_cluster_member.image_id", "SELECT COUNT(*) FROM face_cluster_member x WHERE NOT EXISTS (SELECT 1 FROM images i WHERE i.id = x.image_id)"),
+            ("face_cluster_member.analyzed_image_id", "SELECT COUNT(*) FROM face_cluster_member x WHERE NOT EXISTS (SELECT 1 FROM images i WHERE i.id = x.analyzed_image_id)"),
+            ("face_cluster_member.face_observation_id", "SELECT COUNT(*) FROM face_cluster_member x WHERE NOT EXISTS (SELECT 1 FROM face_observation f WHERE f.id = x.face_observation_id)"),
+            ("similar_photo_group_member.image_id", "SELECT COUNT(*) FROM similar_photo_group_member x WHERE NOT EXISTS (SELECT 1 FROM images i WHERE i.id = x.image_id)"),
+            ("similar_photo_group_member.representative_id", "SELECT COUNT(*) FROM similar_photo_group_member x WHERE NOT EXISTS (SELECT 1 FROM images i WHERE i.id = x.representative_id)"),
+            ("similar_photo_featureprint.image_id", "SELECT COUNT(*) FROM similar_photo_featureprint x WHERE NOT EXISTS (SELECT 1 FROM images i WHERE i.id = x.image_id)"),
+        ];
+        checks.iter().map(|(name, sql)| (*name, count(conn, sql))).collect()
+    }
+
+    fn assert_no_orphans(conn: &Connection, context: &str)
+    {
+        let dangling: Vec<(&'static str, i64)> =
+            orphan_census(conn).into_iter().filter(|(_, n)| *n != 0).collect();
+        assert!(
+            dangling.is_empty(),
+            "{}: rows still point at a removed image — the cascade missed {:?}",
+            context,
+            dangling
+        );
+    }
+
+    fn temp_removal_tables(conn: &Connection) -> i64
+    {
+        count(conn, "SELECT COUNT(*) FROM duckdb_tables() WHERE table_name LIKE 'pl_removal_%'")
+    }
+
+    // -----------------------------------------------------------------
+    // Engine facts the design stands on — cargo tests, not reasoning.
+    // -----------------------------------------------------------------
+
+    /// ⭐ §2.4 / §A-10: a temp table frozen in the AUTOCOMMIT window is readable
+    /// inside a transaction that writes `main`, survives that transaction's
+    /// ROLLBACK, `CREATE OR REPLACE` replaces a stale one, and (recorded, not
+    /// relied on) a temp table can also be created INSIDE a transaction with
+    /// outstanding updates to `main`.
+    #[test]
+    fn temp_tables_frozen_in_autocommit_serve_a_transaction_that_writes_main()
+    {
+        let (path, conn) = fresh_catalogue("probe-temp");
+        for n in 0 .. 3
+        {
+            insert_image(&conn, &format!("/probe/{}.jpg", n));
+        }
+        conn.execute_batch("CREATE OR REPLACE TEMP TABLE pl_removal_probe AS SELECT 1 AS id;")
+            .expect("a stale temp table");
+        conn.execute_batch(
+            "CREATE OR REPLACE TEMP TABLE pl_removal_probe AS \
+             SELECT id FROM images WHERE file_path LIKE '/probe/%';",
+        )
+        .expect("CREATE OR REPLACE TEMP TABLE in autocommit");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM pl_removal_probe"), 3, "the replace took");
+
+        conn.execute_batch("BEGIN TRANSACTION;").expect("begin");
+        conn.execute(
+            "INSERT INTO keyword (image_id, label, path) SELECT id, 'k', 'k' FROM images \
+             WHERE id IN (SELECT id FROM pl_removal_probe)",
+            [],
+        )
+        .expect("write main while reading temp");
+        conn.execute("DELETE FROM images WHERE id IN (SELECT id FROM pl_removal_probe)", [])
+            .expect("delete main while reading temp");
+        conn.execute_batch("CREATE OR REPLACE TEMP TABLE pl_removal_probe_inner AS SELECT 1 AS x;")
+            .expect("temp DDL inside a transaction with outstanding updates");
+        conn.execute_batch("ROLLBACK;").expect("rollback");
+
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM images"), 3, "ROLLBACK restored main");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM keyword"), 0, "ROLLBACK restored main");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM pl_removal_probe"),
+            3,
+            "a temp table frozen BEFORE BEGIN survives the transaction's rollback"
+        );
+        conn.execute_batch("DROP TABLE IF EXISTS pl_removal_probe; DROP TABLE IF EXISTS pl_removal_probe_inner;")
+            .expect("drop in autocommit");
+        assert_eq!(temp_removal_tables(&conn), 0);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// ⭐ §A-1: the scan path knows exactly which rows it inserted — the bundled
+    /// 1.5.5 answers `INSERT OR IGNORE … RETURNING` with ONLY the rows it
+    /// inserted, never the ones it ignored.
+    #[test]
+    fn ingest_returning_names_only_the_rows_it_inserted()
+    {
+        let (path, conn) = fresh_catalogue("probe-returning");
+        insert_image(&conn, "/ret/present.jpg");
+        let records = [record("/ret/present.jpg", false), record("/ret/new.jpg", false)];
+        let mut values: Vec<Value> = Vec::new();
+        for r in &records
+        {
+            push_ingest_row_params(r, &mut values);
+        }
+        let (paths, unreadable) =
+            ingest_insert_returning_paths(&conn, &ingest_insert_returning_sql(2), &values)
+                .expect("the RETURNING insert");
+        assert_eq!(paths, vec!["/ret/new.jpg".to_string()], "only the inserted row is returned");
+        assert_eq!(unreadable, 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM images"), 2);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// ⭐ 2a + 2b: a path that still carries a STALE tombstone is removed again —
+    /// the stale rows are deleted and the fresh ones inserted under the same
+    /// PRIMARY KEY in ONE transaction, which the bundled 1.5.5 permits.
+    #[test]
+    fn a_stale_tombstone_is_replaced_by_the_removal_in_one_transaction()
+    {
+        let (path, conn) = fresh_catalogue("stale-replace");
+        let id = insert_image(&conn, "/s/p.jpg");
+        set_curation(&conn, id, Some(2), None, None, 0);
+        insert_keyword(&conn, id, "Live", 1, KEYWORD_ORIGIN_USER as i64, false, false);
+        // ⭐ Fix round 2: the stale tombstone is a DIFFERENT photograph's (a
+        // dated one; the live row is undated), so the removal REPLACES it. A
+        // same-photo waiting tombstone is MERGED instead — B17c.
+        conn.execute_batch(
+            "INSERT INTO removed_image_tombstone (file_path, file_size, capture_datetime, rating) \
+             VALUES ('/s/p.jpg', 1234, '2031:12:24 09:00:00', 5); \
+             INSERT INTO removed_image_tombstone_keyword (file_path, label, path, status, origin, collection, color) \
+             VALUES ('/s/p.jpg', 'Stale', 'Stale', 1, 1, FALSE, FALSE);",
+        )
+        .expect("stale tombstone");
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &[id]), 1);
+        let rating: Option<i64> = conn
+            .query_row("SELECT rating FROM removed_image_tombstone WHERE file_path = '/s/p.jpg'", [], |r| r.get(0))
+            .expect("fresh tombstone");
+        assert_eq!(rating, Some(2), "the tombstone is the LIVE row's, not the stale one's");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM removed_image_tombstone_keyword WHERE label = 'Stale'"),
+            0,
+            "the stale keyword tombstone was replaced"
+        );
+        assert_eq!(tombstones_for(&conn, "/s/p.jpg"), (1, 1));
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// ENGINE TESTS NEVER FETCH — the fixture's connection is fenced.
+    #[test]
+    fn removal_fixture_connections_are_fenced_against_extension_fetches()
+    {
+        let (path, conn) = fresh_catalogue("fence");
+        let directory: String = conn
+            .query_row("SELECT current_setting('extension_directory')::VARCHAR", [], |r| r.get(0))
+            .expect("extension_directory");
+        assert!(
+            !directory.is_empty() && !directory.contains("/.duckdb"),
+            "this module's fixtures must never point at the real extension store: {:?}",
+            directory
+        );
+        drop(conn);
+        cleanup(&path);
+    }
+
+    // -----------------------------------------------------------------
+    // B1 … B15 — the brief's §5.1 pin.
+    // -----------------------------------------------------------------
+
+    /// B1 — keywords and the four scalars survive a by-ids removal.
+    /// (Absorbs `remove_images_by_ids_explicit_rows_keyword_rows_survive`: the
+    /// empty refusal, a survivor untouched, and an idempotent re-call.)
+    #[test]
+    fn b1_keywords_and_curation_survive_a_by_ids_removal()
+    {
+        let (path, conn) = fresh_catalogue("b1");
+        let kept = insert_image(&conn, "/b1/kept.jpg");
+        let doomed = insert_image(&conn, "/b1/doomed.jpg");
+        let plain = insert_image(&conn, "/b1/plain.jpg");
+        insert_keyword(&conn, kept, "Cats", 1, 1, false, false);
+        set_curation(&conn, doomed, Some(4), Some("pick"), Some("red"), 90);
+        insert_keyword(&conn, doomed, "Hidden", 0, 1, false, false);
+        insert_keyword(&conn, doomed, "Trip", 1, 1, true, false);
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &[]), 0, "no ids must never mean all ids");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM images"), 3, "the refusal removed nothing");
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &[doomed, plain]), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM images"), 1);
+        assert_eq!(id_of(&conn, "/b1/kept.jpg"), kept, "the survivor is untouched");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM keyword WHERE image_id = ?1", params![kept], |r| r.get::<_, i64>(0))
+                .expect("survivor keyword count"),
+            1,
+            "the survivor's keyword row is untouched"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM keyword WHERE image_id = ?1", params![doomed], |r| r.get::<_, i64>(0))
+                .expect("doomed keyword count"),
+            0,
+            "the removed photo's keyword rows left `keyword`"
+        );
+
+        let scalars: (Option<i64>, Option<String>, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT rating, flag, color_label, rotation FROM removed_image_tombstone WHERE file_path = '/b1/doomed.jpg'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("the tombstone row");
+        assert_eq!(scalars, (Some(4), Some("pick".to_string()), Some("red".to_string()), Some(90)));
+        assert_eq!(tombstones_for(&conn, "/b1/doomed.jpg"), (1, 2));
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM removed_image_tombstone_keyword WHERE file_path = '/b1/doomed.jpg' \
+                 AND ((path = 'Hidden' AND status = 0 AND collection = FALSE AND color = FALSE) \
+                   OR (path = 'Trip' AND status = 1 AND collection = TRUE AND color = FALSE))"
+            ),
+            2,
+            "status, collection, colour and path are captured verbatim"
+        );
+        assert_eq!(tombstones_for(&conn, "/b1/plain.jpg"), (0, 0), "no work, no tombstone (W1-4)");
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &[doomed, plain]), 0, "an idempotent re-call");
+        assert_eq!(tombstones_for(&conn, "/b1/doomed.jpg"), (1, 2), "…and it did not clear the tombstone");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B2 — keywords and curation RE-ATTACH on re-add, to a NEW id, through the
+    /// real scan insert. ⭐ R-01's pin hint made executable. A VIDEO rides along
+    /// so `is_video` provably comes from the live row, not from a default.
+    #[test]
+    fn b2_keywords_and_curation_reattach_on_re_add_with_a_new_id()
+    {
+        let (path, conn) = fresh_catalogue("b2");
+        let still = insert_image(&conn, "/b2/still.jpg");
+        let clip = insert_image(&conn, "/b2/clip.mov");
+        conn.execute("UPDATE images SET is_video = TRUE WHERE id = ?1", params![clip]).expect("video");
+        set_curation(&conn, still, Some(4), Some("pick"), Some("red"), 90);
+        insert_keyword(&conn, still, "Dogs", 1, 1, false, false);
+        insert_keyword(&conn, still, "Hidden", 0, 1, false, false);
+        insert_keyword(&conn, still, "Trip", 1, 1, true, false);
+        insert_keyword(&conn, still, "Crimson", 1, 1, false, true);
+        set_curation(&conn, clip, Some(3), None, None, 0);
+        insert_keyword(&conn, clip, "Clip", 1, 1, false, false);
+        let before_still = keyword_shapes(&conn, still);
+        let before_clip = keyword_shapes(&conn, clip);
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &[still, clip]), 2);
+        let inserted = ingest_metadata_impl(
+            &conn,
+            &[record("/b2/still.jpg", false), record("/b2/clip.mov", true)],
+            None,
+        );
+        assert_eq!(inserted, 2);
+
+        let new_still = id_of(&conn, "/b2/still.jpg");
+        let new_clip = id_of(&conn, "/b2/clip.mov");
+        assert_ne!(new_still, still, "a re-added file gets a NEW id");
+        assert_ne!(new_clip, clip);
+
+        let after_still = keyword_shapes(&conn, new_still);
+        let after_clip = keyword_shapes(&conn, new_clip);
+        assert_eq!(after_still.len(), 4, "every keyword row came back");
+        assert_eq!(after_still, before_still, "label/path/status/origin/collection/color/dates byte-equal");
+        assert_eq!(after_clip.len(), 1);
+        assert!(after_clip[0].8, "is_video comes from the LIVE re-added row (TRUE for the clip)");
+        assert_eq!(
+            after_clip[0].0.as_str(),
+            before_clip[0].0.as_str()
+        );
+        assert!(after_still.iter().all(|shape| !shape.8), "and FALSE for the still");
+
+        assert_eq!(curation(&conn, "/b2/still.jpg"), (Some(4), Some("pick".to_string()), Some("red".to_string()), Some(90)));
+        assert_eq!(curation(&conn, "/b2/clip.mov").0, Some(3));
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B3 — the tombstone is consumed exactly once, and a second round trip
+    /// works again without duplicating anything.
+    #[test]
+    fn b3_the_tombstone_is_consumed_exactly_once()
+    {
+        let (path, conn) = fresh_catalogue("b3");
+        let id = insert_image(&conn, "/b3/p.jpg");
+        set_curation(&conn, id, Some(5), None, None, 0);
+        insert_keyword(&conn, id, "Dogs", 1, 1, false, false);
+        insert_keyword(&conn, id, "Cats", 1, 1, false, false);
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &[id]), 1);
+        ingest_metadata_impl(&conn, &[record("/b3/p.jpg", false)], None);
+        assert_eq!(tombstones_for(&conn, "/b3/p.jpg"), (0, 0), "consumed on re-add");
+
+        // A second, IDENTICAL re-scan must not re-attach anything again.
+        ingest_metadata_impl(&conn, &[record("/b3/p.jpg", false)], None);
+        let second = id_of(&conn, "/b3/p.jpg");
+        assert_eq!(keyword_shapes(&conn, second).len(), 2, "no duplicate rows from a re-scan");
+
+        // Round trip #2.
+        assert_eq!(remove_images_by_ids_impl(&conn, &[second]), 1);
+        assert_eq!(tombstones_for(&conn, "/b3/p.jpg"), (1, 2));
+        ingest_metadata_impl(&conn, &[record("/b3/p.jpg", false)], None);
+        let third = id_of(&conn, "/b3/p.jpg");
+        assert_ne!(third, second);
+        assert_eq!(keyword_shapes(&conn, third).len(), 2, "the second round trip re-attached once");
+        assert_eq!(curation(&conn, "/b3/p.jpg").0, Some(5));
+        assert_eq!(tombstones_for(&conn, "/b3/p.jpg"), (0, 0));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM removed_image_tombstone"), 0);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B3b — the re-attach honours the `NOT EXISTS (image_id, path)` guard
+    /// every keyword writer uses. A freshly inserted row normally has no
+    /// keyword rows, so the only way to reach the guard is a row ALREADY at the
+    /// new id: this fixture plants one at the id the sequence hands out next.
+    #[test]
+    fn b3b_the_reattach_honours_the_image_id_path_guard()
+    {
+        let (path, conn) = fresh_catalogue("b3b");
+        let id = insert_image(&conn, "/b3b/p.jpg");
+        insert_keyword(&conn, id, "Dogs", 1, 1, false, false);
+        insert_keyword(&conn, id, "Cats", 1, 1, false, false);
+        assert_eq!(remove_images_by_ids_impl(&conn, &[id]), 1);
+
+        let next: i64 = conn
+            .query_row("SELECT currval('images_id_seq') + 1", [], |r| r.get(0))
+            .expect("the next image id");
+        insert_keyword(&conn, next, "Dogs", 1, 1, false, false);
+
+        ingest_metadata_impl(&conn, &[record("/b3b/p.jpg", false)], None);
+        let new_id = id_of(&conn, "/b3b/p.jpg");
+        assert_eq!(new_id, next, "the fixture planted its row at the id the insert took");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM keyword WHERE image_id = ?1 AND path = 'Dogs'",
+                params![new_id],
+                |r| r.get::<_, i64>(0)
+            )
+            .expect("Dogs rows"),
+            1,
+            "an existing (image_id, path) row is not duplicated"
+        );
+        assert_eq!(keyword_shapes(&conn, new_id).len(), 2, "the missing row still came back");
+        assert_eq!(tombstones_for(&conn, "/b3b/p.jpg"), (0, 0));
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B4 — a People projection's face-origin bit becomes the user bit, it
+    /// re-attaches that way, and its face assignment is gone.
+    #[test]
+    fn b4_a_people_projection_keeps_its_row_with_the_user_bit()
+    {
+        let (path, conn) = fresh_catalogue("b4");
+        let id = insert_image(&conn, "/b4/p.jpg");
+        let people_path = ["People", "Richard"].join(KEYWORD_PATH_SEPARATOR);
+        let face_and_auto = ["Scene", "Beach"].join(KEYWORD_PATH_SEPARATOR);
+        insert_keyword(&conn, id, &people_path, 1, KEYWORD_ORIGIN_FACE as i64, false, false);
+        insert_keyword(&conn, id, &face_and_auto, 1, (KEYWORD_ORIGIN_FACE | KEYWORD_ORIGIN_AUTO) as i64, false, false);
+        let face = insert_face(&conn, id, id, 0);
+        let richard = insert_person(&conn, "Richard");
+        assign(&conn, face, richard, id);
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &[id]), 1);
+        assert_eq!(
+            count_for(&conn, "SELECT origin FROM removed_image_tombstone_keyword WHERE path = ?1", &people_path),
+            KEYWORD_ORIGIN_USER as i64,
+            "face origin (4) is captured as user origin (1)"
+        );
+        assert_eq!(
+            count_for(&conn, "SELECT origin FROM removed_image_tombstone_keyword WHERE path = ?1", &face_and_auto),
+            (KEYWORD_ORIGIN_USER | KEYWORD_ORIGIN_AUTO) as i64,
+            "face+auto (6) keeps the auto bit and gains the user bit (3)"
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person_face_assignment"), 0, "the assignment is cascaded");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person"), 1, "the PERSON is never touched");
+
+        ingest_metadata_impl(&conn, &[record("/b4/p.jpg", false)], None);
+        let new_id = id_of(&conn, "/b4/p.jpg");
+        assert_eq!(
+            conn.query_row(
+                "SELECT origin FROM keyword WHERE image_id = ?1 AND path = ?2",
+                params![new_id, people_path],
+                |r| r.get::<_, i64>(0)
+            )
+            .expect("the re-attached People row"),
+            KEYWORD_ORIGIN_USER as i64
+        );
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// Seed one doomed image with a row in EVERY dependent table, plus a
+    /// survivor with its own rows. Returns (doomed, survivor, doomed face ids).
+    fn seed_every_dependent(conn: &Connection, doomed_path: &str, survivor_path: &str) -> (i64, i64, Vec<i64>)
+    {
+        let doomed = insert_image(conn, doomed_path);
+        let survivor = insert_image(conn, survivor_path);
+        set_curation(conn, doomed, Some(3), None, None, 0);
+        insert_keyword(conn, doomed, "Doomed", 1, 1, false, false);
+        insert_keyword(conn, survivor, "Survivor", 1, 1, false, false);
+        let f0 = insert_face(conn, doomed, doomed, 0);
+        let f1 = insert_face(conn, doomed, doomed, 1);
+        // An observation reaching the doomed image ONLY through analyzed_image_id.
+        let f2 = insert_face(conn, survivor, doomed, 7);
+        let survivor_face = insert_face(conn, survivor, survivor, 0);
+        let person = insert_person(conn, "Someone");
+        assign(conn, f0, person, doomed);
+        assign(conn, survivor_face, person, survivor);
+        insert_cluster_member(conn, "run-doomed", f0, doomed);
+        insert_cluster_member(conn, "run-doomed", survivor_face, survivor);
+        insert_similar_member(conn, doomed, doomed, doomed);
+        insert_similar_member(conn, survivor, doomed, doomed);
+        insert_featureprint(conn, doomed);
+        insert_featureprint(conn, survivor);
+        (doomed, survivor, vec![f0, f1, f2])
+    }
+
+    /// B5 — after a removal, NO dependent row points at a removed image.
+    ///
+    /// ⭐ The census is proved NOT VACUOUS first, on a twin catalogue: the old
+    /// bare `DELETE FROM images` (today's defect) must make EVERY one of its
+    /// eleven checks fire. The face-reference check fires once the faces go
+    /// without their cluster members, which is the only way it can.
+    #[test]
+    fn b5_the_orphan_census_is_zero_after_a_removal()
+    {
+        let (control_path, control) = fresh_catalogue("b5-control");
+        let (bare, _, _) = seed_every_dependent(&control, "/b5/doomed.jpg", "/b5/survivor.jpg");
+        assert_no_orphans(&control, "the seeded control");
+        control
+            .execute("DELETE FROM images WHERE id = ?1", params![bare])
+            .expect("the old bare delete");
+        let after_bare_delete = orphan_census(&control);
+        control
+            .execute(
+                "DELETE FROM face_observation WHERE image_id = ?1 OR analyzed_image_id = ?1",
+                params![bare],
+            )
+            .expect("faces without their cluster members");
+        let after_face_delete = orphan_census(&control);
+        let silent: Vec<&'static str> = after_bare_delete
+            .iter()
+            .zip(after_face_delete.iter())
+            .filter(|((_, first), (_, second))| *first == 0 && *second == 0)
+            .map(|((name, _), _)| *name)
+            .collect();
+        assert_eq!(after_bare_delete.len(), 11, "the census is eleven checks");
+        assert!(silent.is_empty(), "these census checks cannot see an orphan: {:?}", silent);
+        drop(control);
+        cleanup(&control_path);
+
+        let (path, conn) = fresh_catalogue("b5");
+        let (doomed, survivor, _) = seed_every_dependent(&conn, "/b5/doomed.jpg", "/b5/survivor.jpg");
+        assert_no_orphans(&conn, "before the removal");
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &[doomed]), 1);
+        assert_no_orphans(&conn, "after the removal");
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM keyword WHERE image_id = ?1", params![survivor], |r| r.get::<_, i64>(0))
+                .expect("survivor keywords"),
+            1,
+            "the survivor's own keyword row is untouched"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM similar_photo_featureprint WHERE image_id = ?1", params![survivor], |r| r.get::<_, i64>(0))
+                .expect("survivor featureprint"),
+            1
+        );
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B5b — rows an EARLIER writer left dangling (a cluster member and a face
+    /// assignment whose face observation is already gone, both still pointing
+    /// at the image) are swept with that image: the removal's image limbs, which
+    /// the editor-save template has no need for, reach them.
+    #[test]
+    fn b5b_rows_left_dangling_by_an_earlier_writer_are_swept_with_their_image()
+    {
+        let (path, conn) = fresh_catalogue("b5b");
+        let doomed = insert_image(&conn, "/b5b/doomed.jpg");
+        let person = insert_person(&conn, "Someone");
+        assign(&conn, 990_002, person, doomed);
+        insert_cluster_member(&conn, "run-dangling", 990_001, doomed);
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &[doomed]), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person_face_assignment"), 0, "the dangling assignment");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM face_cluster_member"), 0, "the dangling cluster member");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM face_cluster_run WHERE run_id = 'run-dangling'"), 0);
+        assert_no_orphans(&conn, "after sweeping the dangling rows");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B6 — the vectors are ENQUEUED, not leaked: the queue holds exactly the
+    /// removed observations and those rows are gone, in one committed state.
+    /// The enqueue reads `face_observation`, so a wrong order yields an EMPTY
+    /// queue — that is the discriminator.
+    #[test]
+    fn b6_face_vectors_are_enqueued_before_the_faces_are_deleted()
+    {
+        let (path, conn) = fresh_catalogue("b6");
+        let (doomed, _survivor, face_ids) = seed_every_dependent(&conn, "/b6/doomed.jpg", "/b6/survivor.jpg");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM face_vector_pending_delete"), 0);
+
+        let outcome = remove_images_by_ids_impl_with_probe(&conn, &[doomed], None).expect("removal");
+        assert_eq!(outcome.doomed_faces, 3, "the frozen face census (a table read)");
+
+        let mut queued: Vec<i64> = {
+            let mut stmt = conn
+                .prepare("SELECT face_observation_id FROM face_vector_pending_delete")
+                .expect("queue statement");
+            let rows = stmt.query_map([], |r| r.get::<_, i64>(0)).expect("queue");
+            rows.map(|r| r.expect("queue row")).collect()
+        };
+        queued.sort_unstable();
+        let mut expected = face_ids.clone();
+        expected.sort_unstable();
+        assert_eq!(queued, expected, "exactly the removed observations are queued");
+        for face in &face_ids
+        {
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM face_observation WHERE id = ?1", params![face], |r| r.get::<_, i64>(0))
+                    .expect("face gone"),
+                0
+            );
+        }
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B7 — a clustering run the removed face belonged to is invalidated WHOLE;
+    /// an untouched run survives.
+    #[test]
+    fn b7_a_face_cluster_run_is_invalidated_whole()
+    {
+        let (path, conn) = fresh_catalogue("b7");
+        let doomed = insert_image(&conn, "/b7/doomed.jpg");
+        let a = insert_image(&conn, "/b7/a.jpg");
+        let b = insert_image(&conn, "/b7/b.jpg");
+        let fd = insert_face(&conn, doomed, doomed, 0);
+        let fa = insert_face(&conn, a, a, 0);
+        let fb = insert_face(&conn, b, b, 0);
+        insert_cluster_member(&conn, "run-A", fd, doomed);
+        insert_cluster_member(&conn, "run-A", fa, a);
+        insert_cluster_member(&conn, "run-A", fb, b);
+        insert_cluster_member(&conn, "run-B", fa, a);
+        insert_cluster_member(&conn, "run-B", fb, b);
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &[doomed]), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM face_cluster_member WHERE run_id = 'run-A'"), 0, "every member of the run");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM face_cluster_run WHERE run_id = 'run-A'"), 0, "and the run itself");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM face_cluster_member WHERE run_id = 'run-B'"), 2, "an untouched run survives");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM face_cluster_run WHERE run_id = 'run-B'"), 1);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B8 — similar-photo groups, featureprints and EVERY unit checkpoint.
+    /// Group 2 is the discriminator for the representative limb: its ONLY link
+    /// to the removal is `representative_id` (the doomed representative has no
+    /// member row of its own, and the group id is a live image's).
+    ///
+    /// ⭐ Ruling 13 (Sep 27, 2026) reversed what this test pinned: both touched
+    /// groups keep TWO surviving members, so both SURVIVE, each re-represented
+    /// by its lowest surviving image id — and no row may still name a removed
+    /// photo (the representative limb is what reaches group 2 at all).
+    #[test]
+    fn b8_similar_groups_featureprints_and_checkpoints_are_cleared()
+    {
+        let (path, conn) = fresh_catalogue("b8");
+        let d = insert_image(&conn, "/b8/d.jpg");
+        let a = insert_image(&conn, "/b8/a.jpg");
+        let b = insert_image(&conn, "/b8/b.jpg");
+        let d2 = insert_image(&conn, "/b8/d2.jpg");
+        let x = insert_image(&conn, "/b8/x.jpg");
+        let y = insert_image(&conn, "/b8/y.jpg");
+        let s1 = insert_image(&conn, "/b8/s1.jpg");
+        let s2 = insert_image(&conn, "/b8/s2.jpg");
+        // Group 1: a group of 3 whose representative is doomed.
+        insert_similar_member(&conn, d, d, d);
+        insert_similar_member(&conn, a, d, d);
+        insert_similar_member(&conn, b, d, d);
+        // Group 2: reached ONLY through representative_id.
+        insert_similar_member(&conn, x, x, d2);
+        insert_similar_member(&conn, y, x, d2);
+        // Group 3: untouched.
+        insert_similar_member(&conn, s1, s1, s1);
+        insert_similar_member(&conn, s2, s1, s1);
+        insert_featureprint(&conn, d);
+        insert_featureprint(&conn, d2);
+        insert_featureprint(&conn, s1);
+        insert_checkpoint(&conn, "unit-1");
+        insert_checkpoint(&conn, "unit-2");
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &[d, d2]), 2);
+        let mut expected = vec![(a, a, a), (b, a, a), (x, x, x), (y, x, x), (s1, s1, s1), (s2, s1, s1)];
+        expected.sort_unstable();
+        assert_eq!(
+            membership_keys(&conn),
+            expected,
+            "group 1 keeps its two survivors under its lowest one (a); group 2, reached only \
+             through its representative, keeps x and y under x; group 3 is untouched"
+        );
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM similar_photo_featureprint WHERE image_id IN ({}, {})", d, d2)),
+            0,
+            "the removed photos' featureprints are gone"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM similar_photo_featureprint WHERE image_id = ?1", params![s1], |r| r.get::<_, i64>(0))
+                .expect("survivor featureprint"),
+            1
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM similar_photo_unit_checkpoint"), 0, "EVERY checkpoint (W1-11)");
+        assert_no_orphans(&conn, "after the similar-photo cascade");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    // -----------------------------------------------------------------
+    // ⭐ Ruling 13 (Sep 27, 2026): removing one member of a stack — made by
+    // hand or found automatically — leaves the SURVIVING members' stack
+    // intact when two or more remain; only a stack that would drop below two
+    // members dissolves (the S111 drop-below-2 rule). B19a–B19e.
+    // -----------------------------------------------------------------
+
+    /// B19a — a 3-stack that loses one member keeps a 2-stack with the right
+    /// representative: its own, untouched. Two stacks lose a member in ONE
+    /// removal — an automatic one (representative = its lowest id) and a
+    /// hand-made one whose chosen representative is NOT its lowest id — and
+    /// each survivor's row comes through unchanged in every column, so the
+    /// gallery's own reader still expands each to its two survivors.
+    #[test]
+    fn b19a_a_three_stack_losing_a_member_keeps_its_survivors_stacked()
+    {
+        let (path, conn) = fresh_catalogue("b19a");
+        let r = insert_image(&conn, "/b19a/auto-r.jpg");
+        let m1 = insert_image(&conn, "/b19a/auto-m1.jpg");
+        let m2 = insert_image(&conn, "/b19a/auto-m2.jpg");
+        let h1 = insert_image(&conn, "/b19a/hand-1.jpg");
+        let h2 = insert_image(&conn, "/b19a/hand-2.jpg");
+        let h3 = insert_image(&conn, "/b19a/hand-3.jpg");
+        // Automatic: the lowest id represents; distances were measured.
+        insert_membership(&conn, r, r, 0, Some(0.0), 8.5);
+        insert_membership(&conn, m1, r, 1, Some(3.25), 8.5);
+        insert_membership(&conn, m2, r, 2, Some(4.5), 8.5);
+        // Hand-made: the user picked h2 to represent (rank 0), not h1.
+        insert_membership(&conn, h2, h2, 0, Some(0.0), 0.0);
+        insert_membership(&conn, h1, h2, 1, None, 0.0);
+        insert_membership(&conn, h3, h2, 2, None, 0.0);
+        let before = memberships(&conn);
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &[m1, h3]), 2);
+        let mut expected = expected_survivors(&before, &[r, m2, h1, h2], None);
+        expected.sort_by_key(|row| row.0);
+        assert_eq!(
+            memberships(&conn),
+            expected,
+            "each 3-stack keeps its two survivors, every column untouched — the automatic one \
+             still under r, the hand-made one still under the representative its user chose (h2)"
+        );
+        assert_eq!(stack_as_the_gallery_reads_it(&conn, r), vec![(r, r), (m2, r)], "the gallery still expands r's stack");
+        assert_eq!(stack_as_the_gallery_reads_it(&conn, h2), vec![(h1, h2), (h2, h2)], "and h2's");
+        assert_no_orphans(&conn, "after a member left each 3-stack");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B19b — a 2-stack that loses one member dissolves: its survivor keeps no
+    /// membership row, whether the photo removed was a plain member or the
+    /// representative. Run through the FILTERS path (a folder removal), so both
+    /// FFIs' shared routine is pinned from its second door too; an untouched
+    /// 2-stack beside them is unchanged.
+    #[test]
+    fn b19b_a_two_stack_losing_a_member_dissolves()
+    {
+        let (path, conn) = fresh_catalogue("b19b");
+        let p = insert_image(&conn, "/b19b/keep/p.jpg");
+        let q = insert_image(&conn, "/b19b/gone/q.jpg");
+        let u = insert_image(&conn, "/b19b/gone/u.jpg");
+        let v = insert_image(&conn, "/b19b/keep/v.jpg");
+        let s = insert_image(&conn, "/b19b/keep/s.jpg");
+        let t = insert_image(&conn, "/b19b/keep/t.jpg");
+        // {p, q}: loses its plain member q. {u, v}: loses its representative u.
+        insert_membership(&conn, p, p, 0, Some(0.0), 8.5);
+        insert_membership(&conn, q, p, 1, Some(2.0), 8.5);
+        insert_membership(&conn, u, u, 0, Some(0.0), 0.0);
+        insert_membership(&conn, v, u, 1, None, 0.0);
+        insert_membership(&conn, s, s, 0, Some(0.0), 8.5);
+        insert_membership(&conn, t, s, 1, Some(1.5), 8.5);
+        let before = memberships(&conn);
+
+        let outcome = remove_images_for_filters_impl(&conn, "/b19b/gone/", "", None).expect("the folder removal");
+        assert_eq!(outcome.deleted, 2);
+        assert_eq!(
+            memberships(&conn),
+            expected_survivors(&before, &[s, t], None),
+            "both touched 2-stacks dissolve — p and v keep no row — and {{s, t}} is untouched"
+        );
+        assert_eq!(stack_as_the_gallery_reads_it(&conn, p), vec![(p, p)], "p reads as a lone photo again");
+        assert_eq!(stack_as_the_gallery_reads_it(&conn, v), vec![(v, v)], "and so does v");
+        assert_no_orphans(&conn, "after two 2-stacks lost a member");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B19c — a removed representative is replaced by the LOWEST surviving
+    /// image id, as both the representative and the group id (S94: the group
+    /// id IS the representative image id; the S111 merge re-points both the
+    /// same way). The fixture is a hand-made 4-stack whose chosen
+    /// representative (h3) is NOT its lowest id, so "the lowest survivor" and
+    /// "the next in rank" differ: h1 must win. Every other column of every
+    /// survivor is left as stored. First, an engine failure induced after the
+    /// cascade must roll the promotion back with everything else — it runs
+    /// inside the removal's one transaction.
+    #[test]
+    fn b19c_a_removed_representative_is_replaced_by_the_lowest_survivor()
+    {
+        let (path, conn) = fresh_catalogue("b19c");
+        let h1 = insert_image(&conn, "/b19c/h1.jpg");
+        let h2 = insert_image(&conn, "/b19c/h2.jpg");
+        let h3 = insert_image(&conn, "/b19c/h3.jpg");
+        let h4 = insert_image(&conn, "/b19c/h4.jpg");
+        insert_membership(&conn, h3, h3, 0, Some(0.0), 0.0);
+        insert_membership(&conn, h4, h3, 1, None, 0.0);
+        insert_membership(&conn, h2, h3, 2, None, 0.0);
+        insert_membership(&conn, h1, h3, 3, None, 0.0);
+        let before = memberships(&conn);
+
+        let probe = RemovalProbe
+        {
+            fail_at: Some(RemovalStage::AfterCascade),
+            reattach_scalar_sql: None,
+        };
+        assert!(remove_images_by_ids_impl_with_probe(&conn, &[h3], Some(&probe)).is_none());
+        assert_eq!(memberships(&conn), before, "the induced failure rolled the promotion back");
+        assert_eq!(temp_removal_tables(&conn), 0, "the frozen plan is dropped on failure too");
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &[h3]), 1);
+        let mut expected = expected_survivors(&before, &[h1, h2, h4], Some(h1));
+        expected.sort_by_key(|row| row.0);
+        assert_eq!(
+            memberships(&conn),
+            expected,
+            "h1 — the lowest survivor — now represents and keys the stack; ranks, distances and \
+             thresholds are as stored"
+        );
+        assert_eq!(
+            stack_as_the_gallery_reads_it(&conn, h2),
+            vec![(h1, h1), (h2, h1), (h4, h1)],
+            "the gallery expands the three survivors as one stack"
+        );
+        assert_eq!(temp_removal_tables(&conn), 0);
+        assert_no_orphans(&conn, "after the representative left");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B19d — a removal that touches no stack changes no membership row: not
+    /// an automatic stack, not a hand-made one, and not a stack an earlier
+    /// bare `DELETE FROM images` (the pre-slice-B removal) left half-dangling —
+    /// one live member and one row whose photo is already gone, which a
+    /// removal must not "repair" when it never touched it.
+    #[test]
+    fn b19d_a_removal_touching_no_stack_changes_no_membership_row()
+    {
+        let (path, conn) = fresh_catalogue("b19d");
+        let lone = insert_image(&conn, "/b19d/lone.jpg");
+        let r = insert_image(&conn, "/b19d/r.jpg");
+        let m = insert_image(&conn, "/b19d/m.jpg");
+        let h1 = insert_image(&conn, "/b19d/h1.jpg");
+        let h2 = insert_image(&conn, "/b19d/h2.jpg");
+        let k = insert_image(&conn, "/b19d/k.jpg");
+        let gone = insert_image(&conn, "/b19d/gone.jpg");
+        insert_membership(&conn, r, r, 0, Some(0.0), 8.5);
+        insert_membership(&conn, m, r, 1, Some(2.5), 8.5);
+        insert_membership(&conn, h2, h2, 0, Some(0.0), 0.0);
+        insert_membership(&conn, h1, h2, 1, None, 0.0);
+        insert_membership(&conn, k, k, 0, Some(0.0), 8.5);
+        insert_membership(&conn, gone, k, 1, Some(1.0), 8.5);
+        conn.execute("DELETE FROM images WHERE id = ?1", params![gone])
+            .expect("the pre-slice-B bare delete");
+        insert_featureprint(&conn, lone);
+        let before = memberships(&conn);
+        assert_eq!(before.len(), 6);
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &[lone]), 1);
+        assert_eq!(memberships(&conn), before, "a removal touching no stack changes no membership row");
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM similar_photo_featureprint WHERE image_id = {}", lone)),
+            0,
+            "the removed photo's own featureprint still goes"
+        );
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B19e — a member row whose photo is ALREADY gone (an earlier bare
+    /// `DELETE FROM images` left it) is not a survivor: it neither keeps a
+    /// stack alive nor becomes its representative, and a removal that touches
+    /// its group sweeps it (B5b's rule for dangling rows within the cascade's
+    /// reach; B19d pins that an UNtouched group keeps its own). Group 1 has
+    /// such a row at its LOWEST id: when its representative is removed, the
+    /// lowest LIVE survivor (a) is promoted, never the dead row. Group 2 has
+    /// one live survivor plus such a row: it dissolves.
+    #[test]
+    fn b19e_a_member_whose_photo_is_already_gone_is_not_a_survivor()
+    {
+        let (path, conn) = fresh_catalogue("b19e");
+        let dead1 = insert_image(&conn, "/b19e/dead1.jpg");
+        let dead2 = insert_image(&conn, "/b19e/dead2.jpg");
+        let rep = insert_image(&conn, "/b19e/rep.jpg");
+        let a = insert_image(&conn, "/b19e/a.jpg");
+        let b = insert_image(&conn, "/b19e/b.jpg");
+        let p = insert_image(&conn, "/b19e/p.jpg");
+        let q = insert_image(&conn, "/b19e/q.jpg");
+        insert_membership(&conn, rep, rep, 0, Some(0.0), 8.5);
+        insert_membership(&conn, dead1, rep, 1, Some(1.0), 8.5);
+        insert_membership(&conn, a, rep, 2, Some(2.0), 8.5);
+        insert_membership(&conn, b, rep, 3, Some(3.0), 8.5);
+        insert_membership(&conn, p, p, 0, Some(0.0), 8.5);
+        insert_membership(&conn, dead2, p, 1, Some(1.0), 8.5);
+        insert_membership(&conn, q, p, 2, Some(2.0), 8.5);
+        conn.execute(
+            "DELETE FROM images WHERE id IN (?1, ?2)",
+            params![dead1, dead2],
+        )
+        .expect("the pre-slice-B bare delete");
+        let before = memberships(&conn);
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &[rep, q]), 2);
+        let mut expected = expected_survivors(&before, &[a, b], Some(a));
+        expected.sort_by_key(|row| row.0);
+        assert_eq!(
+            memberships(&conn),
+            expected,
+            "group 1 is re-represented by a — its lowest LIVE survivor, not the dead row below it, \
+             which goes — and group 2, one live survivor short, dissolves with its dead row"
+        );
+        assert_eq!(stack_as_the_gallery_reads_it(&conn, b), vec![(a, a), (b, a)], "the gallery expands a and b");
+        assert_no_orphans(&conn, "after sweeping the dead rows of the touched groups");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B19f — a dissolve can never undo a promotion: 3d dissolves (ii) BEFORE
+    /// it promotes (iii). The fixture is the one state where the order shows —
+    /// a stack keyed on an image whose own row sits in ANOTHER stack (the
+    /// progressive per-unit upsert can move a photo between groups and leave
+    /// its old group's rows keyed on it). Removing d promotes a in d's stack;
+    /// removing f leaves the stack keyed on a with one survivor, so it
+    /// dissolves. Dissolving first keeps {a, b}; promoting first would move
+    /// {a, b} onto key a and the dissolve would then delete them.
+    #[test]
+    fn b19f_a_dissolve_never_undoes_a_promotion()
+    {
+        let (path, conn) = fresh_catalogue("b19f");
+        let d = insert_image(&conn, "/b19f/d.jpg");
+        let a = insert_image(&conn, "/b19f/a.jpg");
+        let b = insert_image(&conn, "/b19f/b.jpg");
+        let e = insert_image(&conn, "/b19f/e.jpg");
+        let f = insert_image(&conn, "/b19f/f.jpg");
+        insert_membership(&conn, d, d, 0, Some(0.0), 8.5);
+        insert_membership(&conn, a, d, 1, Some(1.0), 8.5);
+        insert_membership(&conn, b, d, 2, Some(2.0), 8.5);
+        insert_membership(&conn, e, a, 1, Some(1.5), 8.5);
+        insert_membership(&conn, f, a, 2, Some(2.5), 8.5);
+        let before = memberships(&conn);
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &[d, f]), 2);
+        let mut expected = expected_survivors(&before, &[a, b], Some(a));
+        expected.sort_by_key(|row| row.0);
+        assert_eq!(
+            memberships(&conn),
+            expected,
+            "d's stack survives under a; the stack keyed on a, one survivor short, dissolved first"
+        );
+        assert_no_orphans(&conn, "after the dissolve and the promotion");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// Every table the removal touches, counted — the "pre-call state".
+    fn table_counts(conn: &Connection) -> Vec<(&'static str, i64)>
+    {
+        [
+            "images",
+            "keyword",
+            "removed_image_tombstone",
+            "removed_image_tombstone_keyword",
+            "face_observation",
+            "person_face_assignment",
+            "face_cluster_member",
+            "face_cluster_run",
+            "face_vector_pending_delete",
+            "similar_photo_group_member",
+            "similar_photo_featureprint",
+            "similar_photo_unit_checkpoint",
+        ]
+        .iter()
+        .map(|table| (*table, count(conn, &format!("SELECT COUNT(*) FROM {}", table))))
+        .collect()
+    }
+
+    /// B9 — the FILTERS path is transactional (R-76): its cascade leaves no
+    /// orphan, and an induced engine failure at ANY stage rolls the whole
+    /// removal back — `images`, `keyword`, the tombstones and every dependent
+    /// table are exactly as they were, and the temp tables are dropped.
+    ///
+    /// ⭐ §A-14's mechanism: `RemovalProbe.fail_at` makes the transaction run a
+    /// statement the ENGINE rejects at that stage — a real `Err` from a real
+    /// call, never a synthesised one.
+    #[test]
+    fn b9_the_filters_path_is_transactional_and_its_children_match()
+    {
+        let (path, conn) = fresh_catalogue("b9");
+        seed_every_dependent(&conn, "/Vol/A/doomed.jpg", "/Vol/B/survivor.jpg");
+        insert_checkpoint(&conn, "unit-1");
+
+        for stage in [RemovalStage::AfterCapture, RemovalStage::AfterCascade, RemovalStage::AfterDelete]
+        {
+            let before = table_counts(&conn);
+            let probe = RemovalProbe
+            {
+                fail_at: Some(stage),
+                reattach_scalar_sql: None,
+            };
+            assert!(
+                remove_images_for_filters_impl(&conn, "/Vol/A/", "", Some(&probe)).is_none(),
+                "an induced failure at {:?} must report nothing removed",
+                stage
+            );
+            assert_eq!(table_counts(&conn), before, "a failure at {:?} left partial state behind", stage);
+            assert_eq!(temp_removal_tables(&conn), 0, "the frozen sets are dropped on failure too");
+        }
+
+        let outcome = remove_images_for_filters_impl(&conn, "/Vol/A/", "", None).expect("the real removal");
+        assert_eq!(outcome.deleted, 1);
+        assert_no_orphans(&conn, "after the filters-path removal");
+        assert_eq!(tombstones_for(&conn, "/Vol/A/doomed.jpg"), (1, 1));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM images WHERE file_path = '/Vol/B/survivor.jpg'"), 1);
+        assert_eq!(temp_removal_tables(&conn), 0);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B10 — both empty guards still refuse, delete nothing, and write no
+    /// tombstone.
+    #[test]
+    fn b10_the_empty_guards_refuse_and_write_no_tombstone()
+    {
+        let (path, conn) = fresh_catalogue("b10");
+        let id = insert_image(&conn, "/b10/p.jpg");
+        set_curation(&conn, id, Some(5), None, None, 0);
+        insert_keyword(&conn, id, "Dogs", 1, 1, false, false);
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &[]), 0);
+        assert!(remove_images_for_filters_impl(&conn, "", "", None).is_none());
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM images"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM keyword"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM removed_image_tombstone"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM removed_image_tombstone_keyword"), 0);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B11 — W1-4: a row with no work leaves NO tombstone (and a row with only
+    /// a keyword, or only a rotation, does — so the check is not vacuous).
+    #[test]
+    fn b11_a_row_without_work_leaves_no_tombstone()
+    {
+        let (path, conn) = fresh_catalogue("b11");
+        let bare = insert_image(&conn, "/b11/bare.jpg");
+        let kw = insert_image(&conn, "/b11/keyword-only.jpg");
+        let rot = insert_image(&conn, "/b11/rotation-only.jpg");
+        insert_keyword(&conn, kw, "Only", 1, 1, false, false);
+        set_curation(&conn, rot, None, None, None, 270);
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &[bare, kw, rot]), 3);
+        assert_eq!(tombstones_for(&conn, "/b11/bare.jpg"), (0, 0), "no work, no tombstone");
+        assert_eq!(tombstones_for(&conn, "/b11/keyword-only.jpg"), (1, 1));
+        assert_eq!(tombstones_for(&conn, "/b11/rotation-only.jpg"), (1, 0));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM removed_image_tombstone"), 2);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B12 — chunking past 500: 1,205 ids, each with one keyword row.
+    /// (Absorbs `remove_images_by_ids_chunks_past_500`.)
+    #[test]
+    fn b12_chunking_past_500_tombstones_every_row()
+    {
+        let (path, conn) = fresh_catalogue("b12");
+        conn.execute_batch(
+            "INSERT INTO images (file_path, file_size, file_name, created_timestamp, modified_timestamp) \
+             SELECT '/b12/f' || i || '.jpg', 1234, 'f' || i || '.jpg', 0, 0 FROM range(1205) t(i); \
+             INSERT INTO keyword (image_id, label, path) SELECT id, 'k', 'k' FROM images;",
+        )
+        .expect("seed 1,205 rows");
+        let ids: Vec<i64> = {
+            let mut stmt = conn.prepare("SELECT id FROM images ORDER BY id").expect("ids statement");
+            let rows = stmt.query_map([], |r| r.get::<_, i64>(0)).expect("ids");
+            rows.map(|r| r.expect("id")).collect()
+        };
+        assert_eq!(ids.len(), 1205);
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &ids), 1205, "all three chunks executed");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM images"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM removed_image_tombstone"), 1205);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM removed_image_tombstone_keyword"), 1205);
+        assert_no_orphans(&conn, "after the chunked removal");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B13 — R-77: a backup-wins merge over a collided photo clears its
+    /// `face_cluster_member` and `similar_photo_featureprint` rows too, and the
+    /// four tables the cleanup already covered are still covered.
+    #[test]
+    fn b13_backup_wins_merge_clears_cluster_members_and_featureprints()
+    {
+        let (live_path, live) = fresh_catalogue("b13-live");
+        let (backup_path, backup) = fresh_catalogue("b13-backup");
+
+        let shared = insert_image(&live, "/b13/shared.jpg");
+        insert_keyword(&live, shared, "LiveOnly", 1, 1, false, false);
+        let live_face = insert_face(&live, shared, shared, 0);
+        let person = insert_person(&live, "LivePerson");
+        assign(&live, live_face, person, shared);
+        insert_cluster_member(&live, "run-live", live_face, shared);
+        insert_similar_member(&live, shared, shared, shared);
+        insert_featureprint(&live, shared);
+
+        insert_image(&backup, "/b13/shared.jpg");
+        drop(backup);
+
+        merge_catalogue_sql(&live, backup_path.to_string_lossy().as_ref(), MergeCollisionPolicy::BackupWins)
+            .expect("backup-wins merge");
+
+        let at = |sql: &str| live.query_row(sql, params![shared], |r| r.get::<_, i64>(0)).expect(sql);
+        assert_eq!(at("SELECT COUNT(*) FROM face_cluster_member WHERE image_id = ?1"), 0, "R-77: cluster members");
+        assert_eq!(at("SELECT COUNT(*) FROM similar_photo_featureprint WHERE image_id = ?1"), 0, "R-77: featureprints");
+        assert_eq!(at("SELECT COUNT(*) FROM person_face_assignment WHERE image_id = ?1"), 0, "still covered");
+        assert_eq!(at("SELECT COUNT(*) FROM face_observation WHERE image_id = ?1"), 0, "still covered");
+        assert_eq!(at("SELECT COUNT(*) FROM keyword WHERE image_id = ?1"), 0, "still covered");
+        assert_eq!(at("SELECT COUNT(*) FROM similar_photo_group_member WHERE image_id = ?1"), 0, "still covered");
+        drop(live);
+        cleanup(&live_path);
+        cleanup(&backup_path);
+    }
+
+    /// B14a — the merge's INSERT arm (Lightroom / Apple / Copy-and-Import)
+    /// re-attaches a returning photo's work inside its own transaction.
+    #[test]
+    fn b14a_merge_reattaches_on_its_insert_arm()
+    {
+        let (path, conn) = fresh_catalogue("b14a");
+        let id = insert_image(&conn, "/b14a/p.jpg");
+        set_curation(&conn, id, Some(4), Some("reject"), Some("blue"), 180);
+        insert_keyword(&conn, id, "Dogs", 1, 1, false, false);
+        assert_eq!(remove_images_by_ids_impl(&conn, &[id]), 1);
+
+        let result = merge_records_into(&conn, &[record("/b14a/p.jpg", false)]);
+        assert_eq!(result.failed_rows, 0, "{:?}", result.failure_message);
+        assert_eq!(result.inserted, 1);
+        let new_id = id_of(&conn, "/b14a/p.jpg");
+        assert_eq!(keyword_shapes(&conn, new_id).len(), 1, "the keyword came back through the merge");
+        assert_eq!(curation(&conn, "/b14a/p.jpg"), (Some(4), Some("reject".to_string()), Some("blue".to_string()), Some(180)));
+        assert_eq!(tombstones_for(&conn, "/b14a/p.jpg"), (0, 0), "consumed");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// Plant a STALE tombstone for a path whose row is LIVE — the state an
+    /// editor save at a removed path leaves behind (W1-8: that save does not
+    /// re-attach).
+    ///
+    /// ⭐ Fix round 1: it carries the live row's OWN identity (`insert_image`'s
+    /// size, no capture date — B-F2), so the ONLY thing keeping it off the live
+    /// row is §A-1. Planted without an identity it could never match, and
+    /// B14b/B14c would pass for the wrong reason: the mutation ledger's A1-merge
+    /// row (the merge's UPDATE arm feeding the re-attach) went GREEN until this
+    /// was fixed.
+    fn plant_stale_tombstone(conn: &Connection, file_path: &str)
+    {
+        conn.execute(
+            "INSERT INTO removed_image_tombstone \
+                 (file_path, file_size, capture_datetime, rating, flag, color_label, rotation) \
+             VALUES (?1, ?2, NULL, 5, 'pick', 'green', 90)",
+            params![file_path, FIXTURE_FILE_SIZE],
+        )
+        .expect("stale tombstone");
+        conn.execute(
+            "INSERT INTO removed_image_tombstone_keyword (file_path, label, path, status, origin, collection, color) \
+             VALUES (?1, 'Stale', 'Stale', 1, 1, FALSE, FALSE)",
+            params![file_path],
+        )
+        .expect("stale keyword tombstone");
+    }
+
+    /// B14b — §A-1 at the merge: the UPDATE arm reaches a LIVE row, so a stale
+    /// tombstone is neither applied (curation and keywords unchanged, no
+    /// duplicate) nor consumed (ruling 10: never pruned automatically).
+    #[test]
+    fn b14b_merge_update_arm_leaves_a_stale_tombstone_unapplied()
+    {
+        let (path, conn) = fresh_catalogue("b14b");
+        let id = insert_image(&conn, "/b14b/p.jpg");
+        set_curation(&conn, id, Some(2), None, None, 0);
+        insert_keyword(&conn, id, "Live", 1, 1, false, false);
+        plant_stale_tombstone(&conn, "/b14b/p.jpg");
+
+        let result = merge_records_into(&conn, &[record("/b14b/p.jpg", false)]);
+        assert_eq!(result.failed_rows, 0, "{:?}", result.failure_message);
+        assert_eq!(result.updated, 1);
+        assert_eq!(id_of(&conn, "/b14b/p.jpg"), id, "the UPDATE arm is id-stable");
+        assert_eq!(curation(&conn, "/b14b/p.jpg"), (Some(2), None, None, Some(0)), "the live curation is unchanged");
+        let shapes = keyword_shapes(&conn, id);
+        assert_eq!(shapes.len(), 1, "no stale keyword was added");
+        assert_eq!(shapes[0].0, "Live");
+        assert_eq!(tombstones_for(&conn, "/b14b/p.jpg"), (1, 1), "a stale tombstone is not consumed");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B14c — §A-1 at the scan: `INSERT OR IGNORE` skips a LIVE row, and its
+    /// stale tombstone is left alone — the exact case the `rating IS NULL …`
+    /// guard would have got WRONG (an editor-saved row has cleared curation).
+    #[test]
+    fn b14c_ingest_ignore_leaves_a_stale_tombstone_unapplied()
+    {
+        let (path, conn) = fresh_catalogue("b14c");
+        let id = insert_image(&conn, "/b14c/saved.jpg");
+        plant_stale_tombstone(&conn, "/b14c/saved.jpg");
+
+        assert_eq!(ingest_metadata_impl(&conn, &[record("/b14c/saved.jpg", false)], None), 0);
+        assert_eq!(curation(&conn, "/b14c/saved.jpg"), (None, None, None, Some(0)), "the live row is untouched");
+        assert_eq!(keyword_shapes(&conn, id).len(), 0, "no stale keyword was added");
+        assert_eq!(tombstones_for(&conn, "/b14c/saved.jpg"), (1, 1), "and the tombstone is kept");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B14d — ⭐ fix round 1, B-F1: a returning import that CARRIES curation
+    /// keeps it wherever the tombstone is silent; where the tombstone holds a
+    /// value, the tombstone wins (the ruled promise). Both returns ride
+    /// `merge_records_into`, as every importer does: a Lightroom merge
+    /// (stars / pick / colour) and a Copy-and-Import copy (inherited rating and
+    /// rotation). Before the fix the first case came back (NULL, NULL, NULL, 0)
+    /// — the reviewer's PROBE1 — and the verification CONFIRMED the wipe.
+    #[test]
+    fn b14d_a_returning_import_keeps_its_own_curation_where_the_tombstone_is_silent()
+    {
+        let (path, conn) = fresh_catalogue("b14d");
+        let beach = ["Scene", "Beach"].join(KEYWORD_PATH_SEPARATOR);
+        // (1) Only an automatic keyword — the state culling leaves on nearly
+        //     every photo — so every scalar in the tombstone is empty.
+        let silent = insert_image(&conn, "/b14d/silent.jpg");
+        insert_keyword(&conn, silent, &beach, 1, KEYWORD_ORIGIN_AUTO as i64, false, false);
+        // (2) A 3-star photo: the tombstone holds the rating and nothing else.
+        let rated = insert_image(&conn, "/b14d/rated.jpg");
+        set_curation(&conn, rated, Some(3), None, None, 0);
+        // (3) A keyword, no rotation — the copy will bring rotation 180.
+        let unrotated = insert_image(&conn, "/b14d/unrotated.jpg");
+        insert_keyword(&conn, unrotated, "Trip", 1, KEYWORD_ORIGIN_USER as i64, false, false);
+        // (4) Rotated 90 by the user — the copy will bring 180.
+        let rotated = insert_image(&conn, "/b14d/rotated.jpg");
+        set_curation(&conn, rotated, None, None, None, 90);
+        assert_eq!(remove_images_by_ids_impl(&conn, &[silent, rated, unrotated, rotated]), 4);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM removed_image_tombstone"), 4);
+
+        // The Lightroom return: the catalog's own 5 stars, Pick and Red.
+        let mut lr_silent = record("/b14d/silent.jpg", false);
+        lr_silent.rating = Some(5);
+        lr_silent.flag = Some("pick".to_string());
+        lr_silent.color_label = Some("red".to_string());
+        let mut lr_rated = record("/b14d/rated.jpg", false);
+        lr_rated.rating = Some(5);
+        lr_rated.flag = Some("pick".to_string());
+        lr_rated.color_label = Some("red".to_string());
+        let result = merge_records_into(&conn, &[lr_silent, lr_rated]);
+        assert_eq!(result.failed_rows, 0, "{:?}", result.failure_message);
+        assert_eq!(result.inserted, 2);
+        assert_eq!(
+            curation(&conn, "/b14d/silent.jpg"),
+            (Some(5), Some("pick".to_string()), Some("red".to_string()), Some(0)),
+            "the import's own curation survives where the tombstone held none"
+        );
+        assert_eq!(keyword_shapes(&conn, id_of(&conn, "/b14d/silent.jpg")).len(), 1, "…and the keyword came back");
+        assert_eq!(
+            curation(&conn, "/b14d/rated.jpg"),
+            (Some(3), Some("pick".to_string()), Some("red".to_string()), Some(0)),
+            "where the tombstone holds a value it wins; elsewhere the import's value stays"
+        );
+
+        // The Copy-and-Import return: an inherited 4 stars and rotation 180.
+        let mut copy_unrotated = record("/b14d/unrotated.jpg", false);
+        copy_unrotated.rating = Some(4);
+        copy_unrotated.rotation = Some(180);
+        let mut copy_rotated = record("/b14d/rotated.jpg", false);
+        copy_rotated.rotation = Some(180);
+        let result = merge_records_into(&conn, &[copy_unrotated, copy_rotated]);
+        assert_eq!(result.failed_rows, 0, "{:?}", result.failure_message);
+        assert_eq!(
+            curation(&conn, "/b14d/unrotated.jpg"),
+            (Some(4), None, None, Some(180)),
+            "a rotation of 0 in the tombstone is 'none' — the copy's 180 and its stars stay"
+        );
+        assert_eq!(
+            curation(&conn, "/b14d/rotated.jpg").3,
+            Some(90),
+            "the user's own rotation in the tombstone wins over the copy's"
+        );
+
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM removed_image_tombstone"),
+            0,
+            "every tombstone was verified on the fields it holds, and consumed"
+        );
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B14e — ⭐ the re-attach's identity, "the same photograph" (fix round 1,
+    /// B-F2; fix round 2, R2-F1 — `removal_same_file_sql`). The CAPTURE DATE
+    /// decides: a different photograph at a removed path (another day) arrives
+    /// clean and the tombstone waits in place (the reviewer's PROBE2: a stranger
+    /// named Alice, flagged Reject, displayed sideways), while the same
+    /// photograph comes home even though its size moved — rewritten in place by
+    /// another application, or an iCloud-only Photos asset catalogued at size 0
+    /// and downloaded since (R2-F1's two populations). Only an UNDATED pair is
+    /// decided by size, and a size of 0 on either side is unknown. Both entry
+    /// points — the scan's ingest and the importers' merge — are exercised.
+    #[test]
+    fn b14e_a_different_photo_at_a_removed_path_arrives_clean_and_the_true_return_restores()
+    {
+        const TAKEN: &str = "2026:05:01 10:00:00";
+        const OTHER_DAY: &str = "2031:12:24 09:00:00";
+        // (path, seeded size, seeded date, returning size, returning date,
+        //  returns through the scan's ingest (else a merge), the work comes back)
+        type Case = (&'static str, i64, Option<&'static str>, u64, Option<&'static str>, bool, bool);
+        let cases: [Case; 10] = [
+            // A DIFFERENT photograph: another size and another day.
+            ("/b14e/stranger.jpg", 1234, Some(TAKEN), 987_654, Some(OTHER_DAY), true, false),
+            // Another photograph that happens to share the size: another day.
+            ("/b14e/same-size.jpg", 1234, Some(TAKEN), 1234, Some(OTHER_DAY), false, false),
+            // ⭐ R2-F1: the SAME photograph, rewritten in place by another
+            // application — the same day, another size. It comes home.
+            ("/b14e/rewritten.jpg", 1234, Some(TAKEN), 987_654, Some(TAKEN), true, true),
+            // The true return: the same size and day.
+            ("/b14e/true.jpg", 1234, Some(TAKEN), 1234, Some(TAKEN), true, true),
+            // ⭐ R2-F1: an iCloud-only Photos asset catalogued at size 0, its
+            // original downloaded before the re-import. It comes home.
+            ("/b14e/icloud.heic", 0, Some(TAKEN), 5_000_000, Some(TAKEN), false, true),
+            // A dated tombstone never matches an undated return (NULL-safe).
+            ("/b14e/date-lost.jpg", 1234, Some(TAKEN), 1234, None, true, false),
+            // UNDATED: the size decides — equal sizes match…
+            ("/b14e/undated.jpg", 1234, None, 1234, None, false, true),
+            // …different sizes do not…
+            ("/b14e/undated-other.jpg", 1234, None, 987_654, None, true, false),
+            // …and a size of 0 on EITHER side is unknown, never a mismatch.
+            ("/b14e/undated-icloud.heic", 0, None, 5_000_000, None, false, true),
+            ("/b14e/undated-returns-at-0.jpg", 1234, None, 0, None, false, true),
+        ];
+        let (path, conn) = fresh_catalogue("b14e");
+        let alice = ["People", "Alice"].join(KEYWORD_PATH_SEPARATOR);
+        let mut ids = Vec::new();
+        for (file_path, size, capture, _, _, _, _) in cases
+        {
+            let id = insert_image_with_identity(&conn, file_path, size, capture);
+            set_curation(&conn, id, None, Some("reject"), None, 90);
+            insert_keyword(&conn, id, &alice, 1, KEYWORD_ORIGIN_USER as i64, false, false);
+            ids.push(id);
+        }
+        assert_eq!(remove_images_by_ids_impl(&conn, &ids), cases.len() as u64);
+
+        for (file_path, _, _, size, capture, through_scan, restores) in cases
+        {
+            let returning = record_with_identity(file_path, size, capture);
+            if through_scan
+            {
+                assert_eq!(ingest_metadata_impl(&conn, &[returning], None), 1, "{}", file_path);
+            }
+            else
+            {
+                let result = merge_records_into(&conn, &[returning]);
+                assert_eq!(result.failed_rows, 0, "{}: {:?}", file_path, result.failure_message);
+                assert_eq!(result.inserted, 1, "{}", file_path);
+            }
+            if restores
+            {
+                assert_eq!(
+                    curation(&conn, file_path),
+                    (None, Some("reject".to_string()), None, Some(90)),
+                    "{}: the same photograph gets its work back",
+                    file_path
+                );
+                assert_eq!(keyword_shapes(&conn, id_of(&conn, file_path)).len(), 1, "{}", file_path);
+                assert_eq!(tombstones_for(&conn, file_path), (0, 0), "{}: consumed", file_path);
+            }
+            else
+            {
+                assert_eq!(
+                    curation(&conn, file_path),
+                    (None, None, None, Some(0)),
+                    "{}: a different photograph must not inherit the removed one's flag or rotation",
+                    file_path
+                );
+                assert_eq!(
+                    keyword_shapes(&conn, id_of(&conn, file_path)).len(),
+                    0,
+                    "{}: …nor its People keyword",
+                    file_path
+                );
+                assert_eq!(tombstones_for(&conn, file_path), (1, 1), "{}: the tombstone waits in place", file_path);
+            }
+        }
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// The four-tuple of the two new tables (slice K's assertion (e) shape).
+    fn tombstone_column_shapes(conn: &Connection) -> Vec<(String, String, String, bool, Option<String>)>
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT t.table_name, c.column_name, c.data_type, c.is_nullable, c.column_default \
+                 FROM duckdb_columns() c JOIN duckdb_tables() t ON c.table_oid = t.table_oid \
+                 WHERE t.table_name IN ('removed_image_tombstone', 'removed_image_tombstone_keyword') \
+                 ORDER BY t.table_name, c.column_name",
+            )
+            .expect("shape statement");
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .expect("shapes");
+        rows.map(|r| r.expect("shape")).collect()
+    }
+
+    /// B15 — the schema addition is present on BOTH a fresh and an upgraded
+    /// catalogue, with an identical four-tuple — CREATE-time only.
+    #[test]
+    fn b15_the_schema_addition_exists_fresh_and_after_an_upgrade()
+    {
+        let (path, conn) = fresh_catalogue("b15");
+        let fresh = tombstone_column_shapes(&conn);
+        assert_eq!(fresh.len(), 17, "8 + 9 columns: {:?}", fresh);
+        assert!(
+            fresh.iter().any(|(t, c, d, _, _)| t == "removed_image_tombstone" && c == "file_size" && d == "BIGINT")
+                && fresh.iter().any(|(t, c, d, _, _)| t == "removed_image_tombstone"
+                    && c == "capture_datetime"
+                    && d == "VARCHAR"),
+            "B-F2: the tombstone carries the removed file's identity: {:?}",
+            fresh
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_removed_tombstone_keyword_path'"),
+            1
+        );
+
+        // A catalogue created WITHOUT them: drop, close, reopen.
+        conn.execute_batch(
+            "DROP INDEX idx_removed_tombstone_keyword_path; \
+             DROP TABLE removed_image_tombstone_keyword; \
+             DROP TABLE removed_image_tombstone; \
+             CHECKPOINT;",
+        )
+        .expect("simulate an older catalogue");
+        assert_eq!(tombstone_column_shapes(&conn).len(), 0);
+        drop(conn);
+
+        let reopened = open_and_migrate_catalogue(&path).expect("reopen");
+        fence_connection_against_extension_fetches(&reopened);
+        assert_eq!(tombstone_column_shapes(&reopened), fresh, "upgraded == fresh, allow-list-free");
+        assert_eq!(
+            count(&reopened, "SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_removed_tombstone_keyword_path'"),
+            1
+        );
+        drop(reopened);
+        cleanup(&path);
+    }
+
+    /// B17 — a re-attach that did not land is caught ON THE TABLE: the
+    /// transaction rolls back, the photo stays (added without its earlier
+    /// work), and the tombstone is KEPT — never consumed without its work.
+    #[test]
+    fn b17_an_unverified_reattach_rolls_back_and_keeps_the_tombstone()
+    {
+        let (path, conn) = fresh_catalogue("b17");
+        let id = insert_image(&conn, "/b17/p.jpg");
+        set_curation(&conn, id, Some(4), None, None, 0);
+        insert_keyword(&conn, id, "Dogs", 1, 1, false, false);
+        assert_eq!(remove_images_by_ids_impl(&conn, &[id]), 1);
+
+        // The scalar UPDATE silently does nothing.
+        let probe = RemovalProbe
+        {
+            fail_at: None,
+            reattach_scalar_sql: Some("SELECT 1;".to_string()),
+        };
+        assert_eq!(ingest_metadata_impl(&conn, &[record("/b17/p.jpg", false)], Some(&probe)), 1);
+        let new_id = id_of(&conn, "/b17/p.jpg");
+        assert_eq!(curation(&conn, "/b17/p.jpg").0, None);
+        assert_eq!(keyword_shapes(&conn, new_id).len(), 0, "the keyword INSERT was rolled back with it");
+        assert_eq!(tombstones_for(&conn, "/b17/p.jpg"), (1, 1), "the tombstone is KEPT");
+
+        // ⭐ Fix round 1, B-F6 — "kept until its file returns and the re-attach
+        // succeeds", executed. A re-scan of the LIVE bare photo applies nothing
+        // (§A-1)…
+        assert_eq!(ingest_metadata_impl(&conn, &[record("/b17/p.jpg", false)], None), 0);
+        assert_eq!(tombstones_for(&conn, "/b17/p.jpg"), (1, 1), "a re-scan of the live photo leaves it");
+        // …removing the bare photo — it carries no work — leaves the tombstone
+        // IN PLACE (2a replaces a tombstone only with newer work)…
+        assert_eq!(remove_images_by_ids_impl(&conn, &[new_id]), 1);
+        assert_eq!(tombstones_for(&conn, "/b17/p.jpg"), (1, 1), "a removal without work does not clear it");
+        // …and the next SUCCESSFUL re-add restores the original work.
+        assert_eq!(ingest_metadata_impl(&conn, &[record("/b17/p.jpg", false)], None), 1);
+        let restored = id_of(&conn, "/b17/p.jpg");
+        assert_eq!(curation(&conn, "/b17/p.jpg").0, Some(4), "the work came back on the successful re-attach");
+        assert_eq!(keyword_shapes(&conn, restored).len(), 1);
+        assert_eq!(tombstones_for(&conn, "/b17/p.jpg"), (0, 0), "…and only then was it consumed");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B17b — ⭐ fix round 1, B-F1's other half: the verification checks ONLY
+    /// the fields the tombstone holds (B14d), but it must still check EACH of
+    /// them. Four photos, each carrying exactly one field, each re-added in its
+    /// OWN chunk (the verification is all-or-nothing per chunk, so one photo per
+    /// chunk is what lets a lax clause for one field show). The scalar UPDATE
+    /// silently does nothing, so every tombstone must be KEPT; a clause that
+    /// stopped checking its field would consume that photo's work unwritten.
+    #[test]
+    fn b17b_each_field_the_tombstone_holds_is_verified_on_the_table()
+    {
+        let (path, conn) = fresh_catalogue("b17b");
+        let seeded: [(&str, Option<i64>, Option<&str>, Option<&str>, i64); 4] = [
+            ("/b17b/rating.jpg", Some(2), None, None, 0),
+            ("/b17b/flag.jpg", None, Some("pick"), None, 0),
+            ("/b17b/color.jpg", None, None, Some("blue"), 0),
+            ("/b17b/rotation.jpg", None, None, None, 270),
+        ];
+        let mut ids = Vec::new();
+        for (file_path, rating, flag, color, rotation) in seeded
+        {
+            let id = insert_image(&conn, file_path);
+            set_curation(&conn, id, rating, flag, color, rotation);
+            ids.push(id);
+        }
+        assert_eq!(remove_images_by_ids_impl(&conn, &ids), 4);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM removed_image_tombstone"), 4);
+
+        let probe = RemovalProbe
+        {
+            fail_at: None,
+            reattach_scalar_sql: Some("SELECT 1;".to_string()),
+        };
+        for (file_path, _, _, _, _) in seeded
+        {
+            assert_eq!(ingest_metadata_impl(&conn, &[record(file_path, false)], Some(&probe)), 1);
+            assert_eq!(
+                curation(&conn, file_path),
+                (None, None, None, Some(0)),
+                "{}: the photo is added bare",
+                file_path
+            );
+            assert_eq!(
+                tombstones_for(&conn, file_path),
+                (1, 0),
+                "{}: the one field it held did not land, so its tombstone is KEPT",
+                file_path
+            );
+        }
+
+        // B-F6 per field: the bare rows carry no work, so removing them leaves
+        // every tombstone in place, and one successful re-add restores each.
+        let bare: Vec<i64> = seeded.iter().map(|(file_path, _, _, _, _)| id_of(&conn, file_path)).collect();
+        assert_eq!(remove_images_by_ids_impl(&conn, &bare), 4);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM removed_image_tombstone"), 4);
+        let returning: Vec<ImageMetadata> =
+            seeded.iter().map(|(file_path, _, _, _, _)| record(file_path, false)).collect();
+        assert_eq!(ingest_metadata_impl(&conn, &returning, None), 4);
+        for (file_path, rating, flag, color, rotation) in seeded
+        {
+            assert_eq!(
+                curation(&conn, file_path),
+                (rating, flag.map(|f| f.to_string()), color.map(|c| c.to_string()), Some(rotation)),
+                "{}: its one field came back",
+                file_path
+            );
+        }
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM removed_image_tombstone"), 0, "every tombstone consumed");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B17c — ⭐ fix round 2, R2-F2: a removal of the SAME photograph MERGES
+    /// into the tombstone waiting at its path; it never replaces it. The
+    /// reviewer's PROBE5: a re-attach fails, the bare photo gets an AUTOMATIC
+    /// keyword (the post-import chain starts Intelligent Culling on its own),
+    /// the user removes and re-adds it as the record promises — and before this
+    /// fix the stars and the user keyword were gone. Now the keyword rows are
+    /// unioned (one row per path: origin bits OR'd, collection / colour OR'd,
+    /// active if either is), each curation field is the newer photo's where it
+    /// has one and the waiting one's otherwise, and rotation likewise with 0 as
+    /// "none". A DIFFERENT photograph's newer work still REPLACES the waiting
+    /// tombstone (one tombstone per path) — and nothing is mixed across the two.
+    #[test]
+    fn b17c_a_same_photo_removal_merges_into_its_waiting_tombstone()
+    {
+        const TAKEN: &str = "2026:05:01 10:00:00";
+        const OTHER_DAY: &str = "2031:12:24 09:00:00";
+        let (path, conn) = fresh_catalogue("b17c");
+        let beach = ["Scene", "Beach"].join(KEYWORD_PATH_SEPARATOR);
+        // P1: 5 stars, Pick, rotated 90; a user keyword, a user "beach" that is
+        // also a collection, and a HIDDEN keyword.
+        let p1 = insert_image(&conn, "/b17c/p1.jpg");
+        set_curation(&conn, p1, Some(5), Some("pick"), None, 90);
+        insert_keyword(&conn, p1, "Dogs", 1, KEYWORD_ORIGIN_USER as i64, false, false);
+        insert_keyword(&conn, p1, &beach, 1, KEYWORD_ORIGIN_USER as i64, true, false);
+        insert_keyword(&conn, p1, "Old", 0, KEYWORD_ORIGIN_USER as i64, false, false);
+        // P2: 3 stars, rotated 90, no keywords.
+        let p2 = insert_image(&conn, "/b17c/p2.jpg");
+        set_curation(&conn, p2, Some(3), None, None, 90);
+        // P3: a dated photograph with 4 stars and a keyword.
+        let p3 = insert_image_with_identity(&conn, "/b17c/p3.jpg", 1234, Some(TAKEN));
+        set_curation(&conn, p3, Some(4), None, None, 0);
+        insert_keyword(&conn, p3, "Cats", 1, KEYWORD_ORIGIN_USER as i64, false, false);
+        assert_eq!(remove_images_by_ids_impl(&conn, &[p1, p2, p3]), 3);
+
+        // P1 and P2 come back, but their re-attach FAILS (B17's seam): bare.
+        let failing = RemovalProbe
+        {
+            fail_at: None,
+            reattach_scalar_sql: Some("SELECT 1;".to_string()),
+        };
+        assert_eq!(
+            ingest_metadata_impl(&conn, &[record("/b17c/p1.jpg", false), record("/b17c/p2.jpg", false)], Some(&failing)),
+            2
+        );
+        assert_eq!(tombstones_for(&conn, "/b17c/p1.jpg"), (1, 3), "P1's work waits");
+        assert_eq!(tombstones_for(&conn, "/b17c/p2.jpg"), (1, 0), "P2's work waits");
+        // Intelligent Culling reaches the bare P1: an AUTOMATIC "beach" and an
+        // automatic re-appearance of "Old"; the user re-rates it 2.
+        let bare1 = id_of(&conn, "/b17c/p1.jpg");
+        insert_keyword(&conn, bare1, &beach, 1, KEYWORD_ORIGIN_AUTO as i64, false, false);
+        insert_keyword(&conn, bare1, "Old", 1, KEYWORD_ORIGIN_AUTO as i64, false, false);
+        set_curation(&conn, bare1, Some(2), None, None, 0);
+        // The bare P2: an automatic keyword, and the user rotates it 180.
+        let bare2 = id_of(&conn, "/b17c/p2.jpg");
+        insert_keyword(&conn, bare2, "Sky", 1, KEYWORD_ORIGIN_AUTO as i64, false, false);
+        set_curation(&conn, bare2, None, None, None, 180);
+        // At P3's path a DIFFERENT photograph (another day) arrives bare, and
+        // the user gives it a keyword.
+        assert_eq!(
+            ingest_metadata_impl(&conn, &[record_with_identity("/b17c/p3.jpg", 1234, Some(OTHER_DAY))], None),
+            1
+        );
+        let stranger = id_of(&conn, "/b17c/p3.jpg");
+        insert_keyword(&conn, stranger, "Birds", 1, KEYWORD_ORIGIN_USER as i64, false, false);
+
+        // The user removes all three.
+        assert_eq!(remove_images_by_ids_impl(&conn, &[bare1, bare2, stranger]), 3);
+        assert_eq!(tombstones_for(&conn, "/b17c/p1.jpg"), (1, 3), "P1: one row per path, merged");
+        assert_eq!(tombstones_for(&conn, "/b17c/p2.jpg"), (1, 1), "P2: merged");
+        assert_eq!(tombstones_for(&conn, "/b17c/p3.jpg"), (1, 1), "P3: REPLACED by the stranger's work");
+        let (waiting_date, waiting_label): (Option<String>, String) = conn
+            .query_row(
+                "SELECT t.capture_datetime, k.label FROM removed_image_tombstone t \
+                   JOIN removed_image_tombstone_keyword k ON k.file_path = t.file_path \
+                  WHERE t.file_path = '/b17c/p3.jpg'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("the stranger's tombstone");
+        assert_eq!(
+            (waiting_date.as_deref(), waiting_label.as_str()),
+            (Some(OTHER_DAY), "Birds"),
+            "the stranger's work alone — nothing of the original's is mixed in"
+        );
+
+        // P1 and P2 come home — this time the re-attach succeeds.
+        assert_eq!(
+            ingest_metadata_impl(&conn, &[record("/b17c/p1.jpg", false), record("/b17c/p2.jpg", false)], None),
+            2
+        );
+        assert_eq!(
+            curation(&conn, "/b17c/p1.jpg"),
+            (Some(2), Some("pick".to_string()), None, Some(90)),
+            "P1: the newer rating; the waiting Pick; the waiting rotation (the bare photo's 0 is 'none')"
+        );
+        let shapes = keyword_shapes(&conn, id_of(&conn, "/b17c/p1.jpg"));
+        let summary: Vec<(&str, i64, i64, bool, bool)> = shapes
+            .iter()
+            .map(|s| (s.0.as_str(), s.2, s.3, s.4, s.7.is_some()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("Dogs", 1, KEYWORD_ORIGIN_USER as i64, false, false),
+                ("Old", 1, (KEYWORD_ORIGIN_USER | KEYWORD_ORIGIN_AUTO) as i64, false, false),
+                ("Beach", 1, (KEYWORD_ORIGIN_USER | KEYWORD_ORIGIN_AUTO) as i64, true, false),
+            ],
+            "P1: the waiting user keyword survives the automatic one; a shared path is ONE row \
+             with both origin bits, the collection kept, active and unhidden"
+        );
+        assert_eq!(
+            curation(&conn, "/b17c/p2.jpg"),
+            (Some(3), None, None, Some(180)),
+            "P2: the waiting rating; the newer, deliberate rotation"
+        );
+        let shapes = keyword_shapes(&conn, id_of(&conn, "/b17c/p2.jpg"));
+        assert_eq!(shapes.len(), 1);
+        assert_eq!((shapes[0].0.as_str(), shapes[0].3), ("Sky", KEYWORD_ORIGIN_AUTO as i64));
+        assert_eq!(tombstones_for(&conn, "/b17c/p1.jpg"), (0, 0), "P1 consumed");
+        assert_eq!(tombstones_for(&conn, "/b17c/p2.jpg"), (0, 0), "P2 consumed");
+
+        // The ORIGINAL P3 (the earlier day) returns: the waiting work is the
+        // stranger's, which is not its own — it arrives bare, and the
+        // stranger's tombstone keeps waiting.
+        assert_eq!(
+            ingest_metadata_impl(&conn, &[record_with_identity("/b17c/p3.jpg", 1234, Some(TAKEN))], None),
+            1
+        );
+        assert_eq!(curation(&conn, "/b17c/p3.jpg"), (None, None, None, Some(0)));
+        assert_eq!(keyword_shapes(&conn, id_of(&conn, "/b17c/p3.jpg")).len(), 0);
+        assert_eq!(tombstones_for(&conn, "/b17c/p3.jpg"), (1, 1));
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B17d — ⭐ fix round 2, R2-F2 × R2-F1: a same-photo MERGE never trades a
+    /// KNOWN size for an unknown 0. An undated photo is identified by its size,
+    /// so a waiting tombstone that took "size unknown" from a bare return
+    /// catalogued at 0 would afterwards match ANY undated file at its path.
+    #[test]
+    fn b17d_a_merge_keeps_the_known_size_of_an_undated_photo()
+    {
+        let (path, conn) = fresh_catalogue("b17d");
+        // An UNDATED photo, 1234 bytes, rated 5.
+        let original = insert_image_with_identity(&conn, "/b17d/p.jpg", 1234, None);
+        set_curation(&conn, original, Some(5), None, None, 0);
+        assert_eq!(remove_images_by_ids_impl(&conn, &[original]), 1);
+        // It comes back catalogued at size 0 (unknown, so it matches), but the
+        // re-attach FAILS (B17's seam): the photo is bare, the work waits.
+        let failing = RemovalProbe
+        {
+            fail_at: None,
+            reattach_scalar_sql: Some("SELECT 1;".to_string()),
+        };
+        assert_eq!(
+            ingest_metadata_impl(&conn, &[record_with_identity("/b17d/p.jpg", 0, None)], Some(&failing)),
+            1
+        );
+        assert_eq!(tombstones_for(&conn, "/b17d/p.jpg"), (1, 0));
+        // Culling gives the bare photo an automatic keyword, and the user
+        // removes it: the same photograph, so a MERGE.
+        let bare = id_of(&conn, "/b17d/p.jpg");
+        insert_keyword(&conn, bare, "Sky", 1, KEYWORD_ORIGIN_AUTO as i64, false, false);
+        assert_eq!(remove_images_by_ids_impl(&conn, &[bare]), 1);
+        let (size, rating): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT file_size, rating FROM removed_image_tombstone WHERE file_path = '/b17d/p.jpg'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("the merged tombstone");
+        assert_eq!(
+            (size, rating),
+            (Some(1234), Some(5)),
+            "the known size and the waiting rating survive the merge"
+        );
+        // A DIFFERENT undated photo (another size) now takes the path: it
+        // arrives bare, and the merged work keeps waiting for the true file.
+        assert_eq!(
+            ingest_metadata_impl(&conn, &[record_with_identity("/b17d/p.jpg", 987_654, None)], None),
+            1
+        );
+        assert_eq!(curation(&conn, "/b17d/p.jpg"), (None, None, None, Some(0)));
+        assert_eq!(keyword_shapes(&conn, id_of(&conn, "/b17d/p.jpg")).len(), 0);
+        assert_eq!(tombstones_for(&conn, "/b17d/p.jpg"), (1, 1));
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B17e — ⭐ fix round 2, R2-F2: the reviewer's PROBE5, VERBATIM (B17c
+    /// generalises it). A 5-star photo with a user keyword is removed; it
+    /// comes back but its re-attach FAILS (B17's seam), so it is bare and its
+    /// work waits; Intelligent Culling gives the bare photo an AUTOMATIC
+    /// "beach"; the user removes and re-adds it, as the record promises. Before
+    /// the merge this returned `(None, None, None, Some(0))` with only
+    /// `("beach", 2)` — the stars and the user keyword were gone.
+    #[test]
+    fn b17e_the_reviewers_probe5_a_culling_keyword_no_longer_erases_the_waiting_work()
+    {
+        let (path, conn) = fresh_catalogue("b17e");
+        let x = insert_image(&conn, "/b17e/x.jpg");
+        set_curation(&conn, x, Some(5), None, None, 0);
+        insert_keyword(&conn, x, "Dogs", 1, KEYWORD_ORIGIN_USER as i64, false, false);
+        assert_eq!(remove_images_by_ids_impl(&conn, &[x]), 1);
+        assert_eq!(tombstones_for(&conn, "/b17e/x.jpg"), (1, 1));
+
+        let failing = RemovalProbe
+        {
+            fail_at: None,
+            reattach_scalar_sql: Some("SELECT 1;".to_string()),
+        };
+        assert_eq!(ingest_metadata_impl(&conn, &[record("/b17e/x.jpg", false)], Some(&failing)), 1);
+        let bare = id_of(&conn, "/b17e/x.jpg");
+        assert_eq!(curation(&conn, "/b17e/x.jpg"), (None, None, None, Some(0)), "the photo came back bare");
+        assert_eq!(tombstones_for(&conn, "/b17e/x.jpg"), (1, 1), "its work waits");
+
+        insert_keyword(&conn, bare, "beach", 1, KEYWORD_ORIGIN_AUTO as i64, false, false);
+        assert_eq!(remove_images_by_ids_impl(&conn, &[bare]), 1);
+        assert_eq!(tombstones_for(&conn, "/b17e/x.jpg"), (1, 2), "merged, not replaced");
+
+        assert_eq!(ingest_metadata_impl(&conn, &[record("/b17e/x.jpg", false)], None), 1);
+        assert_eq!(
+            curation(&conn, "/b17e/x.jpg"),
+            (Some(5), None, None, Some(0)),
+            "the five stars came back"
+        );
+        let mut keywords: Vec<(String, i64)> = keyword_shapes(&conn, id_of(&conn, "/b17e/x.jpg"))
+            .into_iter()
+            .map(|shape| (shape.0, shape.3))
+            .collect();
+        keywords.sort();
+        assert_eq!(
+            keywords,
+            vec![("Dogs".to_string(), KEYWORD_ORIGIN_USER as i64), ("beach".to_string(), KEYWORD_ORIGIN_AUTO as i64)],
+            "the user keyword came back beside the automatic one"
+        );
+        assert_eq!(tombstones_for(&conn, "/b17e/x.jpg"), (0, 0), "consumed");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// B18 — a merge whose re-attach fails un-merges the WHOLE chunk (R-73's
+    /// channel reports it) and keeps the tombstone. The failure is a real
+    /// engine error: the tombstone-keyword table is gone.
+    #[test]
+    fn b18_a_failed_merge_reattach_unmerges_the_chunk_and_keeps_the_tombstone()
+    {
+        let (path, conn) = fresh_catalogue("b18");
+        let id = insert_image(&conn, "/b18/p.jpg");
+        set_curation(&conn, id, Some(4), None, None, 0);
+        assert_eq!(remove_images_by_ids_impl(&conn, &[id]), 1);
+        conn.execute_batch("DROP INDEX idx_removed_tombstone_keyword_path; DROP TABLE removed_image_tombstone_keyword;")
+            .expect("break the re-attach");
+
+        let result = merge_records_into(&conn, &[record("/b18/p.jpg", false), record("/b18/other.jpg", false)]);
+        assert_eq!(result.failed_rows, 2, "the whole chunk is un-merged");
+        assert!(
+            result.failure_message.as_deref().unwrap_or("").contains("re-attach"),
+            "the failure names the re-attach: {:?}",
+            result.failure_message
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM images"), 0, "rolled back");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM removed_image_tombstone WHERE file_path = '/b18/p.jpg'"), 1, "kept");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// ⭐ §A-10 — the whole-source measurement: ONE removal of 127,859 rows (the
+    /// Sources-removal scale the brief names), every row carrying a keyword and
+    /// a rating, so every row writes a tombstone AND a tombstone keyword in a
+    /// single transaction; then the same 127,859 files re-added through the
+    /// real scan insert in 500-record calls, which re-attaches every one.
+    ///
+    /// `#[ignore]`d: it is a MEASUREMENT, and the dev profile builds bundled
+    /// DuckDB's C++ at -O0 (S179). Run it with:
+    ///   cargo test --release --lib -- --ignored removal_tombstone_tests::b16 --nocapture
+    #[test]
+    #[ignore]
+    fn b16_a_whole_source_removal_is_measured_at_127859_rows()
+    {
+        const ROWS: i64 = 127_859;
+        let (path, conn) = fresh_catalogue("b16");
+        conn.execute_batch(&format!(
+            "INSERT INTO images (file_path, file_size, file_name, created_timestamp, modified_timestamp, rating) \
+             SELECT '/Volumes/Peg_RAWmain/b16/f' || i || '.jpg', 1234, 'f' || i || '.jpg', 0, 0, 3 \
+             FROM range({}) t(i); \
+             INSERT INTO keyword (image_id, label, path) SELECT id, 'k', 'k' FROM images; \
+             CHECKPOINT;",
+            ROWS
+        ))
+        .expect("seed");
+
+        let started = std::time::Instant::now();
+        let outcome = remove_images_for_filters_impl(&conn, "/Volumes/Peg_RAWmain/b16/", "", None)
+            .expect("the whole-source removal");
+        let removal = started.elapsed();
+        assert_eq!(outcome.deleted as i64, ROWS);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM removed_image_tombstone"), ROWS);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM removed_image_tombstone_keyword"), ROWS);
+        assert_no_orphans(&conn, "after the whole-source removal");
+
+        let records: Vec<ImageMetadata> = (0 .. ROWS)
+            .map(|i| record(&format!("/Volumes/Peg_RAWmain/b16/f{}.jpg", i), false))
+            .collect();
+        let started = std::time::Instant::now();
+        let mut inserted = 0u64;
+        for call in records.chunks(500)
+        {
+            inserted += ingest_metadata_impl(&conn, call, None) as u64;
+        }
+        let readd = started.elapsed();
+        assert_eq!(inserted as i64, ROWS);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM removed_image_tombstone"), 0, "every tombstone consumed");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM keyword"), ROWS, "every keyword re-attached");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM images WHERE rating = 3"), ROWS, "every rating re-attached");
+        eprintln!(
+            "[B16] removal of {} rows (tombstone + tombstone keyword each, one transaction): {:.3} s; \
+             re-add through ingest (500-record calls, re-attach per 50-row chunk): {:.3} s",
+            ROWS,
+            removal.as_secs_f64(),
+            readd.as_secs_f64()
+        );
+        drop(conn);
+        cleanup(&path);
     }
 }
 
@@ -24278,7 +27411,7 @@ mod folder_sync_tests {
 /// - false if catalogue not initialized, file not found, or query failed
 pub async fn update_image_rotation(file_path: String, degrees: i32) -> bool {
     // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -24325,7 +27458,7 @@ pub async fn update_image_rotation(file_path: String, degrees: i32) -> bool {
 /// - Empty vec if catalogue is empty or not initialized
 pub async fn get_distinct_date_strings() -> Vec<String> {
     // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -24387,7 +27520,7 @@ pub async fn get_distinct_date_strings() -> Vec<String> {
 /// - Empty vec if catalogue is empty or not initialized
 pub async fn get_distinct_directory_paths() -> Vec<String> {
     // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -24472,7 +27605,7 @@ pub struct CaptureDayImageCount {
 /// since every image has exactly one parent directory).
 pub async fn directory_image_counts(media_type: MediaType) -> Vec<DirectoryImageCount> {
     // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -24546,7 +27679,7 @@ pub async fn directory_image_counts(media_type: MediaType) -> Vec<DirectoryImage
 /// count and still includes them.
 pub async fn capture_day_image_counts(media_type: MediaType) -> Vec<CaptureDayImageCount> {
     // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -24634,7 +27767,7 @@ pub async fn get_images_filtered(
     apply_raw_jpeg_collapse: bool,
 ) -> Vec<ImageRecord> {
     // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -24692,7 +27825,7 @@ pub async fn get_filtered_image_count(
     media_type: MediaType,
 ) -> i64 {
     // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -24739,7 +27872,7 @@ pub async fn get_image_count_for_path_prefix(
     apply_raw_jpeg_collapse: bool,
 ) -> i64 {
     // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -24791,7 +27924,7 @@ pub async fn get_images_for_path_prefix(
     media_type: MediaType,
 ) -> Vec<ImageRecord> {
     // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -24839,7 +27972,7 @@ pub async fn get_image_count_for_filters(
     media_type: MediaType,
 ) -> i64 {
     // Acquire lock and validate connection
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -24874,7 +28007,7 @@ pub async fn get_images_for_path_prefix_gallery(
     similar_algorithm_version: String,
     media_type: MediaType,
 ) -> Vec<ImageRecord> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -24908,7 +28041,7 @@ pub async fn get_image_count_for_filters_gallery(
     similar_algorithm_version: String,
     media_type: MediaType,
 ) -> i64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -25021,6 +28154,19 @@ pub struct FilePathsResult {
 ///   `computeDiff` passes `Both` (its disk side lists video too, and an
 ///   asymmetric gate would flag every catalogued video as a phantom arrival);
 ///   stills-only surfaces pass `StillsOnly`.
+/// Slice F / R-07 — the failure answer a caught panic becomes for the three
+/// `FilePathsResult` entry points: `ok: false`, NO paths (never a partial
+/// list that looks complete), and the reason.
+fn file_paths_panic_result(panic: &str) -> FilePathsResult
+{
+    FilePathsResult
+    {
+        ok: false,
+        paths: Vec::new(),
+        error_message: Some(ffi_panic_report("read the catalogue", panic)),
+    }
+}
+
 pub async fn get_file_paths_for_filters(
     path_prefix: String,
     date_prefix: String,
@@ -25028,9 +28174,15 @@ pub async fn get_file_paths_for_filters(
     apply_raw_jpeg_collapse: bool,
     media_type: MediaType,
 ) -> FilePathsResult {
+    // ⭐ Slice F / R-07 — the panic boundary (`ffi_panic_boundary`): a panic in
+    // the body below is reported through `ok: false` + `error_message` instead of
+    // killing the app. The body keeps its pre-slice indentation on purpose:
+    // inside it the slice changed the lock token and nothing else.
+    ffi_panic_boundary("get_file_paths_for_filters.panic.query_failed", || -> FilePathsResult
+    {
     // Acquire lock and validate connection. Catalogue not initialized
     // is a hard failure — caller must distinguish from "zero matches".
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -25065,6 +28217,8 @@ pub async fn get_file_paths_for_filters(
             error_message: Some(msg),
         },
     }
+    },
+    |panic| file_paths_panic_result(&panic))
 }
 
 // === §10.2 — the whole-machine membership pre-filter (S4) ==================
@@ -25222,6 +28376,12 @@ fn filter_uncatalogued_paths_impl(
 /// path is wildcard-live in `LIKE`, and `/Volumes/Peg_RAWmain` is the live
 /// counter-example on this very machine.
 pub async fn filter_uncatalogued_paths(paths: Vec<String>) -> FilePathsResult {
+    // ⭐ Slice F / R-07 — the panic boundary (`ffi_panic_boundary`): a panic in
+    // the body below is reported through `ok: false` + `error_message` instead of
+    // killing the app. The body keeps its pre-slice indentation on purpose:
+    // inside it the slice changed the lock token and nothing else.
+    ffi_panic_boundary("filter_uncatalogued_paths.panic.query_failed", || -> FilePathsResult
+    {
     // An empty request is answered without touching the catalogue at all —
     // and, deliberately, WITHOUT reporting "not initialized". Zero paths in,
     // zero paths out, ok.
@@ -25233,7 +28393,7 @@ pub async fn filter_uncatalogued_paths(paths: Vec<String>) -> FilePathsResult {
         };
     }
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -25258,6 +28418,8 @@ pub async fn filter_uncatalogued_paths(paths: Vec<String>) -> FilePathsResult {
             error_message: Some(msg),
         },
     }
+    },
+    |panic| file_paths_panic_result(&panic))
 }
 
 // === S6 §(d) — the DIRECTORY-EXACT lifts ====================================
@@ -25377,7 +28539,13 @@ const DIRECTORY_EXACT_PREDICATE: &str = "directory_path = ?";
 /// **Path contract**: values are returned EXACTLY as stored. Order is
 /// UNSPECIFIED — every caller builds a `Set`.
 pub async fn file_paths_in_directory(directory_path: String) -> FilePathsResult {
-    let catalogue = CATALOGUE.lock().unwrap();
+    // ⭐ Slice F / R-07 — the panic boundary (`ffi_panic_boundary`): a panic in
+    // the body below is reported through `ok: false` + `error_message` instead of
+    // killing the app. The body keeps its pre-slice indentation on purpose:
+    // inside it the slice changed the lock token and nothing else.
+    ffi_panic_boundary("file_paths_in_directory.panic.query_failed", || -> FilePathsResult
+    {
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -25402,6 +28570,8 @@ pub async fn file_paths_in_directory(directory_path: String) -> FilePathsResult 
             error_message: Some(msg),
         },
     }
+    },
+    |panic| file_paths_panic_result(&panic))
 }
 
 /// Impl form (takes `&Connection`) so the unit tests can drive it against a
@@ -25475,7 +28645,7 @@ pub async fn image_records_in_directory(
         return Vec::new();
     }
 
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -25569,7 +28739,7 @@ pub async fn get_image_records_for_filters(
     apply_raw_jpeg_collapse: bool,
     media_type: MediaType,
 ) -> Vec<ImageRecord> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -25597,7 +28767,8 @@ pub async fn get_image_records_for_filters(
 /// Session 31: catalogue-only bulk DELETE for the Sources sidebar's
 /// "Remove from Catalogue" context-menu action. Removes every row
 /// matching the same path/date predicate the gallery reader uses —
-/// touches NO files and NO thumbnails.
+/// touches NO files on disk. (⭐ Slice B: the Swift callers now prune the
+/// removed rows' cached thumbnails themselves — R-95.)
 ///
 /// **Predicate parity-by-construction.** Reuses
 /// `build_path_date_predicate`, the same builder consumed by
@@ -25615,38 +28786,81 @@ pub async fn get_image_records_for_filters(
 /// caller always passes a non-empty path_prefix, so this guard never
 /// fires in practice; it exists to bound the blast radius.
 ///
+/// ⭐ **Slice B (Sep 26, 2026) — the removal tombstone + R-76.** The removal
+/// now runs the shared `remove_catalogue_rows` routine: the user's work is
+/// captured into the tombstone, the derived analysis is cascaded, and the
+/// rows are deleted — all in ONE transaction (this path used to be a single
+/// bare `DELETE` outside any transaction; R-76). After the commit, the LanceDB
+/// vectors the cascade queued are deleted through the existing retry
+/// (`retry_pending_face_vector_deletes`), exactly as an editor save does.
+///
 /// **Return.** Number of rows deleted, as i64. Returns 0 on every
 /// failure mode (catalogue not initialized, empty-predicate refusal,
-/// SQL error) — mirroring the failure-as-zero convention of
+/// SQL error — the transaction is then rolled back and NOTHING changed) —
+/// mirroring the failure-as-zero convention of
 /// `get_image_count_for_path_prefix`. Diagnostic detail goes to
 /// stderr. The caller cannot distinguish "zero matched" from "error";
 /// the Swift trace and the post-remove notification carry the user-
 /// facing surface, and a zero return correctly produces no UI change.
-pub async fn remove_images_for_filters(path_prefix: String, date_prefix: String) -> i64 {
-    let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref() {
-        Some(c) => c,
-        None => {
-            eprintln!("Catalogue not initialized");
-            return 0;
-        }
+pub async fn remove_images_for_filters(path_prefix: String, date_prefix: String) -> i64
+{
+    let outcome =
+    {
+        let catalogue = lock_catalogue();
+        let conn = match catalogue.as_ref()
+        {
+            Some(c) => c,
+            None =>
+            {
+                eprintln!("Catalogue not initialized");
+                return 0;
+            }
+        };
+        remove_images_for_filters_impl(conn, &path_prefix, &date_prefix, None)
     };
 
-    let predicate = build_path_date_predicate(&path_prefix, &date_prefix);
+    // The CATALOGUE lock is released above: the retry takes it itself.
+    match outcome
+    {
+        Some(outcome) =>
+        {
+            retry_removal_face_vector_deletes(&outcome, "remove_images_for_filters").await;
+            outcome.deleted as i64
+        }
+        None => 0,
+    }
+}
+
+/// Body of `remove_images_for_filters` against an explicit connection (the
+/// impl/wrapper pattern — slice B's tests drive it on real temp-file
+/// catalogues). `None` = nothing was removed (refusal or a rolled-back
+/// failure); the wrapper turns that into the historical 0.
+fn remove_images_for_filters_impl(
+    conn: &Connection,
+    path_prefix: &str,
+    date_prefix: &str,
+    probe: RemovalProbeRef<'_>,
+) -> Option<CatalogueRemovalOutcome>
+{
+    let predicate = build_path_date_predicate(path_prefix, date_prefix);
     if predicate.is_empty() {
         eprintln!(
             "remove_images_for_filters refused: empty predicate \
              (path_prefix and date_prefix both empty)"
         );
-        return 0;
+        return None;
     }
 
-    let delete_sql = format!("DELETE FROM images WHERE {}", predicate);
-    match conn.execute(&delete_sql, []) {
-        Ok(rows_changed) => rows_changed as i64,
-        Err(e) => {
-            eprintln!("remove_images_for_filters DELETE failed: {}", e);
-            0
+    match remove_catalogue_rows(conn, RemovalSelection::Predicate(&predicate), probe)
+    {
+        Ok(outcome) => Some(outcome),
+        Err(message) =>
+        {
+            eprintln!(
+                "remove_images_for_filters failed and was rolled back — nothing was removed: {}",
+                message
+            );
+            None
         }
     }
 }
@@ -25709,7 +28923,7 @@ fn directory_sync_states_impl(conn: &Connection) -> Vec<DirectorySyncState> {
 /// here (never scanned since the feature landed) compares as changed, which is
 /// correct — its first sync records the baseline.
 pub async fn directory_sync_states() -> Vec<DirectorySyncState> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -25803,7 +29017,7 @@ fn update_directory_sync_states_impl(conn: &Connection, states: &[DirectorySyncS
 /// of every directory scan and every sync (and, on first run, seeded for
 /// already-catalogued directories so the first sweep has a baseline).
 pub async fn update_directory_sync_states(states: Vec<DirectorySyncState>) -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -25815,44 +29029,58 @@ pub async fn update_directory_sync_states(states: Vec<DirectorySyncState>) -> u6
 }
 
 /// Body of `remove_images_by_ids` against an explicit connection (the
-/// impl/wrapper pattern). Chunked `DELETE ... WHERE id IN (...)` inside one
-/// transaction; integer interpolation via `id_in_list` (no injection surface).
-/// Keyword rows are NEVER touched — the S31/S65 doctrine: rows are the
-/// recovery surface, and orphans are invisible because every keyword consumer
-/// joins through `images.id`. Returns rows deleted; 0 on failure (rolled
-/// back) or empty input (refusal — no ids must never mean "all ids").
-fn remove_images_by_ids_impl(conn: &Connection, ids: &[i64]) -> u64 {
+/// impl/wrapper pattern). Integer interpolation via `id_in_list` (no
+/// injection surface), staged 500 ids at a time. Returns rows deleted; 0 on
+/// failure (rolled back) or empty input (refusal — no ids must never mean
+/// "all ids").
+///
+/// ⭐ Slice B (Sep 26, 2026): the S31/S65 doctrine that stood here — "Keyword
+/// rows are NEVER touched: rows are the recovery surface, and orphans are
+/// invisible" — is SUPERSEDED by Q-04. With a sequence-default id the orphaned
+/// rows were never a recovery surface: no re-added file could ever join them.
+/// The removal now runs `remove_catalogue_rows`, which captures the keyword
+/// rows and the four curation columns into the tombstone, cascades the derived
+/// analysis, and deletes — in one transaction.
+///
+/// This `u64` form is the historical signature the tests drive (slice N-2's
+/// T8 among them); production goes through `remove_images_by_ids`, which needs
+/// the full `CatalogueRemovalOutcome` for its post-commit vector retry.
+#[cfg(test)]
+fn remove_images_by_ids_impl(conn: &Connection, ids: &[i64]) -> u64
+{
+    remove_images_by_ids_impl_with_probe(conn, ids, None).map_or(0, |outcome| outcome.deleted)
+}
+
+/// `remove_images_by_ids_impl` with slice B's test seam threaded through
+/// (`RemovalProbe` — uninhabited outside tests, so production passes `None`).
+fn remove_images_by_ids_impl_with_probe(
+    conn: &Connection,
+    ids: &[i64],
+    probe: RemovalProbeRef<'_>,
+) -> Option<CatalogueRemovalOutcome>
+{
     if ids.is_empty() {
-        return 0;
+        return None;
     }
 
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
-        eprintln!("remove_images_by_ids: begin failed: {}", e);
-        return 0;
-    }
+    // One doomed row per id: a repeated id must not stage its row twice (the
+    // tombstone's file_path is a PRIMARY KEY).
+    let mut unique_ids = ids.to_vec();
+    unique_ids.sort_unstable();
+    unique_ids.dedup();
 
-    let mut deleted: u64 = 0;
-    for chunk in ids.chunks(500) {
-        let predicate = match id_in_list(chunk) {
-            Some(p) => p,
-            None => continue,
-        };
-        let delete_sql = format!("DELETE FROM images WHERE {}", predicate);
-        match conn.execute(&delete_sql, []) {
-            Ok(n) => deleted += n as u64,
-            Err(e) => {
-                eprintln!("remove_images_by_ids: DELETE failed: {}", e);
-                let _ = conn.execute_batch("ROLLBACK;");
-                return 0;
-            }
+    match remove_catalogue_rows(conn, RemovalSelection::Ids(&unique_ids), probe)
+    {
+        Ok(outcome) => Some(outcome),
+        Err(message) =>
+        {
+            eprintln!(
+                "remove_images_by_ids failed and was rolled back — nothing was removed: {}",
+                message
+            );
+            None
         }
     }
-
-    if let Err(e) = conn.execute_batch("COMMIT;") {
-        eprintln!("remove_images_by_ids: commit failed: {}", e);
-        return 0;
-    }
-    deleted
 }
 
 /// Session 68: catalogue-only DELETE of EXPLICIT image rows — the full-sync
@@ -25862,16 +29090,992 @@ fn remove_images_by_ids_impl(conn: &Connection, ids: &[i64]) -> u64 {
 /// (2) shown the user a confirm naming the vanished files. Touches NO files
 /// and NO thumbnails (Swift owns cache hygiene for the removed paths).
 /// Refuses an empty list. Returns rows deleted, 0 on any failure.
-pub async fn remove_images_by_ids(ids: Vec<i64>) -> u64 {
-    let catalogue = CATALOGUE.lock().unwrap();
-    let conn = match catalogue.as_ref() {
-        Some(c) => c,
-        None => {
-            eprintln!("Catalogue not initialized");
-            return 0;
+///
+/// ⭐ Slice B: the removal keeps the user's work in the tombstone and cascades
+/// the derived analysis (see `remove_catalogue_rows`); after the commit, the
+/// face vectors it queued are deleted from LanceDB through the existing retry.
+pub async fn remove_images_by_ids(ids: Vec<i64>) -> u64
+{
+    let outcome =
+    {
+        let catalogue = lock_catalogue();
+        let conn = match catalogue.as_ref()
+        {
+            Some(c) => c,
+            None =>
+            {
+                eprintln!("Catalogue not initialized");
+                return 0;
+            }
+        };
+        remove_images_by_ids_impl_with_probe(conn, &ids, None)
+    };
+
+    // The CATALOGUE lock is released above: the retry takes it itself.
+    match outcome
+    {
+        Some(outcome) =>
+        {
+            retry_removal_face_vector_deletes(&outcome, "remove_images_by_ids").await;
+            outcome.deleted
+        }
+        None => 0,
+    }
+}
+
+// ============================================================================
+// ⭐ Slice B (Sep 26, 2026) — the removal tombstone (R-01 · R-76 · R-77 · R-95)
+// ============================================================================
+//
+// THE RULING. Sep 18, 2026 (`01-RULINGS.md` item-4 ruling 1): the Folder Sync
+// removal dialog's "Keywords are kept" — fix the CODE to match the WORDS. Q-04
+// widened it, and rulings 9–12 (Sep 20) shaped it: everything the user
+// AUTHORED survives a removal and comes back when the SAME file returns to the
+// same path and is imported again — every `keyword` row (People/<Name>
+// projections, collection memberships, colour marks and hidden rows included)
+// and the four curation columns on `images` (`rating`, `flag`, `color_label`,
+// `rotation`). Derived analysis is CASCADED, because the pipeline rebuilds it;
+// face-to-person assignments and hand-made stacks do NOT come back (ruling 11).
+// ⭐ Ruling 13 (Sep 27, 2026): the photos that STAY keep their stack — made by
+// hand or found automatically — whenever two or more of its members remain;
+// only a stack left with fewer than two dissolves (step 3d).
+//
+// WHY A TOMBSTONE. `images.id` is a sequence default, so a re-added file always
+// gets a NEW id, and no dependent table carries a file path — the orphans a
+// bare `DELETE FROM images` left behind could never be joined back. So the
+// removal writes the work into `removed_image_tombstone(_keyword)` IN ITS OWN
+// TRANSACTION, keyed by `file_path` (UNIQUE on `images`), and the re-attach
+// REWRITES `keyword.image_id` to the new id.
+//
+// THE SHAPE (the brief's §2.4, on `merge_catalogue_from_backup`'s `plmerge_map`
+// precedent): with the CATALOGUE mutex held — nothing else can write — every
+// doomed/dependent set is FROZEN into temp tables in the AUTOCOMMIT window
+// (the editor-save template "freezes every dependent id before BEGIN" the same
+// way), then ONE transaction captures → cascades → deletes, and the temp tables
+// are dropped on every path. Measured on the bundled 1.5.5 (the probe tests in
+// `removal_tombstone_tests`): a temp table created in autocommit is readable
+// inside a transaction that writes `main`, survives that transaction's
+// ROLLBACK, and `CREATE OR REPLACE` replaces a stale one.
+//
+// ⚠️ S179: no control flow in this family depends on a reported change count.
+// `deleted` rides out as the FFI's return value only; everything that decides
+// anything reads the TABLE.
+
+/// How a removal chooses its rows.
+enum RemovalSelection<'a>
+{
+    /// `remove_images_for_filters` — a `build_path_date_predicate` WHERE text.
+    Predicate(&'a str),
+    /// `remove_images_by_ids` — explicit, de-duplicated ids.
+    Ids(&'a [i64]),
+}
+
+/// What one committed removal did.
+struct CatalogueRemovalOutcome
+{
+    /// The `images` DELETE's reported change count. ⚠️ It is carried ONLY as
+    /// the FFI's return value, exactly as before this slice — never a
+    /// control-flow input (S179).
+    deleted: u64,
+    /// A TABLE READ (`SELECT COUNT(*)` over the frozen face census), not a
+    /// change count: how many face observations this removal cascaded — and
+    /// therefore whether it queued LanceDB vector deletes to retry.
+    doomed_faces: u64,
+}
+
+/// The stages the test seam can fail at (B9's induced rollback).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RemovalStage
+{
+    AfterCapture,
+    AfterCascade,
+    AfterDelete,
+}
+
+/// ⭐ Slice B's test seam, on the `MigrationProbe` / `FocusApplyProbe`
+/// precedent: a plain PARAMETER, no global static, and no `cfg!(test)` branch
+/// in production code. Outside `cfg(test)` its referent type is uninhabited,
+/// so every production call site can only pass `None`.
+///
+/// ⭐ THE KNOB SUBSTITUTES THE SQL; IT DOES NOT FAKE THE ERROR (K's rule): at
+/// `fail_at` the removal transaction runs a statement the ENGINE rejects, so
+/// the rollback under test is driven by a real `Err` from a real call.
+#[cfg(test)]
+struct RemovalProbe
+{
+    /// Run an engine-rejected statement at this stage of the removal
+    /// transaction.
+    fail_at: Option<RemovalStage>,
+    /// Replace the re-attach's scalar UPDATE with THIS statement (run with no
+    /// parameters) — a silent no-op the table verification must catch.
+    reattach_scalar_sql: Option<String>,
+}
+
+#[cfg(test)]
+type RemovalProbeRef<'a> = Option<&'a RemovalProbe>;
+
+/// Uninhabited outside tests: every production call site passes `None` and no
+/// other value can exist.
+#[cfg(not(test))]
+type RemovalProbeRef<'a> = Option<&'a std::convert::Infallible>;
+
+#[cfg(test)]
+fn removal_probe_checkpoint(
+    conn: &Connection,
+    probe: RemovalProbeRef<'_>,
+    stage: RemovalStage,
+) -> Result<(), String>
+{
+    if probe.and_then(|probe| probe.fail_at) == Some(stage)
+    {
+        conn.execute_batch("SELECT pl_no_such_function();")
+            .map_err(|e| format!("induced failure at {:?}: {}", stage, e))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn removal_probe_checkpoint(
+    _conn: &Connection,
+    _probe: RemovalProbeRef<'_>,
+    _stage: RemovalStage,
+) -> Result<(), String>
+{
+    Ok(())
+}
+
+#[cfg(test)]
+fn removal_probe_scalar_sql(probe: RemovalProbeRef<'_>) -> Option<String>
+{
+    probe.and_then(|probe| probe.reattach_scalar_sql.clone())
+}
+
+#[cfg(not(test))]
+fn removal_probe_scalar_sql(_probe: RemovalProbeRef<'_>) -> Option<String>
+{
+    None
+}
+
+/// The temp tables one removal freezes its sets into — dropped on every path.
+/// ⭐ Ruling 13 (Sep 27, 2026) added `pl_removal_similar_plan`, the per-group
+/// stack plan step 3d executes (see `removal_freeze_sets`).
+const REMOVAL_TEMP_TABLES: [&str; 7] = [
+    "pl_removal_doomed",
+    "pl_removal_faces",
+    "pl_removal_cluster_runs",
+    "pl_removal_similar_groups",
+    "pl_removal_similar_plan",
+    "pl_removal_merge",
+    "pl_removal_merge_keyword",
+];
+
+/// ⭐ W1-4 (ruling 10): a tombstone is written ONLY for a removed row that
+/// carries work — any keyword row, or a non-default rating / flag / colour
+/// label / rotation. A row with none leaves nothing behind, which bounds the
+/// tables to exactly the data the promise exists to keep.
+const REMOVAL_TOMBSTONE_CARRIES_WORK_PREDICATE: &str = "\
+    d.rating IS NOT NULL \
+    OR d.flag IS NOT NULL \
+    OR d.color_label IS NOT NULL \
+    OR COALESCE(d.rotation, 0) <> 0 \
+    OR EXISTS (SELECT 1 FROM keyword k WHERE k.image_id = d.id)";
+
+/// ⭐ The ONE spelling of the capture's keyword copy, and of its single
+/// transform: a face-origin bit becomes the USER bit, the
+/// `editor_saved_image_preserve_people_keywords` idiom applied for the same
+/// reason — the `person_face_assignment` that justified the face bit is being
+/// cascaded, so a kept `People/<Name>` row that still claimed face origin would
+/// describe an assignment that no longer exists (ruling 11). Bound as
+/// `?1 = KEYWORD_ORIGIN_FACE`, `?2 = KEYWORD_ORIGIN_USER`,
+/// `?3 = !KEYWORD_ORIGIN_FACE` — the constants, never the literals.
+///
+/// `COALESCE(k.origin, ?2)`: an upgraded catalogue's `keyword.origin` is
+/// nullable (R-42); the open-time backfill makes NULL user-origin, and so does
+/// this — a NULL must not abort a whole removal on the NOT NULL tombstone
+/// column.
+///
+/// ⭐ Fix round 2 (R2-F2) — a SAME-PHOTO MERGE, never a replacement. When the
+/// removed row is the same photograph (`removal_same_file_sql`) as a tombstone
+/// already WAITING at its path — the bare photo a failed re-attach left, which
+/// Intelligent Culling may since have given an automatic keyword — the waiting
+/// keyword rows (frozen in `pl_removal_merge_keyword`, step 0) are UNIONED with
+/// the new ones: one row per path, its origin bits OR'd, its collection / colour
+/// switches OR'd, active if either is, the earliest `created_at`. A path in only
+/// one set passes through unchanged (every aggregate is the identity on one
+/// row), so a removal with nothing waiting captures exactly what it did before.
+const REMOVAL_TOMBSTONE_CAPTURE_KEYWORDS_SQL: &str = "\
+    INSERT INTO removed_image_tombstone_keyword \
+        (file_path, label, path, status, origin, created_at, hidden_at, collection, color) \
+    SELECT u.file_path, MAX(u.label), u.path, MAX(u.status), BIT_OR(u.origin), MIN(u.created_at), \
+           CASE WHEN COUNT(*) > 1 AND MAX(u.status) = 1 THEN NULL ELSE MAX(u.hidden_at) END, \
+           BOOL_OR(u.collection), BOOL_OR(u.color) \
+      FROM (SELECT d.file_path, k.label, k.path, k.status, \
+                   CASE WHEN (COALESCE(k.origin, ?2) & ?1) <> 0 \
+                        THEN ((COALESCE(k.origin, ?2) | ?2) & ?3) \
+                        ELSE COALESCE(k.origin, ?2) END AS origin, \
+                   k.created_at, k.hidden_at, \
+                   COALESCE(k.collection, FALSE) AS collection, COALESCE(k.color, FALSE) AS color \
+              FROM keyword k \
+              JOIN pl_removal_doomed d ON d.id = k.image_id \
+              JOIN removed_image_tombstone t ON t.file_path = d.file_path \
+            UNION ALL \
+            SELECT m.file_path, m.label, m.path, m.status, m.origin, \
+                   m.created_at, m.hidden_at, m.collection, m.color \
+              FROM pl_removal_merge_keyword m) u \
+     GROUP BY u.file_path, u.path";
+
+/// The shared removal: freeze → capture → cascade → delete, one transaction.
+/// Both FFI entry points run it; it is written once.
+fn remove_catalogue_rows(
+    conn: &Connection,
+    selection: RemovalSelection<'_>,
+    probe: RemovalProbeRef<'_>,
+) -> Result<CatalogueRemovalOutcome, String>
+{
+    let result = removal_freeze_sets(conn, &selection).and_then(|doomed_faces| {
+        removal_transaction(conn, probe).map(|deleted| CatalogueRemovalOutcome
+        {
+            deleted,
+            doomed_faces,
+        })
+    });
+    removal_drop_temp_tables(conn);
+    result
+}
+
+/// Step 0 — AUTOCOMMIT, before `BEGIN`: freeze the doomed rows and every
+/// dependent set into temp tables. Placed here precisely so no DDL ever runs
+/// inside the removal transaction (S179: index DDL is refused inside a
+/// transaction with outstanding updates; temp-table DDL is not, but it has no
+/// reason to be there). Returns the frozen face count — a table read.
+fn removal_freeze_sets(conn: &Connection, selection: &RemovalSelection<'_>) -> Result<u64, String>
+{
+    const DOOMED_COLUMNS: &str =
+        "id, file_path, file_size, capture_datetime, rating, flag, color_label, rotation";
+    match selection
+    {
+        RemovalSelection::Predicate(predicate) =>
+        {
+            conn.execute_batch(&format!(
+                "CREATE OR REPLACE TEMP TABLE pl_removal_doomed AS \
+                 SELECT {} FROM images WHERE {};",
+                DOOMED_COLUMNS, predicate
+            ))
+            .map_err(|e| format!("freezing the rows to remove failed: {}", e))?;
+        }
+        RemovalSelection::Ids(ids) =>
+        {
+            conn.execute_batch(&format!(
+                "CREATE OR REPLACE TEMP TABLE pl_removal_doomed AS \
+                 SELECT {} FROM images WHERE FALSE;",
+                DOOMED_COLUMNS
+            ))
+            .map_err(|e| format!("creating the removal set failed: {}", e))?;
+            // The historical 500-id chunking stays; only its target changed.
+            for chunk in ids.chunks(500)
+            {
+                let predicate = match id_in_list(chunk)
+                {
+                    Some(predicate) => predicate,
+                    None => continue,
+                };
+                conn.execute_batch(&format!(
+                    "INSERT INTO pl_removal_doomed SELECT {} FROM images WHERE {};",
+                    DOOMED_COLUMNS, predicate
+                ))
+                .map_err(|e| format!("freezing the rows to remove failed: {}", e))?;
+            }
+        }
+    }
+
+    // The face census: the `editor_saved_image_collect_face_ids` shape. The
+    // `OR analyzed_image_id` limb is the precedent's and it is right — an
+    // observation decoded from a file that is going away has no provenance.
+    //
+    // The cluster-run census is the `editor_saved_image_collect_cluster_runs`
+    // shape PLUS the member's own image columns, so a member row left dangling
+    // by an earlier writer is swept with its run too. The similar-photo census
+    // is `editor_saved_image_collect_similar_groups` verbatim: every group with
+    // a removed member, AND every group that names a removed photo as its
+    // group id or representative without that photo having a row of its own
+    // (B8's group 2) — ruling 13's plan below is built over all of them.
+    conn.execute_batch(
+        "CREATE OR REPLACE TEMP TABLE pl_removal_faces AS \
+             SELECT id FROM face_observation \
+             WHERE image_id IN (SELECT id FROM pl_removal_doomed) \
+                OR analyzed_image_id IN (SELECT id FROM pl_removal_doomed); \
+         CREATE OR REPLACE TEMP TABLE pl_removal_cluster_runs AS \
+             SELECT DISTINCT run_id FROM face_cluster_member \
+             WHERE face_observation_id IN (SELECT id FROM pl_removal_faces) \
+                OR nearest_neighbor_face_observation_id IN (SELECT id FROM pl_removal_faces) \
+                OR image_id IN (SELECT id FROM pl_removal_doomed) \
+                OR analyzed_image_id IN (SELECT id FROM pl_removal_doomed); \
+         CREATE OR REPLACE TEMP TABLE pl_removal_similar_groups AS \
+             SELECT DISTINCT group_id FROM similar_photo_group_member \
+             WHERE image_id IN (SELECT id FROM pl_removal_doomed) \
+                OR group_id IN (SELECT id FROM pl_removal_doomed) \
+                OR representative_id IN (SELECT id FROM pl_removal_doomed);",
+    )
+    .map_err(|e| format!("freezing the dependent sets failed: {}", e))?;
+
+    // ⭐ Ruling 13 (Sep 27, 2026) — the similar-photo PLAN: one row per group
+    // the census reached, carrying
+    //   · `surviving_members` — how many of its members SURVIVE this removal.
+    //     A member survives when its photo stays in the catalogue: it is not
+    //     being removed here, and its `images` row still exists (a member row
+    //     an earlier writer left pointing at a photo that is already gone — a
+    //     pre-slice-B bare `DELETE FROM images` left such rows — is not a
+    //     photo that stays, so it neither keeps a stack alive nor becomes a
+    //     representative, and 3d sweeps it from any group this removal
+    //     touches);
+    //   · `lowest_survivor` — the lowest surviving image id (NULL with none);
+    //   · `representative_removed` — the group's representative is being
+    //     removed: its group id is a doomed id, or a row of it names a doomed
+    //     id as `representative_id`.
+    // Frozen HERE, in the autocommit window like every other set, so step 3d's
+    // statements read only frozen tables — never the table they rewrite, and
+    // never a change count (S179).
+    conn.execute_batch(
+        "CREATE OR REPLACE TEMP TABLE pl_removal_similar_plan AS \
+             WITH survivors AS ( \
+                 SELECT m.group_id, \
+                        COUNT(*) AS surviving_members, \
+                        MIN(m.image_id) AS lowest_survivor \
+                   FROM similar_photo_group_member m \
+                   JOIN pl_removal_similar_groups g ON g.group_id = m.group_id \
+                  WHERE NOT EXISTS (SELECT 1 FROM pl_removal_doomed d WHERE d.id = m.image_id) \
+                    AND EXISTS (SELECT 1 FROM images i WHERE i.id = m.image_id) \
+                  GROUP BY m.group_id), \
+             removed_representatives AS ( \
+                 SELECT DISTINCT m.group_id \
+                   FROM similar_photo_group_member m \
+                   JOIN pl_removal_doomed d ON d.id = m.representative_id) \
+             SELECT g.group_id, \
+                    COALESCE(s.surviving_members, 0) AS surviving_members, \
+                    s.lowest_survivor, \
+                    (g.group_id IN (SELECT id FROM pl_removal_doomed) \
+                     OR g.group_id IN (SELECT group_id FROM removed_representatives)) \
+                        AS representative_removed \
+               FROM pl_removal_similar_groups g \
+               LEFT JOIN survivors s ON s.group_id = g.group_id;",
+    )
+    .map_err(|e| format!("freezing the similar-photo plan failed: {}", e))?;
+
+    // ⭐ Fix round 2 (R2-F2) — the WAITING tombstones this removal will MERGE
+    // into, not replace: a tombstone already at a doomed row's path that belongs
+    // to the SAME photograph (`removal_same_file_sql`), for a row that carries
+    // work (only such a row writes a tombstone, 2b). Frozen here, with their
+    // keyword rows, because 2a deletes them before 2b/2c write the merged state.
+    // A tombstone for a DIFFERENT photograph is not frozen: newer work at that
+    // path still replaces it — one tombstone per path.
+    conn.execute_batch(&format!(
+        "CREATE OR REPLACE TEMP TABLE pl_removal_merge AS \
+             SELECT t.file_path, t.file_size, t.capture_datetime, \
+                    t.rating, t.flag, t.color_label, t.rotation \
+               FROM removed_image_tombstone t \
+               JOIN pl_removal_doomed d ON d.file_path = t.file_path \
+              WHERE ({work}) \
+                AND {same}; \
+         CREATE OR REPLACE TEMP TABLE pl_removal_merge_keyword AS \
+             SELECT k.file_path, k.label, k.path, k.status, k.origin, \
+                    k.created_at, k.hidden_at, k.collection, k.color \
+               FROM removed_image_tombstone_keyword k \
+              WHERE k.file_path IN (SELECT file_path FROM pl_removal_merge);",
+        work = REMOVAL_TOMBSTONE_CARRIES_WORK_PREDICATE,
+        same = removal_same_file_sql("t", "d")
+    ))
+    .map_err(|e| format!("freezing the waiting tombstones failed: {}", e))?;
+
+    conn.query_row("SELECT COUNT(*) FROM pl_removal_faces", [], |row| row.get::<_, i64>(0))
+        .map(|count| count.max(0) as u64)
+        .map_err(|e| format!("reading the frozen face census failed: {}", e))
+}
+
+/// Steps 1–5: `BEGIN` → capture → cascade → delete → `COMMIT`, with `ROLLBACK`
+/// on ANY error. Returns the `images` DELETE's reported count (return value
+/// only — S179).
+fn removal_transaction(conn: &Connection, probe: RemovalProbeRef<'_>) -> Result<u64, String>
+{
+    conn.execute_batch("BEGIN TRANSACTION;")
+        .map_err(|e| format!("BEGIN failed: {}", e))?;
+    match removal_transaction_body(conn, probe)
+    {
+        Ok(deleted) => match conn.execute_batch("COMMIT;")
+        {
+            Ok(()) => Ok(deleted),
+            Err(e) =>
+            {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(format!("COMMIT failed: {}", e))
+            }
+        },
+        Err(message) =>
+        {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(message)
+        }
+    }
+}
+
+fn removal_transaction_body(conn: &Connection, probe: RemovalProbeRef<'_>) -> Result<u64, String>
+{
+    // --- 2. CAPTURE, before the `images` DELETE (step 4). ⚠️ The order that is
+    // --- LOAD-BEARING here is 2c before 2d: the keyword rows are captured by
+    // --- joining `keyword` to the frozen set, so they must be read before they
+    // --- are deleted. The four scalars are read from the FROZEN set, so they
+    // --- no longer depend on the live row surviving until this point.
+    //
+    // 2a. A path may be removed, re-added and removed again: a stale tombstone
+    //     for a path is REPLACED — both tables — but only by a removal that
+    //     writes a fresh one (a row that carries work, W1-4). ⭐ Fix round 1
+    //     (B-F6): a row with no work leaves an older tombstone for its path IN
+    //     PLACE. That is the state a failed or interrupted re-attach leaves
+    //     behind (the file came back bare, its work still in the tombstone), and
+    //     clearing it here would lose that work the first time the bare photo
+    //     was removed again. So a tombstone is kept until its file returns and
+    //     the re-attach succeeds. ⭐ Fix round 2 (R2-F2): when the removed row
+    //     is the SAME photograph as the waiting tombstone, the delete below is
+    //     only half of a MERGE — its state was frozen in `pl_removal_merge*`
+    //     (step 0), and 2b/2c write the union of both. Only a DIFFERENT
+    //     photograph's newer work replaces a waiting tombstone outright (one
+    //     tombstone per path).
+    conn.execute_batch(&format!(
+        "DELETE FROM removed_image_tombstone_keyword \
+             WHERE file_path IN (SELECT d.file_path FROM pl_removal_doomed d WHERE {predicate}); \
+         DELETE FROM removed_image_tombstone \
+             WHERE file_path IN (SELECT d.file_path FROM pl_removal_doomed d WHERE {predicate});",
+        predicate = REMOVAL_TOMBSTONE_CARRIES_WORK_PREDICATE
+    ))
+    .map_err(|e| format!("clearing stale tombstones failed: {}", e))?;
+
+    // 2b. The four scalars and the file's identity (B-F2) — only for rows that
+    //     carry work (W1-4). ⭐ R2-F2: MERGED with a same-photo waiting
+    //     tombstone (`m`): each of rating / flag / colour label is the newer
+    //     row's where it has one and the waiting one's otherwise; rotation
+    //     likewise, 0 being rotation's "none" (B-F1's rule) — so a bare
+    //     returned photo that was never rotated cannot erase a waiting
+    //     rotation; a known size replaces an unknown 0. With nothing waiting
+    //     (`m` absent) every column is the row's own, exactly as before.
+    conn.execute_batch(&format!(
+        "INSERT INTO removed_image_tombstone \
+             (file_path, file_size, capture_datetime, rating, flag, color_label, rotation, removed_at) \
+         SELECT d.file_path, \
+                CASE WHEN m.file_path IS NOT NULL AND COALESCE(d.file_size, 0) = 0 \
+                     THEN m.file_size ELSE d.file_size END, \
+                d.capture_datetime, \
+                COALESCE(d.rating, m.rating), \
+                COALESCE(d.flag, m.flag), \
+                COALESCE(d.color_label, m.color_label), \
+                CASE WHEN m.file_path IS NOT NULL AND COALESCE(d.rotation, 0) = 0 \
+                     THEN m.rotation ELSE d.rotation END, \
+                CURRENT_TIMESTAMP \
+           FROM pl_removal_doomed d \
+           LEFT JOIN pl_removal_merge m ON m.file_path = d.file_path \
+          WHERE {};",
+        REMOVAL_TOMBSTONE_CARRIES_WORK_PREDICATE
+    ))
+    .map_err(|e| format!("capturing the curation into the tombstone failed: {}", e))?;
+
+    // 2c. Every keyword row of exactly the paths that got a tombstone, whatever
+    //     its status / origin / collection / colour — with the one transform —
+    //     unioned with a same-photo waiting tombstone's rows (R2-F2).
+    conn.execute(
+        REMOVAL_TOMBSTONE_CAPTURE_KEYWORDS_SQL,
+        params![KEYWORD_ORIGIN_FACE, KEYWORD_ORIGIN_USER, !KEYWORD_ORIGIN_FACE],
+    )
+    .map_err(|e| format!("capturing the keyword rows into the tombstone failed: {}", e))?;
+
+    // 2d. The captured rows leave `keyword` with their photo (Q-04 supersedes
+    //     the S31/S65 "keyword rows are never touched" doctrine).
+    conn.execute_batch("DELETE FROM keyword WHERE image_id IN (SELECT id FROM pl_removal_doomed);")
+        .map_err(|e| format!("removing the captured keyword rows failed: {}", e))?;
+
+    removal_probe_checkpoint(conn, probe, RemovalStage::AfterCapture)?;
+
+    // --- 3. CASCADE — `editor_saved_image_invalidate_analysis`, statement for
+    // --- statement, driven off the frozen sets.
+    //
+    // 3a. ⚠️ Enqueue the vectors BEFORE deleting the faces: the contract stated
+    //     at the `face_vector_pending_delete` DDL — "a catalogue transaction that
+    //     deletes face observations first records their vector ids here". It
+    //     reads `face_observation`, as the editor path does, so only rows that
+    //     really exist are queued.
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO face_vector_pending_delete (face_observation_id, enqueued_at) \
+         SELECT id, CURRENT_TIMESTAMP FROM face_observation \
+          WHERE id IN (SELECT id FROM pl_removal_faces);",
+    )
+    .map_err(|e| format!("queueing the face vectors for deletion failed: {}", e))?;
+
+    // 3b. Assignments, then the observations — in that order. The two image
+    //     limbs also sweep an assignment left dangling by an earlier writer.
+    conn.execute_batch(
+        "DELETE FROM person_face_assignment \
+          WHERE face_observation_id IN (SELECT id FROM pl_removal_faces) \
+             OR image_id IN (SELECT id FROM pl_removal_doomed) \
+             OR analyzed_image_id IN (SELECT id FROM pl_removal_doomed); \
+         DELETE FROM face_observation WHERE id IN (SELECT id FROM pl_removal_faces);",
+    )
+    .map_err(|e| format!("removing the face analysis failed: {}", e))?;
+
+    // 3c. A clustering run is one global relationship graph. Removing only the
+    //     changed face would leave its cluster counts and transitive membership
+    //     looking authoritative, so invalidate every run that referenced it.
+    //     (The editor-save precedent's reason, inherited verbatim.)
+    conn.execute_batch(
+        "DELETE FROM face_cluster_member \
+          WHERE run_id IN (SELECT run_id FROM pl_removal_cluster_runs); \
+         DELETE FROM face_cluster_run \
+          WHERE run_id IN (SELECT run_id FROM pl_removal_cluster_runs);",
+    )
+    .map_err(|e| format!("invalidating the face-cluster runs failed: {}", e))?;
+
+    // 3d. Similar photos. ⭐ Ruling 13 (Sep 27, 2026 — Richard: "we're aligned
+    //     on everything … through 17, and I agree with that, so we can make
+    //     that so"): removing a member of a stack — made by hand or found
+    //     automatically — leaves the SURVIVING members' stack intact when two
+    //     or more remain; only a stack that would drop below two members
+    //     dissolves: the S111 drop-below-2 rule `merge_catalogue_from_backup`
+    //     already applies. This replaces slice B's three-limb delete, which
+    //     dissolved every stack that lost a member for the photos that stay
+    //     too (review B-F8). All three statements key on the FROZEN plan
+    //     (step 0), never on a read of the table they rewrite:
+    //       (i)   the REMOVED photos' own membership rows go — and, in a group
+    //             this removal touches, a row whose photo is ALREADY gone (an
+    //             earlier bare `DELETE FROM images` left it; the cascade sweeps
+    //             such dangling rows within its reach, as B5b does for faces).
+    //             A surviving member's row is never deleted, and a group this
+    //             removal does not touch is never read or written;
+    //       (ii)  a group left with fewer than two surviving members dissolves,
+    //             its remaining rows with it;
+    //       (iii) a surviving group whose representative was removed takes its
+    //             LOWEST surviving image id as representative — AND as its
+    //             group id, because the group id IS the representative image
+    //             id (S94) and every writer keeps the two equal; the S111 merge
+    //             re-points both columns the same way. Member rank, distance and
+    //             threshold are left as stored, as that merge leaves them.
+    //     (ii) runs before (iii), so no dissolve can ever be keyed on an id a
+    //     promotion just moved a group to. A removed photo's own membership
+    //     does not come back with it (ruling 11): no tombstone records one.
+    //     Then the removed photos' featureprints, and EVERY unit checkpoint — so
+    //     the next grouping pass rebuilds rather than skipping on a stale content
+    //     key (W1-11; the editor save does the same per save).
+    conn.execute_batch(
+        "DELETE FROM similar_photo_group_member \
+          WHERE image_id IN (SELECT id FROM pl_removal_doomed) \
+             OR (group_id IN (SELECT group_id FROM pl_removal_similar_plan) \
+                 AND NOT EXISTS (SELECT 1 FROM images i \
+                                  WHERE i.id = similar_photo_group_member.image_id)); \
+         DELETE FROM similar_photo_group_member \
+          WHERE group_id IN (SELECT group_id FROM pl_removal_similar_plan \
+                              WHERE surviving_members < 2); \
+         UPDATE similar_photo_group_member \
+            SET group_id = p.lowest_survivor, \
+                representative_id = p.lowest_survivor \
+           FROM pl_removal_similar_plan p \
+          WHERE similar_photo_group_member.group_id = p.group_id \
+            AND p.surviving_members >= 2 \
+            AND p.representative_removed; \
+         DELETE FROM similar_photo_featureprint \
+          WHERE image_id IN (SELECT id FROM pl_removal_doomed); \
+         DELETE FROM similar_photo_unit_checkpoint;",
+    )
+    .map_err(|e| format!("removing the similar-photo analysis failed: {}", e))?;
+
+    removal_probe_checkpoint(conn, probe, RemovalStage::AfterCascade)?;
+
+    // --- 4. DELETE the rows themselves.
+    let deleted = conn
+        .execute("DELETE FROM images WHERE id IN (SELECT id FROM pl_removal_doomed)", [])
+        .map_err(|e| format!("DELETE failed: {}", e))? as u64;
+
+    removal_probe_checkpoint(conn, probe, RemovalStage::AfterDelete)?;
+    Ok(deleted)
+}
+
+/// Step 6 — AUTOCOMMIT: drop the frozen sets, on success and failure alike.
+fn removal_drop_temp_tables(conn: &Connection)
+{
+    for table in REMOVAL_TEMP_TABLES
+    {
+        if let Err(e) = conn.execute_batch(&format!("DROP TABLE IF EXISTS {};", table))
+        {
+            eprintln!("[removal] could not drop temp table {} ({}); the next removal replaces it", table, e);
+        }
+    }
+}
+
+/// After a removal COMMITS: delete the LanceDB vectors its cascade queued,
+/// through the existing retry — the `upsert_editor_saved_image` precedent,
+/// which also awaits it inside the FFI call. Decided by the frozen face census
+/// (a table read), never by a change count. Store errors are non-destructive:
+/// unconfirmed ids stay queued for the launch / face-index retries.
+async fn retry_removal_face_vector_deletes(outcome: &CatalogueRemovalOutcome, operation: &str)
+{
+    if outcome.doomed_faces == 0
+    {
+        return;
+    }
+    let cleanup = retry_pending_face_vector_deletes().await;
+    if cleanup.remaining_count > 0
+    {
+        eprintln!(
+            "[WARN faceVectorCleanup] after {}: pending={} acknowledged={} remaining={} message={}",
+            operation, cleanup.pending_count, cleanup.acknowledged_count, cleanup.remaining_count,
+            cleanup.message
+        );
+    }
+}
+
+// --- The re-attach -----------------------------------------------------------
+//
+// ⭐ §A-1 (binding): the re-attach applies ONLY to rows the calling statement
+// INSERTED, never to a live row that merely shares the path — else it would
+// clobber curation on an editor-saved asset (W1-8) or on a row a Lightroom
+// re-import is updating. `merge_records_into` knows its rows from `was_insert`;
+// `ingest_metadata` from `INSERT OR IGNORE … RETURNING file_path`, which the
+// bundled 1.5.5 answers with ONLY the rows it inserted (probed:
+// `ingest_returning_names_only_the_rows_it_inserted`).
+//
+// ⭐ A tombstone is CONSUMED only after its work is verified ON THE TABLE on the
+// new row (§A-2: never a change count). A stale tombstone on a row this call
+// did not insert is neither applied nor consumed (ruling 10: never pruned
+// automatically); a later removal of that path that files newer work merges
+// with it when the row is the same photograph (R2-F2) and replaces it when it
+// is not (2a).
+//
+// ⭐ Fix round 1, B-F2 — THE SAME FILE, NOT THE SAME NAME. Ruling 9 returns the
+// work "if the files return to the same place": the SAME files. A different
+// photograph that later takes a removed path arrives clean, and the tombstone
+// waits in place for the original.
+//
+// ⭐ Fix round 2, R2-F1 — THE SAME PHOTOGRAPH, DECIDED BY ITS CAPTURE DATE. The
+// catalogue writes `file_size` once and never re-reads it, so round 1's size
+// key withheld the work from files that ARE the same photograph: one rewritten
+// in place by another application (Lightroom writing XMP into it, a Photoshop
+// save) and an iCloud-only Photos asset catalogued at size 0 and downloaded
+// since. The capture date decides (NULL-safe); the size stands in for it only
+// when BOTH sides are undated, and a size of 0 is unknown. One function says
+// it — `removal_same_file_sql` — for the re-attach's match AND the removal's
+// same-photo merge (R2-F2).
+//
+// ⭐ Fix round 1, B-F1 — THE TOMBSTONE FILLS ONLY WHAT IT HOLDS. A returning
+// import that carries its own curation (a Lightroom catalog's stars, a
+// Copy-and-Import copy's inherited rotation) keeps it wherever the removed photo
+// had none; where the tombstone holds a value, the tombstone wins — the ruled
+// promise.
+
+/// Path lists bind as parameters (§A-3), at most this many per statement.
+const REATTACH_PATH_CHUNK: usize = 200;
+
+fn reattach_path_placeholders(count: usize) -> String
+{
+    vec!["?"; count].join(", ")
+}
+
+/// Whether ANY tombstone exists — the cheap per-call gate that keeps the
+/// common scan (nothing ever removed) at two extra reads per call. A failed
+/// read answers `true`: the per-path lookup then decides.
+///
+/// A connection whose schema has NO tombstone table holds no tombstones. Every
+/// production open runs the schema batch that creates it, so only a
+/// hand-built test schema is such a connection (two `lightroom_import_tests`
+/// merge against one); checking the catalogue first keeps the merge TOTAL on
+/// it instead of failing the chunk over a table that cannot hold anything.
+fn removal_tombstones_exist(conn: &Connection) -> bool
+{
+    match conn.query_row(
+        "SELECT COUNT(*) FROM duckdb_tables() \
+         WHERE database_name = current_database() AND table_name = 'removed_image_tombstone'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    {
+        Ok(0) => return false,
+        Ok(_) => {}
+        Err(e) =>
+        {
+            eprintln!("[removal tombstone] catalogue probe failed ({}); checking the table", e);
+        }
+    }
+    match conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM removed_image_tombstone)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )
+    {
+        Ok(exists) => exists,
+        Err(e) =>
+        {
+            eprintln!("[removal tombstone] existence probe failed ({}); checking per path", e);
+            true
+        }
+    }
+}
+
+/// ⭐ THE identity — "the same photograph" — as a SQL predicate between a
+/// tombstone (alias `tombstone`) and a catalogue row (alias `row`) at the same
+/// path. Fix round 2 (R2-F1): the CAPTURE DATE decides, NULL-safe, so a file
+/// edited, rewritten in place or downloaded since it was catalogued is still
+/// the same photograph. Only when BOTH are undated does the size stand in for
+/// the date — and a size of 0 (or NULL) on either side is UNKNOWN, never a
+/// mismatch: an iCloud-only Photos asset is catalogued at 0, and so is a
+/// Lightroom record without an import hash. A dated tombstone never matches an
+/// undated row, nor the reverse. ⭐ Called by BOTH the re-attach's match and
+/// the removal's same-photo merge (R2-F2): one decision, one spelling.
+fn removal_same_file_sql(tombstone: &str, row: &str) -> String
+{
+    format!(
+        "{t}.capture_datetime IS NOT DISTINCT FROM {r}.capture_datetime \
+         AND ({t}.capture_datetime IS NOT NULL \
+              OR COALESCE({t}.file_size, 0) = 0 \
+              OR COALESCE({r}.file_size, 0) = 0 \
+              OR {t}.file_size = {r}.file_size)",
+        t = tombstone,
+        r = row
+    )
+}
+
+/// The subset of `paths` whose tombstone belongs to THE SAME PHOTOGRAPH as the
+/// live row now at that path (`removal_same_file_sql`). ⭐ The ONE place the
+/// re-attach's identity is decided — both re-attach callers go through here,
+/// and `reattach_removal_tombstones` trusts the list it is handed. A path whose
+/// tombstone does not match is simply not returned: nothing is applied and
+/// nothing is consumed (ruling 10).
+fn removal_tombstone_matches(conn: &Connection, paths: &[String]) -> Result<Vec<String>, String>
+{
+    let mut matched: Vec<String> = Vec::new();
+    for chunk in paths.chunks(REATTACH_PATH_CHUNK)
+    {
+        let sql = format!(
+            "SELECT DISTINCT t.file_path FROM removed_image_tombstone t \
+               JOIN images i ON i.file_path = t.file_path \
+              WHERE t.file_path IN ({}) \
+                AND {}",
+            reattach_path_placeholders(chunk.len()),
+            removal_same_file_sql("t", "i")
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("tombstone lookup prepare failed: {}", e))?;
+        let rows = stmt
+            .query_map(params_from_iter(chunk.iter()), |row| row.get::<_, String>(0))
+            .map_err(|e| format!("tombstone lookup failed: {}", e))?;
+        let (found, dropped) = collect_rows_counted(rows, "removal_tombstone.lookup");
+        if dropped > 0
+        {
+            // A tombstone we cannot read must not be half-handled.
+            return Err(format!("{} tombstone row(s) could not be read", dropped));
+        }
+        matched.extend(found);
+    }
+    Ok(matched)
+}
+
+/// ⭐ THE re-attach — keywords, then scalars, then a verification ON THE TABLE,
+/// then the consume. `paths` MUST be rows the caller just INSERTED (§A-1),
+/// taken from `removal_tombstone_matches` (the same-file identity, B-F2). Runs
+/// inside the CALLER's transaction: a failure returns `Err` and the caller
+/// rolls back, so a tombstone is consumed only together with its verified
+/// work. Returns how many paths were re-attached.
+fn reattach_removal_tombstones(
+    conn: &Connection,
+    paths: &[String],
+    probe: RemovalProbeRef<'_>,
+) -> Result<u64, String>
+{
+    for chunk in paths.chunks(REATTACH_PATH_CHUNK)
+    {
+        let placeholders = reattach_path_placeholders(chunk.len());
+
+        // Keywords — the `copy_keyword_rows_for_image_pairs_impl` shape with the
+        // same NOT EXISTS (image_id, path) guard every keyword writer uses.
+        // ⭐ `is_video` comes from the LIVE re-added row (S70: "set FROM the image
+        // at insert"); the tombstone does not store it.
+        conn.execute(
+            &format!(
+                "INSERT INTO keyword \
+                     (image_id, label, path, status, origin, created_at, hidden_at, \
+                      collection, color, is_video) \
+                 SELECT i.id, t.label, t.path, t.status, t.origin, t.created_at, t.hidden_at, \
+                        t.collection, t.color, COALESCE(i.is_video, FALSE) \
+                   FROM removed_image_tombstone_keyword t \
+                   JOIN images i ON i.file_path = t.file_path \
+                  WHERE t.file_path IN ({}) \
+                    AND NOT EXISTS (SELECT 1 FROM keyword k \
+                                     WHERE k.image_id = i.id AND k.path = t.path)",
+                placeholders
+            ),
+            params_from_iter(chunk.iter()),
+        )
+        .map_err(|e| format!("re-attaching keyword rows failed: {}", e))?;
+
+        // Scalars. ⚠️ §A-2: `idx_rating` / `idx_flag` / `idx_color_label` are
+        // live, so this UPDATE runs on the S179 delete+insert branch and its
+        // reported count is NOT evidence of anything — the verification below
+        // reads the table instead. ⭐ B-F1: each column is filled ONLY where the
+        // tombstone holds a value (a NULL, or a rotation of 0, is "the removed
+        // photo had none"), so a returning import's own curation survives
+        // wherever the tombstone is silent.
+        match removal_probe_scalar_sql(probe)
+        {
+            Some(substitute) => conn
+                .execute_batch(&substitute)
+                .map_err(|e| format!("re-attach scalar substitute failed: {}", e))?,
+            None =>
+            {
+                conn.execute(
+                    &format!(
+                        "UPDATE images \
+                            SET rating = COALESCE(t.rating, images.rating), \
+                                flag = COALESCE(t.flag, images.flag), \
+                                color_label = COALESCE(t.color_label, images.color_label), \
+                                rotation = CASE WHEN COALESCE(t.rotation, 0) <> 0 \
+                                                THEN t.rotation ELSE images.rotation END \
+                           FROM removed_image_tombstone t \
+                          WHERE images.file_path = t.file_path \
+                            AND t.file_path IN ({})",
+                        placeholders
+                    ),
+                    params_from_iter(chunk.iter()),
+                )
+                .map_err(|e| format!("re-attaching the curation failed: {}", e))?;
+            }
+        }
+
+        // ⭐ VERIFY ON THE TABLE before consuming anything. NOT EXISTS keeps
+        // both reads correct even if an index scan ever emitted a row twice.
+        let keywords_missing: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM removed_image_tombstone_keyword t \
+                       JOIN images i ON i.file_path = t.file_path \
+                      WHERE t.file_path IN ({}) \
+                        AND NOT EXISTS (SELECT 1 FROM keyword k \
+                                         WHERE k.image_id = i.id AND k.path = t.path)",
+                    placeholders
+                ),
+                params_from_iter(chunk.iter()),
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| format!("verifying the re-attached keywords failed: {}", e))?;
+        // ⭐ B-F1: only the fields the tombstone HOLDS are checked — the rest
+        // belong to the returning import and are not the tombstone's to prove.
+        let scalars_missing: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM removed_image_tombstone t \
+                      WHERE t.file_path IN ({}) \
+                        AND NOT EXISTS (SELECT 1 FROM images i \
+                                         WHERE i.file_path = t.file_path \
+                                           AND (t.rating IS NULL \
+                                                OR i.rating IS NOT DISTINCT FROM t.rating) \
+                                           AND (t.flag IS NULL \
+                                                OR i.flag IS NOT DISTINCT FROM t.flag) \
+                                           AND (t.color_label IS NULL \
+                                                OR i.color_label IS NOT DISTINCT FROM t.color_label) \
+                                           AND (COALESCE(t.rotation, 0) = 0 \
+                                                OR i.rotation IS NOT DISTINCT FROM t.rotation))",
+                    placeholders
+                ),
+                params_from_iter(chunk.iter()),
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| format!("verifying the re-attached curation failed: {}", e))?;
+        if keywords_missing != 0 || scalars_missing != 0
+        {
+            return Err(format!(
+                "the re-attached work did not land on the table ({} keyword row(s) and {} \
+                 curation row(s) missing); the tombstones are kept",
+                keywords_missing, scalars_missing
+            ));
+        }
+
+        // Consume, exactly once — and only now.
+        conn.execute(
+            &format!(
+                "DELETE FROM removed_image_tombstone_keyword WHERE file_path IN ({})",
+                placeholders
+            ),
+            params_from_iter(chunk.iter()),
+        )
+        .map_err(|e| format!("consuming the keyword tombstones failed: {}", e))?;
+        conn.execute(
+            &format!("DELETE FROM removed_image_tombstone WHERE file_path IN ({})", placeholders),
+            params_from_iter(chunk.iter()),
+        )
+        .map_err(|e| format!("consuming the tombstones failed: {}", e))?;
+    }
+    Ok(paths.len() as u64)
+}
+
+/// `ingest_metadata`'s re-attach for one chunk, in its OWN transaction (the
+/// ingest INSERT is autocommit and stays that way). A failure is logged and
+/// rolled back — the rows stay inserted, WITHOUT their earlier work — and never
+/// fails the scan. ⭐ Fix round 1 (B-F6), stated exactly: the tombstones are
+/// KEPT IN PLACE, and a tombstone is kept until its file returns and the
+/// re-attach succeeds. The bare photo is live, so it is never re-applied to it
+/// (§A-1); removing that photo again without new work leaves the tombstone
+/// untouched (2a), removing it WITH new work — an automatic keyword Intelligent
+/// Culling gave it, a rating — MERGES that work into the waiting tombstone
+/// (fix round 2, R2-F2: it is the same photograph), and the next successful
+/// re-add restores both. A quit between the INSERT and this transaction leaves
+/// exactly the same state.
+///
+/// ⚠️ The failure reaches the console only (`eprintln!`): `ingest_metadata`
+/// returns a count, so no Operation Log seam exists here without a `.udl`
+/// change, and the user gets no signal — the bare photo looks like an ordinary
+/// re-import (slice P's call). (A merge's re-attach failure un-merges its chunk
+/// and IS logged, through the importers' existing chunk-failure channel.)
+fn reattach_removal_tombstones_after_ingest(
+    conn: &Connection,
+    inserted_paths: &[String],
+    probe: RemovalProbeRef<'_>,
+)
+{
+    if inserted_paths.is_empty()
+    {
+        return;
+    }
+    let matched = match removal_tombstone_matches(conn, inserted_paths)
+    {
+        Ok(matched) => matched,
+        Err(message) =>
+        {
+            eprintln!("[ingest] removal-tombstone lookup failed ({}); the tombstones are kept", message);
+            return;
         }
     };
-    remove_images_by_ids_impl(conn, &ids)
+    if matched.is_empty()
+    {
+        return;
+    }
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("[ingest] removal-tombstone re-attach could not begin ({}); the tombstones are kept", e);
+        return;
+    }
+    match reattach_removal_tombstones(conn, &matched, probe)
+    {
+        Ok(_) =>
+        {
+            if let Err(e) = conn.execute_batch("COMMIT;")
+            {
+                let _ = conn.execute_batch("ROLLBACK;");
+                eprintln!("[ingest] removal-tombstone re-attach COMMIT failed ({}); the tombstones are kept", e);
+            }
+        }
+        Err(message) =>
+        {
+            let _ = conn.execute_batch("ROLLBACK;");
+            eprintln!(
+                "[ingest] removal-tombstone re-attach rolled back ({}); {} photo(s) were added without \
+                 their earlier work and their tombstones are kept",
+                message,
+                matched.len()
+            );
+        }
+    }
 }
 
 /// Session 30 (cross-plan overwrite-gap fix): return every catalogued
@@ -25947,7 +30151,7 @@ pub async fn get_destination_family_records(
     sample_file_path: String,
     canonical_file_name: String,
 ) -> Vec<ImageRecord> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -26036,7 +30240,7 @@ pub async fn find_counterpart_image(file_path: String) -> Option<ImageRecord> {
     counterpart_lookup_parts(&file_path)?;
 
     // 4. Acquire lock and validate connection.
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -26324,7 +30528,7 @@ fn row_to_video_details(row: &duckdb::Row) -> Result<VideoDetails, duckdb::Error
 /// uninitialized, the id is absent, or the row is not a video — all benign
 /// "no Video group" outcomes for the panel, never an error worth surfacing.
 pub async fn get_video_details(image_id: i64) -> Option<VideoDetails> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -26358,7 +30562,7 @@ pub async fn get_video_details(image_id: i64) -> Option<VideoDetails> {
 /// NULL (an ordinary non-Apple row) — all benign "no Apple handle" outcomes, never
 /// an error worth surfacing.
 pub async fn get_external_source_id(image_id: i64) -> Option<String> {
-    let catalogue = CATALOGUE.lock().unwrap();
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -26790,7 +30994,13 @@ fn apple_shared_album_dependent_census_impl(
 pub async fn apple_shared_album_cleanup_targets(
     originals_prefix: String,
 ) -> AppleSharedAlbumCleanupTargets {
-    let catalogue = CATALOGUE.lock().unwrap();
+    // ⭐ Slice F / R-07 — the panic boundary (`ffi_panic_boundary`): a panic in
+    // the body below is reported through `ok: false` + `error_message` (the caller removes nothing) instead of
+    // killing the app. The body keeps its pre-slice indentation on purpose:
+    // inside it the slice changed the lock token and nothing else.
+    ffi_panic_boundary("apple_shared_album_cleanup_targets.panic.query_failed", || -> AppleSharedAlbumCleanupTargets
+    {
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -26808,6 +31018,14 @@ pub async fn apple_shared_album_cleanup_targets(
         eprintln!("{}", message);
     }
     result
+    },
+    |panic| AppleSharedAlbumCleanupTargets
+    {
+        ok: false,
+        image_ids: Vec::new(),
+        file_paths: Vec::new(),
+        error_message: Some(ffi_panic_report("read the catalogue", &panic)),
+    })
 }
 
 /// SLICE N-2 — the Q-36 dependent guard: how many keyword / face / similar-photo
@@ -26819,7 +31037,13 @@ pub async fn apple_shared_album_cleanup_targets(
 pub async fn apple_shared_album_dependent_census(
     image_ids: Vec<i64>,
 ) -> AppleSharedAlbumDependentCensus {
-    let catalogue = CATALOGUE.lock().unwrap();
+    // ⭐ Slice F / R-07 — the panic boundary (`ffi_panic_boundary`): a panic in
+    // the body below is reported through `ok: false` — FAIL-CLOSED, the caller deletes nothing — instead of
+    // killing the app. The body keeps its pre-slice indentation on purpose:
+    // inside it the slice changed the lock token and nothing else.
+    ffi_panic_boundary("apple_shared_album_dependent_census.panic.query_failed", || -> AppleSharedAlbumDependentCensus
+    {
+    let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
         Some(c) => c,
         None => {
@@ -26843,6 +31067,20 @@ pub async fn apple_shared_album_dependent_census(
         eprintln!("{}", message);
     }
     result
+    },
+    |panic| AppleSharedAlbumDependentCensus
+    {
+        ok: false,
+        keyword_rows: 0,
+        face_observation_rows: 0,
+        person_face_assignment_rows: 0,
+        face_cluster_member_rows: 0,
+        similar_photo_group_member_rows: 0,
+        similar_photo_featureprint_rows: 0,
+        queued_vector_deletes: 0,
+        encumbered_image_ids: Vec::new(),
+        error_message: Some(ffi_panic_report("read the catalogue", &panic)),
+    })
 }
 
 /// ⭐⭐ ENGINE TESTS NEVER FETCH — a STANDING RULE, added after an incident in this
@@ -30297,12 +34535,15 @@ mod schema_upgrade_fixture_tests
     /// ⚠️ NARROWED in fix round 1 (2026-09-25, reviewer finding K-F1). This block
     /// used to claim "blast radius of all four: ZERO — no pre-2026-07-03
     /// catalogue can reach this binary". **That does not follow.** Backups do
-    /// begin at S111 (2026-07-03), but a backup ZIP *taken* in the 2026-07-03 →
-    /// 2026-07-22 window — after backups existed, before S127's fresh-catalogue
-    /// baseline — holds a catalogue whose tables were **CREATED** in May or June
-    /// 2026. Restore ▸ additive merge can therefore hand this binary a
-    /// genesis-era catalogue, and whether such an archive exists on Richard's
-    /// disk is Q-29, still unanswered. These four are **Restore-reachable**.
+    /// begin at S111 (2026-07-03), but a backup ZIP *taken* between S111
+    /// (2026-07-03) and S114's bundle rename (~2026-07-09, which gave every
+    /// machine a fresh empty container) holds a catalogue whose tables were
+    /// **CREATED** in May or June 2026 — and so does any later archive taken
+    /// after a **full-replace restore** of such a ZIP, which is what keeps the
+    /// class reachable past S114. Restore ▸ additive merge can therefore hand
+    /// this binary a genesis-era catalogue, and whether such an archive exists
+    /// on Richard's disk is Q-29, still unanswered. These four are
+    /// **Restore-reachable**.
     ///
     /// ⭐ What bounds the risk is MEASUREMENT, not unreachability. Reviewer round
     /// 1 drove all **32** distinct historical batch states through this same
@@ -30352,15 +34593,24 @@ mod schema_upgrade_fixture_tests
                      COLUMN ... DEFAULT <expr>` is the S62 WAL wedge, forbidden by \
                      CLAUDE.md's standing DuckDB rules — converging it would rebuild \
                      a bug this project already shipped once. REACHABLE through a \
-                     Restore of a 2026-07-03...07-22 archive (see the block above and \
+                     Restore of a ZIP taken between S111 (2026-07-03) and S114's \
+                     bundle rename (~2026-07-09, which gave every machine a fresh \
+                     empty container), or of any later archive taken after a \
+                     full-replace restore of such a ZIP, which is what keeps the \
+                     class reachable past S114 (see the block above and \
                      TIER3-4599235, where this same column diverges on a catalogue \
                      born 2026-06-01) and HARMLESS because the batch BACKFILLS THE \
                      VALUES: `UPDATE images SET is_video = FALSE WHERE is_video IS \
                      NULL` runs immediately after the bare ALTER, so only the column \
                      attributes diverge and never the data. Also not user-visible: no \
                      production read distinguishes NULL from FALSE here (both \
-                     `collection` and `color` are read only under `= TRUE`), and all \
-                     nine production INSERT INTO keyword sites name `origin`.",
+                     `collection` and `color` are read only under `= TRUE`), and nine \
+                     of the ten production `INSERT INTO keyword` sites name `origin` \
+                     in a literal column list (slice B's removal-tombstone re-attach \
+                     is the newest of them); the tenth is the additive-merge copy, \
+                     whose column list is the live ∩ backup intersection, so it names \
+                     `origin` whenever the backup has it and otherwise leaves the \
+                     CREATE-body `DEFAULT 1` to supply it.",
         },
         AllowedDivergence
         {
@@ -30381,7 +34631,7 @@ mod schema_upgrade_fixture_tests
     ];
 
     /// ⭐ TIER 3 — R-42's five columns, on a catalogue BORN 2026-06-01, which is
-    /// the shape a real 2026-07-03…07-22 backup ZIP actually holds (added in fix
+    /// the shape a real 2026-07-03…~07-09 backup ZIP actually holds (added in fix
     /// round 1, 2026-09-25, on reviewer finding K-F1).
     ///
     /// All 32 distinct historical batch states were driven through the production
@@ -30493,23 +34743,27 @@ mod schema_upgrade_fixture_tests
     /// the launch path cannot see anything older (S114 renamed the bundle ID,
     /// S127 was a fresh-catalogue baseline). Fingerprinting every commit that
     /// touched the schema batch collapses the post-2026-07-03 window into SIX
-    /// distinct states, V1…V6, of which V6 is the working tree.
+    /// distinct committed states, V1…V6; V7 is the working tree (slice B's
+    /// removal tombstone, S184 — see its row for the provisional name).
     ///
     /// ⚠️ NARROWED in fix round 1 (2026-09-25, reviewer finding K-F1). ⛔ The old
     /// wording, "the reachable window OPENS on 2026-07-03", does **not** follow
     /// and is gone. **2026-07-03 is when a backup could first be TAKEN, not the
-    /// earliest schema a backup can HOLD.** A ZIP taken in the 2026-07-03 →
-    /// 2026-07-22 window — after S111 began backups, before S127's
-    /// fresh-catalogue baseline — contains a catalogue whose tables were CREATED
-    /// in May or June 2026. V1…V6 each model a catalogue *born* at their state;
+    /// earliest schema a backup can HOLD.** A ZIP taken between S111
+    /// (2026-07-03) and S114's bundle rename (~2026-07-09, which gave every
+    /// machine a fresh empty container) holds a catalogue whose tables were
+    /// CREATED in May or June 2026 — and so does any later archive taken after
+    /// a **full-replace restore** of such a ZIP, which is what keeps the class
+    /// reachable past S114. V1…V6 each model a catalogue *born* at their state;
     /// none models a June-born catalogue migrated forward, which is the shape a
     /// real archive of that window actually has. ⇒ TIER3-4599235 and GENESIS.
     ///
-    /// ⚠️ The DDL state of V1 originates at a9300ac (2026-06-25); 8193d5d is the
-    /// S111 commit at which such a catalogue first became BACKUP-able, and its
-    /// lib.rs carries that same batch byte-for-byte. The fixture is named for
-    /// 8193d5d because that is the earliest vintage a backup can be NAMED for.
-    const VINTAGES: [Vintage; 8] = [
+    /// ⚠️ The DDL state of V1 originates at a9300ac (2026-06-25) as the same
+    /// schema STATE — fingerprint-identical; the two blobs differ by 18 bytes in
+    /// one column comment — which is why the fixture is named for 8193d5d and is
+    /// byte-exact against 8193d5d's blob. 8193d5d is also the S111 commit at which
+    /// such a catalogue first became BACKUP-able.
+    const VINTAGES: [Vintage; 9] = [
         Vintage
         {
             tag: "V1",
@@ -30562,10 +34816,29 @@ mod schema_upgrade_fixture_tests
             date: "2026-09-18",
             ddl: include_str!("schema_fixtures/2bc221e.sql"),
             allowed: &[],
+            is_identity_control: false,
+        },
+        // ⭐ V7 — slice B's removal tombstone (S184, 2026-09-26): the two
+        // `removed_image_tombstone*` tables and their index, CREATE-time only.
+        // THE IDENTITY CONTROL. ⚠️ PROVISIONAL NAME: a fixture cannot be named
+        // for the commit that carries it (the file moves that commit's sha), so
+        // it lands as `PENDING-B.sql`, extracted from the working tree by the
+        // README's own cut. The ONE post-commit act, after Richard commits:
+        // re-extract from the new commit's blob (it must `diff` clean against
+        // `PENDING-B.sql`), rename the file to `<sha>.sql`, and change this row's
+        // `commit:` and `include_str!` to that sha — no byte of the fixture
+        // changes (README, "The files").
+        Vintage
+        {
+            tag: "V7",
+            commit: "PENDING-B",
+            date: "2026-09-26",
+            ddl: include_str!("schema_fixtures/PENDING-B.sql"),
+            allowed: &[],
             is_identity_control: true,
         },
         // ⭐ TIER 3 — a catalogue BORN 2026-06-01, which is the shape a real
-        // 2026-07-03…07-22 backup ZIP holds (fix round 1, reviewer finding K-F1).
+        // 2026-07-03…~07-09 backup ZIP holds (fix round 1, reviewer finding K-F1).
         // It is the first fixture with a JUNE-BORN `keyword` table — nullable
         // `origin` with no default, and no `collection`/`color`/`is_video` — the
         // state the batch's value backfills and its backfill-before-
@@ -30583,7 +34856,7 @@ mod schema_upgrade_fixture_tests
             is_identity_control: false,
         },
         // ⭐ GENESIS IS NOT ARCHIVAL — it is the EXTREME INSTANCE of the
-        // Restore-reachable class (a 2026-07-03…07-22 ZIP can hold a catalogue
+        // Restore-reachable class (a 2026-07-03…~07-09 ZIP can hold a catalogue
         // born this early) and the BROADEST pin on assertion (a): 1 table
         // instead of 19 and 29 `images` columns instead of 69, so 40 columns and
         // 18 tables arrive through the migration.
@@ -30621,7 +34894,7 @@ mod schema_upgrade_fixture_tests
     /// `VINTAGES` row is added or removed without updating it. The detector for a
     /// moved schema batch is
     /// `the_identity_control_fixture_is_byte_identical_to_the_in_tree_schema_batch`.
-    const EXPECTED_VINTAGE_COUNT: usize = 8;
+    const EXPECTED_VINTAGE_COUNT: usize = 9;
 
     /// ⭐ VACUITY GUARD. The fresh reference catalogue carried 259 product
     /// columns when this was written; a floor well under it catches "the
@@ -31123,7 +35396,7 @@ mod schema_upgrade_fixture_tests
             "exactly one vintage must be the identity control (the working tree's own \
              schema batch); without it a green sweep proves nothing about the comparison"
         );
-        for tag in ["V1", "V2", "V3", "V4", "V5", "V6", "TIER3-4599235", "GENESIS"]
+        for tag in ["V1", "V2", "V3", "V4", "V5", "V6", "V7", "TIER3-4599235", "GENESIS"]
         {
             let v = vintage(tag);
             assert!(
@@ -31227,22 +35500,31 @@ mod schema_upgrade_fixture_tests
         assert_vintage_upgrades(vintage("V5"));
     }
 
-    /// K-2 — THE IDENTITY CONTROL. V6 is the working tree's own schema batch, so
+    /// V6 — S179's state (2026-09-18). It was the identity control until slice
+    /// B's schema addition made V7 the working tree; its identity assertion
+    /// moved to V7's test with the flag (S184).
+    #[test]
+    fn v6_2026_09_18_upgrades_to_the_current_schema()
+    {
+        assert_vintage_upgrades(vintage("V6"));
+    }
+
+    /// K-2 — THE IDENTITY CONTROL. V7 is the working tree's own schema batch, so
     /// its upgrade must produce ZERO divergence. This is the assertion that
     /// proves a green K-1 means something rather than that the comparison is
     /// broken.
     #[test]
-    fn v6_the_identity_control_upgrades_to_a_byte_identical_schema()
+    fn v7_the_identity_control_upgrades_to_a_byte_identical_schema()
     {
-        let v = vintage("V6");
+        let v = vintage("V7");
         assert!(
             v.is_identity_control,
-            "V6 must be flagged as the identity control"
+            "V7 must be flagged as the identity control"
         );
         assert_vintage_upgrades(v);
     }
 
-    /// ⭐ TIER 3 — the shape a real 2026-07-03…07-22 backup ZIP holds: a
+    /// ⭐ TIER 3 — the shape a real 2026-07-03…~07-09 backup ZIP holds: a
     /// catalogue BORN 2026-06-01 and migrated forward, with a June-born `keyword`
     /// table. Asserts R-42's five columns diverge in exactly the measured way and
     /// nothing else does. Added in fix round 1 on reviewer finding K-F1.
@@ -31343,15 +35625,25 @@ mod schema_upgrade_fixture_tests
         assert_eq!(
             batch, control.ddl,
             "⭐ THE IDENTITY CONTROL IS STALE. The in-tree schema batch no longer \
-             matches src/schema_fixtures/{}.sql, so this module has NO identity \
+             matches src/schema_fixtures/{commit}.sql, so this module has NO identity \
              control and the CURRENT schema state is pinned by no fixture — every \
-             other green assertion (e) here is meaningless until this is fixed. Four \
+             other green assertion (e) here is meaningless until this is fixed. Five \
              things are needed, and ⛔ editing the frozen fixture is NOT one of them: \
              (1) extract the new batch into a new src/schema_fixtures/<sha>.sql by \
-             the README's provenance recipe, (2) add a VINTAGES row for it carrying \
-             is_identity_control, (3) bump EXPECTED_VINTAGE_COUNT and add its \
-             #[test], (4) clear is_identity_control on {}.",
-            control.commit, control.tag
+             the README's provenance recipe (before the commit exists, a provisional \
+             PENDING-<slice>.sql, renamed after it — the README's post-commit act), \
+             (2) add a VINTAGES row for it carrying is_identity_control, (3) bump \
+             EXPECTED_VINTAGE_COUNT and add its #[test], (4) clear \
+             is_identity_control on {tag}, (5) MOVE {tag}'s `v.is_identity_control` \
+             assertion into the new row's #[test] — {tag}'s own test asserts the flag \
+             and goes red the moment (4) lands. If ONLY comments or whitespace moved, \
+             this is not a new schema STATE (the fingerprint recipe strips both — see \
+             `b8ea0a6`→`09834a6`): after committing, re-extract the identity control \
+             from the NEW commit's blob into `<newsha>.sql` and re-point {tag}'s \
+             `VINTAGES` row, rather than adding a duplicate state or editing a frozen \
+             fixture.",
+            commit = control.commit,
+            tag = control.tag
         );
     }
 
@@ -31678,7 +35970,9 @@ mod swallowed_failure_tests
     /// The global CATALOGUE / CATALOGUE_PATH pair is process-wide, so the
     /// tests that must exercise a real FFI entry point (which resolves the
     /// vector store from CATALOGUE_PATH) take this lock for their duration.
-    static GLOBAL_CATALOGUE_LOCK: Mutex<()> = Mutex::new(());
+    /// ⭐ Slice F: `pub(super)` so `panic_boundary_tests` — the only other
+    /// module that installs a global catalogue — serialises on the SAME lock.
+    pub(super) static GLOBAL_CATALOGUE_LOCK: Mutex<()> = Mutex::new(());
 
     struct Fixture
     {
@@ -34368,5 +38662,973 @@ mod swallowed_failure_tests
             .windows(needle.len())
             .position(|window| window == needle)
             .map(|position| from + position)
+    }
+}
+
+// ===========================================================================
+// Slice F (2026-09-27) — the panic boundary's pins: R-07 · R-25 · R-26 · R-69
+// ===========================================================================
+//
+// Every fixture is a REAL temp-file catalogue opened through the production
+// `open_and_migrate_catalogue` and fenced (ENGINE TESTS NEVER FETCH). The two
+// test modules that install a catalogue into the process-global CATALOGUE /
+// CATALOGUE_PATH — this one and `swallowed_failure_tests` — serialise on ONE
+// lock, that module's `GLOBAL_CATALOGUE_LOCK`.
+//
+// ⚠️ These tests panic ON PURPOSE (inside scoped threads, face-runtime workers
+// and the FFI boundary), so the default hook prints "panicked at … slice F
+// test" lines to stderr. Those lines are the fixture working, not a failure;
+// the verdict is `test result:`.
+#[cfg(test)]
+mod panic_boundary_tests
+{
+    use super::*;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    const MODEL: &str = "slice-f-model";
+    const PREPROCESSING: &str = "slice-f-preprocessing";
+    const ALGORITHM: &str = "slice-f-algorithm";
+    const INJECTED: &str = "slice F test: an injected panic";
+
+    fn serial() -> std::sync::MutexGuard<'static, ()>
+    {
+        super::swallowed_failure_tests::GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct Fixture
+    {
+        dir: std::path::PathBuf,
+        catalogue: std::path::PathBuf,
+    }
+
+    impl Drop for Fixture
+    {
+        fn drop(&mut self)
+        {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn fresh_catalogue(tag: &str) -> (Fixture, Connection)
+    {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "plcore-slice-f-{}-{}-{}",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        let catalogue = dir.join("catalogue.db");
+        let conn = open_and_migrate_catalogue(&catalogue).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH.
+        fence_connection_against_extension_fetches(&conn);
+        (Fixture { dir, catalogue }, conn)
+    }
+
+    /// Install a catalogue, starting from an UNPOISONED pair of mutexes.
+    fn install(fixture: &Fixture, conn: Connection)
+    {
+        *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(conn);
+        *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(fixture.catalogue.clone());
+        CATALOGUE.clear_poison();
+        CATALOGUE_PATH.clear_poison();
+    }
+
+    /// Put the globals back exactly as the other test module expects them.
+    struct Installed;
+
+    impl Drop for Installed
+    {
+        fn drop(&mut self)
+        {
+            FFI_PANIC_PROBE_COUNTDOWN.with(|countdown| countdown.set(0));
+            FACE_WORKER_LOCK_PANIC_ARMED.store(false, Ordering::SeqCst);
+            FACE_EMBEDDING_RUNTIME_OVERRIDE.with(|entry| entry.set(None));
+            *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            CATALOGUE.clear_poison();
+            CATALOGUE_PATH.clear_poison();
+        }
+    }
+
+    fn installed(fixture: &Fixture, conn: Connection) -> Installed
+    {
+        install(fixture, conn);
+        Installed
+    }
+
+    fn insert_image(conn: &Connection, file_path: &str) -> i64
+    {
+        conn.execute(
+            "INSERT INTO images (file_path, file_size, file_name, file_stem, image_kind, \
+             created_timestamp, modified_timestamp, is_video) \
+             VALUES (?1, 10, ?2, ?2, 'jpeg', 0, 0, FALSE)",
+            params![file_path, file_path.rsplit('/').next().unwrap_or(file_path)],
+        )
+        .expect("insert image");
+        conn.query_row(
+            "SELECT id FROM images WHERE file_path = ?1",
+            params![file_path],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("image id")
+    }
+
+    fn census(site: &str) -> u64
+    {
+        let report = futures::executor::block_on(dropped_row_report());
+        report
+            .site_names
+            .iter()
+            .position(|name| name == site)
+            .map(|index| report.site_counts[index])
+            .unwrap_or(0)
+    }
+
+    /// Poison CATALOGUE the way R-26 does: a guard taken through the SHIPPING
+    /// accessor, dropped during an unwind. Asserts the precondition rather
+    /// than assuming it.
+    fn poison_catalogue_lock()
+    {
+        let crashed = std::thread::scope(|scope|
+        {
+            scope
+                .spawn(||
+                {
+                    let _guard = lock_catalogue();
+                    panic!("slice F test: a panic under the catalogue guard");
+                })
+                .join()
+        });
+        assert!(crashed.is_err(), "the poisoning thread must have panicked");
+        assert!(CATALOGUE.lock().is_err(), "precondition: CATALOGUE must now be POISONED");
+    }
+
+    fn poison_catalogue_path_lock()
+    {
+        let crashed = std::thread::scope(|scope|
+        {
+            scope
+                .spawn(||
+                {
+                    let _guard = lock_catalogue_path();
+                    panic!("slice F test: a panic under the catalogue-path guard");
+                })
+                .join()
+        });
+        assert!(crashed.is_err(), "the poisoning thread must have panicked");
+        assert!(
+            CATALOGUE_PATH.lock().is_err(),
+            "precondition: CATALOGUE_PATH must now be POISONED"
+        );
+    }
+
+    fn arm_probe_at(point: u32)
+    {
+        FFI_PANIC_PROBE_COUNTDOWN.with(|countdown| countdown.set(point));
+    }
+
+    fn all_paths() -> FilePathsResult
+    {
+        futures::executor::block_on(get_file_paths_for_filters(
+            String::new(),
+            String::new(),
+            false,
+            false,
+            MediaType::Both,
+        ))
+    }
+
+    fn image_metadata(file_path: &str) -> ImageMetadata
+    {
+        ImageMetadata
+        {
+            file_path: file_path.to_string(),
+            file_size: 1000,
+            file_name: file_path.rsplit('/').next().unwrap_or(file_path).to_string(),
+            file_extension: Some("jpg".to_string()),
+            created_timestamp: 1_700_000_000,
+            modified_timestamp: 1_700_000_000,
+            camera_make: None,
+            camera_model: None,
+            lens_model: None,
+            focal_length: None,
+            aperture: None,
+            shutter_speed: None,
+            iso: None,
+            capture_datetime: None,
+            pixel_width: None,
+            pixel_height: None,
+            color_space: None,
+            bit_depth: None,
+            gps_latitude: None,
+            gps_longitude: None,
+            gps_altitude: None,
+            copyright: None,
+            creator: None,
+            description: None,
+            rating: None,
+            flag: None,
+            color_label: None,
+            rotation: None,
+            is_video: false,
+            duration_seconds: None,
+            frame_rate: None,
+            video_kind: None,
+            video_codec: None,
+            video_bitrate: None,
+            color_primaries: None,
+            color_transfer: None,
+            color_matrix: None,
+            color_range: None,
+            dv_profile: None,
+            has_audio: None,
+            audio_codec: None,
+            audio_channels: None,
+            audio_sample_rate: None,
+            audio_bitrate: None,
+            live_photo_id: None,
+            external_source_id: None,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // R1 — poison, then use; and ⭐ §A-1: the rollback, observed.
+    // ------------------------------------------------------------------
+    #[test]
+    fn r1_a_poisoned_catalogue_lock_is_healed_and_the_next_call_answers()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("r1");
+        insert_image(&conn, "/slice-f/r1/kept.jpg");
+        let _installed = installed(&fixture, conn);
+
+        // A panic BETWEEN BEGIN AND COMMIT, under the guard: the connection is
+        // left inside an open transaction holding an uncommitted row.
+        let crashed = std::thread::scope(|scope|
+        {
+            scope
+                .spawn(||
+                {
+                    let guard = lock_catalogue();
+                    let conn = guard.as_ref().expect("a catalogue is installed");
+                    conn.execute_batch("BEGIN TRANSACTION;").expect("begin");
+                    insert_image(conn, "/slice-f/r1/uncommitted.jpg");
+                    panic!("slice F test: a panic between BEGIN and COMMIT");
+                })
+                .join()
+        });
+        assert!(crashed.is_err(), "the writer thread must have panicked");
+        assert!(CATALOGUE.lock().is_err(), "precondition: CATALOGUE must now be POISONED");
+
+        let recovered_before = census(CATALOGUE_LOCK_RECOVERED_SITE);
+        let answer = all_paths();
+        assert!(answer.ok, "a poisoned lock must no longer kill the catalogue API: {:?}", answer.error_message);
+        assert_eq!(
+            answer.paths,
+            vec!["/slice-f/r1/kept.jpg".to_string()],
+            "⭐ §A-1: the recovery must ROLL BACK the panicked transaction — the \
+             uncommitted row must not be visible to the next caller"
+        );
+        assert_eq!(
+            census(CATALOGUE_LOCK_RECOVERED_SITE) - recovered_before,
+            1,
+            "a recovered lock leaves ONE durable census record"
+        );
+        assert!(CATALOGUE.lock().is_ok(), "the recovery must CLEAR the poison");
+
+        // The next call is ordinary: no second rollback, no second record.
+        let again = all_paths();
+        assert!(again.ok);
+        assert_eq!(
+            census(CATALOGUE_LOCK_RECOVERED_SITE) - recovered_before,
+            1,
+            "the rollback must run exactly once, right after the panic"
+        );
+
+        // And the healed connection can open and commit a transaction of its
+        // own (an un-rolled-back one fails its BEGIN).
+        let guard = lock_catalogue();
+        let conn = guard.as_ref().expect("installed");
+        conn.execute_batch("BEGIN TRANSACTION;")
+            .expect("a fresh BEGIN works on the healed connection");
+        conn.execute_batch("COMMIT;").expect("commit");
+        drop(guard);
+    }
+
+    // ------------------------------------------------------------------
+    // R2 — the R-26 arm itself: the re-lock reached BECAUSE of a panic.
+    // ------------------------------------------------------------------
+    #[test]
+    fn r2_the_r26_relock_answers_on_a_poisoned_lock()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("r2");
+        let _installed = installed(&fixture, conn);
+        poison_catalogue_lock();
+
+        let outcome = std::panic::catch_unwind(|| pending_face_vector_delete_count_from_catalogue());
+        assert!(
+            outcome.is_ok(),
+            "the R-26 re-lock (`retry_pending_face_vector_deletes`' failure arm) must not \
+             panic on a poisoned lock"
+        );
+        assert_eq!(outcome.unwrap(), Ok(0), "an empty queue answers 0");
+        assert!(CATALOGUE.lock().is_ok(), "and the poison is cleared");
+    }
+
+    // ------------------------------------------------------------------
+    // R2b — R-26 END TO END: a panic on a face-runtime WORKER, under the
+    // catalogue lock, inside `retry_pending_face_vector_deletes_impl`.
+    // ------------------------------------------------------------------
+    #[test]
+    fn r2b_a_worker_panic_in_the_retry_task_is_reported_and_the_app_keeps_answering()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("r2b");
+        insert_image(&conn, "/slice-f/r2b/kept.jpg");
+        let _installed = installed(&fixture, conn);
+        let recovered_before = census(CATALOGUE_LOCK_RECOVERED_SITE);
+
+        FACE_WORKER_LOCK_PANIC_ARMED.store(true, Ordering::SeqCst);
+        let result = futures::executor::block_on(retry_pending_face_vector_deletes());
+        assert!(
+            !FACE_WORKER_LOCK_PANIC_ARMED.load(Ordering::SeqCst),
+            "vacuity guard: the injected panic must actually have fired on the worker"
+        );
+        assert!(
+            matches!(result.status, FaceVectorDeleteRetryStatus::Failed),
+            "the worker panic is reported as the EXISTING Failed status"
+        );
+        assert!(
+            result.message.contains("runtime failed"),
+            "the JoinError arm names what happened: {}",
+            result.message
+        );
+        assert_eq!(
+            census(CATALOGUE_LOCK_RECOVERED_SITE) - recovered_before,
+            1,
+            "the failure arm's re-lock healed the lock the worker's panic poisoned"
+        );
+        let answer = all_paths();
+        assert!(answer.ok, "an unrelated catalogue call afterwards answers normally");
+        assert_eq!(answer.paths, vec!["/slice-f/r2b/kept.jpg".to_string()]);
+    }
+
+    // ------------------------------------------------------------------
+    // R3 — the R-69 window: `face_observation_pairs_for_ids` on a poisoned
+    // lock, then the checked search.
+    // ------------------------------------------------------------------
+    #[test]
+    fn r3_the_r69_window_answers_on_a_poisoned_lock()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("r3");
+        let _installed = installed(&fixture, conn);
+        poison_catalogue_lock();
+
+        let ids: std::collections::HashSet<i64> = [1_i64, 2].into_iter().collect();
+        let pairs = std::panic::catch_unwind(|| face_observation_pairs_for_ids(&ids));
+        assert!(pairs.is_ok(), "R-69's widest window must not panic on a poisoned lock");
+        assert!(pairs.unwrap().is_empty(), "no such observations: an empty set");
+
+        poison_catalogue_lock();
+        let search = std::panic::catch_unwind(||
+        {
+            futures::executor::block_on(face_embedding_search_checked(
+                vec![1],
+                Vec::new(),
+                MODEL.to_string(),
+                PREPROCESSING.to_string(),
+                0.5,
+                10,
+            ))
+        });
+        assert!(search.is_ok(), "the checked search yields a RESULT, not a crash");
+        let answer = all_paths();
+        assert!(answer.ok, "and the catalogue API answers afterwards");
+    }
+
+    // ------------------------------------------------------------------
+    // R3b — R-69 END TO END: Find This Person's spawned search panics UNDER
+    // the catalogue lock on a face-runtime worker (the widest window).
+    // ------------------------------------------------------------------
+    #[test]
+    fn r3b_a_worker_panic_in_the_face_search_is_reported_and_the_next_call_answers()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("r3b");
+        let image_id = insert_image(&conn, "/slice-f/r3b/face.jpg");
+        let _installed = installed(&fixture, conn);
+
+        // One stored embedding, so the search reaches `face_observation_pairs_for_ids`.
+        let stored = FACE_EMBEDDING_RUNTIME.block_on(upsert_face_embeddings_impl(vec![
+            FaceEmbeddingVectorRecord
+            {
+                face_observation_id: 1,
+                image_id,
+                analyzed_image_id: image_id,
+                face_index: 0,
+                model_name: "slice-f".to_string(),
+                model_version: MODEL.to_string(),
+                preprocessing_version: PREPROCESSING.to_string(),
+                input_size: 112,
+                color_order: "RGB".to_string(),
+                normalization: "none".to_string(),
+                embedding_dimension: 4,
+                embedding_l2_norm: 1.0,
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+            },
+        ]));
+        assert_eq!(stored.status, "stored", "fixture: {}", stored.message);
+
+        let recovered_before = census(CATALOGUE_LOCK_RECOVERED_SITE);
+        FACE_WORKER_LOCK_PANIC_ARMED.store(true, Ordering::SeqCst);
+        let result = futures::executor::block_on(face_embedding_search_checked(
+            vec![1],
+            Vec::new(),
+            MODEL.to_string(),
+            PREPROCESSING.to_string(),
+            0.5,
+            10,
+        ));
+        assert!(
+            !FACE_WORKER_LOCK_PANIC_ARMED.load(Ordering::SeqCst),
+            "vacuity guard: the injected panic must actually have fired under the lock"
+        );
+        assert!(!result.ok, "the search REPORTS the panic (ok: false) — it does not look empty");
+        assert!(
+            result.error_message.as_deref().unwrap_or("").contains("face_embedding_search: task"),
+            "the JoinError arm carries the reason: {:?}",
+            result.error_message
+        );
+        assert!(CATALOGUE.lock().is_err(), "the worker's panic DID poison the lock");
+
+        // ⭐ R-69's decoupled crash: the NEXT, unrelated catalogue call.
+        let answer = all_paths();
+        assert!(answer.ok, "the next unrelated catalogue call answers normally");
+        assert_eq!(answer.paths, vec!["/slice-f/r3b/face.jpg".to_string()]);
+        assert_eq!(census(CATALOGUE_LOCK_RECOVERED_SITE) - recovered_before, 1);
+    }
+
+    // ------------------------------------------------------------------
+    // R4 — the face runtime DEGRADES (L2), in the ruled shapes.
+    // ------------------------------------------------------------------
+    fn always_fails() -> std::io::Result<tokio::runtime::Runtime>
+    {
+        Err(std::io::Error::other("slice F test: simulated fd exhaustion"))
+    }
+
+    fn panics_like_thread_exhaustion() -> std::io::Result<tokio::runtime::Runtime>
+    {
+        panic!("OS can't spawn worker thread: slice F test: simulated thread exhaustion")
+    }
+
+    static FLAKY_BUILDS: AtomicU32 = AtomicU32::new(0);
+
+    fn fails_once_then_builds() -> std::io::Result<tokio::runtime::Runtime>
+    {
+        if FLAKY_BUILDS.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            return Err(std::io::Error::other("slice F test: the first build fails"));
+        }
+        tokio::runtime::Builder::new_current_thread().enable_all().build()
+    }
+
+    fn override_runtime(build: fn() -> std::io::Result<tokio::runtime::Runtime>)
+    {
+        let slot: &'static once_cell::sync::OnceCell<tokio::runtime::Runtime> =
+            Box::leak(Box::new(once_cell::sync::OnceCell::new()));
+        FACE_EMBEDDING_RUNTIME_OVERRIDE.with(|entry| entry.set(Some((slot, build))));
+    }
+
+    #[test]
+    fn r4_an_unbuildable_face_runtime_degrades_every_face_operation()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("r4");
+        let image_id = insert_image(&conn, "/slice-f/r4/face.jpg");
+        let _installed = installed(&fixture, conn);
+
+        // (a) the accessor: an io::Error build is an Err naming the runtime.
+        override_runtime(always_fails);
+        let direct = std::panic::catch_unwind(|| face_embedding_runtime("slice_f_r4.face_runtime_unavailable.query_failed"));
+        let direct = direct.expect("the accessor must NOT panic on a failed build");
+        let reason = direct.expect_err("a failed build is an Err");
+        assert!(reason.contains("face embedding runtime is unavailable"), "{}", reason);
+        assert!(reason.contains("simulated fd exhaustion"), "{}", reason);
+
+        // (b) tokio's OWN panic (blocking/pool.rs, thread exhaustion) is an Err too.
+        override_runtime(panics_like_thread_exhaustion);
+        let panicked = std::panic::catch_unwind(|| face_embedding_runtime("slice_f_r4.face_runtime_unavailable.query_failed"))
+            .expect("a PANICKING build must not escape the accessor");
+        let reason = panicked.expect_err("a panicking build is an Err");
+        assert!(reason.contains("building it panicked"), "{}", reason);
+        assert!(reason.contains("OS can't spawn worker thread"), "{}", reason);
+
+        // (c) every face FFI degrades in its OWN existing shape — and it is L2
+        //     that degraded it, not L3 catching a panic: no panic census moves.
+        override_runtime(always_fails);
+        let l3_sites = [
+            "upsert_face_embeddings.panic.query_failed",
+            "face_embedding_search_checked.panic.query_failed",
+            "face_embedding_search_vector_checked.panic.query_failed",
+            "face_embedding_missing_observation_page.panic.query_failed",
+            "retry_pending_face_vector_deletes.panic.query_failed",
+        ];
+        let l3_before: Vec<u64> = l3_sites.iter().map(|site| census(site)).collect();
+        let unavailable_before = census("upsert_face_embeddings.face_runtime_unavailable.query_failed");
+
+        let upsert = futures::executor::block_on(upsert_face_embeddings(Vec::new()));
+        assert_eq!(upsert.status, "store_failed", "ruling 20: the EXISTING store_failed status");
+        assert!(upsert.message.contains("face embedding runtime"), "{}", upsert.message);
+        assert_eq!(
+            census("upsert_face_embeddings.face_runtime_unavailable.query_failed") - unavailable_before,
+            1,
+            "an unavailable runtime leaves a durable record under the caller's site"
+        );
+
+        let search = futures::executor::block_on(face_embedding_search_checked(
+            vec![1],
+            Vec::new(),
+            MODEL.to_string(),
+            PREPROCESSING.to_string(),
+            0.5,
+            10,
+        ));
+        assert!(!search.ok);
+        assert!(search.error_message.as_deref().unwrap_or("").contains("face embedding runtime"));
+
+        let vector_search = futures::executor::block_on(face_embedding_search_vector_checked(
+            vec![1.0, 0.0, 0.0, 0.0],
+            Vec::new(),
+            MODEL.to_string(),
+            PREPROCESSING.to_string(),
+            0.5,
+            10,
+        ));
+        assert!(!vector_search.ok);
+
+        let work_set = futures::executor::block_on(face_embedding_missing_observation_page(
+            ALGORITHM.to_string(),
+            MODEL.to_string(),
+            PREPROCESSING.to_string(),
+            0,
+        ));
+        assert!(!work_set.store_ok);
+        assert!(work_set.observations.is_empty(), "an EMPTY list, never \"everything is missing\"");
+        let store_error = work_set.store_error.unwrap_or_default();
+        assert!(
+            store_error.starts_with("face_embedding_missing_observations: embedding task"),
+            "the prefix the Swift classifier reads as the index half: {}",
+            store_error
+        );
+
+        let retry = futures::executor::block_on(retry_pending_face_vector_deletes());
+        assert!(matches!(retry.status, FaceVectorDeleteRetryStatus::Failed), "no new enum case");
+        assert!(retry.message.contains("face embedding runtime"), "{}", retry.message);
+
+        let menu = futures::executor::block_on(face_recognition_menu_states(
+            vec![image_id],
+            ALGORITHM.to_string(),
+            MODEL.to_string(),
+            PREPROCESSING.to_string(),
+        ));
+        assert_eq!(menu.len(), 1);
+        assert!(menu[0].store_unavailable, "the menu says the store could not be read");
+
+        assert_eq!(
+            futures::executor::block_on(face_embedding_count(MODEL.to_string(), PREPROCESSING.to_string())),
+            0
+        );
+        assert!(futures::executor::block_on(face_embedding_nearest_neighbors(
+            MODEL.to_string(),
+            PREPROCESSING.to_string(),
+            5,
+        ))
+        .is_empty());
+        let canonical = futures::executor::block_on(canonicalize_face_embeddings());
+        assert!(canonical.vector_delete_failed, "fail CLOSED — the one-shot Swift flag cannot latch");
+        assert_eq!(futures::executor::block_on(backup_manifest_counts()).face_embedding_count, 0);
+
+        let l3_after: Vec<u64> = l3_sites.iter().map(|site| census(site)).collect();
+        assert_eq!(
+            l3_after, l3_before,
+            "L2 must DEGRADE these calls — none of them may have been rescued by L3 catching a panic"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // R5 — the runtime no longer poisons itself: a later attempt succeeds.
+    // ------------------------------------------------------------------
+    #[test]
+    fn r5_a_failed_runtime_build_is_retried_not_cached()
+    {
+        let _serial = serial();
+        FLAKY_BUILDS.store(0, Ordering::SeqCst);
+        override_runtime(fails_once_then_builds);
+        let _reset = Installed;
+
+        let first = face_embedding_runtime("slice_f_r5.face_runtime_unavailable.query_failed");
+        assert!(first.is_err(), "the first build fails");
+        let second = face_embedding_runtime("slice_f_r5.face_runtime_unavailable.query_failed");
+        let runtime = second.expect("⭐ W1-2: a LATER attempt succeeds — the failure was not cached");
+        let third = face_embedding_runtime("slice_f_r5.face_runtime_unavailable.query_failed")
+            .expect("and the built runtime is kept");
+        assert!(std::ptr::eq(runtime, third), "one runtime, reused");
+        assert_eq!(FLAKY_BUILDS.load(Ordering::SeqCst), 2, "built once after the one failure");
+        assert_eq!(runtime.block_on(async { 41 + 1 }), 42, "and it runs work");
+    }
+
+    // ------------------------------------------------------------------
+    // R6 + R7 — ⭐ the boundary CATCHES, through every wrapped FFI function,
+    // and leaves a durable census record. The injected panic fires at the
+    // first probe point the call reaches on this thread — under the catalogue
+    // lock, or in the face-runtime accessor — i.e. INSIDE the body.
+    // ------------------------------------------------------------------
+    fn caught<T>(site: &str, point: u32, call: impl FnOnce() -> T) -> T
+    {
+        let before = census(site);
+        arm_probe_at(point);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call));
+        let disarmed = FFI_PANIC_PROBE_COUNTDOWN.with(|countdown| countdown.replace(0));
+        let value = outcome.unwrap_or_else(|_| {
+            panic!("R6 `{}`: the panic ESCAPED the FFI boundary — this would kill the app", site)
+        });
+        assert_eq!(disarmed, 0, "R6 `{}`: vacuity guard — the injected panic never fired", site);
+        assert_eq!(census(site) - before, 1, "R7 `{}`: the caught panic leaves ONE census record", site);
+        value
+    }
+
+    fn says_injected(text: &str) -> bool
+    {
+        text.contains(INJECTED)
+    }
+
+    #[test]
+    fn r6_every_wrapped_ffi_function_reports_a_panic_instead_of_dying()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("r6");
+        let backup = fixture.dir.join("backup-catalogue.db");
+        let _installed = installed(&fixture, conn);
+
+        let r = caught("get_file_paths_for_filters.panic.query_failed", 1, all_paths);
+        assert!(!r.ok && says_injected(r.error_message.as_deref().unwrap_or("")), "{:?}", r.error_message);
+
+        let r = caught("filter_uncatalogued_paths.panic.query_failed", 1, ||
+            futures::executor::block_on(filter_uncatalogued_paths(vec!["/slice-f/x.jpg".to_string()])));
+        assert!(!r.ok && r.paths.is_empty() && says_injected(r.error_message.as_deref().unwrap_or("")));
+
+        let r = caught("file_paths_in_directory.panic.query_failed", 1, ||
+            futures::executor::block_on(file_paths_in_directory("/slice-f".to_string())));
+        assert!(!r.ok && says_injected(r.error_message.as_deref().unwrap_or("")));
+
+        let r = caught("relocate_file_path_prefix.panic.query_failed", 1, ||
+            futures::executor::block_on(relocate_file_path_prefix("/a".to_string(), "/b".to_string())));
+        assert!(!r.ok && r.updated == 0 && says_injected(&r.message), "{}", r.message);
+        assert!(r.message.starts_with("PhotoLibrarian hit an internal error"), "{}", r.message);
+
+        let r = caught("apple_shared_album_cleanup_targets.panic.query_failed", 1, ||
+            futures::executor::block_on(apple_shared_album_cleanup_targets(
+                "/L.photoslibrary/originals/".to_string(),
+            )));
+        assert!(!r.ok && r.image_ids.is_empty() && says_injected(r.error_message.as_deref().unwrap_or("")));
+
+        let r = caught("apple_shared_album_dependent_census.panic.query_failed", 1, ||
+            futures::executor::block_on(apple_shared_album_dependent_census(vec![1, 2])));
+        assert!(!r.ok, "fail CLOSED: the caller deletes nothing");
+        assert!(says_injected(r.error_message.as_deref().unwrap_or("")));
+
+        let r = caught("focus_analysis_candidate_page.panic.query_failed", 1, ||
+            futures::executor::block_on(focus_analysis_candidate_page(
+                10,
+                ALGORITHM.to_string(),
+                "run".to_string(),
+            )));
+        assert!(!r.query_ok && r.candidates.is_empty() && says_injected(r.query_error.as_deref().unwrap_or("")));
+
+        let r = caught("focus_analysis_candidate_page_for_ids.panic.query_failed", 1, ||
+            futures::executor::block_on(focus_analysis_candidate_page_for_ids(
+                vec![1],
+                10,
+                ALGORITHM.to_string(),
+                "run".to_string(),
+            )));
+        assert!(!r.query_ok && says_injected(r.query_error.as_deref().unwrap_or("")));
+
+        let r = caught("update_focus_analysis_results.panic.query_failed", 1, ||
+            futures::executor::block_on(update_focus_analysis_results(vec![FocusAnalysisResult
+            {
+                id: 1,
+                focus_score: None,
+                focus_basis: None,
+                algorithm_version: ALGORITHM.to_string(),
+                analysis_run_id: "run".to_string(),
+                status: "failed".to_string(),
+                focus_human_score: None,
+                focus_animal_score: None,
+                focus_foreground_score: None,
+                focus_saliency_score: None,
+                focus_animal_pose_score: None,
+                focus_whole_image_score: None,
+                face_count: None,
+                face_quality_best: None,
+                face_quality_average: None,
+                face_quality_min: None,
+                face_eyes_open_count: None,
+                face_blink_risk_count: None,
+                auto_keywords: Vec::new(),
+                face_observations: Vec::new(),
+            }])));
+        assert_eq!(r.failure_stage.as_deref(), Some("catalogue"), "an EXISTING stage the runner reads as failure");
+        assert_eq!(r.updated, 0);
+        assert!(says_injected(r.failed_reason.as_deref().unwrap_or("")));
+
+        let r = caught("accept_face_cluster_as_person.panic.query_failed", 1, ||
+            futures::executor::block_on(accept_face_cluster_as_person("run".to_string(), 1, "Ada".to_string())));
+        assert_eq!(r.status, "failed", "an EXISTING failure status");
+        assert!(says_injected(&r.message));
+
+        let r = caught("assign_face_observations_to_person.panic.query_failed", 1, ||
+            futures::executor::block_on(assign_face_observations_to_person(vec![1], "Ada".to_string())));
+        assert_eq!(r.status, "failed");
+        assert!(says_injected(&r.message));
+
+        let r = caught("assign_face_search_matches_to_person.panic.query_failed", 1, ||
+            futures::executor::block_on(assign_face_search_matches_to_person(
+                Vec::new(),
+                "Ada".to_string(),
+                MODEL.to_string(),
+                PREPROCESSING.to_string(),
+                0.5,
+            )));
+        assert_eq!(r.status, "failed", "Swift reads anything but `assigned` as failure");
+        assert!(says_injected(&r.message));
+
+        let r = caught("merge_lightroom_records.panic.query_failed", 1, ||
+            futures::executor::block_on(merge_lightroom_records(vec![image_metadata("/slice-f/lr.jpg")])));
+        assert_eq!(r.failed_rows, 1, "the whole chunk is reported as not merged");
+        assert!(r.image_ids.is_empty() && says_injected(r.failure_message.as_deref().unwrap_or("")));
+
+        let r = caught("merge_lightroom_videos.panic.query_failed", 1, ||
+            futures::executor::block_on(merge_lightroom_videos(vec![LightroomVideoRecord
+            {
+                file_path: "/slice-f/lr.mov".to_string(),
+                file_size: 10,
+                file_name: "lr.mov".to_string(),
+                file_extension: Some("mov".to_string()),
+                created_timestamp: 0,
+                modified_timestamp: 0,
+                capture_datetime: None,
+                pixel_width: None,
+                pixel_height: None,
+                duration_seconds: None,
+                frame_rate: None,
+                has_audio: None,
+                video_kind: None,
+                rating: None,
+                flag: None,
+                color_label: None,
+            }])));
+        assert_eq!(r.failed_rows, 1);
+        assert!(says_injected(r.failure_message.as_deref().unwrap_or("")));
+
+        let r = caught("upsert_editor_saved_image.panic.query_failed", 1, ||
+            futures::executor::block_on(upsert_editor_saved_image(image_metadata("/slice-f/edit.jpg"), true)));
+        assert!(matches!(r.status, EditorSavedImageCatalogueStatus::Failed));
+        assert!(says_injected(&r.message), "{}", r.message);
+
+        let r = caught("merge_catalogue_from_backup.panic.query_failed", 1, ||
+            futures::executor::block_on(merge_catalogue_from_backup(
+                backup.to_string_lossy().to_string(),
+                String::new(),
+                MergeCollisionPolicy::CurrentWins,
+            )));
+        assert!(!r.succeeded && says_injected(&r.message), "{}", r.message);
+        // …and a panic in step 3's synchronous start (probe point 2, the runtime
+        // accessor) AFTER the SQL merge committed: 0 vectors copied, and the
+        // committed merge is NOT reported as a failure.
+        let r = caught("merge_catalogue_from_backup.panic.query_failed", 2, ||
+            futures::executor::block_on(merge_catalogue_from_backup(
+                backup.to_string_lossy().to_string(),
+                String::new(),
+                MergeCollisionPolicy::CurrentWins,
+            )));
+        assert!(r.succeeded, "the merge COMMITTED; a failed vector copy is non-fatal: {}", r.message);
+        assert_eq!(r.face_embeddings_copied, 0);
+
+        let r = caught("upsert_face_embeddings.panic.query_failed", 1, ||
+            futures::executor::block_on(upsert_face_embeddings(Vec::new())));
+        assert_eq!(r.status, "store_failed");
+        assert!(says_injected(&r.message));
+
+        let r = caught("face_embedding_search_checked.panic.query_failed", 1, ||
+            futures::executor::block_on(face_embedding_search_checked(
+                vec![1],
+                Vec::new(),
+                MODEL.to_string(),
+                PREPROCESSING.to_string(),
+                0.5,
+                10,
+            )));
+        assert!(!r.ok && says_injected(r.error_message.as_deref().unwrap_or("")));
+
+        let r = caught("face_embedding_search_vector_checked.panic.query_failed", 1, ||
+            futures::executor::block_on(face_embedding_search_vector_checked(
+                vec![1.0, 0.0, 0.0, 0.0],
+                Vec::new(),
+                MODEL.to_string(),
+                PREPROCESSING.to_string(),
+                0.5,
+                10,
+            )));
+        assert!(!r.ok && says_injected(r.error_message.as_deref().unwrap_or("")));
+
+        // The work set — BOTH boundaries: the runtime half (probe point 1)…
+        let r = caught("face_embedding_missing_observation_page.panic.query_failed", 1, ||
+            futures::executor::block_on(face_embedding_missing_observation_page(
+                ALGORITHM.to_string(),
+                MODEL.to_string(),
+                PREPROCESSING.to_string(),
+                0,
+            )));
+        assert!(!r.store_ok && r.observations.is_empty());
+        let error = r.store_error.unwrap_or_default();
+        assert!(error.starts_with("face_embedding_missing_observations: embedding task"), "{}", error);
+        assert!(says_injected(&error));
+        // …and the catalogue half (probe point 2, under the catalogue lock).
+        let r = caught("face_embedding_missing_observation_page.panic.query_failed", 2, ||
+            futures::executor::block_on(face_embedding_missing_observation_page(
+                ALGORITHM.to_string(),
+                MODEL.to_string(),
+                PREPROCESSING.to_string(),
+                0,
+            )));
+        assert!(!r.store_ok && r.observations.is_empty());
+        let error = r.store_error.unwrap_or_default();
+        assert!(error.starts_with("face_embedding_missing_observations: query"), "{}", error);
+        assert!(says_injected(&error));
+
+        // The retry — the spawn segment (point 1)…
+        let r = caught("retry_pending_face_vector_deletes.panic.query_failed", 1, ||
+            futures::executor::block_on(retry_pending_face_vector_deletes()));
+        assert!(matches!(r.status, FaceVectorDeleteRetryStatus::Failed));
+        assert!(says_injected(&r.message));
+        // …and its failure arm's R-26 re-lock (point 2, reached because the
+        // runtime could not start).
+        override_runtime(always_fails);
+        let r = caught("retry_pending_face_vector_deletes.panic.query_failed", 2, ||
+            futures::executor::block_on(retry_pending_face_vector_deletes()));
+        assert!(matches!(r.status, FaceVectorDeleteRetryStatus::Failed));
+        assert!(says_injected(&r.message) && r.message.contains("face embedding runtime"), "{}", r.message);
+        FACE_EMBEDDING_RUNTIME_OVERRIDE.with(|entry| entry.set(None));
+
+        // After all of that, the catalogue answers normally.
+        let answer = all_paths();
+        assert!(answer.ok, "the process is alive and the catalogue answers: {:?}", answer.error_message);
+    }
+
+    // ------------------------------------------------------------------
+    // R8 — a boundary, not a retry.
+    // ------------------------------------------------------------------
+    #[test]
+    fn r8_the_boundary_runs_the_body_once_and_the_handler_at_most_once()
+    {
+        let body_runs = std::cell::Cell::new(0);
+        let handler_runs = std::cell::Cell::new(0);
+
+        let value = ffi_panic_boundary(
+            "slice_f_r8.panic.query_failed",
+            || { body_runs.set(body_runs.get() + 1); 7 },
+            |_| { handler_runs.set(handler_runs.get() + 1); 0 },
+        );
+        assert_eq!((value, body_runs.get(), handler_runs.get()), (7, 1, 0), "no panic: no handler");
+
+        let value = ffi_panic_boundary(
+            "slice_f_r8.panic.query_failed",
+            || -> i32 { body_runs.set(body_runs.get() + 1); panic!("slice F test: r8 static") },
+            |message| { handler_runs.set(handler_runs.get() + 1); assert_eq!(message, "slice F test: r8 static"); 9 },
+        );
+        assert_eq!((value, body_runs.get(), handler_runs.get()), (9, 2, 1), "exactly once each");
+
+        let value = ffi_panic_boundary(
+            "slice_f_r8.panic.query_failed",
+            || -> i32 { panic!("slice F test: r8 {}", "formatted") },
+            |message| { assert_eq!(message, "slice F test: r8 formatted"); 3 },
+        );
+        assert_eq!(value, 3, "a String payload is recovered too");
+
+        let value = ffi_panic_boundary(
+            "slice_f_r8.panic.query_failed",
+            || -> i32 { std::panic::panic_any(42_u8) },
+            |message| { assert_eq!(message, "unknown panic"); 4 },
+        );
+        assert_eq!(value, 4, "an opaque payload is reported, never re-raised");
+    }
+
+    // ------------------------------------------------------------------
+    // R9 — the catalogue-PATH lock (every face call's `face_embedding_store_uri`).
+    // ------------------------------------------------------------------
+    #[test]
+    fn r9_a_poisoned_catalogue_path_lock_is_recovered()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("r9");
+        let _installed = installed(&fixture, conn);
+        poison_catalogue_path_lock();
+
+        let before = census(CATALOGUE_PATH_LOCK_RECOVERED_SITE);
+        let uri = std::panic::catch_unwind(face_embedding_store_uri)
+            .expect("the path lock must not panic once poisoned");
+        let expected = fixture.dir.join("vectors.lancedb").to_string_lossy().to_string();
+        assert_eq!(uri, Some(expected), "the recovered value is the installed path");
+        assert_eq!(census(CATALOGUE_PATH_LOCK_RECOVERED_SITE) - before, 1);
+        assert!(CATALOGUE_PATH.lock().is_ok(), "and the poison is cleared");
+    }
+
+    // ------------------------------------------------------------------
+    // R10 — the recovery doc's claim about temp tables, executed on the
+    // bundled engine: one created INSIDE a transaction is gone after ROLLBACK
+    // (the `plcanon_map` shape).
+    // ------------------------------------------------------------------
+    #[test]
+    fn r10_a_temp_table_created_inside_a_rolled_back_transaction_is_gone()
+    {
+        let (_fixture, conn) = fresh_catalogue("r10");
+        conn.execute_batch("BEGIN TRANSACTION; CREATE TEMP TABLE slice_f_probe AS SELECT 1 AS x;")
+            .expect("begin + temp table");
+        conn.execute_batch("ROLLBACK;").expect("rollback");
+        assert!(
+            conn.query_row("SELECT COUNT(*) FROM slice_f_probe", [], |row| row.get::<_, i64>(0)).is_err(),
+            "the rollback removed the temp table"
+        );
+        // And a ROLLBACK on a clean connection errors harmlessly (the recovery
+        // ignores it), leaving the connection usable.
+        assert!(conn.execute_batch("ROLLBACK;").is_err());
+        conn.execute_batch("BEGIN TRANSACTION; COMMIT;").expect("the connection is usable");
+    }
+
+    // ------------------------------------------------------------------
+    // P6 — N-2's positional census map stays six wide (`counts[0..5]` in
+    // `apple_shared_album_dependent_census_impl`). N-2's own
+    // `census_counts_every_dependent_table_including_the_twin_columns`
+    // pins the mapping; this names the failure.
+    // ------------------------------------------------------------------
+    #[test]
+    fn p6_the_apple_cleanup_dependent_tables_stay_six_wide()
+    {
+        assert_eq!(
+            APPLE_CLEANUP_DEPENDENT_TABLES.len(),
+            6,
+            "`apple_shared_album_dependent_census_impl` reads counts[0]…counts[5] positionally"
+        );
     }
 }

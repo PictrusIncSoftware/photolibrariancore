@@ -40,7 +40,46 @@ The guard that actually catches it is the assertion
 added in fix round 1: it re-extracts the batch from `lib.rs` at the same two
 boundaries this README's recipe cuts at and compares it to the
 `is_identity_control` vintage's DDL. Move the batch without adding a fixture and
-that test goes red naming the four things to do.
+that test goes red naming the five things to do — ⚠️ the fifth, added by slice B
+(S184), is the one the original four-step advice missed: the OLD identity
+control's own `#[test]` asserts the flag, so its `v.is_identity_control`
+assertion must MOVE into the new row's test when the flag moves. If ONLY comments
+or whitespace moved, this is not a new schema STATE (the fingerprint recipe
+strips both — see `b8ea0a6`→`09834a6`): after committing, re-extract the
+identity control from the NEW commit's blob into `<newsha>.sql` and re-point the
+identity control's `VINTAGES` row, rather than adding a duplicate state or
+editing a frozen fixture.
+
+### ⭐ A new schema state before its commit exists — `PENDING-<slice>.sql`
+
+A fixture can never be named for the commit that carries it: adding the file
+changes that commit's sha. So a slice that moves the schema batch lands its
+identity control as **`PENDING-<slice>.sql`**, cut from the WORKING TREE's
+`lib.rs` at this README's own two boundaries, with a `VINTAGES` row whose
+`commit:` is `"PENDING-<slice>"`. Every commit stays green; the detector stays
+live (any further batch edit turns it red against the pending file). Until the
+commit exists the pending file is the WORKING TREE's cut, so a further batch edit
+in the same uncommitted work — even a comment — is answered by RE-CUTTING it by
+the same recipe (slice B's fix round 2 did exactly that); once committed it is
+frozen like every other fixture.
+
+**The post-commit act — after Richard commits, exactly this and nothing more:**
+
+```sh
+cd photolibrariancore
+c=$(git rev-parse --short=7 HEAD)                   # the commit that carries the batch
+git show "${c}:src/lib.rs" > /tmp/new-lib.rs        # ⚠️ ${c}: — trap 2 below
+s=$(grep -n 'let schema = r#"' /tmp/new-lib.rs | head -1 | cut -d: -f1)
+e=$(awk -v st="$s" 'NR>st && /^[[:space:]]*"#;[[:space:]]*$/ {print NR; exit}' /tmp/new-lib.rs)
+sed -n "$((s+1)),$((e-1))p" /tmp/new-lib.rs | diff - src/schema_fixtures/PENDING-B.sql   # MUST be empty
+```
+
+then rename `src/schema_fixtures/PENDING-B.sql` → `src/schema_fixtures/${c}.sql`
+(no byte changes) and change V7's row in `VINTAGES` — `commit: "PENDING-B"` and
+`include_str!("schema_fixtures/PENDING-B.sql")` — to that sha; update the V7 line
+of the table and the sha list below. A non-empty `diff` means the batch moved
+after the pending file was cut: that is a new state, handled as one, never by
+editing the pending file to match.
 
 ## Provenance — reproduce any file byte-for-byte
 
@@ -78,14 +117,17 @@ until S111 (`8193d5d`, 2026-07-03), and restore gates
 `manifest.formatVersion <= 1`; the launch path cannot see anything older (S114
 renamed the bundle ID, S127 was a fresh-catalogue production baseline).
 Fingerprinting **every** commit that touched the batch collapses the
-post-2026-07-03 window into **six** distinct states, V1…V6.
+post-2026-07-03 window into **six** distinct committed states, V1…V6; **V7** is
+the working tree's (slice B, S184 — provisional name until its commit).
 
 ⚠️ **NARROWED in fix round 1 (2026-09-25, reviewer finding K-F1).** This section
 used to say "the reachable window opens on 2026-07-03". ⛔ **That does not
 follow.** 2026-07-03 is when a backup could first be **taken**, not the earliest
-schema a backup can **hold**: a ZIP taken in the 2026-07-03 → 2026-07-22 window
-(after S111 began backups, before S127's fresh-catalogue baseline) contains a
-catalogue whose tables were **CREATED** in May or June 2026. V1…V6 each model a
+schema a backup can **hold**: a ZIP taken between S111 (2026-07-03) and S114's
+bundle rename (~2026-07-09, which gave every machine a fresh empty container)
+holds a catalogue whose tables were **CREATED** in May or June 2026 — and so does
+any later archive taken after a **full-replace restore** of such a ZIP, which is
+what keeps the class reachable past S114. V1…V6 each model a
 catalogue *born* at their own state, so the June-born-and-migrated-forward shape
 a real archive of that window has was modelled by nothing — which is why
 `4599235` (tier 3) and `b3f9998` (genesis) are in the set and why neither is
@@ -112,13 +154,14 @@ cannot happen.
 
 | tag | file | commit | date | lines | bytes | tables | live retired indexes | note |
 |---|---|---|---|---|---|---|---|---|
-| **V1** | `8193d5d.sql` | `8193d5d` | 2026-07-03 | 614 | 36332 | 15 | 14 | the first reachable vintage — S111, backups begin. ⚠️ The DDL state itself originates at `a9300ac` (2026-06-25) and is byte-identical there; the file is named for the S111 commit because that is the earliest vintage a **backup** can hold. |
+| **V1** | `8193d5d.sql` | `8193d5d` | 2026-07-03 | 614 | 36332 | 15 | 14 | the first reachable vintage — S111, backups begin. ⚠️ The DDL state itself originates at `a9300ac` (2026-06-25) as the same schema STATE — fingerprint-identical; the two blobs differ by 18 bytes in one column comment — which is why the fixture is named for `8193d5d` and is byte-exact against `8193d5d`'s blob. |
 | **V2** | `3c5895b.sql` | `3c5895b` | 2026-07-04 | 649 | 38259 | 17 | 14 | operation log |
 | **V3** | `68f88f9.sql` | `68f88f9` | 2026-07-20 | 666 | 39157 | 18 | 14 | |
 | **V4** | `ee9640c.sql` | `ee9640c` | 2026-07-21 | 679 | 40001 | 18 | 14 | `19fedf7` is the same state |
 | **V5** | `b8ea0a6.sql` | `b8ea0a6` | 2026-08-06 | 688 | 40500 | 19 | 14 | `09834a6` (S173, 2026-09-15) is the same state — it changed **Rust**, and only comments and blank lines in the batch |
-| **V6** | `2bc221e.sql` | `2bc221e` | 2026-09-18 | 765 | 45598 | 19 | 0 | S179. **The identity control** — byte-identical to the working tree's batch, so its upgrade must produce ZERO divergence |
-| **T3** | `4599235.sql` | `4599235` | 2026-06-01 | 128 | 7370 | 2 | 0 | ⭐ **tier 3**, added in fix round 1 (K-F1). A catalogue **BORN 2026-06-01** — the shape a real 2026-07-03…07-22 archive holds. The commit that introduced the `keyword` table, so it is the only fixture with a **June-born `keyword`**: nullable `origin` with no default, and no `collection`/`color`/`is_video`. Shows **all five** of R-42's columns at once (13 of the 32 historical states diverge; this is the strongest single choice, and by 2026-06-22 the divergence is gone). |
+| **V6** | `2bc221e.sql` | `2bc221e` | 2026-09-18 | 765 | 45598 | 19 | 0 | S179. The identity control until S184 (its flag and its identity assertion moved to V7) |
+| **V7** | `PENDING-B.sql` | *(pending — renamed to the commit's sha by the post-commit act above)* | 2026-09-26 | 813 | 48210 | 21 | 0 | S184, slice B: the two `removed_image_tombstone*` tables and their index, CREATE-time. **The identity control** — byte-identical to the working tree's batch, so its upgrade must produce ZERO divergence |
+| **T3** | `4599235.sql` | `4599235` | 2026-06-01 | 128 | 7370 | 2 | 0 | ⭐ **tier 3**, added in fix round 1 (K-F1). A catalogue **BORN 2026-06-01** — the shape a real 2026-07-03…~07-09 archive holds. The commit that introduced the `keyword` table, so it is the only fixture with a **June-born `keyword`**: nullable `origin` with no default, and no `collection`/`color`/`is_video`. Shows **all five** of R-42's columns at once (21 of the 32 historical states diverge, 18 of them in R-42's columns alone; this is the strongest single choice, and by 2026-06-22 the divergence is gone). |
 | **G** | `b3f9998.sql` | `b3f9998` | 2026-05-04 | 52 | 1827 | 1 | 0 | **genesis** — ⛔ **not "archival"**: the EXTREME instance of the Restore-reachable class, and the only fixture that can fail the "open returns `Some`" assertion under the S93 mutation. `87f2e93` is the same state. **Do not delete it.** |
 
 `sha256` of each file, for the record:
@@ -132,6 +175,7 @@ ee146d834f1689f605ddd84906c656627c4ba135fdc0abfd2f142c53e3839b24  3c5895b.sql
 e79617a9a3bd17a51f009ecf2eec46356818f069d017266dbe156045a3a1102d  ee9640c.sql
 e0710199517ba3871e479743ce905db7ebf23a16960ee13a016fab3b7eb7c525  b8ea0a6.sql
 b49df4acf4cc9bef312f81fc05491407cf4e13d73992e9198ab570567d3edeb6  2bc221e.sql
+435bd241a6e6a49a05a0b0495e77411348c49de795330ca7d4b8e25fc3619b93  PENDING-B.sql
 ```
 
 ## Why genesis is kept — ⛔ and why it must not be deleted
