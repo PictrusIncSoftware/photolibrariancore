@@ -27,6 +27,21 @@ once_cell = "1.20"
 [build-dependencies]
 uniffi = { version = "0.31", features = ["build"] }
 
+# Sep 28, 2026 (slice K2, ruling 32): TEST-ONLY. The schema-upgrade fixture
+# tests in src/lib.rs re-hash every content-named fixture
+# (src/schema_fixtures/sha256-<12 hex>.sql) to prove its name is the SHA-256
+# of its own bytes. sha2 0.10.9 was already in Cargo.lock (lancedb ->
+# datafusion-functions), so this adds one dev edge to the lock and no crate.
+# default-features = false adds no feature to any build, and a dev-dependency
+# never reaches the release library (resolver 2, edition 2021), so
+# libphotolibrariancore.a is unchanged. The requirement is a caret (`0.10`),
+# not the exact pin the product crates carry: Cargo.lock is the pin (0.10.9
+# today), and a lancedb or datafusion move within 0.10.x unifies with this
+# line untouched. A move to 0.11 would resolve a second sha2 and is answered
+# by moving this line in the same edit.
+[dev-dependencies]
+sha2 = { version = "0.10", default-features = false }
+
 # Sep 26, 2026 (Xcode 27 / macOS 27): never strip build scripts or proc-macros.
 # The release profile strips debuginfo by default; rustc 1.95 does it with its
 # bundled rust-objcopy, which leaves a proc-macro dylib linked by Xcode 27's ld

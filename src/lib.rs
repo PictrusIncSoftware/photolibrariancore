@@ -34722,15 +34722,27 @@ mod schema_upgrade_fixture_tests
         },
     ];
 
-    /// One historical schema state: the schema batch of `commit`, stored
-    /// VERBATIM in `src/schema_fixtures/<commit>.sql`.
+    /// One schema state: a schema batch stored VERBATIM in
+    /// `src/schema_fixtures/<file>`.
     struct Vintage
     {
         tag: &'static str,
-        commit: &'static str,
+        /// PROVENANCE ONLY — the commit whose `src/lib.rs` blob reproduces this
+        /// file byte-for-byte by the README's cut ("Provenance"). `None` for a
+        /// fixture cut from a working tree until someone fills it in: a
+        /// Rust-side edit to this row, never a fixture edit, never a rename.
+        /// For the eight `LEGACY_COMMIT_NAMED_FIXTURES` it is also the name.
+        source_commit: Option<&'static str>,
         date: &'static str,
+        /// The fixture's file name under `src/schema_fixtures/` — the SAME
+        /// literal as the `include_str!` path on the next line; the naming pin
+        /// holds the two together. Ruling 32: the identity control and every
+        /// future fixture are `sha256-<first 12 lowercase hex digits of the
+        /// SHA-256 of the file's own bytes>.sql`, as `shasum -a 256` prints
+        /// them; the eight legacy fixtures keep `<source_commit>.sql`.
+        file: &'static str,
         ddl: &'static str,
-        /// Non-empty for GENESIS only.
+        /// Non-empty for GENESIS and TIER3-4599235 only.
         allowed: &'static [AllowedDivergence],
         /// `true` for the vintage whose DDL is byte-identical to the working
         /// tree's — the identity control. Exactly one vintage carries it.
@@ -34743,8 +34755,9 @@ mod schema_upgrade_fixture_tests
     /// the launch path cannot see anything older (S114 renamed the bundle ID,
     /// S127 was a fresh-catalogue baseline). Fingerprinting every commit that
     /// touched the schema batch collapses the post-2026-07-03 window into SIX
-    /// distinct committed states, V1…V6; V7 is the working tree (slice B's
-    /// removal tombstone, S184 — see its row for the provisional name).
+    /// distinct committed states, V1…V6; V7 is slice B's removal tombstone
+    /// (S184, committed in 5bad24c): the identity control, and the first
+    /// fixture named by its content hash (ruling 32).
     ///
     /// ⚠️ NARROWED in fix round 1 (2026-09-25, reviewer finding K-F1). ⛔ The old
     /// wording, "the reachable window OPENS on 2026-07-03", does **not** follow
@@ -34767,8 +34780,9 @@ mod schema_upgrade_fixture_tests
         Vintage
         {
             tag: "V1",
-            commit: "8193d5d",
+            source_commit: Some("8193d5d"),
             date: "2026-07-03",
+            file: "8193d5d.sql",
             ddl: include_str!("schema_fixtures/8193d5d.sql"),
             allowed: &[],
             is_identity_control: false,
@@ -34776,8 +34790,9 @@ mod schema_upgrade_fixture_tests
         Vintage
         {
             tag: "V2",
-            commit: "3c5895b",
+            source_commit: Some("3c5895b"),
             date: "2026-07-04",
+            file: "3c5895b.sql",
             ddl: include_str!("schema_fixtures/3c5895b.sql"),
             allowed: &[],
             is_identity_control: false,
@@ -34785,8 +34800,9 @@ mod schema_upgrade_fixture_tests
         Vintage
         {
             tag: "V3",
-            commit: "68f88f9",
+            source_commit: Some("68f88f9"),
             date: "2026-07-20",
+            file: "68f88f9.sql",
             ddl: include_str!("schema_fixtures/68f88f9.sql"),
             allowed: &[],
             is_identity_control: false,
@@ -34794,8 +34810,9 @@ mod schema_upgrade_fixture_tests
         Vintage
         {
             tag: "V4",
-            commit: "ee9640c",
+            source_commit: Some("ee9640c"),
             date: "2026-07-21",
+            file: "ee9640c.sql",
             ddl: include_str!("schema_fixtures/ee9640c.sql"),
             allowed: &[],
             is_identity_control: false,
@@ -34803,8 +34820,9 @@ mod schema_upgrade_fixture_tests
         Vintage
         {
             tag: "V5",
-            commit: "b8ea0a6",
+            source_commit: Some("b8ea0a6"),
             date: "2026-08-06",
+            file: "b8ea0a6.sql",
             ddl: include_str!("schema_fixtures/b8ea0a6.sql"),
             allowed: &[],
             is_identity_control: false,
@@ -34812,28 +34830,32 @@ mod schema_upgrade_fixture_tests
         Vintage
         {
             tag: "V6",
-            commit: "2bc221e",
+            source_commit: Some("2bc221e"),
             date: "2026-09-18",
+            file: "2bc221e.sql",
             ddl: include_str!("schema_fixtures/2bc221e.sql"),
             allowed: &[],
             is_identity_control: false,
         },
         // ⭐ V7 — slice B's removal tombstone (S184, 2026-09-26): the two
         // `removed_image_tombstone*` tables and their index, CREATE-time only.
-        // THE IDENTITY CONTROL. ⚠️ PROVISIONAL NAME: a fixture cannot be named
-        // for the commit that carries it (the file moves that commit's sha), so
-        // it lands as `PENDING-B.sql`, extracted from the working tree by the
-        // README's own cut. The ONE post-commit act, after Richard commits:
-        // re-extract from the new commit's blob (it must `diff` clean against
-        // `PENDING-B.sql`), rename the file to `<sha>.sql`, and change this row's
-        // `commit:` and `include_str!` to that sha — no byte of the fixture
-        // changes (README, "The files").
+        // THE IDENTITY CONTROL, and the first fixture named by the SHA-256 of
+        // its own bytes (ruling 32): `shasum -a 256` of the file begins
+        // 435bd241a6e6, and the naming pin re-checks that on every run. Cut
+        // from the working tree as `PENDING-B.sql` (S184), renamed
+        // `5bad24c.sql` once 5bad24c carried it (2026-09-28), then renamed to
+        // its content name by slice K2; no byte has changed since the cut.
+        // The `5bad24c.sql` name lived only in the working tree between those
+        // two acts and never reached a commit: git history shows
+        // `PENDING-B.sql` → `sha256-435bd241a6e6.sql` directly.
+        // `source_commit` is the commit whose blob reproduces it byte-for-byte.
         Vintage
         {
             tag: "V7",
-            commit: "PENDING-B",
+            source_commit: Some("5bad24c"),
             date: "2026-09-26",
-            ddl: include_str!("schema_fixtures/PENDING-B.sql"),
+            file: "sha256-435bd241a6e6.sql",
+            ddl: include_str!("schema_fixtures/sha256-435bd241a6e6.sql"),
             allowed: &[],
             is_identity_control: true,
         },
@@ -34849,8 +34871,9 @@ mod schema_upgrade_fixture_tests
         Vintage
         {
             tag: "TIER3-4599235",
-            commit: "4599235",
+            source_commit: Some("4599235"),
             date: "2026-06-01",
+            file: "4599235.sql",
             ddl: include_str!("schema_fixtures/4599235.sql"),
             allowed: &TIER3_4599235_ALLOW_LIST,
             is_identity_control: false,
@@ -34877,8 +34900,9 @@ mod schema_upgrade_fixture_tests
         Vintage
         {
             tag: "GENESIS",
-            commit: "b3f9998",
+            source_commit: Some("b3f9998"),
             date: "2026-05-04",
+            file: "b3f9998.sql",
             ddl: include_str!("schema_fixtures/b3f9998.sql"),
             allowed: &GENESIS_ALLOW_LIST,
             is_identity_control: false,
@@ -34895,6 +34919,25 @@ mod schema_upgrade_fixture_tests
     /// moved schema batch is
     /// `the_identity_control_fixture_is_byte_identical_to_the_in_tree_schema_batch`.
     const EXPECTED_VINTAGE_COUNT: usize = 9;
+
+    /// ⭐ RULING 32 (2026-09-27) — the ONLY fixtures that keep a COMMIT name,
+    /// because their provenance is real: each reproduces byte-for-byte from its
+    /// own commit's `src/lib.rs` blob (README, "Provenance"). ⛔ CLOSED — never
+    /// add a name here. The identity control and every future fixture are
+    /// `sha256-<12 hex>.sql`, and the naming pin refuses any other commit name.
+    /// Each name carries its file's FULL SHA-256 as `shasum -a 256` prints it
+    /// (the README's list), so the pin also refuses an EDITED legacy fixture —
+    /// K2 fix round 1: a legacy name alone pinned nothing about its bytes.
+    const LEGACY_COMMIT_NAMED_FIXTURES: [(&str, &str); 8] = [
+        ("8193d5d.sql", "2fbc2656cdd314c2215a7bb06d66f71272737faffb1d84475e6f7c9ead9d24f4"),
+        ("3c5895b.sql", "ee146d834f1689f605ddd84906c656627c4ba135fdc0abfd2f142c53e3839b24"),
+        ("68f88f9.sql", "955dcd794bf8c5c3ca7c26f12d1730bd00ee94257da92e17589949e47e80f64d"),
+        ("ee9640c.sql", "e79617a9a3bd17a51f009ecf2eec46356818f069d017266dbe156045a3a1102d"),
+        ("b8ea0a6.sql", "e0710199517ba3871e479743ce905db7ebf23a16960ee13a016fab3b7eb7c525"),
+        ("2bc221e.sql", "b49df4acf4cc9bef312f81fc05491407cf4e13d73992e9198ab570567d3edeb6"),
+        ("4599235.sql", "fe0f2d43a31f465e26eeb945ae63e7d1286e808730546c07edbb844102f5dc75"),
+        ("b3f9998.sql", "9efbd986d28b823d3d49a36c0b3c2a8c747ba39b9b8468348b516eacb6779f01"),
+    ];
 
     /// ⭐ VACUITY GUARD. The fresh reference catalogue carried 259 product
     /// columns when this was written; a floor well under it catches "the
@@ -35036,15 +35079,15 @@ mod schema_upgrade_fixture_tests
     {
         let path = fixture_path(v.tag);
         let old = Connection::open(&path)
-            .unwrap_or_else(|e| panic!("{} ({}): could not create the fixture file: {}", v.tag, v.commit, e));
+            .unwrap_or_else(|e| panic!("{} ({}): could not create the fixture file: {}", v.tag, v.file, e));
         // ⭐ ENGINE TESTS NEVER FETCH — this connection is opened raw, outside
         // `open_and_migrate_catalogue`, so it is fenced here by hand.
         fence_connection_against_extension_fetches(&old);
         old.execute_batch(v.ddl).unwrap_or_else(|e| {
             panic!(
                 "{} ({}, {}): the historical schema batch from \
-                 src/schema_fixtures/{}.sql FAILED to replay: {}",
-                v.tag, v.commit, v.date, v.commit, e
+                 src/schema_fixtures/{} FAILED to replay: {}",
+                v.tag, v.file, v.date, v.file, e
             )
         });
         for row in rows
@@ -35150,7 +35193,7 @@ mod schema_upgrade_fixture_tests
                  existing catalogue (S93), or an additive restore that silently \
                  does nothing. Run with --nocapture: the engine's error is on \
                  stderr above.",
-                v.tag, v.commit, v.date
+                v.tag, v.file, v.date
             )
         });
 
@@ -35287,7 +35330,7 @@ mod schema_upgrade_fixture_tests
         eprintln!(
             "[K-1] {} ({}, {}): fresh = {} column tuples, upgraded = {}, diverged = {}",
             v.tag,
-            v.commit,
+            v.file,
             v.date,
             fresh_shapes.len(),
             upgraded_shapes.len(),
@@ -35310,7 +35353,7 @@ mod schema_upgrade_fixture_tests
                      This is a NEW instance of the R-60 / R-82 / R-96 class (a \
                      CREATE-body edit that never reached an existing catalogue). It is \
                      a FINDING — do not add it to the allow-list to make this green.",
-                    v.tag, v.commit, v.date, key.0, key.1, fresh_side, upgraded_side
+                    v.tag, v.file, v.date, key.0, key.1, fresh_side, upgraded_side
                 )
             });
 
@@ -35325,7 +35368,7 @@ mod schema_upgrade_fixture_tests
                  different divergence, so this is a NEW finding wearing an old entry's \
                  name — do not update the entry to match.",
                 v.tag,
-                v.commit,
+                v.file,
                 key.0,
                 key.1,
                 entry.register_entry
@@ -35360,7 +35403,7 @@ mod schema_upgrade_fixture_tests
                  broken, not the migration — every other green assertion (e) in this \
                  module is therefore meaningless until this is fixed.",
                 v.tag,
-                v.commit,
+                v.file,
                 diverged.len()
             );
         }
@@ -35401,11 +35444,11 @@ mod schema_upgrade_fixture_tests
             let v = vintage(tag);
             assert!(
                 !v.ddl.trim().is_empty(),
-                "VACUITY GUARD FAILED: fixture {} ({}) is EMPTY — src/schema_fixtures/{}.sql \
+                "VACUITY GUARD FAILED: fixture {} ({}) is EMPTY — src/schema_fixtures/{} \
                  did not survive the extraction",
                 tag,
-                v.commit,
-                v.commit
+                v.file,
+                v.file
             );
         }
     }
@@ -35612,8 +35655,8 @@ mod schema_upgrade_fixture_tests
         assert!(
             batch.len() > 10_000,
             "the extracted schema batch is only {} bytes, which cannot be the real \
-             765-line batch — the extraction boundary moved and this detector is now \
-             blind",
+             schema batch (813 lines at V7) — the extraction boundary moved and this \
+             detector is now blind",
             batch.len()
         );
 
@@ -35625,26 +35668,144 @@ mod schema_upgrade_fixture_tests
         assert_eq!(
             batch, control.ddl,
             "⭐ THE IDENTITY CONTROL IS STALE. The in-tree schema batch no longer \
-             matches src/schema_fixtures/{commit}.sql, so this module has NO identity \
+             matches src/schema_fixtures/{file}, so this module has NO identity \
              control and the CURRENT schema state is pinned by no fixture — every \
-             other green assertion (e) here is meaningless until this is fixed. Five \
-             things are needed, and ⛔ editing the frozen fixture is NOT one of them: \
-             (1) extract the new batch into a new src/schema_fixtures/<sha>.sql by \
-             the README's provenance recipe (before the commit exists, a provisional \
-             PENDING-<slice>.sql, renamed after it — the README's post-commit act), \
-             (2) add a VINTAGES row for it carrying is_identity_control, (3) bump \
-             EXPECTED_VINTAGE_COUNT and add its #[test], (4) clear \
-             is_identity_control on {tag}, (5) MOVE {tag}'s `v.is_identity_control` \
-             assertion into the new row's #[test] — {tag}'s own test asserts the flag \
-             and goes red the moment (4) lands. If ONLY comments or whitespace moved, \
-             this is not a new schema STATE (the fingerprint recipe strips both — see \
-             `b8ea0a6`→`09834a6`): after committing, re-extract the identity control \
-             from the NEW commit's blob into `<newsha>.sql` and re-point {tag}'s \
-             `VINTAGES` row, rather than adding a duplicate state or editing a frozen \
-             fixture.",
-            commit = control.commit,
+             other green assertion (e) here is meaningless until this is fixed. \
+             ⛔ Editing or renaming a frozen fixture is NOT the fix. Cut the batch at \
+             the README's two boundaries, `shasum -a 256` it, and save it as \
+             src/schema_fixtures/sha256-<first 12 hex digits of the sum>.sql \
+             (README, 'A new schema state' — no commit is needed and nothing is \
+             renamed afterwards). Then, for a new schema STATE, five things: (1) add \
+             a VINTAGES row for it — file, ddl: include_str!, source_commit: None \
+             (or the commit whose blob it was cut from), is_identity_control: true, \
+             (2) clear is_identity_control on {tag}, (3) MOVE {tag}'s \
+             `v.is_identity_control` assertion into the new row's #[test] — {tag}'s \
+             own test asserts the flag and goes red the moment (2) lands, (4) bump \
+             the VINTAGES array length and EXPECTED_VINTAGE_COUNT and add the new tag \
+             to the vacuity test's tag list, (5) add the README's table row and sha \
+             line. Which act is decided on three schema fingerprints (the README's \
+             fp: comments, whitespace and blank lines stripped) — W the new cut, C \
+             {tag}'s file, H HEAD's batch: only W != H with C == H is a new schema \
+             STATE (the five things above), while W == H (only comments or whitespace \
+             moved — see `b8ea0a6`→`09834a6`) or C != H ({tag} is itself an \
+             uncommitted intermediate, and a state that never reached a commit is not \
+             a vintage) means RE-POINT {tag}'s row — file, include_str!, \
+             source_commit — to the new file and delete the content-named file it \
+             named before, rather than adding a duplicate state or editing a frozen \
+             fixture. Either act ends by rewording whatever still calls the old \
+             control the identity control or quotes its old name (README, 'A new \
+             schema state').",
+            file = control.file,
             tag = control.tag
         );
+    }
+
+    /// ⭐ K2 — RULING 32: EVERY FIXTURE IS PINNED TO ITS BYTES — a content-named
+    /// fixture by the hash in its own name, a legacy fixture by the full SHA-256
+    /// recorded beside its name in the closed `LEGACY_COMMIT_NAMED_FIXTURES`.
+    /// N1 — a row's `file` is the very file its `include_str!` compiled in.
+    /// N2 — a `sha256-` name is 12 lowercase hex digits + `.sql`, and those 12
+    ///      are the first 12 of the SHA-256 of the file's bytes: a mis-named or
+    ///      later-edited file is REFUSED.
+    /// N3 — any other name is one of the eight legacy names, is
+    ///      `<source_commit>.sql`, and its bytes hash to the full SHA-256
+    ///      recorded for it: a NEW commit-named fixture, or an EDITED legacy
+    ///      one, is REFUSED.
+    /// N4 — vacuity: every `VINTAGES` row was checked.
+    /// N5 — every row names a DISTINCT file: two rows on one fixture (a
+    ///      duplicated state, or a row re-pointed at another row's file) are
+    ///      REFUSED.
+    #[test]
+    fn each_fixture_file_is_named_by_its_own_content_hash_or_is_a_legacy_commit_name()
+    {
+        use sha2::{Digest, Sha256};
+
+        let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("schema_fixtures");
+        let is_lower_hex = |s: &str| s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+
+        let mut checked = 0usize;
+        for v in VINTAGES.iter()
+        {
+            // N1
+            let on_disk = std::fs::read(fixture_dir.join(v.file)).unwrap_or_else(|e| {
+                panic!("⭐ K2 NAMING PIN (N1) — {}: src/schema_fixtures/{} cannot be read ({}). \
+                        The row's `file` and its include_str! path have drifted apart, or the \
+                        file is gone.", v.tag, v.file, e)
+            });
+            assert!(on_disk.as_slice() == v.ddl.as_bytes(),
+                "⭐ K2 NAMING PIN (N1) — {}: src/schema_fixtures/{} is not the file this row's \
+                 include_str! compiled in — `file` and the include_str! path name DIFFERENT \
+                 files.", v.tag, v.file);
+
+            // The full SHA-256 of the bytes this row compiled in, as `shasum -a 256`
+            // prints it — N2 checks a content name against it, N3 a legacy sum.
+            let sum: String = Sha256::digest(v.ddl.as_bytes())
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect();
+
+            if let Some(rest) = v.file.strip_prefix("sha256-")
+            {
+                // N2
+                let hex12 = rest.strip_suffix(".sql").unwrap_or("");
+                assert!(hex12.len() == 12 && is_lower_hex(hex12),
+                    "⭐ K2 NAMING PIN (N2) — {}: {} is not sha256-<12 lowercase hex digits>.sql",
+                    v.tag, v.file);
+                assert_eq!(hex12, &sum[..12],
+                    "⭐ K2 NAMING PIN (N2) — {} is named {} but the SHA-256 of its bytes is {} \
+                     (`shasum -a 256` prints the same). The name no longer describes the content, \
+                     so the file is REFUSED. A content-named fixture is frozen: never edit or \
+                     rename it to match. If the schema batch moved, cut a NEW fixture (README, \
+                     'A new schema state').", v.tag, v.file, sum);
+            }
+            else
+            {
+                // N3
+                let recorded = LEGACY_COMMIT_NAMED_FIXTURES
+                    .iter()
+                    .find(|entry| entry.0 == v.file)
+                    .map(|entry| entry.1)
+                    .unwrap_or_else(|| {
+                        panic!("⭐ K2 NAMING PIN (N3) — {}: {} is neither content-named (sha256-<12 hex>.sql) \
+                                nor one of the eight legacy commit-named fixtures. Ruling 32 (2026-09-27): \
+                                every new fixture is named by the SHA-256 of its own bytes — cut it, \
+                                `shasum -a 256` it, name it (README, 'A new schema state'). A commit name is \
+                                never used again.", v.tag, v.file)
+                    });
+                let commit = v.source_commit.unwrap_or("<none>");
+                assert!(commit.len() == 7 && is_lower_hex(commit) && v.file == format!("{}.sql", commit),
+                    "⭐ K2 NAMING PIN (N3) — {}: legacy fixture {} must be named for its own \
+                     source_commit ({}) — its provenance IS that commit's blob.",
+                    v.tag, v.file, commit);
+                assert_eq!(sum.as_str(), recorded,
+                    "⭐ K2 NAMING PIN (N3) — {}: legacy fixture {} has SHA-256 {} (`shasum -a 256` \
+                     prints the same), not the {} recorded for it in LEGACY_COMMIT_NAMED_FIXTURES \
+                     and the README's list. Its bytes are its provenance, so the file is REFUSED: \
+                     never edit a frozen fixture — restore it from its own commit's blob (README, \
+                     'Provenance').", v.tag, v.file, sum, recorded);
+            }
+            checked += 1;
+        }
+
+        // N4
+        assert_eq!(checked, EXPECTED_VINTAGE_COUNT,
+            "VACUITY GUARD FAILED: the naming pin checked {} fixture rows, not \
+             EXPECTED_VINTAGE_COUNT = {} — it is skipping rows", checked, EXPECTED_VINTAGE_COUNT);
+
+        // N5
+        let mut distinct = std::collections::HashSet::new();
+        let repeated: Vec<&str> = VINTAGES
+            .iter()
+            .map(|v| v.file)
+            .filter(|file| !distinct.insert(*file))
+            .collect();
+        assert_eq!(distinct.len(), EXPECTED_VINTAGE_COUNT,
+            "⭐ K2 NAMING PIN (N5) — the VINTAGES rows name {} distinct fixture files for \
+             EXPECTED_VINTAGE_COUNT = {} rows; named more than once: {:?}. Two rows on one file \
+             are one schema state counted twice, or a row pointed at another row's fixture — \
+             each row must own its own file.", distinct.len(), EXPECTED_VINTAGE_COUNT, repeated);
     }
 
     // -----------------------------------------------------------------------
@@ -35835,7 +35996,7 @@ mod schema_upgrade_fixture_tests
                 panic!(
                     "Restore ▸ additive merge: a {} ({}) backup could not be migrated, so \
                      the restore would silently do nothing",
-                    v.tag, v.commit
+                    v.tag, v.file
                 )
             });
             drop(migrated);
