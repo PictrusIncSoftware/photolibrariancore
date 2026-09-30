@@ -271,9 +271,9 @@ b49df4acf4cc9bef312f81fc05491407cf4e13d73992e9198ab570567d3edeb6  2bc221e.sql
 All seven current `images` indexes are over **genesis-era** columns, and every
 vintage from V1 on already carries every column the batch touches — so the S93
 mutation (a `CREATE INDEX` hoisted above the `ALTER` that adds its column) has
-nothing to break in the reachable window. Genesis has **1 table instead of 19**
-and **29 `images` columns instead of 69**, so 40 columns and 18 tables arrive
-through the migration: it is the **broadest** pin on that assertion.
+nothing to break in the reachable window. Genesis has **1 table instead of 21**
+and **29 `images` columns instead of 69** (V7), so 40 columns and 20 tables
+arrive through the migration: it is the **broadest** pin on that assertion.
 **Mutation-proved three times on the same mutation** — the S93 shape over
 `images.is_video` is RED on GENESIS and GREEN on V1…V6 (implementer M1, reviewer
 M-B, fix-round-1 T1).

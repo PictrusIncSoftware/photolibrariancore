@@ -66,14 +66,14 @@ static CATALOGUE_PATH: once_cell::sync::Lazy<Arc<Mutex<Option<PathBuf>>>> =
 // it there could only invent an empty answer that looks like a real one. The
 // boundary has an edge, and that is where it is.
 //
-// ⚠️ Five legacy list-returning twins sit on the caught side of that edge by
+// ⚠️ Four legacy list-returning twins sit on the caught side of that edge by
 // DELEGATION, not by design: each returns its wrapped twin's list, so a panic
 // caught inside the twin reaches it as an EMPTY list — `focus_analysis_candidates`
 // and `focus_analysis_candidates_for_ids` (no photos to analyse),
-// `face_embedding_search` and `face_embedding_search_vector` (no matches) — or,
-// for `face_embedding_missing_observations`, as its "every observation"
-// fallback (a re-read that itself runs outside any boundary). None of the five
-// has a Swift caller; they retire at the sweep's closeout.
+// `face_embedding_search` and `face_embedding_search_vector` (no matches). None
+// of the four has a Swift caller; they retire at the sweep's closeout. (A fifth,
+// the face work set's interim twin, was removed by the closeout act on
+// Sep 30, 2026 — `face_embedding_missing_observation_page` is its only door.)
 
 // ⭐ Layer 3 needs `panic = "unwind"`: under `abort`, `catch_unwind` catches
 // nothing. `Cargo.toml` declares it for release; this turns ANY route to an
@@ -2432,11 +2432,11 @@ fn forced_repair_sql(_probe: MigrationProbeRef<'_>) -> Option<String>
 /// `fence_connection_against_extension_fetches`' own doc block recorded the
 /// hole this closes: every test fixture fenced its connection only AFTER
 /// `open_and_migrate_catalogue` had returned, so the `SELECT version()` probe,
-/// the 765-line schema batch, the S173 repair and the S179 index drops all ran
-/// UNFENCED under `cargo test`. What now holds BY CONSTRUCTION is exactly one
-/// thing: a `cargo test` run can no longer reach a real extension repository
-/// from inside the open path, so the S181 incident cannot recur from the
-/// harness.
+/// the schema batch (813 lines at V7), the S173 repair and the S179 index
+/// drops all ran UNFENCED under `cargo test`. What now holds BY CONSTRUCTION is
+/// exactly one thing: a `cargo test` run can no longer reach a real extension
+/// repository from inside the open path, so the S181 incident cannot recur from
+/// the harness.
 ///
 /// ⚠️ **PRODUCTION IS UNCHANGED** — the `#[cfg(not(test))]` twin immediately
 /// below has an EMPTY body. In the shipped app those same statements are
@@ -12692,7 +12692,8 @@ pub struct FaceObservationWorkSet
 
 /// The CATALOGUE half of the face-index work set, separated out in fix round 1
 /// so both the page and its legacy twin read the same rows through one code
-/// path (HIGH-1 + MEDIUM-1).
+/// path (HIGH-1 + MEDIUM-1). The twin was removed by the closeout act
+/// (Sep 30, 2026); the page is now the only reader.
 struct FaceObservationCandidates
 {
     observations: Vec<FaceObservationRecord>,
@@ -12721,64 +12722,20 @@ fn face_observation_candidates_failure(message: String) -> FaceObservationCandid
     }
 }
 
-/// Return face observations that do not yet have a LanceDB embedding for the
-/// requested model/preprocessing pair. `limit == 0` means no limit.
+/// Slice 7 / R-31 + R-08 — the face observations that do not yet have a
+/// LanceDB embedding for the requested model/preprocessing pair (`limit == 0`
+/// means no limit), carrying the dropped-row count and the reachability of the
+/// work set's two halves. ⛔ On `store_ok == false` the list is EMPTY, never
+/// "everything is missing".
 ///
-/// ⚠️ Slice 7: LEGACY shape, kept so nothing breaks while the Swift halves are
-/// sequenced. It discards the dropped-row count AND the store's reachability.
-/// New callers use `face_embedding_missing_observation_page`.
-///
-/// ⭐ FIX ROUND 1 — HIGH-1, and this is an INTERIM that must not be deleted
-/// before `FaceRecognitionIndexBuilder.swift`'s `storeOk` gate lands (lane
-/// H-Swift-B, brief §3.12). This twin is still wired at
-/// `FaceRecognitionIndexBuilder.swift:414`, whose `guard !observations.isEmpty`
-/// reports *"Face recognition index is already up to date."* — so as first
-/// built, an UNREADABLE `vectors.lancedb` made the builder claim success on a
-/// catalogue whose index it could not read, which is QUIETER than the product
-/// was before this slice (core `2bc221e:12183-12192` returned every observation
-/// on a store failure, the builder ran, and its LanceDB writes failed loudly).
-/// Until the Swift gate lands, a store failure restores exactly that pre-slice
-/// direction: the full candidate set, so the failure surfaces where it always
-/// did. The NEW page keeps the ruled EMPTY-list contract untouched.
-pub async fn face_embedding_missing_observations(
-    algorithm_version: String,
-    model_version: String,
-    preprocessing_version: String,
-    limit: u32,
-) -> Vec<FaceObservationRecord> {
-    let page = face_embedding_missing_observation_page(
-        algorithm_version.clone(),
-        model_version,
-        preprocessing_version,
-        limit,
-    )
-    .await;
-
-    if page.store_ok
-    {
-        return page.observations;
-    }
-
-    // Pre-slice failure direction: with no readable store, NOTHING is known to
-    // be embedded, so every observation is a candidate. On a CATALOGUE failure
-    // this re-query fails too and yields the empty list — which is also exactly
-    // what the pre-slice code did. One path, both answers honest.
-    eprintln!(
-        "face_embedding_missing_observations: the work set could not be built \
-         ({}); returning the full candidate set so the failure surfaces \
-         downstream (slice 7 fix round 1, HIGH-1 interim)",
-        page.store_error.as_deref().unwrap_or("no reason given")
-    );
-    face_embedding_observation_candidates(
-        &algorithm_version,
-        limit,
-        &std::collections::HashSet::new(),
-    )
-    .observations
-}
-
-/// Slice 7 / R-31 + R-08 — the same work set, carrying its dropped-row count
-/// and the vector store's reachability.
+/// ⭐ The closeout act (Sep 30, 2026) removed the legacy twin
+/// `face_embedding_missing_observations`, whose bare list discarded both facts
+/// (and whose HIGH-1 interim returned the FULL candidate set on a store
+/// failure). This page is now the work set's ONLY door. ⚠️ Its error texts
+/// KEEP the `face_embedding_missing_observations: …` prefixes on purpose:
+/// `FaceIndexWorkSetOutcome.unreadableHalf` names the failed half from them
+/// (ruling 5), and `Spikes/SwallowedFailuresSwiftBGate` L8 pins them — they are
+/// wire text, not a reference to the removed function.
 pub async fn face_embedding_missing_observation_page(
     algorithm_version: String,
     model_version: String,
@@ -34479,8 +34436,8 @@ mod directory_exact_tests
 // R-42 / R-60 / R-82 / R-96 (fresh-vs-upgraded schema divergences, PINNED here
 // as an asserted allow-list rather than converged — see the list's own notes).
 //
-// ⭐ WHAT THIS MODULE BUYS. The catalogue open path is one 765-line
-// `execute_batch`. A single failing statement aborts the batch,
+// ⭐ WHAT THIS MODULE BUYS. The catalogue open path is one `execute_batch`
+// (813 lines at V7). A single failing statement aborts the batch,
 // `open_and_migrate_catalogue` returns `None`, and the app reports an EMPTY
 // LIBRARY on every existing catalogue (S93). Until this module, the assumption
 // that the CREATE batch's statement ORDER and its ALTER set are complete for
@@ -34881,8 +34838,8 @@ mod schema_upgrade_fixture_tests
         // ⭐ GENESIS IS NOT ARCHIVAL — it is the EXTREME INSTANCE of the
         // Restore-reachable class (a 2026-07-03…~07-09 ZIP can hold a catalogue
         // born this early) and the BROADEST pin on assertion (a): 1 table
-        // instead of 19 and 29 `images` columns instead of 69, so 40 columns and
-        // 18 tables arrive through the migration.
+        // instead of 21 and 29 `images` columns instead of 69 (V7), so 40
+        // columns and 20 tables arrive through the migration.
         //
         // MEASURED, three times on the same mutation: the S93 shape (a
         // `CREATE INDEX` hoisted above the `ALTER` that adds its column, over
@@ -35578,8 +35535,8 @@ mod schema_upgrade_fixture_tests
     }
 
     /// ⭐ The EXTREME instance of the Restore-reachable class — not an archival
-    /// curiosity — and the BROADEST pin on assertion (a): 1 table instead of 19,
-    /// 29 `images` columns instead of 69. (Fix round 1's T1 shows TIER3-4599235
+    /// curiosity — and the BROADEST pin on assertion (a): 1 table instead of 21,
+    /// 29 `images` columns instead of 69 (V7). (Fix round 1's T1 shows TIER3-4599235
     /// also catches the S93 shape over `images.is_video`; genesis alone reaches
     /// the columns and tables that arrived before 2026-06-01.)
     /// ⛔ Do not delete this fixture.
@@ -36939,62 +36896,17 @@ mod swallowed_failure_tests
     }
 
     // ------------------------------------------------------------------
-    // T10 — FIX ROUND 1 / HIGH-1. The still-wired LEGACY twin must never
-    // answer "nothing to do" for a store it could not read.
-    //
-    // `FaceRecognitionIndexBuilder.swift:414` still calls this twin, and its
-    // `guard !observations.isEmpty` reports *"Face recognition index is
-    // already up to date."* — so an empty answer here is a claim of success
-    // on a catalogue whose index cannot be read. Pre-slice (core
-    // `2bc221e:12183-12192`) a store failure returned EVERY observation, the
-    // builder ran, and its LanceDB writes failed loudly. This pins that
-    // direction until H-Swift-B's `storeOk` gate lands.
+    // T10 — RETIRED by the closeout act (Sep 30, 2026). It pinned the HIGH-1
+    // INTERIM: the legacy twin `face_embedding_missing_observations` returned
+    // the FULL candidate set for an unreadable store, so the index builder that
+    // still called it could not report "already up to date". The builder reads
+    // the page since H-Swift-B, and the twin is gone from the wire (absence
+    // pinned by `Spikes/SwallowedFailuresSwiftBGate` L1 and G3). T10's other
+    // half — the page answers `store_ok == false` with an EMPTY list for the
+    // same unreadable store — is exactly T6
+    // (`face_embedding_work_set_reports_an_unreadable_store_with_an_empty_list`),
+    // which stays.
     // ------------------------------------------------------------------
-    #[test]
-    fn the_legacy_face_work_set_twin_never_answers_empty_for_an_unreadable_store()
-    {
-        let _guard = GLOBAL_CATALOGUE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (fixture, conn) = fresh_catalogue("t10");
-        let image_id = insert_image(&conn, "/p/faces.jpg");
-        insert_face_observation(&conn, image_id, 0, "v6", false);
-        insert_face_observation(&conn, image_id, 1, "v6", false);
-        // A regular FILE at the store path cannot be opened as a store.
-        // Nothing is deleted; this is the drive script's own recipe.
-        std::fs::write(fixture.vectors(), b"not a vector store").expect("write bad store");
-        install_global_catalogue(&fixture, conn);
-
-        let legacy = futures::executor::block_on(face_embedding_missing_observations(
-            "v6".to_string(),
-            "model-1".to_string(),
-            "prep-1".to_string(),
-            0,
-        ));
-        assert_eq!(
-            legacy.len(),
-            2,
-            "⛔ an unreadable store must NOT read as an up-to-date index through \
-             the legacy twin — it returned {} observation(s)",
-            legacy.len()
-        );
-
-        // …and the NEW page keeps the ruled empty-list contract untouched.
-        let page = futures::executor::block_on(face_embedding_missing_observation_page(
-            "v6".to_string(),
-            "model-1".to_string(),
-            "prep-1".to_string(),
-            0,
-        ));
-        assert!(!page.store_ok);
-        assert!(
-            page.observations.is_empty(),
-            "the page must still answer EMPTY — never 'everything is missing'"
-        );
-
-        clear_global_catalogue();
-        drop(fixture);
-    }
 
     // ------------------------------------------------------------------
     // T11 — FIX ROUND 1 / MEDIUM-1. A CATALOGUE failure must be
@@ -37039,17 +36951,6 @@ mod swallowed_failure_tests
             page.store_error
         );
         assert!(page.observations.is_empty());
-
-        // The legacy twin's re-query fails the same way and yields the empty
-        // list — which is exactly what the pre-slice code did on a catalogue
-        // failure, so nothing regressed there either.
-        let legacy = futures::executor::block_on(face_embedding_missing_observations(
-            "v6".to_string(),
-            "model-1".to_string(),
-            "prep-1".to_string(),
-            0,
-        ));
-        assert!(legacy.is_empty());
 
         clear_global_catalogue();
         drop(fixture);

@@ -495,21 +495,9 @@ namespace photolibrariancore {
     // Face embedding vector store. Vectors live in LanceDB beside the
     // catalogue, keyed by face_observation.id plus model/preprocessing versions
     // so future alignment/model migrations can coexist or regenerate safely.
-    //
-    // ⚠️ LEGACY shape — use face_embedding_missing_observation_page. Slice 7
-    // fix round 1 (HIGH-1): when the work set cannot be built this twin returns
-    // the FULL candidate set, restoring the pre-slice failure direction so an
-    // unreadable vector store surfaces downstream instead of reading as
-    // "nothing to do". ⛔ That interim must not be removed before
-    // FaceRecognitionIndexBuilder.swift is repointed at the page function and
-    // gated on storeOk / droppedRows (lane H-Swift-B).
-    [Async]
-    sequence<FaceObservationRecord> face_embedding_missing_observations(
-        string algorithm_version,
-        string model_version,
-        string preprocessing_version,
-        u32 limit
-    );
+    // (The work set's legacy list twin was removed by the closeout act,
+    // Sep 30, 2026; face_embedding_missing_observation_page, below, is the
+    // only way to read it.)
 
     [Async]
     FaceEmbeddingStoreResult upsert_face_embeddings(sequence<FaceEmbeddingVectorRecord> records);
@@ -1058,7 +1046,8 @@ namespace photolibrariancore {
     // could not be read — and store_error names which; that is distinct from an
     // index that was never built (store_ok = true with an empty list). ⛔ On
     // store_ok = false the list is EMPTY, never "everything is missing".
-    // Supersedes face_embedding_missing_observations.
+    // It replaced the legacy twin face_embedding_missing_observations, which
+    // the closeout act removed (Sep 30, 2026).
     [Async]
     FaceObservationWorkSet face_embedding_missing_observation_page(
         string algorithm_version,
