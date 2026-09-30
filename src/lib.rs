@@ -1493,6 +1493,12 @@ pub enum FaceVectorDeleteRetryStatus
     Failed,
 }
 
+/// ⭐ Slice P / D6 — `orphans_enqueued` and `orphan_scan_ran` (appended LAST,
+/// `.udl` defaults 0 / false, the S65 rule) report the orphan-vector sweep that
+/// runs after a completed drain: `orphan_scan_ran` = the cheap gate opened and
+/// the store's ids were read; `orphans_enqueued` = orphan ids confirmed on the
+/// queue after this pass (deleted by the NEXT retry). When it is non-zero,
+/// `remaining_count` includes them; `status` still describes the drain.
 #[derive(Debug, Clone)]
 pub struct FaceVectorDeleteRetryResult
 {
@@ -1501,6 +1507,8 @@ pub struct FaceVectorDeleteRetryResult
     pub acknowledged_count: u64,
     pub remaining_count: u64,
     pub message: String,
+    pub orphans_enqueued: u64,
+    pub orphan_scan_ran: bool,
 }
 
 /// Compact gallery metadata for a visible similar-photo representative.
@@ -1718,6 +1726,12 @@ pub struct FaceEmbeddingStoreResult {
 
 /// Catalogue counts for the backup manifest — one FFI call gathers the
 /// facts the Settings backup list shows before any restore is committed.
+///
+/// ⭐ Slice P / R-30's Rust half (A2's S-1) — `untaken_counts` (appended LAST,
+/// `.udl` default 0, the S65 rule) is a bitmask of the counts that could NOT be
+/// taken: a set bit means that field's number is a placeholder 0, not a count,
+/// and the manifest must write it as an absent key. Bits, in field order:
+/// `BACKUP_COUNT_UNTAKEN_*` below. 0 = every count was taken.
 #[derive(Debug, Clone)]
 pub struct BackupCounts {
     pub image_count: u64,
@@ -1726,7 +1740,16 @@ pub struct BackupCounts {
     pub person_count: u64,
     pub face_observation_count: u64,
     pub face_embedding_count: u64,
+    pub untaken_counts: u32,
 }
+
+/// `BackupCounts.untaken_counts` bits, one per count, in field order.
+pub const BACKUP_COUNT_UNTAKEN_IMAGE: u32 = 1 << 0;
+pub const BACKUP_COUNT_UNTAKEN_VIDEO: u32 = 1 << 1;
+pub const BACKUP_COUNT_UNTAKEN_KEYWORD_ROW: u32 = 1 << 2;
+pub const BACKUP_COUNT_UNTAKEN_PERSON: u32 = 1 << 3;
+pub const BACKUP_COUNT_UNTAKEN_FACE_OBSERVATION: u32 = 1 << 4;
+pub const BACKUP_COUNT_UNTAKEN_FACE_EMBEDDING: u32 = 1 << 5;
 
 /// Pre-merge census for the additive restore's confirmation / batch-prompt
 /// dialog. `backup_readable = false` means the backup catalogue could not
@@ -5168,12 +5191,18 @@ fn media_predicate(media_type: MediaType) -> Option<&'static str> {
 /// the pre-extraction call sites — Queue item 4 (Chunk 6) will parameterize
 /// this as a separate change. Both inputs are treated as untrusted strings
 /// that may legitimately contain single quotes (paths with apostrophes,
-/// for instance) AND the `LIKE` wildcards `%` / `_` (see C1 below).
+/// for instance) AND the `LIKE` wildcards `%` / `_` (see C1 below) — BOTH
+/// arms are wildcard-escaped, the date arm since slice E2 (R-45).
+///
+/// ⭐ This is the ONLY producer of `capture_datetime LIKE` in the crate
+/// (slice E2, R-90: `get_images_filtered` and `get_filtered_image_count`
+/// call it rather than interpolating their own). A source lock in
+/// `engine_contract_residue_tests` counts that.
 ///
 /// Arms:
 /// - (empty,  empty)  → empty predicate (no path/date filter)
 /// - (path,   empty)  → `file_path LIKE 'PATH%' ESCAPE '\'`
-/// - (empty,  date)   → `capture_datetime LIKE 'DATE%'`
+/// - (empty,  date)   → `capture_datetime LIKE 'DATE%' ESCAPE '\'`
 /// - (path,   date)   → both, AND-joined
 ///
 /// Composes safely with the other inner-WHERE predicates
@@ -5189,12 +5218,29 @@ fn build_path_date_predicate(path_prefix: &str, date_prefix: &str) -> String {
     // surrounding SQL literal — the same order `filename_ilike_atom` uses — and pin
     // `ESCAPE '\'` on the two `file_path LIKE` forms below.
     //
-    // The `LIKE 'literal%'` SHAPE is deliberately kept (rather than switching to
-    // `starts_with`): this is the hot sidebar/gallery predicate, and a literal-prefix
-    // LIKE stays index/zone-map friendly. Only the wildcard vocabulary changes here,
-    // never the access path.
+    // R-45 (slice E2): the DATE prefix gets the same treatment, in the same order,
+    // and both `capture_datetime LIKE` forms carry `ESCAPE '\'` too. Its tokens are
+    // not trusted either: they come back out of `capture_datetime`, which holds the
+    // verbatim EXIF `DateTimeOriginal` string, and the only check on the way to the
+    // sidebar is `split(":").count == 3` — so a token like `2026:0_:04` is
+    // reachable, and unescaped its `_` scoped Copy To… / Materialize / Resized
+    // Export to several days instead of one. After escaping, such a token scopes to
+    // exactly its own rows.
+    //
+    // The `LIKE 'literal%'` SHAPE is deliberately kept rather than switching to
+    // `starts_with`, for symmetry between the two arms of the both-arm form below.
+    // ⚠️ CORRECTED (slice E2, bundled 1.5.5): the `ESCAPE` clause DOES change how
+    // the filter is pushed down. Without it the optimiser range-rewrites the
+    // literal-prefix LIKE into `>= … AND < …`; with it the filter stays
+    // `like_escape(…)` (both a SEQ_SCAN). Measured within ~1–3 ms either way at 1M
+    // rows: the S182 brief review saw `ESCAPE` faster (2.70 vs 8.65 ms), E2's
+    // review saw it 1.3–1.7× SLOWER on a time-ordered and a shuffled fixture
+    // (1.1 → 1.9 ms, 1.7 → 2.2 ms, `--release`) — sub-millisecond either way, so
+    // SAFE on this hot predicate, but a small real cost on every ordinary Dates
+    // token. The earlier claim that "only the wildcard vocabulary changes, never
+    // the access path" was not true, and is withdrawn.
     let escaped_path = escape_for_ilike(path_prefix).replace('\'', "''");
-    let escaped_date = date_prefix.replace("'", "''");
+    let escaped_date = escape_for_ilike(date_prefix).replace('\'', "''");
 
     // Apple Photos library originals live INSIDE a `.photoslibrary` package and are
     // surfaced under their own "Apple Libraries" sidebar scope — the Sources folder
@@ -5223,9 +5269,9 @@ fn build_path_date_predicate(path_prefix: &str, date_prefix: &str) -> String {
             "file_path LIKE '{}%' ESCAPE '\\'{}",
             escaped_path, apple_exclusion
         ),
-        (true, false) => format!("capture_datetime LIKE '{}%'", escaped_date),
+        (true, false) => format!("capture_datetime LIKE '{}%' ESCAPE '\\'", escaped_date),
         (false, false) => format!(
-            "file_path LIKE '{}%' ESCAPE '\\' AND capture_datetime LIKE '{}%'{}",
+            "file_path LIKE '{}%' ESCAPE '\\' AND capture_datetime LIKE '{}%' ESCAPE '\\'{}",
             escaped_path, escaped_date, apple_exclusion
         ),
     }
@@ -5383,7 +5429,11 @@ fn build_destination_family_predicate(sample_file_path: &str, canonical_file_nam
 /// - where_clause: predicate text only (no "WHERE" keyword); empty string
 ///   for no caller-supplied filter
 /// - order_by: ORDER BY expression text only (no "ORDER BY" keyword);
-///   helper prepends the keyword
+///   helper prepends the keyword AND APPENDS the total tie-break `, id ASC`
+///   (slice E1, R-06 — `build_image_record_query_sql`), so every page of
+///   every caller, present and future, is sliced from ONE total order. A
+///   caller never needs to end its own order on `id`, and one that leads
+///   with `id` is unaffected (the appended key is never reached).
 /// - limit: LIMIT value, bound as ?1
 /// - offset: OFFSET value, bound as ?2
 /// - apply_duplicate_filter: when true, wrap projection in subquery and
@@ -5391,8 +5441,18 @@ fn build_destination_family_predicate(sample_file_path: &str, canonical_file_nam
 /// - apply_raw_jpeg_collapse: when true, AND-in
 ///   `RAW_JPEG_COLLAPSE_PREDICATE` at inner WHERE level
 ///
+/// ⭐ **The count/page consistency rule (slice E1, R-06).** A paged query and
+/// its count must differ in NOTHING but the projection, the ORDER BY and the
+/// LIMIT/OFFSET. Both sides build the same predicate text through the same
+/// `build_filter_predicate` / `build_scoped_filter_predicate` and pass the same
+/// three collapse booleans and the same `MediaType`; the count helper
+/// (`execute_image_count_query`) carries no ORDER BY, so the page's total
+/// tie-break cannot desynchronise them. Any future filter fragment added to one
+/// side must be added to the other, at the shared helper, never at a call site.
+///
 /// Returns:
-/// - Vec of `ImageRecord` structs in the order specified by `order_by`.
+/// - Vec of `ImageRecord` structs in the order specified by `order_by`, ties
+///   broken by ascending `id`.
 /// - Empty Vec if prepare or query_map fails; errors logged via eprintln!.
 fn execute_image_record_query(
     conn: &Connection,
@@ -5406,129 +5466,18 @@ fn execute_image_record_query(
     similar_algorithm_version: &str,
     media_type: MediaType,
 ) -> Vec<ImageRecord> {
-    // Assemble the inner WHERE from the caller-supplied predicate text
-    // and the RAW+JPEG collapse predicate (both stored-column references;
-    // both safely composable with AND at the inner level).
-    let mut inner_predicates: Vec<&str> = Vec::new();
-    if !where_clause.is_empty() {
-        inner_predicates.push(where_clause);
-    }
-    if apply_raw_jpeg_collapse {
-        inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
-    }
-    // Media-type stance (DESIGN-Video-Schema-Unified-Table.md §11): gallery,
-    // Browse, ⌘A, filtered counts, and path/date-prefix queries all gate through
-    // this one seam. `media_predicate` maps the caller's MediaType to its WHERE
-    // fragment — None for Both (stills + video together), so nothing is pushed.
-    if let Some(media_pred) = media_predicate(media_type) {
-        inner_predicates.push(media_pred);
-    }
-    let inner_where = if inner_predicates.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", inner_predicates.join(" AND "))
-    };
-
-    let similar_join =
-        similar_photo_join_clause(apply_similar_photo_collapse, similar_algorithm_version);
-    let effective_similar_collapse = apply_similar_photo_collapse && !similar_join.is_empty();
-    let needs_outer_filter = apply_duplicate_filter || effective_similar_collapse;
-    let duplicate_filter = if apply_duplicate_filter {
-        Some(DUPLICATE_FILTER_PREDICATE)
-    } else {
-        None
-    };
-    let similar_filter = if effective_similar_collapse {
-        Some(SIMILAR_COLLAPSE_PREDICATE)
-    } else {
-        None
-    };
-    let outer_filters = [duplicate_filter, similar_filter]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<&str>>()
-        .join(" AND ");
-    let similar_inner_projection = if effective_similar_collapse {
-        ", spgm.group_id AS similar_group_id, image_kind AS similar_image_kind"
-    } else {
-        ""
-    };
-
-    // Branch on outer filters. Duplicate and similar-photo collapse both need
-    // projection aliases, so they share the same wrap shape. When inactive,
-    // emit the minimal top-level projection.
-    let query_sql = if needs_outer_filter {
-        let inner_select = format!(
-            r#"
-            SELECT
-                id, epoch(indexed_timestamp) as indexed_ts_epoch,
-                file_path, file_size, file_name, file_extension,
-                created_timestamp, modified_timestamp,
-                camera_make, camera_model, lens_model,
-                focal_length, aperture, shutter_speed, iso,
-                capture_datetime,
-                pixel_width, pixel_height, color_space, bit_depth,
-                gps_latitude, gps_longitude, gps_altitude,
-                copyright, creator, description,
-                rating, flag, color_label, rotation,
-                {},
-                focus_score
-                {}
-            FROM images
-            {}
-            {}
-        "#,
-            DUPLICATE_GROUP_ID_CASE, similar_inner_projection, similar_join, inner_where
-        );
-        let filtered_source = if effective_similar_collapse {
-            format!(
-                r#"
-                SELECT
-                    *,
-                    {}
-                FROM (
-                    {}
-                )
-            "#,
-                SIMILAR_VISIBLE_ID_PROJECTION, inner_select
-            )
-        } else {
-            inner_select
-        };
-        format!(
-            r#"
-            SELECT * FROM (
-                {}
-            )
-            WHERE {}
-            ORDER BY {}
-            LIMIT ?1 OFFSET ?2
-        "#,
-            filtered_source, outer_filters, order_by
-        )
-    } else {
-        format!(
-            r#"
-            SELECT
-                id, epoch(indexed_timestamp) as indexed_ts_epoch,
-                file_path, file_size, file_name, file_extension,
-                created_timestamp, modified_timestamp,
-                camera_make, camera_model, lens_model,
-                focal_length, aperture, shutter_speed, iso,
-                capture_datetime,
-                pixel_width, pixel_height, color_space, bit_depth,
-                gps_latitude, gps_longitude, gps_altitude,
-                copyright, creator, description,
-                rating, flag, color_label, rotation,
-                {}
-            FROM images
-            {}
-            ORDER BY {}
-            LIMIT ?1 OFFSET ?2
-        "#,
-            DUPLICATE_GROUP_ID_CASE, inner_where, order_by
-        )
-    };
+    // The SQL text is built by `build_image_record_query_sql` (slice E1), a
+    // pure function, so the emitted ORDER BY can be asserted without a
+    // connection (`paging_tie_order_tests`).
+    let query_sql = build_image_record_query_sql(
+        where_clause,
+        order_by,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+        apply_similar_photo_collapse,
+        similar_algorithm_version,
+        media_type,
+    );
 
     let mut stmt = match conn.prepare(&query_sql) {
         Ok(s) => s,
@@ -5593,6 +5542,168 @@ fn execute_image_record_query(
     }
 
     records
+}
+
+/// Build the SQL text `execute_image_record_query` prepares — the predicate
+/// assembly, the duplicate / similar-photo outer-filter wrap, the shared
+/// projection, and the `ORDER BY … LIMIT ?1 OFFSET ?2` tail of BOTH branches.
+///
+/// Extracted verbatim from `execute_image_record_query` by slice E1 (R-06) so
+/// the emitted `ORDER BY` can be pinned as TEXT, without a connection. Pure: no
+/// `Connection`, no I/O, no global state. The one
+/// behavioural change the extraction carries is the total tie-break: the
+/// caller's `order_by` is emitted as `<order_by>, id ASC` in both branches
+/// (see the binding below, and `paging_tie_order_tests`).
+fn build_image_record_query_sql(
+    where_clause: &str,
+    order_by: &str,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+    apply_similar_photo_collapse: bool,
+    similar_algorithm_version: &str,
+    media_type: MediaType,
+) -> String
+{
+    // Assemble the inner WHERE from the caller-supplied predicate text
+    // and the RAW+JPEG collapse predicate (both stored-column references;
+    // both safely composable with AND at the inner level).
+    let mut inner_predicates: Vec<&str> = Vec::new();
+    if !where_clause.is_empty() {
+        inner_predicates.push(where_clause);
+    }
+    if apply_raw_jpeg_collapse {
+        inner_predicates.push(RAW_JPEG_COLLAPSE_PREDICATE);
+    }
+    // Media-type stance (DESIGN-Video-Schema-Unified-Table.md §11): gallery,
+    // Browse, ⌘A, filtered counts, and path/date-prefix queries all gate through
+    // this one seam. `media_predicate` maps the caller's MediaType to its WHERE
+    // fragment — None for Both (stills + video together), so nothing is pushed.
+    if let Some(media_pred) = media_predicate(media_type) {
+        inner_predicates.push(media_pred);
+    }
+    let inner_where = if inner_predicates.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", inner_predicates.join(" AND "))
+    };
+
+    let similar_join =
+        similar_photo_join_clause(apply_similar_photo_collapse, similar_algorithm_version);
+    let effective_similar_collapse = apply_similar_photo_collapse && !similar_join.is_empty();
+    let needs_outer_filter = apply_duplicate_filter || effective_similar_collapse;
+    let duplicate_filter = if apply_duplicate_filter {
+        Some(DUPLICATE_FILTER_PREDICATE)
+    } else {
+        None
+    };
+    let similar_filter = if effective_similar_collapse {
+        Some(SIMILAR_COLLAPSE_PREDICATE)
+    } else {
+        None
+    };
+    let outer_filters = [duplicate_filter, similar_filter]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<&str>>()
+        .join(" AND ");
+    let similar_inner_projection = if effective_similar_collapse {
+        ", spgm.group_id AS similar_group_id, image_kind AS similar_image_kind"
+    } else {
+        ""
+    };
+
+    // R-06 / slice E1 — a paged ORDER BY must be a TOTAL order or LIMIT/OFFSET
+    // is not a partition: DuckDB promises nothing about tie order, and the
+    // per-row `DUPLICATE_GROUP_ID_CASE` window every paged query projects feeds
+    // the sort in an order that varies per execution, so ANY tie of 2+ rows
+    // straddling a page boundary lost photos (measured Sep 30, 2026, E1 review
+    // round 1; the same SQL without that window was stable in every scenario
+    // measured, which is why earlier probes saw it as latent). `images.id` is the
+    // table's INTEGER PRIMARY KEY (the `images` DDL in
+    // `open_and_migrate_catalogue`'s schema batch), so appending it makes the
+    // order total for every caller-supplied prefix. Callers that already lead
+    // with `id` keep their exact order — the appended key is simply never
+    // reached. ONE binding, used by BOTH branches below; the caller's
+    // `order_by` is never interpolated on its own.
+    let total_order_by = format!("{}, id ASC", order_by);
+
+    // Branch on outer filters. Duplicate and similar-photo collapse both need
+    // projection aliases, so they share the same wrap shape. When inactive,
+    // emit the minimal top-level projection.
+    let query_sql = if needs_outer_filter {
+        let inner_select = format!(
+            r#"
+            SELECT
+                id, epoch(indexed_timestamp) as indexed_ts_epoch,
+                file_path, file_size, file_name, file_extension,
+                created_timestamp, modified_timestamp,
+                camera_make, camera_model, lens_model,
+                focal_length, aperture, shutter_speed, iso,
+                capture_datetime,
+                pixel_width, pixel_height, color_space, bit_depth,
+                gps_latitude, gps_longitude, gps_altitude,
+                copyright, creator, description,
+                rating, flag, color_label, rotation,
+                {},
+                focus_score
+                {}
+            FROM images
+            {}
+            {}
+        "#,
+            DUPLICATE_GROUP_ID_CASE, similar_inner_projection, similar_join, inner_where
+        );
+        let filtered_source = if effective_similar_collapse {
+            format!(
+                r#"
+                SELECT
+                    *,
+                    {}
+                FROM (
+                    {}
+                )
+            "#,
+                SIMILAR_VISIBLE_ID_PROJECTION, inner_select
+            )
+        } else {
+            inner_select
+        };
+        format!(
+            r#"
+            SELECT * FROM (
+                {}
+            )
+            WHERE {}
+            ORDER BY {}
+            LIMIT ?1 OFFSET ?2
+        "#,
+            filtered_source, outer_filters, total_order_by
+        )
+    } else {
+        format!(
+            r#"
+            SELECT
+                id, epoch(indexed_timestamp) as indexed_ts_epoch,
+                file_path, file_size, file_name, file_extension,
+                created_timestamp, modified_timestamp,
+                camera_make, camera_model, lens_model,
+                focal_length, aperture, shutter_speed, iso,
+                capture_datetime,
+                pixel_width, pixel_height, color_space, bit_depth,
+                gps_latitude, gps_longitude, gps_altitude,
+                copyright, creator, description,
+                rating, flag, color_label, rotation,
+                {}
+            FROM images
+            {}
+            ORDER BY {}
+            LIMIT ?1 OFFSET ?2
+        "#,
+            DUPLICATE_GROUP_ID_CASE, inner_where, total_order_by
+        )
+    };
+
+    query_sql
 }
 
 /// Execute a `COUNT(*)` query against the `images` table.
@@ -6360,10 +6471,17 @@ pub async fn update_image_flag(file_path: String, flag: Option<String>) -> bool 
 }
 
 /// Result of `relocate_file_path_prefix`. `ok` = the rewrite committed (or
-/// there was nothing to move); `updated` = rows whose `file_path` and stored
-/// `directory_path` were rewritten; `message` carries a short diagnostic on
-/// failure (e.g. a UNIQUE collision when the new location overlaps another
-/// cataloged root), empty on success.
+/// there was nothing to move); `updated` = the number of rows the rewrite's
+/// own WHERE matched, counted EXACTLY by `RELOCATE_PREFIX_SCOPE_COUNT_SQL`
+/// inside the same transaction just before the rewrite — every one of them
+/// has its `file_path` and stored `directory_path` rewritten when `ok`;
+/// `message` carries a short diagnostic on failure (e.g. a UNIQUE collision
+/// when the new location overlaps another cataloged root), empty on success.
+///
+/// R-15 (slice E2): `updated` is deliberately NOT the UPDATE's own change
+/// count. That number is `duckdb_rows_changed`, which the engine does not
+/// promise equals the rows rewritten — S179 proved it can be the rows the scan
+/// fed the operator — so a count is a hint, never a fact.
 pub struct RelocateResult {
     pub ok: bool,
     pub updated: u64,
@@ -6401,6 +6519,19 @@ const RELOCATE_PREFIX_UPDATE_SQL: &str = "UPDATE images \
             LENGTH(?1 || SUBSTR(file_path, LENGTH(?2) + 1)) \
                 - INSTR(REVERSE(?1 || SUBSTR(file_path, LENGTH(?2) + 1)), '/')) \
     WHERE starts_with(file_path, ?2 || '/')";
+
+/// R-15 (slice E2): the EXACT scope of `RELOCATE_PREFIX_UPDATE_SQL`, counted
+/// inside the same transaction immediately before the rewrite, and the number
+/// `RelocateResult.updated` reports. ?1 = old_prefix.
+///
+/// Its WHERE is the UPDATE's WHERE with the one parameter renumbered (the
+/// UPDATE binds `old_prefix` as `?2`, since `?1` is the new prefix there), so
+/// the two statements can never disagree about which rows are in scope. The
+/// two texts are separate because a SQL `const` cannot be composed from a
+/// shared fragment without editing the UPDATE's pinned text;
+/// `engine_contract_residue_tests` locks them together instead.
+const RELOCATE_PREFIX_SCOPE_COUNT_SQL: &str =
+    "SELECT COUNT(*) FROM images WHERE starts_with(file_path, ?1 || '/')";
 
 /// Re-point every catalogued row under `old_prefix` to `new_prefix` — a bulk
 /// path-prefix rewrite for the Source-panel relocate feature (no re-scan).
@@ -6463,18 +6594,52 @@ pub async fn relocate_file_path_prefix(old_prefix: String, new_prefix: String) -
         };
     }
 
-    let changed = match conn.execute(RELOCATE_PREFIX_UPDATE_SQL, params![new_prefix, old_prefix]) {
-        Ok(n) => n as u64,
-        Err(e) => {
-            eprintln!("relocate_file_path_prefix: update failed: {}", e);
+    // R-15 (slice E2): the number reported is this exact COUNT(*) over the
+    // rewrite's own WHERE, taken inside the transaction and BEFORE the rewrite —
+    // never the UPDATE's change count (an engine hint, S179). Fail closed: a
+    // scope that could not be counted reports no number and moves nothing.
+    let in_scope = match conn.query_row(
+        RELOCATE_PREFIX_SCOPE_COUNT_SQL,
+        params![old_prefix],
+        |row| row.get::<_, i64>(0),
+    )
+    {
+        Ok(n) if n >= 0 => n as u64,
+        Ok(n) =>
+        {
+            eprintln!("relocate_file_path_prefix: scope count returned {}", n);
             let _ = conn.execute_batch("ROLLBACK;");
-            return RelocateResult {
+            return RelocateResult
+            {
                 ok: false,
                 updated: 0,
-                message: format!("rewrite failed (possible path collision): {}", e),
+                message: format!("scope count returned {}", n),
+            };
+        }
+        Err(e) =>
+        {
+            eprintln!("relocate_file_path_prefix: scope count failed: {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return RelocateResult
+            {
+                ok: false,
+                updated: 0,
+                message: format!("scope count failed: {}", e),
             };
         }
     };
+
+    if let Err(e) = conn.execute(RELOCATE_PREFIX_UPDATE_SQL, params![new_prefix, old_prefix])
+    {
+        eprintln!("relocate_file_path_prefix: update failed: {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return RelocateResult
+        {
+            ok: false,
+            updated: 0,
+            message: format!("rewrite failed (possible path collision): {}", e),
+        };
+    }
 
     if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("relocate_file_path_prefix: commit failed: {}", e);
@@ -6488,11 +6653,11 @@ pub async fn relocate_file_path_prefix(old_prefix: String, new_prefix: String) -
 
     eprintln!(
         "relocate_file_path_prefix: moved {} rows '{}' -> '{}'",
-        changed, old_prefix, new_prefix
+        in_scope, old_prefix, new_prefix
     );
     RelocateResult {
         ok: true,
-        updated: changed,
+        updated: in_scope,
         message: String::new(),
     }
     },
@@ -7514,6 +7679,10 @@ const FOCUS_FILTER_ORDER_BY: &str =
 /// order; the Swift side still allows page-local column re-sorting on top.
 /// `count_query_images` needs no order, so it is unaffected (count/page parity
 /// is about the WHERE, not the ORDER BY).
+///
+/// None of these three constants is a total order on its own. The tie-break
+/// (`, id ASC`) is appended at the ONE paged chokepoint,
+/// `build_image_record_query_sql` (slice E1, R-06) — never edit it in here.
 fn order_by_for_filter(predicates: &[QueryPredicate]) -> &'static str {
     match predicates.first() {
         Some(p) => match p.kind.as_str() {
@@ -11277,14 +11446,235 @@ fn plan_focus_analysis_writebacks(
         .collect()
 }
 
+/// ⭐ Slice P / R-18 — the cross-store cascade for ONE writeback target, run
+/// BEFORE its `face_observation` DELETE, inside the writeback's own
+/// transaction, modelled on `editor_saved_image_invalidate_analysis`:
+///
+/// 1. CENSUS the doomed ids — ⛔ FAIL CLOSED (H's N8 rule, verbatim): an
+///    UN-PERFORMED census is not an EMPTY census. A prepare / query failure or
+///    a non-zero dropped-row count fails the chunk with
+///    `FOCUS_WRITEBACK_STAGE_APPLY`, which rolls it back; it is NOT retried
+///    (S179's retry keys on `invariant_facts`, which this failure does not
+///    carry), so the run reports the chunk failed. It never goes on to the
+///    DELETE with a short list. An EMPTY census — the common case, a target
+///    with no faces yet — skips every step below (no `IN ()`).
+/// 2. CENSUS the named people on those faces (ruling 16), fail closed too.
+/// 3. ENQUEUE the vector ids — ⭐ BEFORE the DELETE: the enqueue selects the
+///    rows from `face_observation`, so after the DELETE it would find nothing.
+///    This is the schema's own `face_vector_pending_delete` contract, which the
+///    editor-save path and (since slice P) the backup-wins merge honour.
+/// 4. DELETE the `person_face_assignment` rows that named those faces.
+/// 5. DELETE the `face_cluster_member` rows for those faces — ⚠️ BY FACE ID,
+///    not whole runs. The editor path invalidates entire runs because a
+///    partially-emptied run shows authoritative-looking counts to a browser —
+///    and that browser is gone (`FaceClusterBrowserView.swift` and
+///    `FaceEmbeddingDiagnosticsExporter.swift`, deleted under Q-26): nothing
+///    reads `face_cluster_run` / `face_cluster_member` today, so the dangling
+///    member rows are removed and the runs are left alone. The editor path's
+///    own decision is untouched. (A member's `nearest_neighbor_face_observation_id`
+///    may still name a destroyed face — a diagnostic column with no reader.)
+/// 6. RULING 16 (Sep 30, 2026 — ruling 11's removal rule, applied
+///    automatically): a `People/<Name>` keyword whose face-origin bit no
+///    assignment backs any more keeps the name as the user's OWN keyword — the
+///    `editor_saved_image_preserve_people_keywords` transform — backed-ness
+///    judged exactly as a manual re-label judges it
+///    (`remove_obsolete_face_keyword_projections`: that person on that image;
+///    the bare `People` row only when no assignment is left on the image).
+///
+/// ⚠️ This makes the destruction HONEST; it does not stop it. The RAW/JPEG
+/// twin fan-out still replaces a RAW's observations (and their assignments)
+/// with fresh ids the old assignments cannot reach — re-keying assignments
+/// onto replacement observations is out of scope (register candidate).
+/// S179: these are DELETEs and a keyword re-origin — none enters the
+/// UPDATE-on-`images` path the change-count doctrine is about, and every
+/// target has already been stamped and verified before this runs.
+fn cascade_face_observations_before_replace(
+    conn: &Connection,
+    result: &FocusAnalysisResult,
+    target_id: i64,
+    probe: FocusApplyProbeRef<'_>,
+) -> Result<(), FocusAnalysisWritebackFailure>
+{
+    const DOOMED_SITE: &str = "replace_face_observations_for_targets.doomed_ids";
+    const PEOPLE_SITE: &str = "replace_face_observations_for_targets.named_people";
+
+    let fail = |what: String| {
+        FocusAnalysisWritebackFailure::new(
+            FOCUS_WRITEBACK_STAGE_APPLY,
+            format!(
+                "replace_face_observations_for_targets: {} for source_image_id={} target_image_id={} algorithm_version={:?}",
+                what, result.id, target_id, result.algorithm_version
+            ),
+            Some(result.id),
+            Some(target_id),
+        )
+    };
+
+    // 1. The doomed ids — fail CLOSED.
+    let doomed = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id FROM face_observation
+                 WHERE image_id = ?1
+                   AND algorithm_version = ?2
+                 ORDER BY id",
+            )
+            .map_err(|e| fail(format!("doomed face-id census could not be prepared: {}", e)))?;
+        let column = focus_apply_probe_face_census_column(probe, target_id);
+        let rows = statement
+            .query_map(params![target_id, &result.algorithm_version], move |row| {
+                row.get::<_, i64>(column)
+            })
+            .map_err(|e| fail(format!("doomed face-id census failed: {}", e)))?;
+        let (ids, dropped) = collect_rows_counted(rows, DOOMED_SITE);
+        if dropped > 0
+        {
+            return Err(fail(format!(
+                "doomed face-id census lost {} row(s) — an un-performed census is not an empty census, so nothing was deleted",
+                dropped
+            )));
+        }
+        ids
+    };
+    if doomed.is_empty()
+    {
+        return Ok(());
+    }
+    let faces = editor_saved_image_id_csv(&doomed);
+
+    // 2. The named people on those faces — fail CLOSED.
+    let named = {
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT DISTINCT assignment.image_id, assignment.person_id, person.display_name
+                 FROM person_face_assignment assignment
+                 JOIN person ON person.id = assignment.person_id
+                 WHERE assignment.face_observation_id IN ({})
+                 ORDER BY assignment.image_id, assignment.person_id",
+                faces
+            ))
+            .map_err(|e| fail(format!("named-people census could not be prepared: {}", e)))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+            })
+            .map_err(|e| fail(format!("named-people census failed: {}", e)))?;
+        let (people, dropped) = collect_rows_counted(rows, PEOPLE_SITE);
+        if dropped > 0
+        {
+            return Err(fail(format!(
+                "named-people census lost {} row(s), so nothing was deleted",
+                dropped
+            )));
+        }
+        people
+    };
+
+    // 3. The vectors — queued BEFORE the rows go.
+    editor_saved_image_enqueue_face_vector_deletes(conn, &doomed)
+        .map_err(|e| fail(format!("face-vector enqueue failed: {}", e)))?;
+
+    // 4. The assignments that named those faces.
+    conn.execute(
+        &format!(
+            "DELETE FROM person_face_assignment WHERE face_observation_id IN ({})",
+            faces
+        ),
+        [],
+    )
+    .map_err(|e| fail(format!("DELETE person_face_assignment failed: {}", e)))?;
+
+    // 5. The cluster members for those faces (by face id — see the doc).
+    conn.execute(
+        &format!(
+            "DELETE FROM face_cluster_member WHERE face_observation_id IN ({})",
+            faces
+        ),
+        [],
+    )
+    .map_err(|e| fail(format!("DELETE face_cluster_member failed: {}", e)))?;
+
+    // 6. Ruling 16 — a name no face backs any more stays as the user's own.
+    let mut images = std::collections::BTreeSet::new();
+    for (image_id, person_id, person_name) in &named
+    {
+        images.insert(*image_id);
+        let remaining_for_person: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM person_face_assignment
+                 WHERE image_id = ?1
+                   AND person_id = ?2",
+                params![image_id, person_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| fail(format!("remaining-assignment count failed: {}", e)))?;
+        if remaining_for_person == 0
+        {
+            let person_path = ["People", person_name.as_str()].join(KEYWORD_PATH_SEPARATOR);
+            keep_face_keyword_as_user_keyword(conn, *image_id, &person_path)
+                .map_err(|e| fail(format!("People keyword preservation failed: {}", e)))?;
+        }
+    }
+    for image_id in images
+    {
+        let remaining_on_image: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM person_face_assignment WHERE image_id = ?1",
+                params![image_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| fail(format!("remaining-assignment count failed: {}", e)))?;
+        if remaining_on_image == 0
+        {
+            keep_face_keyword_as_user_keyword(conn, image_id, "People")
+                .map_err(|e| fail(format!("People keyword preservation failed: {}", e)))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Ruling 16's transform on ONE keyword path — the
+/// `editor_saved_image_preserve_people_keywords` SET, bit for bit: the
+/// face-origin bit becomes the USER bit on an ACTIVE row that carries it.
+fn keep_face_keyword_as_user_keyword(
+    conn: &Connection,
+    image_id: i64,
+    path: &str,
+) -> Result<(), duckdb::Error>
+{
+    let clear_face_mask = !KEYWORD_ORIGIN_FACE;
+    conn.execute(
+        "UPDATE keyword
+         SET origin = ((origin | ?1) & ?2)
+         WHERE image_id = ?3
+           AND status = 1
+           AND path = ?4
+           AND (origin & ?5) <> 0",
+        params![
+            KEYWORD_ORIGIN_USER,
+            clear_face_mask,
+            image_id,
+            path,
+            KEYWORD_ORIGIN_FACE,
+        ],
+    )?;
+    Ok(())
+}
+
 fn replace_face_observations_for_targets(
     conn: &Connection,
     result: &FocusAnalysisResult,
     target_ids: &[i64],
     is_complete: bool,
+    probe: FocusApplyProbeRef<'_>,
 ) -> Result<(), FocusAnalysisWritebackFailure>
 {
     for target_id in target_ids {
+        // ⭐ Slice P / R-18 — BEFORE the DELETE, and on the `!is_complete` path
+        // too: a result that is going to destroy observations must at least
+        // not orphan their assignments or leak their vectors.
+        cascade_face_observations_before_replace(conn, result, *target_id, probe)?;
         if let Err(e) = conn.execute(
             "DELETE FROM face_observation
              WHERE image_id = ?1
@@ -11388,8 +11778,15 @@ fn replace_face_observations_for_targets(
     Ok(())
 }
 
-/// Disable ART index scans for the life of this guard, and restore the engine
-/// defaults on EVERY exit path — including an early `return` or a `?`.
+/// Disable ART index scans ON THIS CONNECTION for the life of this guard, and
+/// remove that override on EVERY exit path — including an early `return` or a
+/// `?` — so the connection is back on the DATABASE-WIDE (GLOBAL) value, tuned
+/// or default. ⚠️ That is not "the settings in force before it" in every case:
+/// a tuning made with an unqualified or `GLOBAL` SET survives, but a
+/// `SESSION`-scoped value set earlier on THIS connection does NOT — `RESET
+/// SESSION` clears the override, it does not restore a prior one (E2 review F1:
+/// SESSION 777 / 0.5 before the guard → GLOBAL 2048 / 0.001 after). Latent:
+/// nothing in the product sets either value today.
 ///
 /// This exists because the verification must not be performed with the same
 /// mechanism it is checking. In bundled DuckDB 1.5.5 the index-scan path emits
@@ -11412,15 +11809,44 @@ fn replace_face_observations_for_targets(
 /// ~42 scans for that chunk.
 ///
 /// ⚠️ SCOPE: an unqualified `SET` on these two writes the GLOBAL default (both
-/// carry `SettingScopeTarget::GLOBAL_DEFAULT`), so a leaked `index_scan_max_count
-/// = 0` would disable ART index scans for every query the process issues until
-/// it quits. That is why the two SETs are applied SEPARATELY and why `Drop`
-/// always attempts both RESETs regardless of what landed.
+/// carry `SettingScopeTarget::GLOBAL_DEFAULT` — bundled 1.5.5
+/// `duckdb/src/include/duckdb/main/settings.hpp:1081` for
+/// `IndexScanMaxCountSetting` and `:1094` for `IndexScanPercentageSetting`;
+/// an unqualified SET/RESET resolves to GLOBAL scope at
+/// `execution/operator/helper/physical_set.cpp:33-52`), so a leaked
+/// `index_scan_max_count = 0` would disable ART index scans for every query the
+/// process issues until it quits.
+///
+/// R-44 (slice E2) — and the unqualified pair had a second gap: `RESET` restores
+/// the COMPILED-IN default (2048 / 0.001), not the value in force before the
+/// guard, so a GLOBAL tuning `SET` made at open would have been silently
+/// discarded by the first verification. Hence `SET SESSION` / `RESET SESSION`:
+/// the zeroing is a per-connection override that no other connection sees, and
+/// `RESET SESSION` removes only that override (`physical_reset.cpp:59-64`
+/// clears the client's user setting, where the unqualified form resets the
+/// global one), so the connection falls back to whatever GLOBAL value is in
+/// force — tuned or default — with nothing captured. (A prior SESSION value on
+/// this connection is cleared with it — see the headline.) The session value is
+/// the one the scan reads: `table_scan.cpp:713-714` takes both through
+/// `Settings::Get(context)`, which consults the client's settings before the
+/// database's (`client_context.cpp:1459-1461`). Probed on the
+/// bundled crate: tuned 4242 → `SET SESSION … = 0` → this connection 0 (LOCAL),
+/// another 4242 → `RESET SESSION` → 4242 (GLOBAL). ⚠️ The Postgres spelling
+/// `SET LOCAL` / `RESET LOCAL` is "Not implemented" in 1.5.5; `SESSION` is.
+///
+/// The two SETs are still applied SEPARATELY and `Drop` still attempts both
+/// RESETs regardless of what landed — a half-applied pair must never outlive the
+/// guard, even on one connection. ⚠️ KNOWN GAP, pre-existing and QUEUED (E2
+/// review O1): if the transaction is ABORTED while the guard is live, both
+/// `RESET SESSION`s fail ("Current transaction is aborted") and the zeroing
+/// survives the ROLLBACK on this connection until the next guard's `Drop`
+/// succeeds. Before E2 the same path leaked the zeroing database-wide.
 struct FocusWritebackIndexScansDisabled<'a>
 {
     conn: &'a Connection,
     /// True only when BOTH settings landed. False means the verification ran
-    /// against engine defaults, and it says so rather than silently pretending.
+    /// with the connection's index-scan settings in force (index scans still
+    /// possible), and it says so rather than silently pretending.
     active: bool,
 }
 
@@ -11433,17 +11859,19 @@ impl<'a> FocusWritebackIndexScansDisabled<'a>
         //
         // Applied as two SEPARATE statements, deliberately: `execute_batch`
         // runs them one at a time and returns on the first error, so a failure
-        // on the second would silently leave the first applied — globally.
+        // on the second would silently leave the first applied. `SESSION`
+        // scope (R-44, slice E2): the override is this connection's alone.
         let mut active = true;
         for statement in [
-            "SET index_scan_max_count = 0;",
-            "SET index_scan_percentage = 0;",
+            "SET SESSION index_scan_max_count = 0;",
+            "SET SESSION index_scan_percentage = 0;",
         ] {
             if let Err(e) = conn.execute_batch(statement) {
                 active = false;
                 eprintln!(
                     "update_focus_analysis_results: could not disable index scans for the \
-                     writeback verification ({}: {}); verifying with engine defaults",
+                     writeback verification ({}: {}); verifying with the connection's \
+                     index-scan settings in force",
                     statement, e
                 );
             }
@@ -11454,8 +11882,8 @@ impl<'a> FocusWritebackIndexScansDisabled<'a>
     /// Test-only: a guard that never applied its settings, so the fail-closed
     /// path can be exercised. There is no input through which a caller can make
     /// a valid `SET` fail, so this seam is the only way to reach that branch.
-    /// `Drop` still attempts both RESETs, which is harmless — they are
-    /// idempotent when the matching `SET` never landed.
+    /// `Drop` still attempts both RESETs, which is harmless — `RESET SESSION`
+    /// removes an override that was never set, a no-op.
     #[cfg(test)]
     fn inactive_for_test(conn: &'a Connection) -> Self
     {
@@ -11493,13 +11921,16 @@ impl<'a> Drop for FocusWritebackIndexScansDisabled<'a>
 {
     fn drop(&mut self)
     {
-        // Unconditional and independent: `RESET` is idempotent and harmless
-        // when the matching `SET` never landed, and one of the two failing must
-        // not stop the other. A partially-applied pair that never got reset
-        // would degrade every later query in the process.
+        // Unconditional and independent: `RESET SESSION` is idempotent and
+        // harmless when the matching `SET` never landed, and one of the two
+        // failing must not stop the other. A partially-applied pair that never
+        // got reset would degrade every later query on this connection — and
+        // the catalogue has ONE connection. `SESSION` (R-44, slice E2): an
+        // unqualified `RESET` would clear the GLOBAL value to the compiled-in
+        // default and leave this connection's override standing.
         for statement in [
-            "RESET index_scan_max_count;",
-            "RESET index_scan_percentage;",
+            "RESET SESSION index_scan_max_count;",
+            "RESET SESSION index_scan_percentage;",
         ] {
             if let Err(e) = self.conn.execute_batch(statement) {
                 eprintln!(
@@ -11750,6 +12181,11 @@ struct FocusApplyProbe
     /// When true, the verification runs with a guard that never applied its
     /// settings — the fail-closed path.
     force_index_scan_settings_failure: bool,
+    /// Slice P (P5): when true, the D3 doomed-face census for `target_id`
+    /// reads a column that does not exist — a real per-row `Err`, which
+    /// `collect_rows_counted` counts as DROPPED — so the cascade's fail-closed
+    /// arm runs for real.
+    fail_face_census: bool,
     firings: std::cell::Cell<u32>,
 }
 
@@ -11766,6 +12202,7 @@ impl FocusApplyProbe
             collateral_id: None,
             duplicate_after_id: None,
             force_index_scan_settings_failure: false,
+            fail_face_census: false,
             firings: std::cell::Cell::new(0),
         }
     }
@@ -11791,6 +12228,12 @@ impl FocusApplyProbe
     fn forcing_index_scan_settings_failure(mut self) -> Self
     {
         self.force_index_scan_settings_failure = true;
+        self
+    }
+
+    fn failing_face_census(mut self) -> Self
+    {
+        self.fail_face_census = true;
         self
     }
 
@@ -11841,6 +12284,24 @@ fn focus_apply_probe_report(
 ) -> Option<(usize, bool, Option<i64>, Option<i64>)>
 {
     None
+}
+
+/// Slice P (P5): the column the D3 doomed-face census reads — 0, unless a test
+/// probe points it at a column that does not exist for this target.
+#[cfg(test)]
+fn focus_apply_probe_face_census_column(probe: FocusApplyProbeRef<'_>, target_id: i64) -> usize
+{
+    match probe
+    {
+        Some(probe) if probe.fail_face_census && probe.target_id == target_id => 7,
+        _ => 0,
+    }
+}
+
+#[cfg(not(test))]
+fn focus_apply_probe_face_census_column(_probe: FocusApplyProbeRef<'_>, _target_id: i64) -> usize
+{
+    0
 }
 
 fn update_focus_analysis_target(
@@ -12123,7 +12584,7 @@ fn write_focus_analysis_plans_in_transaction(
             continue;
         }
 
-        replace_face_observations_for_targets(conn, result, &updated_target_ids, is_complete)?;
+        replace_face_observations_for_targets(conn, result, &updated_target_ids, is_complete, probe)?;
 
         if is_complete {
             let mut labels = result
@@ -12681,6 +13142,14 @@ pub async fn face_recognition_menu_states(
 ///
 /// ⛔ On `store_ok = false` the observation list is EMPTY, never "everything is
 /// missing": the latter would make the builder re-embed the whole catalogue.
+///
+/// ⭐ Slice P / ruling 5's durable cure — `unreadable_half` (appended LAST,
+/// `.udl` default null, the S65 rule) names the half that could not be read,
+/// STRUCTURALLY: `"index"` (the vector store, `vectors.lancedb`) or
+/// `"catalogue"` (the `face_observation` rows); `None` whenever `store_ok`.
+/// Until the Swift side reads it, `FaceIndexWorkSetOutcome.unreadableHalf`
+/// keeps classifying the `store_error` PREFIX, and those prefixes are unchanged
+/// (`Spikes/SwallowedFailuresSwiftBGate` L8).
 #[derive(Debug, Clone)]
 pub struct FaceObservationWorkSet
 {
@@ -12688,6 +13157,7 @@ pub struct FaceObservationWorkSet
     pub dropped_rows: u64,
     pub store_ok: bool,
     pub store_error: Option<String>,
+    pub unreadable_half: Option<String>,
 }
 
 /// The CATALOGUE half of the face-index work set, separated out in fix round 1
@@ -12799,6 +13269,9 @@ pub async fn face_embedding_missing_observation_page(
                 dropped_rows: 0,
                 store_ok: false,
                 store_error: Some(message),
+                // Ruling 5, structurally: this arm is the VECTOR STORE half —
+                // its read, or the task that runs it.
+                unreadable_half: Some("index".to_string()),
             };
         }
     };
@@ -12827,6 +13300,8 @@ pub async fn face_embedding_missing_observation_page(
             dropped_rows: built.dropped_rows,
             store_ok: false,
             store_error: Some(message),
+            // Ruling 5, structurally: this arm is the CATALOGUE half.
+            unreadable_half: Some("catalogue".to_string()),
         },
         None => FaceObservationWorkSet
         {
@@ -12834,6 +13309,7 @@ pub async fn face_embedding_missing_observation_page(
             dropped_rows: built.dropped_rows,
             store_ok: true,
             store_error: None,
+            unreadable_half: None,
         },
     }
 }
@@ -13098,11 +13574,35 @@ static FACE_EMBEDDING_RUNTIME: once_cell::sync::Lazy<&'static tokio::runtime::Ru
             .expect("test builds: the face embedding runtime")
     });
 
-/// Serializes durable pending-delete retries without holding a blocking mutex
-/// across LanceDB awaits. Editor refresh, launch recovery, and index build can
-/// all request a retry; one queue consumer at a time keeps acknowledgement
-/// ordering deterministic and every delete idempotent.
-static FACE_VECTOR_DELETE_RETRY_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+/// ⭐ Slice P / N-2 — the ONE lock every `vectors.lancedb` WRITER takes.
+///
+/// It began as `FACE_VECTOR_DELETE_RETRY_LOCK`, taken by the pending-delete
+/// retry alone, while three other writers — the index-build upsert,
+/// canonicalize's twin delete and the additive restore's cleanup — each opened
+/// their own connection and committed with no lock at all onto the SAME
+/// multi-thread runtime. Lance answers a commit conflict by retrying 20 times
+/// with backoff and then FAILING (`lance-8.0.0/src/io/commit.rs:1125-1132`,
+/// default `num_retries: 20` at `lance-table-8.0.0/src/io/commit.rs:1547-1553`),
+/// so a single process could reach `CommitConflict` — which the user would see
+/// as `store_failed`.
+///
+/// Taken ONCE, never nested, by exactly three leaf writers:
+/// `upsert_face_embeddings_impl` (around its open + `merge_insert` + count),
+/// `retry_pending_face_vector_deletes_probed` (the queue drain, and the orphan
+/// sweep that runs inside it) and `delete_face_vectors_by_observation_ids`
+/// (canonicalize's Phase 2). The restore's cleanup is the retry itself
+/// (`copy_face_embeddings_for_merge` calls the drain), so it inherits the lock
+/// and adds none. ⛔ No CALLER of those three may hold it — a nested take
+/// deadlocks: `canonicalize_face_embeddings_probed` releases the catalogue
+/// mutex before Phase 2 and holds nothing; `copy_face_embeddings_for_merge`
+/// holds nothing.
+///
+/// ⚠️ Held across `await`s BY DESIGN — that is why it is a `tokio::sync::Mutex`
+/// and never a `std::sync::Mutex`. It does not guard against another PROCESS;
+/// nothing does, and nothing needs to: the app is this store's only writer.
+/// Pinned by `cross_store_tests` P14 (a real contention test on this lock plus
+/// a source lock that each writer takes it exactly once).
+static FACE_EMBEDDING_STORE_WRITE_LOCK: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
     once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
 
 fn face_embedding_schema(dimension: u32) -> SchemaRef {
@@ -13130,6 +13630,20 @@ fn face_embedding_schema(dimension: u32) -> SchemaRef {
     ]))
 }
 
+/// The face-embedding store's location: `vectors.lancedb` beside the catalogue.
+///
+/// ⭐ Slice P / D7 — the HANDLE-PINNING invariant. An open LanceDB `Table` PINS
+/// the manifest version it was opened at: `connect()` leaves
+/// `read_consistency_interval: None` (`lancedb-0.31.0/src/connection.rs:686,
+/// 1071`) ⇒ `ConsistencyMode::Lazy` (`src/table/dataset.rs:59-65`) ⇒ `get()`
+/// hands back the cached dataset with no re-resolution (`:104-134`); it moves
+/// only on a write through that same handle or an explicit `checkout_latest`.
+/// This product is correct ONLY because every operation opens a fresh
+/// `connect` + `open_table`. ⛔ Never cache a `lancedb::Table` or
+/// `lancedb::Connection` in a `static` / `Lazy` / `OnceCell`, and never call
+/// `read_consistency_interval` — a cached handle would silently serve stale
+/// vectors after another writer's commit. `cross_store_tests` P11 locks this;
+/// its runtime twins are P8 and P10b.
 fn face_embedding_store_uri() -> Option<String> {
     let catalogue_path = lock_catalogue_path();
     let path = catalogue_path.as_ref()?;
@@ -13137,21 +13651,91 @@ fn face_embedding_store_uri() -> Option<String> {
     Some(parent.join("vectors.lancedb").to_string_lossy().to_string())
 }
 
+/// ⭐ Slice P / R-62 — the WRITE-side open: create the table ONLY on LanceDB's
+/// TYPED "never built", and report every other open failure by name.
+///
+/// It used to answer ANY `open_table` error with `create_empty_table`. Its mode
+/// is `CreateTableMode::Create` (`lancedb-0.31.0/src/database.rs:95-98`), which
+/// errors when the table exists, so an unsupported file version, a corrupt
+/// manifest, a permissions failure or a schema mismatch all came back as
+/// "Table 'face_embeddings' already exists" — a message that names neither the
+/// store nor the real failure, on the one seam that would identify a Lance
+/// format break. Nothing was ever overwritten (`Create` never does); the lie was
+/// in the words.
+///
+/// Two callers, two policies, ONE classifier. The READ side
+/// (`open_face_embedding_table_at_uri`) answers a MISSING directory with
+/// `NeverBuilt` — an honest EMPTY answer, and it must not create the store as a
+/// side effect of a read. This, the write side, answers a missing directory by
+/// falling through to `connect` + `create_empty_table` — the first-ever build.
+/// Both hand `open_table`'s error to `classify_face_embedding_open_error`,
+/// which matches the typed `lancedb::Error::TableNotFound` and never text.
+///
+/// ⚠️ A lost `_versions` directory is `TableNotFound` by construction
+/// (`lance-8.0.0/src/dataset/builder.rs:860-866` → `lancedb-0.31.0/src/table.rs:
+/// 2003,2132`), so here it is re-created and re-embedded — the correct recovery
+/// for DERIVED data — while `open_face_vector_table_at_uri_for_delete` defers
+/// its queue on the same state. Both fail safe in their own direction; the
+/// asymmetry is deliberate (Q-09 §1.7 Q13) and `cross_store_tests` P10c / P18(c)
+/// execute both.
 async fn open_or_create_face_embedding_table(
     dimension: u32,
-) -> Result<lancedb::Table, lancedb::Error> {
-    let uri = face_embedding_store_uri().ok_or_else(|| lancedb::Error::InvalidInput {
-        message: "catalogue path is not initialized".to_string(),
+) -> Result<lancedb::Table, String>
+{
+    const OPERATION: &str = "upsert_face_embeddings";
+    let uri = face_embedding_store_uri()
+        .ok_or_else(|| format!("{}: catalogue path is not initialized", OPERATION))?;
+
+    match std::fs::metadata(&uri)
+    {
+        Ok(metadata) =>
+        {
+            if !metadata.is_dir()
+            {
+                return Err(format!(
+                    "{}: face-embedding store path is not a directory: {}",
+                    OPERATION, uri
+                ));
+            }
+        }
+        // ⭐ The FIRST-EVER build: nothing at the path yet. Fall through —
+        // `connect` creates the directory and the `NeverBuilt` arm below
+        // creates the table. ⛔ Never an empty answer on the write side.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) =>
+        {
+            return Err(format!(
+                "{}: face-embedding store metadata failed for {}: {}",
+                OPERATION, uri, error
+            ));
+        }
+    }
+
+    let database = lancedb::connect(&uri).execute().await.map_err(|error|
+    {
+        format!("{}: face-embedding store connect failed: {}", OPERATION, error)
     })?;
 
-    let db = lancedb::connect(&uri).execute().await?;
-    match db.open_table(FACE_EMBEDDING_TABLE).execute().await {
+    match database.open_table(FACE_EMBEDDING_TABLE).execute().await
+    {
         Ok(table) => Ok(table),
-        Err(_) => {
-            db.create_empty_table(FACE_EMBEDDING_TABLE, face_embedding_schema(dimension))
+        Err(error) => match classify_face_embedding_open_error(error, OPERATION)
+        {
+            Ok(FaceEmbeddingTableState::NeverBuilt) => database
+                .create_empty_table(FACE_EMBEDDING_TABLE, face_embedding_schema(dimension))
                 .execute()
                 .await
-        }
+                .map_err(|error|
+                {
+                    format!("{}: face-embedding table create failed: {}", OPERATION, error)
+                }),
+            // Unreachable from the classifier today; answered without a panic
+            // because every FFI call site is `try!` (R-07).
+            Ok(FaceEmbeddingTableState::Present(table)) => Ok(table),
+            // ⛔ R-62: an open that failed for any other reason is REPORTED,
+            // never answered with `create_empty_table`.
+            Err(message) => Err(message),
+        },
     }
 }
 
@@ -13410,6 +13994,33 @@ async fn upsert_face_embeddings_impl(
         };
     }
 
+    // ⭐ Slice P / D2 — ONE record per key. Every valid record already carries
+    // the first record's model/preprocessing pair, so the merge key below
+    // reduces to `face_observation_id` here. `merge_insert` REFUSES a source
+    // holding two rows for one existing target row ("Ambiguous merge inserts
+    // are prohibited", `lance-8.0.0/src/dataset/write/merge_insert.rs:220`),
+    // where the old delete-then-add stored both; the LAST occurrence wins, which
+    // is what a replace means. The work set is distinct ids, so this is inert
+    // for the index builder and exists for the restore's re-keyed copy.
+    let valid_records = {
+        let mut last_index = std::collections::HashMap::<i64, usize>::new();
+        for (index, record) in valid_records.iter().enumerate()
+        {
+            last_index.insert(record.face_observation_id, index);
+        }
+        valid_records
+            .into_iter()
+            .enumerate()
+            .filter(|(index, record)| last_index.get(&record.face_observation_id) == Some(index))
+            .map(|(_, record)| record)
+            .collect::<Vec<_>>()
+    };
+
+    // ⭐ Slice P / D5 — the ONE store write lock, taken after validation and
+    // held around the open, the single commit and the count. Never nested:
+    // no caller of this function holds it (see the lock's own doc).
+    let _store_write = FACE_EMBEDDING_STORE_WRITE_LOCK.lock().await;
+
     let table = match open_or_create_face_embedding_table(dimension).await {
         Ok(table) => table,
         Err(e) => {
@@ -13422,25 +14033,6 @@ async fn upsert_face_embeddings_impl(
             };
         }
     };
-
-    let ids = valid_records
-        .iter()
-        .map(|record| record.face_observation_id.to_string())
-        .collect::<Vec<_>>();
-    let delete_filter = format!(
-        "{} AND face_observation_id IN ({})",
-        face_embedding_version_filter(&model_version, &preprocessing_version),
-        ids.join(",")
-    );
-    if let Err(e) = table.delete(&delete_filter).await {
-        return FaceEmbeddingStoreResult {
-            requested_count,
-            stored_count: 0,
-            total_count: table.count_rows(None).await.unwrap_or(0) as u64,
-            status: "replace_failed".to_string(),
-            message: format!("Failed to replace existing face embeddings: {}", e),
-        };
-    }
 
     let batch = match face_embedding_batch(&valid_records, dimension) {
         Ok(batch) => batch,
@@ -13455,7 +14047,35 @@ async fn upsert_face_embeddings_impl(
         }
     };
 
-    if let Err(e) = table.add(batch).execute().await {
+    // ⭐ Slice P / R-50 — ONE Lance commit. This used to be `table.delete(…)`
+    // then `table.add(…)`: two independent commits, and because the index
+    // builder hands the WHOLE pass to one call, a kill between them lost every
+    // pre-existing vector the pass was replacing AND every replacement until
+    // the next launch re-embedded them. A `merge_insert` is one commit
+    // (`CommitBuilder::execute` once per `execute`), and a partial write is never
+    // visible: readers find fragments only through the manifest (Q-09 §1.7
+    // Q1–Q2). It also retires the `IN (…)` filter that spelled out every id of
+    // the pass, and leaves one manifest version per pass instead of two.
+    //
+    // ⭐ The key is THREE columns, the faithful translation of the old filter
+    // (`face_embedding_version_filter(…) AND face_observation_id IN (…)`): only
+    // rows of the SAME model/preprocessing contract are replaced, never another
+    // contract's vector for the same face (`cross_store_tests` P6).
+    // ⛔ Never `use_lsm_write(true)` / `set_lsm_write_spec(…)` — that is the
+    // opt-in MemWAL path, a durability model this product has not evaluated.
+    let mut merge = table.merge_insert(&[
+        "face_observation_id",
+        "model_version",
+        "preprocessing_version",
+    ]);
+    merge.when_matched_update_all(None).when_not_matched_insert_all();
+    let schema = batch.schema();
+    let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
+    // ⛔ S179, across the other engine: a reported change count is a HINT,
+    // never control flow. `MergeResult`'s row counts are documented "for user
+    // statistics" (`lancedb-0.31.0/src/table/merge.rs:22-34`) and are not read;
+    // `stored_count` below stays the number of records this call committed.
+    if let Err(e) = merge.execute(Box::new(reader)).await {
         return FaceEmbeddingStoreResult {
             requested_count,
             stored_count: 0,
@@ -13479,15 +14099,28 @@ async fn face_embedding_total_count() -> u64 {
     // W1 — this feeds an informational total on the store-write result; its
     // "0 on failure" behaviour is unchanged by slice 7. R-08's fix is scoped to
     // the READ path whose zero is mistaken for an answer.
-    match open_face_embedding_table_for_read("face_embedding_total_count").await {
-        Ok(FaceEmbeddingTableState::Present(table)) => {
-            table.count_rows(None).await.unwrap_or(0) as u64
-        }
-        Ok(FaceEmbeddingTableState::NeverBuilt) => 0,
+    match face_embedding_total_count_checked().await {
+        Ok(count) => count,
         Err(message) => {
             eprintln!("{}", message);
             0
         }
+    }
+}
+
+/// ⭐ Slice P / R-30 (A2's S-1) — the store's row count with failure KEPT
+/// apart from empty: a never-built store is an honest `Ok(0)`; an unreadable
+/// store, or a `count_rows` that failed, is `Err`. `backup_manifest_counts`
+/// reads it so the manifest can write an absent key instead of a false 0.
+async fn face_embedding_total_count_checked() -> Result<u64, String> {
+    match open_face_embedding_table_for_read("face_embedding_total_count").await {
+        Ok(FaceEmbeddingTableState::Present(table)) => table
+            .count_rows(None)
+            .await
+            .map(|count| count as u64)
+            .map_err(|error| format!("face_embedding_total_count: count_rows failed: {}", error)),
+        Ok(FaceEmbeddingTableState::NeverBuilt) => Ok(0),
+        Err(message) => Err(message),
     }
 }
 
@@ -15135,9 +15768,460 @@ fn acknowledge_pending_face_vector_deletes_from_catalogue(
     )
 }
 
+/// ⭐ Slice P / A-10 — which passes a retry runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrphanSweepMode
+{
+    /// Launch recovery and the index build (the FFI): drain the queue, then
+    /// reconcile orphan vectors (D6).
+    DrainAndSweep,
+    /// The additive restore's cleanup: drain ONLY. A full store scan has no
+    /// place inside a Restore the user is waiting on; the next launch or index
+    /// build sweeps.
+    DrainOnly,
+}
+
+/// The FFI's retry: drain the durable queue, then reconcile orphan vectors.
+/// The ONLY production drain-and-sweep call — the probe type is uninhabited
+/// outside tests.
 async fn retry_pending_face_vector_deletes_impl() -> FaceVectorDeleteRetryResult
 {
-    let _retry_guard = FACE_VECTOR_DELETE_RETRY_LOCK.lock().await;
+    retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, None).await
+}
+
+/// ⭐ Slice P / D4.2 + A-10 — the additive restore's cleanup: the queue drain
+/// WITHOUT the orphan sweep. `copy_face_embeddings_for_merge` calls it after
+/// the merge committed its replaced ids into the queue.
+async fn retry_pending_face_vector_deletes_drain_only() -> FaceVectorDeleteRetryResult
+{
+    retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainOnly, None).await
+}
+
+/// The retry's one leaf: takes the store write lock ONCE (D5) and holds it
+/// across the drain AND the sweep, so no upsert can commit between the sweep's
+/// read of the store's ids and its read of the catalogue's.
+async fn retry_pending_face_vector_deletes_probed(
+    mode: OrphanSweepMode,
+    probe: OrphanSweepProbeRef<'_>,
+) -> FaceVectorDeleteRetryResult
+{
+    let _store_write = FACE_EMBEDDING_STORE_WRITE_LOCK.lock().await;
+    let drained = drain_pending_face_vector_deletes().await;
+    if mode == OrphanSweepMode::DrainOnly
+    {
+        return drained;
+    }
+
+    // The sweep runs only after a COMPLETED drain. `Deferred` / `Failed` mean
+    // the store or the queue could not be used just now; `VectorTableAbsent`
+    // means there is no table to hold an orphan.
+    match drained.status
+    {
+        FaceVectorDeleteRetryStatus::NoPendingDeletes | FaceVectorDeleteRetryStatus::Deleted => {}
+        FaceVectorDeleteRetryStatus::VectorTableAbsent
+        | FaceVectorDeleteRetryStatus::Deferred
+        | FaceVectorDeleteRetryStatus::Failed => return drained,
+    }
+
+    let sweep = match open_face_vector_table_for_delete("reconcile_orphan_face_vectors").await
+    {
+        Ok(FaceVectorTableForDelete::Present(table)) =>
+        {
+            reconcile_orphan_face_vectors(&table, probe).await
+        }
+        Ok(FaceVectorTableForDelete::Absent) => OrphanSweep
+        {
+            ran: false,
+            enqueued: 0,
+            note: "Orphan scan: there is no face-vector table to reconcile.".to_string(),
+        },
+        Err(message) => OrphanSweep
+        {
+            ran: false,
+            enqueued: 0,
+            note: format!("Orphan scan skipped: {}", message),
+        },
+    };
+
+    // The queue's own count after the pass, verified on the table — so a
+    // sweep that queued orphans reports them as REMAINING (they are deleted by
+    // the next retry, through the existing acknowledged-only path). The drain's
+    // status is kept: it describes the drain.
+    let remaining_count = if sweep.enqueued > 0
+    {
+        pending_face_vector_delete_count_from_catalogue().unwrap_or(drained.remaining_count + sweep.enqueued)
+    }
+    else
+    {
+        drained.remaining_count
+    };
+    FaceVectorDeleteRetryResult
+    {
+        status: drained.status,
+        pending_count: drained.pending_count,
+        acknowledged_count: drained.acknowledged_count,
+        remaining_count,
+        message: format!("{} {}", drained.message, sweep.note),
+        orphans_enqueued: sweep.enqueued,
+        orphan_scan_ran: sweep.ran,
+    }
+}
+
+/// ⭐ Slice P / D6 — at most this many orphan ids are queued per run; the
+/// remainder is found again by the next one. Pinned by P15's cap assertion.
+const ORPHAN_VECTOR_SWEEP_CAP: usize = 50_000;
+
+/// What one orphan sweep did. `ran` = the gate opened and the store's ids were
+/// read; `enqueued` = orphan ids confirmed ON THE QUEUE TABLE after the insert.
+struct OrphanSweep
+{
+    ran: bool,
+    enqueued: u64,
+    note: String,
+}
+
+/// Test-only seam for the orphan sweep (the S179 `FocusApplyProbe` discipline:
+/// private, parameter-threaded, no global statics, no environment variables;
+/// outside `cfg(test)` the referent type is UNINHABITED, so production provably
+/// passes `None` and the release build carries no dead code).
+#[cfg(test)]
+struct OrphanSweepProbe
+{
+    /// P17(a): answer the store's `count_rows` with an error.
+    fail_store_count: bool,
+    /// P17(b): read the live ids from a column that does not exist — a real
+    /// per-row `Err`, which `collect_rows_counted` counts as dropped.
+    live_id_column: usize,
+    /// P15 / M17: a smaller cap than `ORPHAN_VECTOR_SWEEP_CAP`.
+    cap: Option<usize>,
+    /// P16: how many times the store's ids were SCANNED. An atomic, not a
+    /// `Cell`: the retry future is spawned on the runtime and must stay `Send`.
+    scans: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(test)]
+impl OrphanSweepProbe
+{
+    fn new() -> Self
+    {
+        Self
+        {
+            fail_store_count: false,
+            live_id_column: 0,
+            cap: None,
+            scans: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+type OrphanSweepProbeRef<'a> = Option<&'a OrphanSweepProbe>;
+
+/// Uninhabited outside tests: the production call sites pass `None` and no
+/// other value can exist.
+#[cfg(not(test))]
+type OrphanSweepProbeRef<'a> = Option<&'a std::convert::Infallible>;
+
+#[cfg(test)]
+fn orphan_sweep_probe_fails_store_count(probe: OrphanSweepProbeRef<'_>) -> bool
+{
+    probe.map(|probe| probe.fail_store_count).unwrap_or(false)
+}
+
+#[cfg(not(test))]
+fn orphan_sweep_probe_fails_store_count(_probe: OrphanSweepProbeRef<'_>) -> bool
+{
+    false
+}
+
+#[cfg(test)]
+fn orphan_sweep_probe_live_id_column(probe: OrphanSweepProbeRef<'_>) -> usize
+{
+    probe.map(|probe| probe.live_id_column).unwrap_or(0)
+}
+
+#[cfg(not(test))]
+fn orphan_sweep_probe_live_id_column(_probe: OrphanSweepProbeRef<'_>) -> usize
+{
+    0
+}
+
+#[cfg(test)]
+fn orphan_sweep_cap(probe: OrphanSweepProbeRef<'_>) -> usize
+{
+    probe.and_then(|probe| probe.cap).unwrap_or(ORPHAN_VECTOR_SWEEP_CAP)
+}
+
+#[cfg(not(test))]
+fn orphan_sweep_cap(_probe: OrphanSweepProbeRef<'_>) -> usize
+{
+    ORPHAN_VECTOR_SWEEP_CAP
+}
+
+#[cfg(test)]
+fn orphan_sweep_probe_note_scan(probe: OrphanSweepProbeRef<'_>)
+{
+    if let Some(probe) = probe
+    {
+        probe.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(not(test))]
+fn orphan_sweep_probe_note_scan(_probe: OrphanSweepProbeRef<'_>) {}
+
+/// ⭐ Slice P / D6 (N-4) — the bounded orphan-vector reconciliation.
+///
+/// Vector-LESS rows are already swept: `face_embedding_missing_observation_page`
+/// anti-joins the catalogue against the store and `faceIndexPassPending`
+/// re-runs the builder. Nothing swept the other direction — a vector whose
+/// `face_observation` row is GONE — and such vectors exist: R-18's writeback
+/// never enqueued what it destroyed, N-1's backup-wins merge deleted them
+/// outside the queue, and — the ONGOING source D5's lock does not close — the
+/// index builder reads its candidate ids at pass start, an Intelligent Culling
+/// writeback can destroy those observations mid-pass (enqueueing ids whose
+/// vectors do not exist yet, which the next drain acknowledges), and the
+/// pass's upsert then stores vectors no row claims.
+///
+/// 1. THE CHEAP GATE: `count_rows` on the store against the CANONICAL
+///    observation count. The store holds canonical-only vectors
+///    (`face_embedding_observation_candidates` reads `image_id =
+///    analyzed_image_id`), so `store > canonical` is the only surplus that can
+///    signal an orphan. ⚠️ False-negative ONLY: when un-embedded canonical rows
+///    outnumber the orphans the gate stays shut, and the orphans wait for a run
+///    where it opens. Any error on either side ⇒ SKIP, fail-open, and say so.
+///    ⚠️ Cost: on a store written before compaction existed, `count_rows(None)`
+///    opens a data file per legacy fragment (`lance-8.0.0/src/dataset/
+///    fragment.rs:1211-1233`).
+/// 2. THE SCAN, only when the gate opens: the `face_observation_id` column
+///    ALONE — ⛔ never `vector`, whose read is ~900 MB at the Studio's scale.
+/// 3. THE ANTI-JOIN against EVERY `face_observation` id — ⚠️ "no row with this
+///    id at all", never "not canonical": the twin rows canonicalize kept must
+///    not have their ids re-deleted. ⛔ A live-id read that DROPPED rows
+///    ABANDONS the sweep: a short live set would queue LIVE vectors for
+///    deletion, the worst failure direction there is.
+/// 4. ENQUEUE, capped at `ORPHAN_VECTOR_SWEEP_CAP` per run, in 500-id
+///    statements; the existing acknowledged-only retry deletes them next time.
+///    P adds no second delete path.
+///
+/// Holds the store write lock (its caller's) and never the catalogue mutex
+/// across an `await`: every DuckDB touch is a synchronous `*_from_catalogue`
+/// wrapper.
+async fn reconcile_orphan_face_vectors(
+    table: &lancedb::Table,
+    probe: OrphanSweepProbeRef<'_>,
+) -> OrphanSweep
+{
+    let skipped = |reason: String| OrphanSweep
+    {
+        ran: false,
+        enqueued: 0,
+        note: format!("Orphan scan skipped: {}", reason),
+    };
+
+    let store_count = if orphan_sweep_probe_fails_store_count(probe)
+    {
+        Err("the store's row count failed (injected by the test probe)".to_string())
+    }
+    else
+    {
+        table
+            .count_rows(None)
+            .await
+            .map(|count| count as u64)
+            .map_err(|error| format!("the store's row count failed: {}", error))
+    };
+    let store_count = match store_count
+    {
+        Ok(count) => count,
+        Err(reason) => return skipped(reason),
+    };
+    let canonical_count = match canonical_face_observation_count_from_catalogue()
+    {
+        Ok(count) => count,
+        Err(reason) => return skipped(reason),
+    };
+    if store_count <= canonical_count
+    {
+        return OrphanSweep
+        {
+            ran: false,
+            enqueued: 0,
+            note: format!(
+                "Orphan scan not needed: the store holds {} vector(s) for {} canonical face record(s).",
+                store_count, canonical_count
+            ),
+        };
+    }
+
+    orphan_sweep_probe_note_scan(probe);
+    let store_ids = match stored_face_vector_ids(table).await
+    {
+        Ok(ids) => ids,
+        Err(reason) => return skipped(reason),
+    };
+
+    match enqueue_orphan_face_vectors_from_catalogue(&store_ids, orphan_sweep_cap(probe), probe)
+    {
+        Ok((found, enqueued)) => OrphanSweep
+        {
+            ran: true,
+            enqueued,
+            note: if found == 0
+            {
+                format!(
+                    "Orphan scan: none of the store's {} vector(s) is missing its face record.",
+                    store_ids.len()
+                )
+            }
+            else
+            {
+                format!(
+                    "Orphan scan: {} stored vector(s) belong to no face record; {} queued for deletion on the next retry (at most {} per run).",
+                    found, enqueued, orphan_sweep_cap(probe)
+                )
+            },
+        },
+        Err(reason) => OrphanSweep
+        {
+            ran: true,
+            enqueued: 0,
+            note: format!("Orphan scan abandoned, nothing was queued: {}", reason),
+        },
+    }
+}
+
+/// Every `face_observation_id` the store holds, projected to that ONE column.
+async fn stored_face_vector_ids(
+    table: &lancedb::Table,
+) -> Result<std::collections::HashSet<i64>, String>
+{
+    let batches = table
+        .query()
+        .select(lancedb::query::Select::columns(&["face_observation_id"]))
+        .execute()
+        .await
+        .map_err(|error| format!("the store's id scan failed: {}", error))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|error| format!("the store's id scan failed: {}", error))?;
+    let mut ids = std::collections::HashSet::new();
+    for batch in batches
+    {
+        let column = batch
+            .column_by_name("face_observation_id")
+            .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| {
+                "the store's id scan returned no Int64 face_observation_id column".to_string()
+            })?;
+        for row in 0..column.len()
+        {
+            if column.is_null(row)
+            {
+                return Err("the store's id scan returned a NULL face_observation_id".to_string());
+            }
+            ids.insert(column.value(row));
+        }
+    }
+    Ok(ids)
+}
+
+fn canonical_face_observation_count_from_catalogue() -> Result<u64, String>
+{
+    let catalogue = lock_catalogue();
+    let conn = catalogue
+        .as_ref()
+        .ok_or_else(|| "the catalogue is not initialized".to_string())?;
+    conn.query_row(
+        "SELECT COUNT(*) FROM face_observation WHERE image_id = analyzed_image_id",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count.max(0) as u64)
+    .map_err(|error| format!("the canonical face-record count failed: {}", error))
+}
+
+/// Steps 3 and 4 under ONE synchronous catalogue-lock acquisition: the live
+/// ids, the anti-join, and the capped enqueue. Returns (orphans found, orphan
+/// ids confirmed on the queue table after the insert).
+fn enqueue_orphan_face_vectors_from_catalogue(
+    store_ids: &std::collections::HashSet<i64>,
+    cap: usize,
+    probe: OrphanSweepProbeRef<'_>,
+) -> Result<(u64, u64), String>
+{
+    const SITE: &str = "reconcile_orphan_face_vectors.live_ids";
+
+    let catalogue = lock_catalogue();
+    let conn = catalogue
+        .as_ref()
+        .ok_or_else(|| "the catalogue is not initialized".to_string())?;
+
+    let mut statement = conn
+        .prepare("SELECT id FROM face_observation")
+        .map_err(|error| format!("the face-record id read could not be prepared: {}", error))?;
+    let column = orphan_sweep_probe_live_id_column(probe);
+    let rows = statement
+        .query_map([], move |row| row.get::<_, i64>(column))
+        .map_err(|error| format!("the face-record id read failed: {}", error))?;
+    let (live_ids, dropped) = collect_rows_counted(rows, SITE);
+    if dropped > 0
+    {
+        return Err(format!(
+            "{} face record(s) could not be read, so the live set is short and a live vector could be mistaken for an orphan",
+            dropped
+        ));
+    }
+    let live_ids = live_ids.into_iter().collect::<std::collections::HashSet<i64>>();
+
+    let mut orphans = store_ids
+        .iter()
+        .copied()
+        .filter(|id| !live_ids.contains(id))
+        .collect::<Vec<_>>();
+    orphans.sort_unstable();
+    let found = orphans.len() as u64;
+    orphans.truncate(cap);
+
+    let mut enqueued = 0u64;
+    for chunk in orphans.chunks(500)
+    {
+        let values = chunk
+            .iter()
+            .map(|id| format!("({}, CURRENT_TIMESTAMP)", id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute(
+            &format!(
+                "INSERT OR IGNORE INTO face_vector_pending_delete (face_observation_id, enqueued_at) VALUES {}",
+                values
+            ),
+            [],
+        )
+        .map_err(|error| format!("the orphan enqueue failed: {}", error))?;
+        // S179 — the INSERT's change count is a hint (an id already queued is
+        // IGNORED, not counted); the TABLE says what is queued.
+        let confirmed = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM face_vector_pending_delete WHERE face_observation_id IN ({})",
+                    editor_saved_image_id_csv(chunk)
+                ),
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("the orphan enqueue could not be verified: {}", error))?;
+        enqueued += confirmed.max(0) as u64;
+    }
+    Ok((found, enqueued))
+}
+
+/// The queue drain — until slice P, the whole of
+/// `retry_pending_face_vector_deletes_impl`. ⛔ Runs ONLY under
+/// `FACE_EMBEDDING_STORE_WRITE_LOCK`, taken by its one caller,
+/// `retry_pending_face_vector_deletes_probed`.
+async fn drain_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
+{
     let pending_ids = match pending_face_vector_delete_ids_from_catalogue()
     {
         Ok(ids) => ids,
@@ -15147,6 +16231,8 @@ async fn retry_pending_face_vector_deletes_impl() -> FaceVectorDeleteRetryResult
             {
                 status: FaceVectorDeleteRetryStatus::Failed,
                 pending_count: 0,
+                orphans_enqueued: 0,
+                orphan_scan_ran: false,
                 acknowledged_count: 0,
                 remaining_count: 0,
                 message,
@@ -15160,6 +16246,8 @@ async fn retry_pending_face_vector_deletes_impl() -> FaceVectorDeleteRetryResult
         {
             status: FaceVectorDeleteRetryStatus::NoPendingDeletes,
             pending_count: 0,
+            orphans_enqueued: 0,
+            orphan_scan_ran: false,
             acknowledged_count: 0,
             remaining_count: 0,
             message: "No obsolete face vectors are waiting for deletion.".to_string(),
@@ -15190,6 +16278,8 @@ async fn retry_pending_face_vector_deletes_impl() -> FaceVectorDeleteRetryResult
                             FaceVectorDeleteRetryStatus::Deferred
                         },
                         pending_count,
+                        orphans_enqueued: 0,
+                        orphan_scan_ran: false,
                         acknowledged_count,
                         remaining_count,
                         message: if remaining_count == 0
@@ -15208,6 +16298,8 @@ async fn retry_pending_face_vector_deletes_impl() -> FaceVectorDeleteRetryResult
                 {
                     status: FaceVectorDeleteRetryStatus::Deferred,
                     pending_count,
+                    orphans_enqueued: 0,
+                    orphan_scan_ran: false,
                     acknowledged_count: 0,
                     remaining_count: pending_count,
                     message,
@@ -15225,6 +16317,8 @@ async fn retry_pending_face_vector_deletes_impl() -> FaceVectorDeleteRetryResult
             {
                 status: FaceVectorDeleteRetryStatus::Deferred,
                 pending_count,
+                orphans_enqueued: 0,
+                orphan_scan_ran: false,
                 acknowledged_count: 0,
                 remaining_count: pending_count,
                 message,
@@ -15248,6 +16342,8 @@ async fn retry_pending_face_vector_deletes_impl() -> FaceVectorDeleteRetryResult
             {
                 status: FaceVectorDeleteRetryStatus::Deferred,
                 pending_count,
+                orphans_enqueued: 0,
+                orphan_scan_ran: false,
                 acknowledged_count,
                 remaining_count,
                 message: format!("Face-vector deletion was deferred: {}", error),
@@ -15265,6 +16361,8 @@ async fn retry_pending_face_vector_deletes_impl() -> FaceVectorDeleteRetryResult
                 {
                     status: FaceVectorDeleteRetryStatus::Deferred,
                     pending_count,
+                    orphans_enqueued: 0,
+                    orphan_scan_ran: false,
                     acknowledged_count,
                     remaining_count,
                     message,
@@ -15282,6 +16380,8 @@ async fn retry_pending_face_vector_deletes_impl() -> FaceVectorDeleteRetryResult
             {
                 status: FaceVectorDeleteRetryStatus::Failed,
                 pending_count,
+                orphans_enqueued: 0,
+                orphan_scan_ran: false,
                 acknowledged_count,
                 remaining_count: pending_count.saturating_sub(acknowledged_count),
                 message,
@@ -15300,6 +16400,8 @@ async fn retry_pending_face_vector_deletes_impl() -> FaceVectorDeleteRetryResult
     {
         status,
         pending_count,
+        orphans_enqueued: 0,
+        orphan_scan_ran: false,
         acknowledged_count,
         remaining_count,
         message: if remaining_count == 0
@@ -15316,6 +16418,8 @@ async fn retry_pending_face_vector_deletes_impl() -> FaceVectorDeleteRetryResult
 /// Retry every durable obsolete-face-vector id. Queue rows survive every
 /// unconfirmed store error; the API is safe to call at launch, before an index
 /// build, and immediately after an editor-refresh transaction commits.
+/// ⭐ Slice P / D6: after a completed drain it also runs the bounded orphan
+/// sweep (`reconcile_orphan_face_vectors`) — ruling 15, Sep 30, 2026.
 pub async fn retry_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
 {
     // ⭐ Slice F — L2 + L3. The runtime is acquired fallibly (R-25: an
@@ -15358,6 +16462,8 @@ pub async fn retry_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
             {
                 status: FaceVectorDeleteRetryStatus::Failed,
                 pending_count: remaining_count,
+                orphans_enqueued: 0,
+                orphan_scan_ran: false,
                 acknowledged_count: 0,
                 remaining_count,
                 message: failure.clone(),
@@ -15367,6 +16473,8 @@ pub async fn retry_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
         {
             status: FaceVectorDeleteRetryStatus::Failed,
             pending_count: 0,
+            orphans_enqueued: 0,
+            orphan_scan_ran: false,
             acknowledged_count: 0,
             remaining_count: 0,
             message: format!(
@@ -15390,6 +16498,10 @@ async fn delete_face_vectors_by_observation_ids(
     {
         return (0, false);
     }
+    // ⭐ Slice P / D5 — the ONE store write lock. Its caller,
+    // `canonicalize_face_embeddings_probed`, has released the catalogue mutex
+    // and holds nothing.
+    let _store_write = FACE_EMBEDDING_STORE_WRITE_LOCK.lock().await;
     let table = match open_face_vector_table_for_delete(operation).await
     {
         Ok(FaceVectorTableForDelete::Absent) => return (0, false),
@@ -15589,6 +16701,8 @@ async fn canonicalize_face_embeddings_probed(
     }
 
     // Phase 2 — the LanceDB delete on the embedding runtime, lock released.
+    // ⭐ Slice P / D5: this function holds NOTHING here — the catalogue guard
+    // above has dropped — so the store write lock the delete takes cannot nest.
     // ⭐ Slice F / R-25: an unbuildable runtime FAILS CLOSED — nothing is
     // deleted and `vector_delete_failed` is true — so the Swift one-shot
     // flag cannot latch and the migration retries at the next index build.
@@ -18342,38 +19456,69 @@ pub async fn checkpoint_catalogue() -> bool {
 /// the global lock; the LanceDB total hops to the embedding runtime AFTER
 /// the lock is released.
 pub async fn backup_manifest_counts() -> BackupCounts {
+    // ⭐ Slice P / R-30 (A2's S-1): every count that could not be TAKEN sets its
+    // `untaken_counts` bit and reports a placeholder 0, so the manifest writes
+    // an absent key — "unknown" — never a count of zero it did not measure.
+    let mut untaken_counts = 0u32;
     let (image_count, video_count, keyword_row_count, person_count, face_observation_count) = {
         let catalogue = lock_catalogue();
         match catalogue.as_ref() {
             Some(conn) => {
-                let one = |sql: &str| -> u64 {
-                    conn.query_row(sql, [], |row| row.get::<_, i64>(0))
-                        .unwrap_or(0)
-                        .max(0) as u64
+                let mut one = |sql: &str, bit: u32| -> u64 {
+                    match conn.query_row(sql, [], |row| row.get::<_, i64>(0)) {
+                        Ok(count) => count.max(0) as u64,
+                        Err(e) => {
+                            eprintln!("backup_manifest_counts: {} failed: {}", sql, e);
+                            untaken_counts |= bit;
+                            0
+                        }
+                    }
                 };
                 (
-                    one("SELECT COUNT(*) FROM images WHERE is_video IS NOT TRUE"),
-                    one("SELECT COUNT(*) FROM images WHERE is_video IS TRUE"),
-                    one("SELECT COUNT(*) FROM keyword"),
-                    one("SELECT COUNT(*) FROM person"),
-                    one("SELECT COUNT(*) FROM face_observation"),
+                    one("SELECT COUNT(*) FROM images WHERE is_video IS NOT TRUE", BACKUP_COUNT_UNTAKEN_IMAGE),
+                    one("SELECT COUNT(*) FROM images WHERE is_video IS TRUE", BACKUP_COUNT_UNTAKEN_VIDEO),
+                    one("SELECT COUNT(*) FROM keyword", BACKUP_COUNT_UNTAKEN_KEYWORD_ROW),
+                    one("SELECT COUNT(*) FROM person", BACKUP_COUNT_UNTAKEN_PERSON),
+                    one("SELECT COUNT(*) FROM face_observation", BACKUP_COUNT_UNTAKEN_FACE_OBSERVATION),
                 )
             }
-            None => (0, 0, 0, 0, 0),
+            None => {
+                untaken_counts |= BACKUP_COUNT_UNTAKEN_IMAGE
+                    | BACKUP_COUNT_UNTAKEN_VIDEO
+                    | BACKUP_COUNT_UNTAKEN_KEYWORD_ROW
+                    | BACKUP_COUNT_UNTAKEN_PERSON
+                    | BACKUP_COUNT_UNTAKEN_FACE_OBSERVATION;
+                (0, 0, 0, 0, 0)
+            }
         }
     };
-    // Slice F / R-25 — no failure channel on `BackupCounts`: an unbuildable
-    // runtime answers today's 0 for the manifest's vector count, logged and
-    // censused by the accessor.
+    // Slice F / R-25 — an unbuildable runtime (logged and censused by the
+    // accessor), a failed task, or an unreadable store answers 0 for the
+    // manifest's vector count — and, since slice P, says it is UNTAKEN.
     let face_embedding_count = match face_embedding_runtime(
         "backup_manifest_counts.face_runtime_unavailable.query_failed",
     )
     {
-        Ok(runtime) => runtime
-            .spawn(face_embedding_total_count())
+        Ok(runtime) => match runtime
+            .spawn(face_embedding_total_count_checked())
             .await
-            .unwrap_or(0),
-        Err(_unavailable) => 0,
+        {
+            Ok(Ok(count)) => count,
+            Ok(Err(message)) => {
+                eprintln!("backup_manifest_counts: {}", message);
+                untaken_counts |= BACKUP_COUNT_UNTAKEN_FACE_EMBEDDING;
+                0
+            }
+            Err(error) => {
+                eprintln!("backup_manifest_counts: face embedding count task failed: {}", error);
+                untaken_counts |= BACKUP_COUNT_UNTAKEN_FACE_EMBEDDING;
+                0
+            }
+        },
+        Err(_unavailable) => {
+            untaken_counts |= BACKUP_COUNT_UNTAKEN_FACE_EMBEDDING;
+            0
+        }
     };
     BackupCounts {
         image_count,
@@ -18382,6 +19527,7 @@ pub async fn backup_manifest_counts() -> BackupCounts {
         person_count,
         face_observation_count,
         face_embedding_count,
+        untaken_counts,
     }
 }
 
@@ -18755,6 +19901,22 @@ fn merge_catalogue_sql_inner(
         );
         drop(stmt);
 
+        // ⭐ Slice P / N-1 — the `face_vector_pending_delete` contract: the
+        // replaced ids are queued INSIDE this transaction, BEFORE the DELETE
+        // below, while their rows still exist (the enqueue selects them from
+        // `face_observation`). They used to be deleted from the store only after
+        // COMMIT, ad hoc and outside the queue, so a busy or unreadable store —
+        // or a quit between COMMIT and that delete — leaked every replaced
+        // vector permanently. Now `copy_face_embeddings_for_merge` drains the
+        // queue, and a failure there DEFERS instead of losing. Chunked at 500,
+        // the queue's own statement size, so a large restore never builds one
+        // giant `IN (…)`.
+        for chunk in replaced_live_face_ids.chunks(500)
+        {
+            editor_saved_image_enqueue_face_vector_deletes(conn, chunk)
+                .map_err(|e| format!("backup-wins face-vector enqueue failed: {}", e))?;
+        }
+
         conn.execute_batch(
             "DELETE FROM person_face_assignment WHERE face_observation_id IN \
                  (SELECT id FROM face_observation WHERE image_id IN \
@@ -18778,18 +19940,25 @@ fn merge_catalogue_sql_inner(
             .map(|c| format!("{} = b.{}", c, c))
             .collect::<Vec<_>>()
             .join(", ");
-        images_replaced = changed_count(
-            conn.execute(
-                &format!(
-                    "UPDATE images SET {} \
-                     FROM plbackup.images b JOIN plmerge_map m ON m.old_id = b.id \
-                     WHERE NOT m.is_new AND images.id = m.new_id",
-                    set_clause
-                ),
-                [],
+        conn.execute(
+            &format!(
+                "UPDATE images SET {} \
+                 FROM plbackup.images b JOIN plmerge_map m ON m.old_id = b.id \
+                 WHERE NOT m.is_new AND images.id = m.new_id",
+                set_clause
             ),
-            "backup-wins image update",
-        )?;
+            [],
+        )
+        .map_err(|e| format!("backup-wins image update failed: {}", e))?;
+        // R-15 (slice E2): the reported number is `colliding_count`, the exact
+        // COUNT(*) of the collision map taken above — never this UPDATE's own
+        // change count, which is `duckdb_rows_changed`: an engine hint, not a
+        // fact (S179 — on the delete+insert branch it is the rows the scan fed
+        // the operator). Each collision row names one live image by its
+        // UNIQUE `file_path`, so the UPDATE rewrites exactly that many rows, and
+        // `images_kept_current` below already reads the same number: the two
+        // lines of one Restore summary now come from one source.
+        images_replaced = colliding_count;
     }
 
     // --- New images copy with their mapped ids.
@@ -19050,23 +20219,28 @@ async fn copy_face_embeddings_for_merge(
 ) -> u64 {
     // Replaced observations are gone from DuckDB — their vectors must not
     // linger as neighbor-slot pollution in the live store.
+    // ⭐ Slice P / N-1 (D4.2) — through the DURABLE queue: the merge queued the
+    // replaced ids inside its own transaction, and this drains it. It replaces
+    // an ad-hoc open-and-delete that ignored an unreadable store and logged a
+    // failed delete to stderr, losing the ids for good; a failure now DEFERS,
+    // and the next launch or index build retries. DRAIN ONLY (A-10): no orphan
+    // scan inside a Restore the user is waiting on.
+    // ⚠️ Deadlock check: the drain takes FACE_EMBEDDING_STORE_WRITE_LOCK, and
+    // this function holds NO lock here (the catalogue guard was released when
+    // `merge_catalogue_sql` returned). The grouped upserts at the bottom take
+    // the same lock one call at a time, after the drain has released it.
     if !replaced_live_face_ids.is_empty() {
-        if let Ok(FaceEmbeddingTableState::Present(table)) =
-            open_face_embedding_table_for_read("merge vector cleanup").await
+        let drained = retry_pending_face_vector_deletes_drain_only().await;
+        if drained.remaining_count > 0
+            || matches!(
+                drained.status,
+                FaceVectorDeleteRetryStatus::Deferred | FaceVectorDeleteRetryStatus::Failed
+            )
         {
-            for chunk in replaced_live_face_ids.chunks(500) {
-                let filter = format!(
-                    "face_observation_id IN ({})",
-                    chunk
-                        .iter()
-                        .map(|id| id.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
-                if let Err(e) = table.delete(&filter).await {
-                    eprintln!("merge vector cleanup: delete failed: {}", e);
-                }
-            }
+            eprintln!(
+                "merge vector cleanup: {:?} remaining={} message={}",
+                drained.status, drained.remaining_count, drained.message
+            );
         }
     }
 
@@ -19240,6 +20414,9 @@ async fn copy_face_embeddings_for_merge(
     }
 
     let mut copied = 0u64;
+    // Slice P / D5: each upsert takes FACE_EMBEDDING_STORE_WRITE_LOCK for its
+    // own commit, sequentially; the drain above released it, and nothing here
+    // holds it across the loop.
     for (_, records) in grouped {
         let result = upsert_face_embeddings_impl(records).await;
         if result.status == "stored" {
@@ -19897,6 +21074,32 @@ mod face_observation_tests {
              );",
         )
         .expect("face observation DDL");
+        // Slice P / R-18: the writeback's face-observation replace now runs the
+        // cross-store cascade (queue the vectors, drop the assignments and
+        // cluster members, keep a named face's People keyword as the user's)
+        // inside its transaction, so the tables it touches must exist here too.
+        // Shapes copied from the production schema batch.
+        conn.execute_batch(
+            "CREATE TABLE face_vector_pending_delete (
+                 face_observation_id INTEGER PRIMARY KEY,
+                 enqueued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+             );
+             CREATE TABLE person (
+                 id INTEGER PRIMARY KEY,
+                 display_name TEXT NOT NULL
+             );
+             CREATE TABLE person_face_assignment (
+                 face_observation_id INTEGER PRIMARY KEY,
+                 person_id INTEGER NOT NULL,
+                 image_id INTEGER NOT NULL
+             );
+             CREATE TABLE face_cluster_member (
+                 run_id TEXT NOT NULL,
+                 face_observation_id INTEGER NOT NULL,
+                 PRIMARY KEY (run_id, face_observation_id)
+             );",
+        )
+        .expect("cross-store cascade DDL");
         conn
     }
 
@@ -19960,7 +21163,8 @@ mod face_observation_tests {
             &conn,
             &first,
             &[1, 2],
-            true
+            true,
+            None
         )
         .is_ok());
 
@@ -19976,7 +21180,8 @@ mod face_observation_tests {
             &conn,
             &replacement,
             &[1, 2],
-            true
+            true,
+            None
         )
         .is_ok());
 
@@ -20003,7 +21208,8 @@ mod face_observation_tests {
             &conn,
             &complete,
             &[1],
-            true
+            true,
+            None
         )
         .is_ok());
 
@@ -20011,7 +21217,8 @@ mod face_observation_tests {
             &conn,
             &complete,
             &[1],
-            false
+            false,
+            None
         )
         .is_ok());
 
@@ -20107,6 +21314,30 @@ mod focus_analysis_writeback_tests {
                  (52, '/a/multi.jpeg', 'jpeg', 'multi', '/a');",
         )
         .expect("focus writeback schema");
+        // Slice P / R-18: the face-observation replace now runs the cross-store
+        // cascade inside the writeback transaction; the tables it touches,
+        // shaped as in the production schema batch.
+        conn.execute_batch(
+            "CREATE TABLE face_vector_pending_delete (
+                 face_observation_id INTEGER PRIMARY KEY,
+                 enqueued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+             );
+             CREATE TABLE person (
+                 id INTEGER PRIMARY KEY,
+                 display_name TEXT NOT NULL
+             );
+             CREATE TABLE person_face_assignment (
+                 face_observation_id INTEGER PRIMARY KEY,
+                 person_id INTEGER NOT NULL,
+                 image_id INTEGER NOT NULL
+             );
+             CREATE TABLE face_cluster_member (
+                 run_id TEXT NOT NULL,
+                 face_observation_id INTEGER NOT NULL,
+                 PRIMARY KEY (run_id, face_observation_id)
+             );",
+        )
+        .expect("cross-store cascade DDL");
         conn
     }
 
@@ -20399,7 +21630,10 @@ mod focus_analysis_writeback_tests {
         assert_eq!(receipt.target_image_id, Some(20));
         let reason = receipt.failed_reason.expect("face failure detail");
         assert!(reason.contains("replace_face_observations_for_targets"));
-        assert!(reason.contains("DELETE face_observation"));
+        // Slice P / R-18: the first face statement is now the cascade's
+        // fail-closed doomed-id census, so a missing `face_observation` table
+        // fails THERE, before the DELETE — with the same stage and ids.
+        assert!(reason.contains("doomed face-id census could not be prepared"));
         assert!(reason.contains("source_image_id=20"));
         assert!(reason.contains("target_image_id=20"));
         assert!(reason.contains("face_observation"));
@@ -21147,6 +22381,8 @@ mod focus_writeback_index_tests
     fn index_scan_settings_exist_and_the_guard_restores_them()
     {
         let conn = Connection::open_in_memory().expect("in-memory db");
+        // ⭐ ENGINE TESTS NEVER FETCH (slice E2: this test was unfenced).
+        fence_connection_against_extension_fetches(&conn);
 
         let read = |name: &str| -> String {
             conn.query_row(
@@ -21193,10 +22429,15 @@ mod focus_writeback_index_tests
                 "the transaction's uncommitted write must still be visible under the guard"
             );
         }
+        // Nothing but the guard set either value on this connection, so the
+        // value in force before it IS the default. The non-default case — a
+        // tuning that must SURVIVE the guard — is E2-T6
+        // (`engine_contract_residue_tests`).
         assert_eq!(
             read("index_scan_max_count"),
             default_max,
-            "the guard must restore the engine default on drop"
+            "the guard must hand back the value in force before it (here: the \
+             engine default, since nothing else set one) on drop"
         );
         assert_eq!(read("index_scan_percentage"), default_percentage);
         assert_eq!(probe_value(), 999, "still inside the same transaction");
@@ -22475,16 +23716,17 @@ mod keyword_tests {
             "file_path LIKE '/Users/x/Pictures/Photos Library.photoslibrary/%' ESCAPE '\\'"
         );
 
-        // Date-only (no folder) is unchanged — Apple is not excluded from Dates.
+        // Date-only (no folder) — Apple is not excluded from Dates. The date
+        // LIKE carries ESCAPE too since slice E2 (R-45).
         assert_eq!(
             build_path_date_predicate("", "2026:06:"),
-            "capture_datetime LIKE '2026:06:%'"
+            "capture_datetime LIKE '2026:06:%' ESCAPE '\\'"
         );
 
         // Folder + date → exclusion still appended after both clauses.
         assert_eq!(
             build_path_date_predicate("/Users/richardwagner/", "2026:06:"),
-            "file_path LIKE '/Users/richardwagner/%' ESCAPE '\\' AND capture_datetime LIKE '2026:06:%' AND file_path NOT LIKE '%.photoslibrary/%'"
+            "file_path LIKE '/Users/richardwagner/%' ESCAPE '\\' AND capture_datetime LIKE '2026:06:%' ESCAPE '\\' AND file_path NOT LIKE '%.photoslibrary/%'"
         );
     }
 
@@ -24968,6 +26210,1020 @@ mod query_builder_tests {
             build_filter_predicate(&preds, &conns),
             "(((flag = 'pick')) <> ((color_label = 'red')))"
         );
+    }
+}
+
+#[cfg(test)]
+mod paging_tie_order_tests
+{
+    //! ⭐ Slice E1 (register R-06) — every paged `ImageRecord` query is sliced
+    //! from ONE total order.
+    //!
+    //! `build_image_record_query_sql` appends `, id ASC` to the caller's
+    //! `order_by` in BOTH of its branches. The always-on pin is DETERMINISTIC
+    //! (T1/T2/T3/T4): it asserts the SQL the builder actually EMITS, and the
+    //! paged sweeps on a real temp-file catalogue. T1/T2 do NOT depend on the
+    //! engine misbehaving (the S157 / S178 decoration lesson): whether the
+    //! engine happens to scramble a tie on a given machine and fixture is not
+    //! something a pin may rely on. T5 is the scale EVIDENCE arm — `#[ignore]`d,
+    //! run explicitly with `--release`, and recorded in the slice's report.
+    //!
+    //! ⚠️ No source lock, deliberately: a lock on the `, id ASC` literal can be
+    //! satisfied by a comment. T1 asserts the emitted SQL instead, and refuses a
+    //! comment INSIDE the emitted ORDER BY clause (`ORDER BY x -- , id ASC` makes
+    //! DuckDB ignore the tie-break while the text still ends in it — brief §A,
+    //! A-5).
+    //!
+    //! ⭐⭐ ENGINE TESTS NEVER FETCH: every connection here is opened through the
+    //! production `open_and_migrate_catalogue` on a real temp FILE and then
+    //! fenced with `fence_connection_against_extension_fetches`.
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// The four inline copies of the default order (`get_images_sorted`,
+    /// `get_images_filtered`, `get_images_for_path_prefix`,
+    /// `get_images_for_path_prefix_gallery`) pass this exact string; the brief
+    /// asks for the value, not a read of `lib.rs`.
+    const INLINE_DEFAULT_ORDER_BY: &str =
+        "capture_datetime DESC NULLS LAST, created_timestamp DESC";
+
+    /// Every `order_by` a product caller can hand the helper today: the three
+    /// `order_by_for_filter` constants, the inline default literal, and the two
+    /// already-total forms (`get_all_images`' `"id"`, the basename helper's
+    /// `"id ASC"`).
+    const PRODUCT_ORDERS: [(&str, &str); 6] = [
+        ("DEFAULT_FILTER_ORDER_BY", DEFAULT_FILTER_ORDER_BY),
+        ("inline default literal", INLINE_DEFAULT_ORDER_BY),
+        ("RATING_FILTER_ORDER_BY", RATING_FILTER_ORDER_BY),
+        ("FOCUS_FILTER_ORDER_BY", FOCUS_FILTER_ORDER_BY),
+        ("get_all_images \"id\"", "id"),
+        ("basename helper \"id ASC\"", "id ASC"),
+    ];
+
+    const PAGING_TAIL: &str = "LIMIT ?1 OFFSET ?2";
+
+    /// A real temp-FILE catalogue (the defect is a file-backed catalogue's
+    /// physical plan), opened through the production open path and fenced.
+    /// Dropping it closes the connection first, then removes the files.
+    struct Fixture
+    {
+        path: std::path::PathBuf,
+        conn: Option<Connection>,
+    }
+
+    impl Fixture
+    {
+        fn new(tag: &str) -> Fixture
+        {
+            let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let path = std::env::temp_dir().join(format!(
+                "plcore-paging-tie-order-{}-{}-{}.db",
+                std::process::id(),
+                n,
+                tag
+            ));
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path.with_extension("db.wal"));
+            let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+            fence_connection_against_extension_fetches(&conn);
+            Fixture
+            {
+                path,
+                conn: Some(conn),
+            }
+        }
+
+        fn conn(&self) -> &Connection
+        {
+            self.conn.as_ref().expect("fixture connection is open")
+        }
+    }
+
+    impl Drop for Fixture
+    {
+        fn drop(&mut self)
+        {
+            drop(self.conn.take());
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(self.path.with_extension("db.wal"));
+        }
+    }
+
+    fn normalise(text: &str) -> String
+    {
+        text.split_whitespace().collect::<Vec<&str>>().join(" ")
+    }
+
+    /// A fixed permutation of `1..=n` (xorshift Fisher-Yates, constant seed),
+    /// so a fixture's INSERT order is NOT its id order: natural storage order
+    /// would satisfy "strictly ascending" on its own (brief §A, A-6).
+    fn shuffled_ids(n: i64) -> Vec<i64>
+    {
+        let mut ids: Vec<i64> = (1..=n).collect();
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        for i in (1..ids.len()).rev()
+        {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let j = (state % (i as u64 + 1)) as usize;
+            ids.swap(i, j);
+        }
+        ids
+    }
+
+    /// Insert one row per id, in the given order, in ONE statement (`unnest`
+    /// of a list literal preserves the list's order). `tied` rows share a NULL
+    /// `capture_datetime`, one `created_timestamp`, one `rating` and one
+    /// `focus_score` — a tie block under ALL THREE product orders. Untied rows
+    /// get a distinct `capture_datetime`, a varied `rating` and `focus_score`.
+    /// Every row has a distinct `file_stem`, so the duplicate filter keeps
+    /// every row (it needs a shared non-NULL `capture_datetime` AND stem).
+    fn seed(conn: &Connection, ids_in_insert_order: &[i64], tied: &dyn Fn(i64) -> bool)
+    {
+        assert!(!ids_in_insert_order.is_empty(), "seed: an empty fixture proves nothing");
+        let tied_list = ids_in_insert_order
+            .iter()
+            .map(|id| if tied(*id) { "TRUE" } else { "FALSE" })
+            .collect::<Vec<&str>>()
+            .join(",");
+        let id_list = ids_in_insert_order
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<String>>()
+            .join(",");
+        let sql = format!(
+            "INSERT INTO images (id, file_path, file_size, file_name, created_timestamp, \
+             modified_timestamp, capture_datetime, rating, focus_score, file_stem, \
+             image_kind, is_video) \
+             SELECT id, '/e1/' || id || '.jpg', 1000, id || '.jpg', \
+                    CASE WHEN tied THEN 1700000000 ELSE 1700000000 + (id * 7919) % 5000 END, \
+                    1700000000, \
+                    CASE WHEN tied THEN NULL \
+                         ELSE '2000:' || lpad(CAST((id * 7919) % 100003 AS VARCHAR), 8, '0') END, \
+                    CASE WHEN tied THEN 3 ELSE CAST(id % 6 AS INTEGER) END, \
+                    CASE WHEN tied THEN 1.5 ELSE CAST(id % 97 AS DOUBLE) END, \
+                    'e1-' || id, 'jpeg', FALSE \
+             FROM (SELECT unnest([{}]) AS id, unnest([{}]) AS tied)",
+            id_list, tied_list
+        );
+        conn.execute_batch(&sql)
+            .unwrap_or_else(|e| panic!("seeding {} rows failed: {}", ids_in_insert_order.len(), e));
+    }
+
+    fn table_ids(conn: &Connection) -> Vec<i64>
+    {
+        let mut stmt = conn.prepare("SELECT id FROM images ORDER BY id").expect("prepare ids");
+        let ids = stmt
+            .query_map([], |row| row.get::<_, i64>(0))
+            .expect("query ids")
+            .collect::<Result<Vec<i64>, _>>()
+            .expect("decode ids");
+        ids
+    }
+
+    /// Page a query exactly the way `CopyService.pagedRecords` does: until an
+    /// empty page or a short page. `execute_image_record_query` returns an
+    /// empty Vec on a prepare failure, so a malformed ORDER BY shows up here as
+    /// a short sweep — never as a pass.
+    fn sweep(conn: &Connection, order_by: &str, apply_duplicate_filter: bool, page: i64) -> Vec<i64>
+    {
+        sweep_scoped(conn, "", order_by, apply_duplicate_filter, false, "", page)
+    }
+
+    /// `sweep` with the caller predicate and the similar-photo collapse exposed
+    /// (T4c pages the collapse branch).
+    fn sweep_scoped(
+        conn: &Connection,
+        where_clause: &str,
+        order_by: &str,
+        apply_duplicate_filter: bool,
+        apply_similar_photo_collapse: bool,
+        similar_algorithm_version: &str,
+        page: i64,
+    ) -> Vec<i64>
+    {
+        let mut ids = Vec::new();
+        let mut offset = 0i64;
+        loop
+        {
+            let rows = execute_image_record_query(
+                conn,
+                where_clause,
+                order_by,
+                page,
+                offset,
+                apply_duplicate_filter,
+                false,
+                apply_similar_photo_collapse,
+                similar_algorithm_version,
+                MediaType::StillsOnly,
+            );
+            if rows.is_empty()
+            {
+                break;
+            }
+            let fetched = rows.len() as i64;
+            ids.extend(rows.iter().map(|r| r.id));
+            offset += page;
+            if fetched < page
+            {
+                break;
+            }
+            assert!(offset <= 10_000_000, "sweep did not terminate");
+        }
+        ids
+    }
+
+    /// (duplicated, omitted, foreign) of a sweep against the table's ids.
+    fn partition_errors(swept: &[i64], table: &[i64]) -> (usize, usize, usize)
+    {
+        let distinct: HashSet<i64> = swept.iter().copied().collect();
+        let table_set: HashSet<i64> = table.iter().copied().collect();
+        let duplicated = swept.len() - distinct.len();
+        let omitted = table_set.difference(&distinct).count();
+        let foreign = distinct.difference(&table_set).count();
+        (duplicated, omitted, foreign)
+    }
+
+    // ── T1 ────────────────────────────────────────────────────────────────
+
+    struct T1Case
+    {
+        label: String,
+        where_clause: &'static str,
+        order_by: &'static str,
+        apply_duplicate_filter: bool,
+        apply_raw_jpeg_collapse: bool,
+        apply_similar_photo_collapse: bool,
+        media_type: MediaType,
+    }
+
+    /// 6 orders × 2 predicates × duplicate filter × RAW+JPEG collapse ×
+    /// similar collapse × 3 media stances.
+    const EXPECTED_T1_CASES: usize = 6 * 2 * 2 * 2 * 2 * 3;
+
+    fn t1_cases() -> Vec<T1Case>
+    {
+        let mut cases = Vec::new();
+        for (order_name, order_by) in PRODUCT_ORDERS
+        {
+            for where_clause in ["", "(rating >= 3)"]
+            {
+                for apply_duplicate_filter in [false, true]
+                {
+                    for apply_raw_jpeg_collapse in [false, true]
+                    {
+                        for apply_similar_photo_collapse in [false, true]
+                        {
+                            for media_type in
+                                [MediaType::StillsOnly, MediaType::VideosOnly, MediaType::Both]
+                            {
+                                cases.push(T1Case
+                                {
+                                    label: format!(
+                                        "order={} where={:?} dup={} rawjpeg={} similar={} media={:?}",
+                                        order_name,
+                                        where_clause,
+                                        apply_duplicate_filter,
+                                        apply_raw_jpeg_collapse,
+                                        apply_similar_photo_collapse,
+                                        media_type
+                                    ),
+                                    where_clause,
+                                    order_by,
+                                    apply_duplicate_filter,
+                                    apply_raw_jpeg_collapse,
+                                    apply_similar_photo_collapse,
+                                    media_type,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cases
+    }
+
+    /// ⭐ T1 — the emitted SQL ends in a total order, for EVERY order the
+    /// product can pass, in BOTH branches. Each assertion carries a `T1/<check>`
+    /// tag; the slice's mutation ledger names these tags.
+    #[test]
+    fn t1_every_emitted_paged_order_by_ends_in_the_total_tie_break()
+    {
+        let cases = t1_cases();
+        // Anti-vacuity: an empty or shrunken case list must fail LOUDLY.
+        assert!(!cases.is_empty(), "T1/case-count: the case list is EMPTY — T1 would pass vacuously");
+        assert_eq!(
+            cases.len(),
+            EXPECTED_T1_CASES,
+            "T1/case-count: the case list lost cases"
+        );
+
+        let mut outer_branch = 0usize;
+        let mut plain_branch = 0usize;
+        for case in &cases
+        {
+            let sql = build_image_record_query_sql(
+                case.where_clause,
+                case.order_by,
+                case.apply_duplicate_filter,
+                case.apply_raw_jpeg_collapse,
+                case.apply_similar_photo_collapse,
+                // A non-empty version, so a similar-collapse case really takes
+                // the outer-filter branch.
+                "e1-v1",
+                case.media_type,
+            );
+
+            // Branch coverage — each case lands in the branch its flags ask for.
+            let expects_outer = case.apply_duplicate_filter || case.apply_similar_photo_collapse;
+            let is_outer = sql.contains("SELECT * FROM (");
+            assert_eq!(
+                is_outer, expects_outer,
+                "T1/branch-shape: {} — expected the {} branch",
+                case.label,
+                if expects_outer { "outer-filter" } else { "plain" }
+            );
+            if is_outer
+            {
+                outer_branch += 1;
+            }
+            else
+            {
+                plain_branch += 1;
+            }
+
+            let tails = sql.matches(PAGING_TAIL).count();
+            assert_eq!(
+                tails, 1,
+                "T1/exactly-one-limit: {} — `{}` occurs {} times in:\n{}",
+                case.label, PAGING_TAIL, tails, sql
+            );
+            let tail_at = sql.find(PAGING_TAIL).expect("counted above");
+            let head = &sql[..tail_at];
+            let order_at = head.rfind("ORDER BY").unwrap_or_else(|| {
+                panic!("T1/order-by-present: {} — no ORDER BY before the paging tail", case.label)
+            });
+            let raw_clause = &head[order_at + "ORDER BY".len()..];
+
+            // A comment in the EMITTED clause makes DuckDB ignore whatever text
+            // follows it — refuse it before reading the clause's words (A-5).
+            assert!(
+                !raw_clause.contains("--") && !raw_clause.contains("/*"),
+                "T1/no-comment-in-clause: {} — the emitted ORDER BY clause carries an SQL comment: {:?}",
+                case.label,
+                raw_clause
+            );
+
+            let clause = normalise(raw_clause);
+            let caller = normalise(case.order_by);
+            assert!(
+                clause.starts_with(&caller),
+                "T1/prefix-preserved: {} — the clause {:?} does not START with the caller's order {:?}",
+                case.label,
+                clause,
+                caller
+            );
+            assert!(
+                clause.ends_with(", id ASC"),
+                "T1/ends-with-id-asc: {} — the clause {:?} does not end in the total tie-break",
+                case.label,
+                clause
+            );
+            assert_eq!(
+                clause,
+                format!("{}, id ASC", caller),
+                "T1/exact-clause: {}",
+                case.label
+            );
+        }
+
+        // Both halves of the surface were covered (a builder change that
+        // collapsed the branches would otherwise pass on half of it).
+        assert_eq!(outer_branch, EXPECTED_T1_CASES * 3 / 4, "T1/branch-coverage: outer-filter cases");
+        assert_eq!(plain_branch, EXPECTED_T1_CASES / 4, "T1/branch-coverage: plain cases");
+    }
+
+    // ── T2 ────────────────────────────────────────────────────────────────
+
+    /// The two SQL templates exactly as `execute_image_record_query` built
+    /// them BEFORE slice E1 (core `b8e8f19`), cut mechanically from that tree
+    /// and pasted byte-for-byte. ⛔ Do not re-indent: the raw strings'
+    /// whitespace IS the frozen value. T2 compares the live builder against
+    /// this with `<order_by>, id ASC` substituted, which proves the extraction
+    /// moved nothing but the appended key.
+    #[allow(clippy::too_many_arguments)]
+    fn frozen_pre_e1_query_sql(
+        needs_outer_filter: bool,
+        effective_similar_collapse: bool,
+        inner_where: &str,
+        similar_join: &str,
+        similar_inner_projection: &str,
+        outer_filters: &str,
+        order_by: &str,
+    ) -> String
+    {
+    let query_sql = if needs_outer_filter {
+        let inner_select = format!(
+            r#"
+            SELECT
+                id, epoch(indexed_timestamp) as indexed_ts_epoch,
+                file_path, file_size, file_name, file_extension,
+                created_timestamp, modified_timestamp,
+                camera_make, camera_model, lens_model,
+                focal_length, aperture, shutter_speed, iso,
+                capture_datetime,
+                pixel_width, pixel_height, color_space, bit_depth,
+                gps_latitude, gps_longitude, gps_altitude,
+                copyright, creator, description,
+                rating, flag, color_label, rotation,
+                {},
+                focus_score
+                {}
+            FROM images
+            {}
+            {}
+        "#,
+            DUPLICATE_GROUP_ID_CASE, similar_inner_projection, similar_join, inner_where
+        );
+        let filtered_source = if effective_similar_collapse {
+            format!(
+                r#"
+                SELECT
+                    *,
+                    {}
+                FROM (
+                    {}
+                )
+            "#,
+                SIMILAR_VISIBLE_ID_PROJECTION, inner_select
+            )
+        } else {
+            inner_select
+        };
+        format!(
+            r#"
+            SELECT * FROM (
+                {}
+            )
+            WHERE {}
+            ORDER BY {}
+            LIMIT ?1 OFFSET ?2
+        "#,
+            filtered_source, outer_filters, order_by
+        )
+    } else {
+        format!(
+            r#"
+            SELECT
+                id, epoch(indexed_timestamp) as indexed_ts_epoch,
+                file_path, file_size, file_name, file_extension,
+                created_timestamp, modified_timestamp,
+                camera_make, camera_model, lens_model,
+                focal_length, aperture, shutter_speed, iso,
+                capture_datetime,
+                pixel_width, pixel_height, color_space, bit_depth,
+                gps_latitude, gps_longitude, gps_altitude,
+                copyright, creator, description,
+                rating, flag, color_label, rotation,
+                {}
+            FROM images
+            {}
+            ORDER BY {}
+            LIMIT ?1 OFFSET ?2
+        "#,
+            DUPLICATE_GROUP_ID_CASE, inner_where, order_by
+        )
+    };
+        query_sql
+    }
+
+    /// T2 — the extraction changed nothing but the appended key. Six cases,
+    /// with each input the frozen template needs written out BY HAND (not
+    /// re-derived through the product's own assembly code).
+    #[test]
+    fn t2_the_extracted_builder_differs_from_the_pre_e1_sql_only_by_the_tie_break()
+    {
+        let similar_join = "LEFT JOIN similar_photo_group_member spgm ON spgm.image_id = images.id \
+                            AND spgm.algorithm_version = 'e1-v1'";
+        let similar_projection =
+            ", spgm.group_id AS similar_group_id, image_kind AS similar_image_kind";
+        let duplicate_and_similar =
+            format!("{} AND {}", DUPLICATE_FILTER_PREDICATE, SIMILAR_COLLAPSE_PREDICATE);
+        let plain_filtered_where = format!(
+            "WHERE (rating >= 3) AND {} AND {}",
+            RAW_JPEG_COLLAPSE_PREDICATE, STILLS_ONLY_PREDICATE
+        );
+        let stills_where = format!("WHERE {}", STILLS_ONLY_PREDICATE);
+        let videos_flag_where = format!("WHERE (flag = 'pick') AND {}", VIDEOS_ONLY_PREDICATE);
+
+        // (label, live-builder inputs, frozen-template inputs)
+        let cases: Vec<(&str, String, (bool, bool, String, &str, &str, String))> = vec![
+            (
+                "plain, no predicate, Both, DEFAULT",
+                build_image_record_query_sql("", DEFAULT_FILTER_ORDER_BY, false, false, false, "", MediaType::Both),
+                (false, false, String::new(), "", "", String::new()),
+            ),
+            (
+                "plain, predicate + RAW/JPEG, StillsOnly, RATING",
+                build_image_record_query_sql("(rating >= 3)", RATING_FILTER_ORDER_BY, false, true, false, "", MediaType::StillsOnly),
+                (false, false, plain_filtered_where, "", "", String::new()),
+            ),
+            (
+                "outer, duplicate filter, StillsOnly, FOCUS",
+                build_image_record_query_sql("", FOCUS_FILTER_ORDER_BY, true, false, false, "", MediaType::StillsOnly),
+                (true, false, stills_where, "", "", DUPLICATE_FILTER_PREDICATE.to_string()),
+            ),
+            (
+                "outer, duplicate + similar, VideosOnly, id",
+                build_image_record_query_sql("(flag = 'pick')", "id", true, false, true, "e1-v1", MediaType::VideosOnly),
+                (true, true, videos_flag_where, similar_join, similar_projection, duplicate_and_similar),
+            ),
+            (
+                "outer, similar only, Both, inline default",
+                build_image_record_query_sql("", INLINE_DEFAULT_ORDER_BY, false, false, true, "e1-v1", MediaType::Both),
+                (true, true, String::new(), similar_join, similar_projection, SIMILAR_COLLAPSE_PREDICATE.to_string()),
+            ),
+            (
+                "plain, similar requested with an empty version, Both, id ASC",
+                build_image_record_query_sql("", "id ASC", false, false, true, "", MediaType::Both),
+                (false, false, String::new(), "", "", String::new()),
+            ),
+        ];
+        let orders = [
+            DEFAULT_FILTER_ORDER_BY,
+            RATING_FILTER_ORDER_BY,
+            FOCUS_FILTER_ORDER_BY,
+            "id",
+            INLINE_DEFAULT_ORDER_BY,
+            "id ASC",
+        ];
+        assert_eq!(cases.len(), orders.len(), "T2/case-count");
+
+        for ((label, live, frozen_inputs), order_by) in cases.iter().zip(orders)
+        {
+            let (outer, similar, inner_where, join, projection, outer_filters) = frozen_inputs;
+            let expected = frozen_pre_e1_query_sql(
+                *outer,
+                *similar,
+                inner_where,
+                join,
+                projection,
+                outer_filters,
+                &format!("{}, id ASC", order_by),
+            );
+            assert_eq!(
+                live, &expected,
+                "T2/byte-identical-but-the-tie-break: {} — the builder's SQL moved beyond the appended key",
+                label
+            );
+            // And the key really is the difference: the frozen pre-E1 text is
+            // what remains when the appended key is taken back out.
+            let pre_e1 = frozen_pre_e1_query_sql(
+                *outer,
+                *similar,
+                inner_where,
+                join,
+                projection,
+                outer_filters,
+                order_by,
+            );
+            assert_ne!(live, &pre_e1, "T2/tie-break-present: {}", label);
+            assert_eq!(
+                live.replacen(
+                    &format!("ORDER BY {}, id ASC\n", order_by),
+                    &format!("ORDER BY {}\n", order_by),
+                    1
+                ),
+                pre_e1,
+                "T2/only-difference: {}",
+                label
+            );
+        }
+    }
+
+    // ── T3 ────────────────────────────────────────────────────────────────
+
+    /// T3 — the already-total callers keep their exact order: `ORDER BY id,
+    /// id ASC` behaves as `ORDER BY id`. 200 rows inserted in SHUFFLED order,
+    /// all sharing one non-NULL `capture_datetime` and one `created_timestamp`,
+    /// so `id` is the only discriminator. The sweep passes exactly
+    /// `get_all_images`' arguments (`""`, `"id"`, no similar collapse, `""`);
+    /// that function takes the global `CATALOGUE` lock, so the test drives its
+    /// body's one call directly.
+    #[test]
+    fn t3_already_total_callers_keep_their_exact_order()
+    {
+        let fixture = Fixture::new("t3");
+        let conn = fixture.conn();
+        let insert_order = shuffled_ids(200);
+        seed(conn, &insert_order, &|_| false);
+        conn.execute_batch(
+            "UPDATE images SET capture_datetime = '2026:01:01 00:00:00', \
+             created_timestamp = 1700000000",
+        )
+        .expect("tie every row on the date keys");
+        let same_name_ids = [3i64, 42, 77, 150, 199];
+        for (n, id) in same_name_ids.iter().enumerate()
+        {
+            let name = ["Same.JPG", "same.jpg", "SAME.jpg", "same.JPG", "sAmE.jpg"][n];
+            conn.execute("UPDATE images SET file_name = ?1 WHERE id = ?2", params![name, id])
+                .expect("name a same-basename row");
+        }
+
+        let expected: Vec<i64> = (1..=200).collect();
+        assert_eq!(table_ids(conn), expected, "T3/fixture: the table must hold ids 1..=200");
+
+        for apply_duplicate_filter in [false, true]
+        {
+            let mut swept = Vec::new();
+            let mut pages = 0;
+            for page in 0..8i64
+            {
+                let rows = execute_image_record_query(
+                    conn,
+                    "",
+                    "id",
+                    25,
+                    page * 25,
+                    apply_duplicate_filter,
+                    false,
+                    false,
+                    "",
+                    MediaType::StillsOnly,
+                );
+                assert_eq!(rows.len(), 25, "T3/page-size: page {} (dup={})", page, apply_duplicate_filter);
+                swept.extend(rows.iter().map(|r| r.id));
+                pages += 1;
+            }
+            assert_eq!(pages, 8, "T3/page-count");
+            assert_eq!(
+                swept, expected,
+                "T3/get-all-images-order: `id` paged at 25 must return 1..=200 ascending (dup={})",
+                apply_duplicate_filter
+            );
+            let past_the_end = execute_image_record_query(
+                conn, "", "id", 25, 200, apply_duplicate_filter, false, false, "", MediaType::StillsOnly,
+            );
+            assert!(past_the_end.is_empty(), "T3/past-the-end: page 9 must be empty");
+        }
+
+        let same_name: Vec<i64> = image_records_with_same_basename_impl(conn, "same.jpg")
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(
+            same_name,
+            same_name_ids.to_vec(),
+            "T3/basename-helper: the case-folded basename matches, ascending by id"
+        );
+    }
+
+    // ── T4 ────────────────────────────────────────────────────────────────
+
+    /// T4 — a paged query is a PARTITION, on a real temp-file catalogue, for
+    /// every ORDER variant.
+    ///
+    /// ⚠️ T4 is a correctness test, not the mutation catcher — T1 is. The brief
+    /// expected the engine to be deterministic at 5,000 rows either way; MEASURED
+    /// Sep 30, 2026 it is NOT through this helper: with the tie-break removed,
+    /// this very fixture lost 1,166–1,876 rows per DEFAULT sweep (dev and
+    /// `--release`, shuffled AND natural insert order). Treat that as a bonus
+    /// that depends on the engine, never as the proof. T4 exists so that a
+    /// malformed `ORDER BY`, a lost `LIMIT`, or a branch that drops the
+    /// tie-break entirely fails immediately and cheaply.
+    ///
+    /// 5,000 rows, ALL tied under all three orders (NULL `capture_datetime`,
+    /// one `created_timestamp`, one `rating`, one `focus_score`), inserted in
+    /// SHUFFLED order (A-6), page 500.
+    #[test]
+    fn t4_every_order_variant_pages_as_a_partition_in_ascending_id_order()
+    {
+        let fixture = Fixture::new("t4");
+        let conn = fixture.conn();
+        seed(conn, &shuffled_ids(5_000), &|_| true);
+        let table = table_ids(conn);
+        assert_eq!(table.len(), 5_000, "T4/fixture: 5,000 rows expected");
+
+        for (order_name, order_by) in [
+            ("DEFAULT", DEFAULT_FILTER_ORDER_BY),
+            ("RATING", RATING_FILTER_ORDER_BY),
+            ("FOCUS", FOCUS_FILTER_ORDER_BY),
+        ]
+        {
+            for apply_duplicate_filter in [false, true]
+            {
+                let label = format!("{} dup={}", order_name, apply_duplicate_filter);
+                let first = sweep(conn, order_by, apply_duplicate_filter, 500);
+                assert!(!first.is_empty(), "T4/non-empty: {} — the sweep returned nothing", label);
+                assert_eq!(first.len(), 5_000, "T4/fetched: {}", label);
+                let (duplicated, omitted, foreign) = partition_errors(&first, &table);
+                assert_eq!(
+                    (duplicated, omitted, foreign),
+                    (0, 0, 0),
+                    "T4/partition: {} — (duplicated, omitted, foreign)",
+                    label
+                );
+                assert!(
+                    first.windows(2).all(|w| w[0] < w[1]),
+                    "T4/ascending: {} — tied rows must come back in strictly ascending id order",
+                    label
+                );
+                for run in 2..=3
+                {
+                    assert_eq!(
+                        sweep(conn, order_by, apply_duplicate_filter, 500),
+                        first,
+                        "T4/repeatable: {} — sweep {} differs from sweep 1",
+                        label,
+                        run
+                    );
+                }
+            }
+        }
+    }
+
+    /// T4b — the caller's order stays PRIMARY and the tie-break is SECONDARY.
+    ///
+    /// Added by the implementer: T4's all-tied fixture cannot tell `<order>, id
+    /// ASC` from `id ASC, <order>` (both are ascending there), so the ledger's
+    /// M4 → T4 row needs a fixture with real sort keys. 5,000 rows in SHUFFLED
+    /// insert order; the even ids carry distinct dates / varied ratings and
+    /// focus scores, the odd ids are one tie block under all three orders. The
+    /// oracle is ONE unpaged execution of `<order>, id ASC` — a total order, so
+    /// deterministic by definition.
+    #[test]
+    fn t4b_the_callers_order_stays_primary_and_ties_break_by_id()
+    {
+        let fixture = Fixture::new("t4b");
+        let conn = fixture.conn();
+        seed(conn, &shuffled_ids(5_000), &|id| id % 2 == 1);
+        let table = table_ids(conn);
+        assert_eq!(table.len(), 5_000, "T4b/fixture: 5,000 rows expected");
+
+        for (order_name, order_by) in [
+            ("DEFAULT", DEFAULT_FILTER_ORDER_BY),
+            ("RATING", RATING_FILTER_ORDER_BY),
+            ("FOCUS", FOCUS_FILTER_ORDER_BY),
+        ]
+        {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT id FROM images WHERE is_video IS NOT TRUE ORDER BY {}, id ASC",
+                    order_by
+                ))
+                .expect("prepare oracle");
+            let oracle = stmt
+                .query_map([], |row| row.get::<_, i64>(0))
+                .expect("query oracle")
+                .collect::<Result<Vec<i64>, _>>()
+                .expect("decode oracle");
+            assert_eq!(oracle.len(), 5_000, "T4b/oracle: {}", order_name);
+            assert!(
+                !oracle.windows(2).all(|w| w[0] < w[1]),
+                "T4b/fixture-discriminates: {} — the oracle is plain ascending, so this fixture \
+                 could not tell the caller's order from `id ASC`",
+                order_name
+            );
+
+            let swept = sweep(conn, order_by, false, 500);
+            let (duplicated, omitted, foreign) = partition_errors(&swept, &table);
+            assert_eq!(
+                (duplicated, omitted, foreign),
+                (0, 0, 0),
+                "T4b/partition: {} — (duplicated, omitted, foreign)",
+                order_name
+            );
+            assert_eq!(
+                swept, oracle,
+                "T4b/caller-order-then-id: {} — the paged sequence is not `<order>, id ASC`",
+                order_name
+            );
+        }
+    }
+
+    /// T4c — the SIMILAR-PHOTO COLLAPSE branch pages as a partition too (E1
+    /// review round 1, LOW-T1: no sweep executed that branch before).
+    ///
+    /// 5,000 rows in SHUFFLED insert order, the odd ids one tie block under all
+    /// three orders; 300 real duplicate pairs (shared date, stem, camera and
+    /// size); 400 similar groups of five (ids 1..=2000, version `e1-v1`, every
+    /// member a JPEG, so the lowest id is the visible one). For DEFAULT /
+    /// RATING / FOCUS / `id` × {similar, duplicate + similar} × {no predicate,
+    /// `(rating >= 3)`}, paged at 250: the sweep is a partition of the
+    /// unpaged result, its size equals `execute_image_count_query` with the
+    /// SAME flags, the collapse really dropped rows, and the sequence is the
+    /// independent oracle `<order>, id ASC` over the visible ids.
+    #[test]
+    fn t4c_the_similar_collapse_branch_pages_as_a_partition()
+    {
+        let fixture = Fixture::new("t4c");
+        let conn = fixture.conn();
+        seed(conn, &shuffled_ids(5_000), &|id| id % 2 == 1);
+        // 300 duplicate pairs among the untied (even) ids: id ≡ 2 (mod 4)
+        // copies the date and stem of id + 2.
+        conn.execute_batch(
+            "UPDATE images AS a SET capture_datetime = b.capture_datetime, file_stem = b.file_stem \
+             FROM images AS b \
+             WHERE b.id = a.id + 2 AND a.id % 4 = 2 AND a.id <= 1200",
+        )
+        .expect("make duplicate pairs");
+        conn.execute_batch(
+            "INSERT INTO similar_photo_group_member (image_id, group_id, representative_id, \
+             member_rank, distance_to_representative, algorithm_version, threshold) \
+             SELECT i, (i - 1) // 5, ((i - 1) // 5) * 5 + 1, (i - 1) % 5, 0.0, 'e1-v1', 0.5 \
+             FROM range(1, 2001) t(i)",
+        )
+        .expect("seed similar groups");
+        let table = table_ids(conn);
+        assert_eq!(table.len(), 5_000, "T4c/fixture: 5,000 rows expected");
+
+        let mut combinations = 0usize;
+        for (order_name, order_by) in [
+            ("DEFAULT", DEFAULT_FILTER_ORDER_BY),
+            ("RATING", RATING_FILTER_ORDER_BY),
+            ("FOCUS", FOCUS_FILTER_ORDER_BY),
+            ("id", "id"),
+        ]
+        {
+            for apply_duplicate_filter in [false, true]
+            {
+                for where_clause in ["", "(rating >= 3)"]
+                {
+                    combinations += 1;
+                    let label = format!(
+                        "{} dup={} where={:?}",
+                        order_name, apply_duplicate_filter, where_clause
+                    );
+                    let unpaged: Vec<i64> = execute_image_record_query(
+                        conn,
+                        where_clause,
+                        order_by,
+                        i64::MAX,
+                        0,
+                        apply_duplicate_filter,
+                        false,
+                        true,
+                        "e1-v1",
+                        MediaType::StillsOnly,
+                    )
+                    .iter()
+                    .map(|r| r.id)
+                    .collect();
+                    let count = execute_image_count_query(
+                        conn,
+                        where_clause,
+                        apply_duplicate_filter,
+                        false,
+                        true,
+                        "e1-v1",
+                        MediaType::StillsOnly,
+                    );
+                    assert!(!unpaged.is_empty(), "T4c/non-empty: {}", label);
+                    assert_eq!(count, unpaged.len() as i64, "T4c/count-parity: {}", label);
+                    let without_collapse = execute_image_count_query(
+                        conn,
+                        where_clause,
+                        apply_duplicate_filter,
+                        false,
+                        false,
+                        "",
+                        MediaType::StillsOnly,
+                    );
+                    assert!(
+                        count + 500 < without_collapse,
+                        "T4c/collapse-active: {} — the collapse dropped only {} rows ({} → {})",
+                        label,
+                        without_collapse - count,
+                        without_collapse,
+                        count
+                    );
+
+                    let swept = sweep_scoped(
+                        conn,
+                        where_clause,
+                        order_by,
+                        apply_duplicate_filter,
+                        true,
+                        "e1-v1",
+                        250,
+                    );
+                    let (duplicated, omitted, foreign) = partition_errors(&swept, &unpaged);
+                    assert_eq!(
+                        (duplicated, omitted, foreign),
+                        (0, 0, 0),
+                        "T4c/partition: {} — (duplicated, omitted, foreign) against the unpaged result",
+                        label
+                    );
+
+                    let id_list = unpaged
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<String>>()
+                        .join(",");
+                    let mut stmt = conn
+                        .prepare(&format!(
+                            "SELECT id FROM images WHERE id IN ({}) ORDER BY {}, id ASC",
+                            id_list, order_by
+                        ))
+                        .expect("prepare oracle");
+                    let oracle = stmt
+                        .query_map([], |row| row.get::<_, i64>(0))
+                        .expect("query oracle")
+                        .collect::<Result<Vec<i64>, _>>()
+                        .expect("decode oracle");
+                    assert_eq!(
+                        swept, oracle,
+                        "T4c/caller-order-then-id: {} — the paged sequence is not `<order>, id ASC`",
+                        label
+                    );
+                }
+            }
+        }
+        assert_eq!(combinations, 16, "T4c/case-count");
+    }
+
+    // ── T5 ────────────────────────────────────────────────────────────────
+
+    /// ⭐ T5 — the scale EVIDENCE arm, the brief's fixture: 400,000 rows with a
+    /// 250,000-row tie block (the highest ids, NULL date) under
+    /// `DEFAULT_FILTER_ORDER_BY`, page 5,000, every page swept, the union
+    /// compared with the table. With the tie-break removed it measured
+    /// 101,084 duplicated / 101,084 omitted (Sep 30, 2026); the Studio-shaped
+    /// 541,000 / 1,679 (`PL_E1_T5_ROWS=541000 PL_E1_T5_TIE=1679`) lost 381–408.
+    /// Run it with `--release` (the dev profile builds bundled
+    /// DuckDB's C++ at -O0). ⚠️ If it stays GREEN with the tie-break REMOVED on a
+    /// given machine, that is vacuity, not a pass: raise the fixture with
+    /// `PL_E1_T5_ROWS` / `PL_E1_T5_TIE` until it goes red there, and record the
+    /// size that was needed.
+    #[test]
+    #[ignore = "scale evidence — run explicitly: cargo test --lib --release paging_tie_order -- --ignored --nocapture"]
+    fn t5_scale_evidence_a_large_tie_block_pages_as_a_partition()
+    {
+        let env_i64 = |name: &str, default: i64| -> i64
+        {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(default)
+        };
+        let rows = env_i64("PL_E1_T5_ROWS", 400_000);
+        let tie = env_i64("PL_E1_T5_TIE", 250_000);
+        let page = 5_000i64;
+        assert!(rows > 0 && tie > 0 && tie <= rows, "T5/fixture: bad size {} / {}", rows, tie);
+
+        let fixture = Fixture::new("t5");
+        let conn = fixture.conn();
+        let seeded = std::time::Instant::now();
+        // One contiguous tie block (the highest ids), the rest dated distinctly.
+        conn.execute_batch(&format!(
+            "INSERT INTO images (id, file_path, file_size, file_name, created_timestamp, \
+             modified_timestamp, capture_datetime, rating, focus_score, file_stem, \
+             image_kind, is_video) \
+             SELECT i, '/e1/t5/' || i || '.jpg', 1000, i || '.jpg', 1700000000, 1700000000, \
+                    CASE WHEN i > {dated} THEN NULL \
+                         ELSE '2000:' || lpad(CAST(i AS VARCHAR), 9, '0') END, \
+                    3, 1.5, 'e1-t5-' || i, 'jpeg', FALSE \
+             FROM range(1, {end}) t(i)",
+            dated = rows - tie,
+            end = rows + 1
+        ))
+        .expect("seed the T5 fixture");
+        let table = table_ids(conn);
+        assert_eq!(table.len() as i64, rows, "T5/fixture: row count");
+        eprintln!(
+            "T5: seeded {} rows ({}-row tie block) in {:.1} s",
+            rows,
+            tie,
+            seeded.elapsed().as_secs_f64()
+        );
+
+        let started = std::time::Instant::now();
+        let swept = sweep(conn, DEFAULT_FILTER_ORDER_BY, false, page);
+        let elapsed = started.elapsed().as_secs_f64();
+        let (duplicated, omitted, foreign) = partition_errors(&swept, &table);
+        eprintln!(
+            "T5: DEFAULT order, page {}, {} pages — fetched={} duplicated={} omitted={} foreign={} \
+             sweep wall clock {:.1} s",
+            page,
+            (rows + page - 1) / page,
+            swept.len(),
+            duplicated,
+            omitted,
+            foreign,
+            elapsed
+        );
+        assert_eq!(
+            (duplicated, omitted, foreign),
+            (0, 0, 0),
+            "T5/partition: the union of every page is not the table — (duplicated, omitted, foreign)"
+        );
+        assert_eq!(swept.len() as i64, rows, "T5/fetched");
     }
 }
 
@@ -27734,15 +29990,10 @@ pub async fn get_images_filtered(
     };
 
     // Build optional predicate (predicate-only convention per decision
-    // C3 — no "WHERE" keyword). Preserves the pre-extraction format!
-    // interpolation pattern verbatim (decision C6) — Queue item 4
-    // (Chunk 6) will parameterize this as a separate change. Empty
-    // date_prefix → empty predicate; non-empty → LIKE filter.
-    let predicate = if date_prefix.is_empty() {
-        String::new()
-    } else {
-        format!("capture_datetime LIKE '{}%'", date_prefix)
-    };
+    // C3 — no "WHERE" keyword). R-90 (slice E2): from the single source of
+    // truth, which quote-doubles AND wildcard-escapes the date prefix — the
+    // raw `format!` here did neither. Empty date_prefix → empty predicate.
+    let predicate = build_path_date_predicate("", &date_prefix);
 
     execute_image_record_query(
         conn,
@@ -27792,14 +30043,10 @@ pub async fn get_filtered_image_count(
     };
 
     // Build optional predicate (predicate-only convention per decision
-    // C3 — no "WHERE" keyword). Single-quote escape preserved verbatim
-    // from the pre-extraction code (decision C6) — Queue item 4 (Chunk
-    // 6) will parameterize this as a separate change.
-    let predicate = if date_prefix.is_empty() {
-        String::new()
-    } else {
-        format!("capture_datetime LIKE '{}%'", date_prefix)
-    };
+    // C3 — no "WHERE" keyword). R-90 (slice E2): from the single source of
+    // truth, which quote-doubles AND wildcard-escapes the date prefix — the
+    // raw `format!` here did neither. Empty date_prefix → empty predicate.
+    let predicate = build_path_date_predicate("", &date_prefix);
 
     execute_image_count_query(
         conn,
@@ -39692,5 +41939,3472 @@ mod panic_boundary_tests
             6,
             "`apple_shared_album_dependent_census_impl` reads counts[0]…counts[5] positionally"
         );
+    }
+}
+
+// ===========================================================================
+// Slice E2 (2026-09-30) — engine-contract residue: R-45 · R-90 · R-15 · R-44,
+// and Q-03's `;`-in-`execute(` audit as a lock
+// ===========================================================================
+//
+// Every DuckDB connection here is fenced (ENGINE TESTS NEVER FETCH), and every
+// runtime fixture is a REAL temp-file catalogue opened through the production
+// `open_and_migrate_catalogue`. The two tests that call an FFI entry point
+// (E2-T3b, E2-T5c) install the catalogue into the process-global CATALOGUE /
+// CATALOGUE_PATH and therefore serialise on `swallowed_failure_tests`'
+// `GLOBAL_CATALOGUE_LOCK`, the one lock every such module shares.
+//
+// ⭐ THE SOURCE LOCKS read `include_str!("lib.rs")` through a stripper that is
+// the INVERSE of the usual one: the locked text (`capture_datetime LIKE …`, the
+// `;` in an `execute(` literal) lives INSIDE string literals, so comments are
+// blanked and literals KEPT for matching, while brace/paren matching and the
+// Rust-code needles run on a second view in which literal bodies are blanked
+// too. The arms are copied from `swallowed_failure_tests`'
+// `blank_comments_and_string_bodies` (line and nested block comments, raw
+// strings, escapes, char literals vs lifetimes) rather than re-invented, and
+// the product region excises every `#[cfg(test)]` item exactly as its
+// `product_ranges` does. Every lock FAILS LOUDLY on an empty extraction.
+#[cfg(test)]
+mod engine_contract_residue_tests
+{
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture
+    {
+        dir: std::path::PathBuf,
+        catalogue: std::path::PathBuf,
+    }
+
+    impl Drop for Fixture
+    {
+        fn drop(&mut self)
+        {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A fresh REAL catalogue file in its own directory, through the production
+    /// open path, fenced.
+    fn fresh_catalogue(tag: &str) -> (Fixture, Connection)
+    {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "plcore-slice-e2-{}-{}-{}",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        let catalogue = dir.join("catalogue.db");
+        let conn = open_and_migrate_catalogue(&catalogue).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH.
+        fence_connection_against_extension_fetches(&conn);
+        (Fixture { dir, catalogue }, conn)
+    }
+
+    fn serial() -> std::sync::MutexGuard<'static, ()>
+    {
+        super::swallowed_failure_tests::GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The process-global catalogue, installed for the life of this value and
+    /// cleared on drop (panic or not), from an UNPOISONED pair of mutexes.
+    struct Installed;
+
+    impl Installed
+    {
+        fn new(fixture: &Fixture, conn: Connection) -> Self
+        {
+            *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(conn);
+            *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(fixture.catalogue.clone());
+            CATALOGUE.clear_poison();
+            CATALOGUE_PATH.clear_poison();
+            Installed
+        }
+    }
+
+    impl Drop for Installed
+    {
+        fn drop(&mut self)
+        {
+            *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
+
+    fn insert_dated(conn: &Connection, file_path: &str, capture_datetime: &str)
+    {
+        conn.execute(
+            "INSERT INTO images (file_path, file_size, file_name, created_timestamp, \
+             modified_timestamp, capture_datetime) VALUES (?1, 100, ?2, 0, 0, ?3)",
+            params![
+                file_path,
+                file_path.rsplit('/').next().unwrap_or(file_path),
+                capture_datetime
+            ],
+        )
+        .expect("insert dated image");
+    }
+
+    /// The §1.1 fixture: four spellings of one July day (only ONE of them is a
+    /// well-formed token), three well-formed 2026 months, and the R-90 quote
+    /// row. Every path sits under `/photos/` so the both-arm form can run too.
+    fn seed_date_fixture(conn: &Connection)
+    {
+        for (file, date) in [
+            ("a.nef", "2019:07:04 10:00:00"),
+            ("b.nef", "2019_07_04 10:00:00"),
+            ("c.nef", "2019-07-04 10:00:00"),
+            ("d.nef", "2019.07.04 10:00:00"),
+            ("e.nef", "2026:06:01 10:00:00"),
+            ("f.nef", "2026:07:15 10:00:00"),
+            ("g.nef", "2026:09:30 10:00:00"),
+            ("h.nef", "it's a date"),
+        ]
+        {
+            insert_dated(conn, &format!("/photos/{}", file), date);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The inverse stripper.
+    // ------------------------------------------------------------------
+
+    /// Two byte-aligned views of one source file, plus its string literals.
+    struct Scan
+    {
+        /// Comments AND string/char literal bodies blanked: Rust code only.
+        /// Brace/paren matching and every Rust-code needle run on this.
+        code: Vec<u8>,
+        /// Comments blanked, literals KEPT: where locked SQL text is matched.
+        text: Vec<u8>,
+        /// `[start, end)` of every string literal's BODY (between the quotes).
+        literals: Vec<(usize, usize)>,
+    }
+
+    fn scan(source: &str) -> Scan
+    {
+        let bytes = source.as_bytes();
+        let mut code = bytes.to_vec();
+        let mut text = bytes.to_vec();
+        let mut literals: Vec<(usize, usize)> = Vec::new();
+        let mut index = 0usize;
+
+        let blank = |view: &mut Vec<u8>, at: usize| {
+            if view[at] != b'\n'
+            {
+                view[at] = b' ';
+            }
+        };
+
+        while index < bytes.len()
+        {
+            // Line comment.
+            if bytes[index] == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'/'
+            {
+                while index < bytes.len() && bytes[index] != b'\n'
+                {
+                    blank(&mut code, index);
+                    blank(&mut text, index);
+                    index += 1;
+                }
+                continue;
+            }
+
+            // Block comment (nesting is legal in Rust).
+            if bytes[index] == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*'
+            {
+                let mut depth = 1usize;
+                for at in [index, index + 1]
+                {
+                    blank(&mut code, at);
+                    blank(&mut text, at);
+                }
+                index += 2;
+                while index < bytes.len() && depth > 0
+                {
+                    let opens = bytes[index] == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*';
+                    let closes = bytes[index] == b'*' && index + 1 < bytes.len() && bytes[index + 1] == b'/';
+                    if opens || closes
+                    {
+                        if opens
+                        {
+                            depth += 1;
+                        }
+                        else
+                        {
+                            depth -= 1;
+                        }
+                        for at in [index, index + 1]
+                        {
+                            blank(&mut code, at);
+                            blank(&mut text, at);
+                        }
+                        index += 2;
+                        continue;
+                    }
+                    blank(&mut code, index);
+                    blank(&mut text, index);
+                    index += 1;
+                }
+                continue;
+            }
+
+            // Raw string: r, r#, r##, … followed by a quote.
+            if bytes[index] == b'r'
+            {
+                let mut hashes = 0usize;
+                let mut probe = index + 1;
+                while probe < bytes.len() && bytes[probe] == b'#'
+                {
+                    hashes += 1;
+                    probe += 1;
+                }
+                if probe < bytes.len() && bytes[probe] == b'"'
+                {
+                    let start = probe + 1;
+                    index = start;
+                    'raw: while index < bytes.len()
+                    {
+                        if bytes[index] == b'"'
+                        {
+                            let mut seen = 0usize;
+                            while seen < hashes
+                                && index + 1 + seen < bytes.len()
+                                && bytes[index + 1 + seen] == b'#'
+                            {
+                                seen += 1;
+                            }
+                            if seen == hashes
+                            {
+                                literals.push((start, index));
+                                index += 1 + hashes;
+                                break 'raw;
+                            }
+                        }
+                        blank(&mut code, index);
+                        index += 1;
+                    }
+                    continue;
+                }
+            }
+
+            // Ordinary string literal.
+            if bytes[index] == b'"'
+            {
+                let start = index + 1;
+                index = start;
+                while index < bytes.len()
+                {
+                    if bytes[index] == b'\\'
+                    {
+                        blank(&mut code, index);
+                        if index + 1 < bytes.len()
+                        {
+                            blank(&mut code, index + 1);
+                        }
+                        index += 2;
+                        continue;
+                    }
+                    if bytes[index] == b'"'
+                    {
+                        literals.push((start, index));
+                        index += 1;
+                        break;
+                    }
+                    blank(&mut code, index);
+                    index += 1;
+                }
+                continue;
+            }
+
+            // Character / byte-character literal: `'x'`, `b'"'`, `'\''` — never a
+            // lifetime (`'a`) or a loop label (`'raw:`).
+            if bytes[index] == b'\''
+            {
+                if let Some(end) = char_literal_end(bytes, index)
+                {
+                    for at in index + 1..end
+                    {
+                        blank(&mut code, at);
+                    }
+                    index = end + 1;
+                    continue;
+                }
+            }
+
+            index += 1;
+        }
+
+        Scan { code, text, literals }
+    }
+
+    /// Copied from `swallowed_failure_tests::char_literal_end`: the closing quote
+    /// of a char literal at `start`, or `None` for a lifetime / label.
+    fn char_literal_end(bytes: &[u8], start: usize) -> Option<usize>
+    {
+        if start + 2 >= bytes.len()
+        {
+            return None;
+        }
+        if bytes[start + 1] == b'\\'
+        {
+            let mut index = start + 3;
+            while index < bytes.len() && index <= start + 11
+            {
+                if bytes[index] == b'\''
+                {
+                    return Some(index);
+                }
+                index += 1;
+            }
+            return None;
+        }
+        if bytes[start + 2] == b'\''
+        {
+            return Some(start + 2);
+        }
+        None
+    }
+
+    /// The PRODUCT `[start, end)` ranges: everything outside every `#[cfg(test)]`
+    /// item — module, fn, const, struct, impl — found by real brace/bracket
+    /// matching on the code view (the `product_ranges` / `end_of_item` pair of
+    /// `swallowed_failure_tests`, copied).
+    fn product_ranges(source: &str, code: &[u8]) -> Vec<(usize, usize)>
+    {
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut region_start = 0usize;
+        let mut offset = 0usize;
+        let mut pending_attribute: Option<usize> = None;
+
+        for line in source.split('\n')
+        {
+            let line_start = offset;
+            offset += line.len() + 1;
+
+            if line_start < region_start
+            {
+                continue;
+            }
+
+            if let Some(attribute_start) = pending_attribute
+            {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with("#[") || trimmed.starts_with("//")
+                {
+                    continue;
+                }
+                pending_attribute = None;
+                ranges.push((region_start, attribute_start));
+                region_start = end_of_item(code, line_start);
+                continue;
+            }
+
+            if line.trim() == "#[cfg(test)]"
+            {
+                pending_attribute = Some(line_start);
+            }
+        }
+
+        ranges.push((region_start, source.len()));
+        ranges.retain(|(start, end)| start < end);
+        ranges
+    }
+
+    fn end_of_item(code: &[u8], from: usize) -> usize
+    {
+        let mut depth = 0i32;
+        let mut saw_body = false;
+        let mut index = from;
+        while index < code.len()
+        {
+            match code[index]
+            {
+                b'{' =>
+                {
+                    depth += 1;
+                    saw_body = true;
+                }
+                b'[' | b'(' => depth += 1,
+                b'}' | b']' | b')' =>
+                {
+                    depth -= 1;
+                    if depth == 0 && saw_body
+                    {
+                        return index + 1;
+                    }
+                }
+                b';' if depth == 0 => return index + 1,
+                _ => {}
+            }
+            index += 1;
+        }
+        code.len()
+    }
+
+    fn in_ranges(ranges: &[(usize, usize)], position: usize) -> bool
+    {
+        ranges.iter().any(|(start, end)| *start <= position && position < *end)
+    }
+
+    fn find_from(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize>
+    {
+        if needle.is_empty() || from >= haystack.len()
+        {
+            return None;
+        }
+        haystack[from..]
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .map(|found| from + found)
+    }
+
+    fn is_identifier_byte(byte: u8) -> bool
+    {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+
+    /// The `[start, end)` BODY span (inside the braces) of the ONE product
+    /// function called `name`, brace-matched on the code view. Err — never a
+    /// vacuous pass — when it is missing or ambiguous.
+    fn body_of(scan: &Scan, ranges: &[(usize, usize)], name: &str) -> Result<(usize, usize), String>
+    {
+        let needle = ["fn ", name].concat();
+        let mut found: Vec<usize> = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(at) = find_from(&scan.code, needle.as_bytes(), cursor)
+        {
+            cursor = at + 1;
+            let before_ok = at == 0 || !is_identifier_byte(scan.code[at - 1]);
+            let after = at + needle.len();
+            let after_ok = after < scan.code.len() && (scan.code[after] == b'(' || scan.code[after] == b'<');
+            if before_ok && after_ok && in_ranges(ranges, at)
+            {
+                found.push(at);
+            }
+        }
+        if found.len() != 1
+        {
+            return Err(format!(
+                "the source lock found {} product declarations of `fn {}` (expected exactly 1) — \
+                 it is not reading the crate, or the function moved",
+                found.len(),
+                name
+            ));
+        }
+        let mut open = found[0];
+        while open < scan.code.len() && scan.code[open] != b'{'
+        {
+            open += 1;
+        }
+        let mut depth = 0i32;
+        let mut index = open;
+        while index < scan.code.len()
+        {
+            match scan.code[index]
+            {
+                b'{' => depth += 1,
+                b'}' =>
+                {
+                    depth -= 1;
+                    if depth == 0
+                    {
+                        if index <= open + 1
+                        {
+                            return Err(format!("the body of `fn {}` extracted EMPTY", name));
+                        }
+                        return Ok((open + 1, index));
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        Err(format!("the body of `fn {}` never closed", name))
+    }
+
+    /// A whitespace-free copy of `view[start..end]` (a `\`-newline string
+    /// continuation's backslash is dropped too), so `a ( b )` matches `a(b)`.
+    fn squeezed(view: &[u8], start: usize, end: usize) -> String
+    {
+        let mut out = Vec::with_capacity(end - start);
+        let mut index = start;
+        while index < end
+        {
+            let byte = view[index];
+            if byte == b'\\' && index + 1 < end && view[index + 1] == b'\n'
+            {
+                index += 2;
+                continue;
+            }
+            if !byte.is_ascii_whitespace()
+            {
+                out.push(byte);
+            }
+            index += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    fn line_of(source: &str, position: usize) -> usize
+    {
+        source.as_bytes()[..position].iter().filter(|byte| **byte == b'\n').count() + 1
+    }
+
+    /// Every `capture_datetime [NOT] [I]LIKE` in `view` — case-insensitive, any
+    /// run of whitespace or `\`-newline continuation between the words — so a
+    /// re-spaced or re-cased new offender is still counted.
+    fn capture_datetime_like_sites(view: &[u8]) -> Vec<usize>
+    {
+        let lower: Vec<u8> = view.iter().map(|byte| byte.to_ascii_lowercase()).collect();
+        let column = b"capture_datetime";
+        let skip_gap = |mut at: usize| -> (usize, bool) {
+            let mut saw = false;
+            while at < lower.len()
+            {
+                if lower[at].is_ascii_whitespace()
+                {
+                    saw = true;
+                    at += 1;
+                }
+                else if lower[at] == b'\\' && at + 1 < lower.len() && lower[at + 1] == b'\n'
+                {
+                    saw = true;
+                    at += 2;
+                }
+                else
+                {
+                    break;
+                }
+            }
+            (at, saw)
+        };
+        let word_at = |at: usize, word: &[u8]| -> bool {
+            lower.len() >= at + word.len()
+                && &lower[at..at + word.len()] == word
+                && (at + word.len() == lower.len() || !is_identifier_byte(lower[at + word.len()]))
+        };
+
+        let mut sites = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(at) = find_from(&lower, column, cursor)
+        {
+            cursor = at + 1;
+            if at > 0 && is_identifier_byte(lower[at - 1])
+            {
+                continue;
+            }
+            let (mut next, saw) = skip_gap(at + column.len());
+            if !saw
+            {
+                continue;
+            }
+            if word_at(next, b"not")
+            {
+                let (after_not, saw_after) = skip_gap(next + 3);
+                if !saw_after
+                {
+                    continue;
+                }
+                next = after_not;
+            }
+            if word_at(next, b"like") || word_at(next, b"ilike")
+            {
+                sites.push(at);
+            }
+        }
+        sites
+    }
+
+    /// E2-T2's lock over `source`. Ok(count of sites) or Err(why).
+    fn date_like_lock(source: &str) -> Result<usize, String>
+    {
+        let scan = scan(source);
+        let ranges = product_ranges(source, &scan.code);
+        let sites: Vec<usize> = capture_datetime_like_sites(&scan.text)
+            .into_iter()
+            .filter(|at| in_ranges(&ranges, *at))
+            .collect();
+        if sites.is_empty()
+        {
+            return Err(
+                "E2-T2/empty-extraction: found 0 product `capture_datetime LIKE` sites — the lock \
+                 is not reading the crate"
+                    .to_string(),
+            );
+        }
+
+        let (body_start, body_end) = body_of(&scan, &ranges, "build_path_date_predicate")?;
+
+        // (1) exactly the two arms.
+        if sites.len() != 2
+        {
+            let lines: Vec<usize> = sites.iter().map(|at| line_of(source, *at)).collect();
+            return Err(format!(
+                "E2-T2/count: {} product `capture_datetime LIKE` sites at lines {:?}, expected \
+                 exactly 2 (the two date arms of `build_path_date_predicate`) — a new producer \
+                 must route through `build_path_date_predicate` (R-45 / R-90)",
+                sites.len(),
+                lines
+            ));
+        }
+
+        let pinned = "capture_datetime LIKE '{}%' ESCAPE '\\\\'";
+        for at in &sites
+        {
+            // (2) inside the one function.
+            if !(body_start <= *at && *at < body_end)
+            {
+                return Err(format!(
+                    "E2-T2/inside-the-function: the `capture_datetime LIKE` at line {} is outside \
+                     `build_path_date_predicate`",
+                    line_of(source, *at)
+                ));
+            }
+            // It must be SQL text, i.e. inside a string literal.
+            if !scan.literals.iter().any(|(start, end)| *start <= *at && *at < *end)
+            {
+                return Err(format!(
+                    "E2-T2/in-a-literal: the `capture_datetime LIKE` at line {} is not inside a \
+                     string literal",
+                    line_of(source, *at)
+                ));
+            }
+            // (3) POSITIONAL (S182 A-3): ` ESCAPE '\\'` immediately follows THIS
+            // `LIKE '{}%'` — a per-literal check would pass the both-arm literal
+            // on the path arm's `ESCAPE` alone.
+            if !source[*at..].starts_with(pinned)
+            {
+                let shown: String = source[*at..].chars().take(48).collect();
+                return Err(format!(
+                    "E2-T2/escape-follows-each-like: line {} reads `{}` — each date `LIKE '{{}}%'` \
+                     must be followed immediately by ` ESCAPE '\\\\'` (R-45)",
+                    line_of(source, *at),
+                    shown
+                ));
+            }
+        }
+
+        // STYLE lock, stated as such (S182 A-4): the date arm is escaped in the
+        // path arm's order — wildcards first, then the quote doubling. The two
+        // alphabets are disjoint so the order cannot change the output; this
+        // pins the one idiom, and it is also what reverting the escape (M3)
+        // trips.
+        let body_text = squeezed(&scan.text, body_start, body_end);
+        if !body_text.contains("letescaped_date=escape_for_ilike(date_prefix).replace('\\'',\"''\");")
+        {
+            return Err(
+                "E2-T2/date-escaped-like-the-path: `escaped_date` must be \
+                 `escape_for_ilike(date_prefix).replace('\\'', \"''\")` — the path arm's idiom"
+                    .to_string(),
+            );
+        }
+
+        // (4) the two FFI arms call the single source of truth.
+        for ffi in ["get_images_filtered", "get_filtered_image_count"]
+        {
+            let (start, end) = body_of(&scan, &ranges, ffi)?;
+            let body_code = squeezed(&scan.code, start, end);
+            if !body_code.contains("letpredicate=build_path_date_predicate(\"\",&date_prefix);")
+            {
+                return Err(format!(
+                    "E2-T2/ffi-routes-through-the-builder: `{}` must build its predicate with \
+                     `build_path_date_predicate(\"\", &date_prefix)` (R-90)",
+                    ffi
+                ));
+            }
+        }
+
+        Ok(sites.len())
+    }
+
+    /// The `;` rule for one SQL literal (S182 A-11): strip SQL `'…'` strings
+    /// (`''`-aware) first, then allow NO `;` — or exactly one, trailing.
+    fn semicolon_offender(sql: &str) -> Option<String>
+    {
+        let mut outside = String::with_capacity(sql.len());
+        let mut in_quote = false;
+        let chars: Vec<char> = sql.chars().collect();
+        let mut index = 0usize;
+        while index < chars.len()
+        {
+            let character = chars[index];
+            if in_quote
+            {
+                if character == '\''
+                {
+                    if index + 1 < chars.len() && chars[index + 1] == '\''
+                    {
+                        index += 2;
+                        continue;
+                    }
+                    in_quote = false;
+                }
+                index += 1;
+                continue;
+            }
+            if character == '\''
+            {
+                in_quote = true;
+                index += 1;
+                continue;
+            }
+            outside.push(character);
+            index += 1;
+        }
+        let trimmed = outside.trim_end_matches(|c: char| c.is_whitespace() || c == '\\');
+        let semicolons = trimmed.matches(';').count();
+        if semicolons == 0 || (semicolons == 1 && trimmed.ends_with(';'))
+        {
+            None
+        }
+        else
+        {
+            Some(sql.to_string())
+        }
+    }
+
+    /// What E2-T7's scan saw, for the report and the guards.
+    #[derive(Debug)]
+    struct ExecuteCensus
+    {
+        sites: usize,
+        no_argument: usize,
+        literal_first: usize,
+        const_first: usize,
+        invisible_variable_first: usize,
+        consts_scanned: usize,
+    }
+
+    /// E2-T7's lock over `source`.
+    fn execute_semicolon_lock(source: &str) -> Result<ExecuteCensus, String>
+    {
+        let scan = scan(source);
+        let ranges = product_ranges(source, &scan.code);
+        let literal_at = |position: usize| -> Option<(usize, usize)> {
+            scan.literals.iter().copied().find(|(start, _)| *start == position)
+        };
+        let skip_space = |mut at: usize| -> usize {
+            while at < scan.code.len() && scan.code[at].is_ascii_whitespace()
+            {
+                at += 1;
+            }
+            at
+        };
+        // The body of the literal that STARTS at `at` (`"…"`, `r"…"`, `r#"…"#`).
+        let literal_starting = |at: usize| -> Option<(usize, usize)> {
+            let bytes = source.as_bytes();
+            if at >= bytes.len()
+            {
+                return None;
+            }
+            if bytes[at] == b'"'
+            {
+                return literal_at(at + 1);
+            }
+            if bytes[at] == b'r'
+            {
+                let mut probe = at + 1;
+                while probe < bytes.len() && bytes[probe] == b'#'
+                {
+                    probe += 1;
+                }
+                if probe < bytes.len() && bytes[probe] == b'"'
+                {
+                    return literal_at(probe + 1);
+                }
+            }
+            None
+        };
+
+        let mut census = ExecuteCensus {
+            sites: 0,
+            no_argument: 0,
+            literal_first: 0,
+            const_first: 0,
+            invisible_variable_first: 0,
+            consts_scanned: 0,
+        };
+        let mut offenders: Vec<String> = Vec::new();
+        let mut referenced_consts: Vec<(String, usize)> = Vec::new();
+
+        let mut cursor = 0usize;
+        while let Some(at) = find_from(&scan.code, b".execute(", cursor)
+        {
+            cursor = at + 1;
+            if !in_ranges(&ranges, at)
+            {
+                continue;
+            }
+            census.sites += 1;
+            let mut argument = skip_space(at + b".execute(".len());
+            if argument < scan.code.len() && scan.code[argument] == b')'
+            {
+                // A no-argument builder `.execute()` (LanceDB): no SQL to scan,
+                // excluded by its SHAPE, not by name.
+                census.no_argument += 1;
+                continue;
+            }
+            if argument < scan.code.len() && scan.code[argument] == b'&'
+            {
+                argument = skip_space(argument + 1);
+            }
+            if scan.code[argument..].starts_with(b"format!")
+            {
+                argument = skip_space(argument + b"format!".len());
+                if argument < scan.code.len() && scan.code[argument] == b'('
+                {
+                    argument = skip_space(argument + 1);
+                }
+            }
+            if let Some((start, end)) = literal_starting(argument)
+            {
+                census.literal_first += 1;
+                if let Some(sql) = semicolon_offender(&source[start..end])
+                {
+                    offenders.push(format!("line {}: {}", line_of(source, at), sql));
+                }
+                continue;
+            }
+            let identifier_end = (argument..scan.code.len())
+                .find(|index| !is_identifier_byte(scan.code[*index]))
+                .unwrap_or(scan.code.len());
+            let identifier = &source[argument..identifier_end];
+            let is_const = !identifier.is_empty()
+                && identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+                && identifier.bytes().any(|byte| byte.is_ascii_uppercase());
+            if is_const
+            {
+                census.const_first += 1;
+                referenced_consts.push((identifier.to_string(), at));
+            }
+            else
+            {
+                // ⚠️ A VARIABLE first argument is invisible to this lock — stated,
+                // not hidden: the SQL it holds is built somewhere this scan does
+                // not follow.
+                census.invisible_variable_first += 1;
+            }
+        }
+
+        // Every product `const NAME: &str = "…"` whose name says SQL, plus every
+        // const an `.execute(` names, is scanned by the same rule.
+        let mut scanned_consts: Vec<String> = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(at) = find_from(&scan.code, b"const ", cursor)
+        {
+            cursor = at + 1;
+            if !in_ranges(&ranges, at) || (at > 0 && is_identifier_byte(scan.code[at - 1]))
+            {
+                continue;
+            }
+            let name_start = at + b"const ".len();
+            let name_end = (name_start..scan.code.len())
+                .find(|index| !is_identifier_byte(scan.code[*index]))
+                .unwrap_or(scan.code.len());
+            let name = &source[name_start..name_end];
+            let wanted = name.contains("SQL")
+                || referenced_consts.iter().any(|(referenced, _)| referenced == name);
+            if !wanted
+            {
+                continue;
+            }
+            let declaration = squeezed(&scan.code, name_end, (name_end + 40).min(scan.code.len()));
+            if !(declaration.starts_with(":&str=") || declaration.starts_with(":&'staticstr="))
+            {
+                continue;
+            }
+            let mut value = name_end;
+            while value < scan.code.len() && scan.code[value] != b'='
+            {
+                value += 1;
+            }
+            let value = skip_space(value + 1);
+            match literal_starting(value)
+            {
+                Some((start, end)) =>
+                {
+                    census.consts_scanned += 1;
+                    scanned_consts.push(name.to_string());
+                    if let Some(sql) = semicolon_offender(&source[start..end])
+                    {
+                        offenders.push(format!("const {} (line {}): {}", name, line_of(source, at), sql));
+                    }
+                }
+                None => offenders.push(format!(
+                    "const {} (line {}) is not a single string literal, so its `;` cannot be \
+                     scanned — make it one, or extend this lock",
+                    name,
+                    line_of(source, at)
+                )),
+            }
+        }
+        for (name, at) in &referenced_consts
+        {
+            if !scanned_consts.iter().any(|scanned| scanned == name)
+            {
+                offenders.push(format!(
+                    "line {}: `.execute({}` names a const this lock could not find and scan",
+                    line_of(source, *at),
+                    name
+                ));
+            }
+        }
+
+        if census.sites < 100 || census.literal_first < 50 || census.consts_scanned < 4
+        {
+            return Err(format!(
+                "E2-T7/empty-extraction: the scan saw {:?} — fewer than 100 product `.execute(` \
+                 sites, 50 literal first arguments or 4 SQL consts; it is not reading the crate",
+                census
+            ));
+        }
+        if !offenders.is_empty()
+        {
+            return Err(format!(
+                "E2-T7/no-multi-statement-execute: {} product SQL text(s) passed to `execute(` \
+                 carry a `;` outside a SQL string that is not the one trailing terminator. \
+                 duckdb-rs `prepare` runs every leading statement UNPARAMETERIZED and returns only \
+                 the last one's count (Q-03):\n{}",
+                offenders.len(),
+                offenders.join("\n")
+            ));
+        }
+        Ok(census)
+    }
+
+    // ------------------------------------------------------------------
+    // E2-T1 — the date arm's SQL text (R-45).
+    // ------------------------------------------------------------------
+    #[test]
+    fn e2_t1_the_date_arm_is_wildcard_escaped_and_pins_escape()
+    {
+        assert_eq!(
+            build_path_date_predicate("", "2026:0_:"),
+            "capture_datetime LIKE '2026:0\\_:%' ESCAPE '\\'",
+            "E2-T1/underscore"
+        );
+        assert_eq!(
+            build_path_date_predicate("", "2019_07_04"),
+            "capture_datetime LIKE '2019\\_07\\_04%' ESCAPE '\\'",
+            "E2-T1/both-underscores"
+        );
+        assert_eq!(
+            build_path_date_predicate("", "2026:0%"),
+            "capture_datetime LIKE '2026:0\\%%' ESCAPE '\\'",
+            "E2-T1/percent"
+        );
+        assert_eq!(
+            build_path_date_predicate("", "2026:06:"),
+            "capture_datetime LIKE '2026:06:%' ESCAPE '\\'",
+            "E2-T1/legitimate-token-unchanged-but-for-escape"
+        );
+        assert_eq!(
+            build_path_date_predicate("", "it's"),
+            "capture_datetime LIKE 'it''s%' ESCAPE '\\'",
+            "E2-T1/quote-doubled"
+        );
+        assert_eq!(
+            build_path_date_predicate("/Users/x/", "2026:0_:"),
+            "file_path LIKE '/Users/x/%' ESCAPE '\\' AND capture_datetime LIKE '2026:0\\_:%' \
+             ESCAPE '\\' AND file_path NOT LIKE '%.photoslibrary/%'",
+            "E2-T1/both-arm: ESCAPE on BOTH halves, Apple exclusion still appended"
+        );
+        assert_eq!(build_path_date_predicate("", ""), "", "E2-T1/empty-is-empty");
+    }
+
+    // ------------------------------------------------------------------
+    // E2-T2 — the source lock: every product `capture_datetime LIKE` lives in
+    // `build_path_date_predicate` and carries `ESCAPE` (R-45 / R-90).
+    //
+    // Adversarial probes (the ledger in the slice report): a `//` decoy, an
+    // inline `/* */` decoy on the anchored line and a multi-line block-comment
+    // decoy cannot satisfy it (comments are blanked before matching); a decoy
+    // inside an UNRELATED string literal outside the function FAILS it — on
+    // purpose, because that is exactly what a new offender looks like.
+    //
+    // ⚠️ LIMITATION, stated honestly (E2 review T2): the lock counts only the
+    // SPELLED operator — `capture_datetime [NOT] [I]LIKE`, any case, any
+    // whitespace. The operator spellings `capture_datetime ~~ '…'` and the
+    // function form `like(capture_datetime, '…')` would slip past it; nothing in
+    // the crate writes either today.
+    // ------------------------------------------------------------------
+    #[test]
+    fn e2_t2_every_capture_datetime_like_is_in_the_builder_and_escaped()
+    {
+        match date_like_lock(include_str!("lib.rs"))
+        {
+            Ok(sites) => assert_eq!(sites, 2, "E2-T2/count"),
+            Err(why) => panic!("{}", why),
+        }
+        // The empty-extraction guard is loud, not vacuous.
+        let empty = date_like_lock("fn main()\n{\n}\n").expect_err("E2-T2/empty-extraction must FAIL");
+        assert!(empty.contains("not reading the crate"), "{}", empty);
+    }
+
+    // ------------------------------------------------------------------
+    // E2-T3 — the runtime twin: a wildcard token scopes to its own day.
+    // Executed on a real engine, because the text can read correctly while the
+    // wildcard still fires; the raw (pre-E2) form is run beside it so the
+    // fixture is proved to DISCRIMINATE.
+    // ------------------------------------------------------------------
+    #[test]
+    fn e2_t3_a_wildcard_date_token_scopes_to_its_own_rows()
+    {
+        let (_fixture, conn) = fresh_catalogue("t3");
+        seed_date_fixture(&conn);
+
+        let fixed = |path: &str, token: &str| -> i64 {
+            execute_image_count_query(
+                &conn,
+                &build_path_date_predicate(path, token),
+                false,
+                false,
+                false,
+                "",
+                MediaType::Both,
+            )
+        };
+        let raw = |token: &str| -> i64 {
+            execute_image_count_query(
+                &conn,
+                &format!("capture_datetime LIKE '{}%'", token),
+                false,
+                false,
+                false,
+                "",
+                MediaType::Both,
+            )
+        };
+
+        // (token, before, after)
+        for (token, before, after) in [
+            ("2019_07_04", 4, 1),
+            ("2026:0%", 3, 0),
+            ("2026:0_:", 3, 0),
+            ("2026:", 3, 3),
+            ("2019:07:04", 1, 1),
+        ]
+        {
+            assert_eq!(raw(token), before, "E2-T3/fixture-discriminates: raw `{}`", token);
+            assert_eq!(fixed("", token), after, "E2-T3/date-arm: `{}`", token);
+        }
+        // The both-arm form, through the same engine.
+        assert_eq!(fixed("/photos/", "2026:0_:"), 0, "E2-T3/both-arm-wildcard");
+        assert_eq!(fixed("/photos/", "2026:"), 3, "E2-T3/both-arm-legitimate");
+    }
+
+    // ------------------------------------------------------------------
+    // E2-T3b — S182 A-10: the FFI arms themselves, through the global
+    // catalogue. `get_filtered_image_count("2026:0_:")` must not count
+    // `2026:09:`; the empty prefix (the one live Swift caller, All Photos) is
+    // unchanged.
+    // ------------------------------------------------------------------
+    #[test]
+    fn e2_t3b_the_ffi_date_arms_escape_through_the_builder()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("t3b");
+        seed_date_fixture(&conn);
+        let _installed = Installed::new(&fixture, conn);
+
+        let count = |token: &str| -> i64 {
+            futures::executor::block_on(get_filtered_image_count(
+                token.to_string(),
+                false,
+                false,
+                MediaType::StillsOnly,
+            ))
+        };
+        assert_eq!(count("2026:0_:"), 0, "E2-T3b/count-wildcard-token");
+        assert_eq!(count("2026:09:"), 1, "E2-T3b/count-legitimate-day");
+        assert_eq!(count("2026:"), 3, "E2-T3b/count-legitimate-year");
+        assert_eq!(count("it's"), 1, "E2-T3b/count-quote: no parser error swallowed to 0");
+        assert_eq!(count(""), 8, "E2-T3b/count-empty-prefix-is-everything");
+
+        let paths = |token: &str| -> Vec<String> {
+            futures::executor::block_on(get_images_filtered(100, 0, token.to_string(), false, false))
+                .into_iter()
+                .map(|record| record.file_path)
+                .collect()
+        };
+        assert!(paths("2026:0_:").is_empty(), "E2-T3b/records-wildcard-token");
+        assert_eq!(paths("2026:09:"), vec!["/photos/g.nef".to_string()], "E2-T3b/records-day");
+        assert_eq!(paths("it's"), vec!["/photos/h.nef".to_string()], "E2-T3b/records-quote");
+        assert_eq!(paths("").len(), 8, "E2-T3b/records-empty-prefix");
+    }
+
+    // ------------------------------------------------------------------
+    // E2-T4 — R-90's quote, with a discriminator. "0 rows" is what BOTH the
+    // swallowed parser error and a correct empty answer look like, so the
+    // fixture carries a row that MUST match.
+    // ------------------------------------------------------------------
+    #[test]
+    fn e2_t4_a_quote_in_the_date_prefix_matches_its_row()
+    {
+        let (_fixture, conn) = fresh_catalogue("t4");
+        seed_date_fixture(&conn);
+
+        let predicate = build_path_date_predicate("", "it's");
+        assert!(predicate.contains("it''s"), "E2-T4/quote-doubled: {}", predicate);
+        let matched = execute_image_count_query(&conn, &predicate, false, false, false, "", MediaType::Both);
+        assert_eq!(matched, 1, "E2-T4/the-quote-row-matches");
+
+        // Negative control, built HERE and never in the product: the raw
+        // interpolation R-90 carried does not even prepare.
+        let raw = format!("SELECT COUNT(*) FROM images WHERE capture_datetime LIKE '{}%'", "it's");
+        assert!(conn.prepare(&raw).is_err(), "E2-T4/raw-form-fails-to-prepare");
+    }
+
+    // ------------------------------------------------------------------
+    // E2-T5a — R-15, the two source locks. The engine count and the exact
+    // count AGREED on every fixture measured (5k / 50k / 200k), so no runtime
+    // test can tell the two sources apart: what is pinned is which one is
+    // reported.
+    // ------------------------------------------------------------------
+    #[test]
+    fn e2_t5a_the_reported_counts_come_from_exact_counts()
+    {
+        let source = include_str!("lib.rs");
+        let scan = scan(source);
+        let ranges = product_ranges(source, &scan.code);
+
+        // Merge: `images_replaced` is `colliding_count`, and the backup-wins
+        // UPDATE is not an argument to `changed_count(`.
+        let (start, end) = body_of(&scan, &ranges, "merge_catalogue_sql_inner")
+            .unwrap_or_else(|why| panic!("{}", why));
+        let code = squeezed(&scan.code, start, end);
+        let mut assignments: Vec<String> = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(at) = code[cursor..].find("images_replaced=")
+        {
+            let from = cursor + at + "images_replaced=".len();
+            let value: String = code[from..].chars().take_while(|c| *c != ';').collect();
+            assignments.push(value);
+            cursor = from;
+        }
+        assert!(
+            assignments.iter().any(|value| value == "colliding_count"),
+            "E2-T5a/merge-reports-colliding-count: assignments seen {:?}",
+            assignments
+        );
+        assert!(
+            assignments.iter().all(|value| value == "0u64" || value == "colliding_count"),
+            "E2-T5a/merge-reports-colliding-count: `images_replaced` may only be initialised \
+             to 0 or set from `colliding_count`, saw {:?}",
+            assignments
+        );
+        let text = squeezed(&scan.text, start, end);
+        let mut cursor = 0usize;
+        while let Some(at) = text[cursor..].find("changed_count(")
+        {
+            let from = cursor + at;
+            let window: String = text[from..].chars().take(160).collect::<String>().to_ascii_uppercase();
+            assert!(
+                !window.contains("UPDATEIMAGESSET"),
+                "E2-T5a/merge-update-not-a-changed-count: the backup-wins `UPDATE images SET` is \
+                 wrapped in `changed_count(` again"
+            );
+            cursor = from + 1;
+        }
+
+        // Relocate: `updated` is fed by the query_row COUNT(*), taken after
+        // BEGIN and before the UPDATE, whose own return is structurally dropped.
+        let (start, end) = body_of(&scan, &ranges, "relocate_file_path_prefix")
+            .unwrap_or_else(|why| panic!("{}", why));
+        let code = squeezed(&scan.code, start, end);
+        let text = squeezed(&scan.text, start, end);
+        assert!(
+            code.contains("query_row(RELOCATE_PREFIX_SCOPE_COUNT_SQL,params![old_prefix],"),
+            "E2-T5a/relocate-precount-is-a-query-row"
+        );
+        assert!(
+            code.contains("ifletErr(e)=conn.execute(RELOCATE_PREFIX_UPDATE_SQL,"),
+            "E2-T5a/relocate-update-return-dropped: the UPDATE's change count must not be bound"
+        );
+        let mut updated: Vec<String> = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(at) = code[cursor..].find("updated:")
+        {
+            let from = cursor + at + "updated:".len();
+            updated.push(code[from..].chars().take_while(|c| *c != ',' && *c != '}').collect());
+            cursor = from;
+        }
+        assert!(
+            updated.iter().any(|value| value == "in_scope")
+                && updated.iter().all(|value| value == "0" || value == "in_scope"),
+            "E2-T5a/relocate-reports-the-precount: `updated:` values seen {:?}",
+            updated
+        );
+        let begin = text.find("BEGINTRANSACTION;").expect("E2-T5a/relocate-order: BEGIN");
+        let count = text
+            .find("RELOCATE_PREFIX_SCOPE_COUNT_SQL")
+            .expect("E2-T5a/relocate-order: pre-count");
+        let update = text
+            .find("conn.execute(RELOCATE_PREFIX_UPDATE_SQL")
+            .expect("E2-T5a/relocate-order: UPDATE");
+        assert!(
+            begin < count && count < update,
+            "E2-T5a/relocate-order: the pre-count must sit inside the transaction and BEFORE \
+             the UPDATE"
+        );
+
+        // S182 A-5: the two statements' WHEREs are one predicate, `?2` in the
+        // UPDATE being `?1` in the count.
+        let where_of = |sql: &str| -> String {
+            let at = sql.rfind("WHERE").expect("a WHERE clause");
+            sql[at..].split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        assert_eq!(
+            where_of(RELOCATE_PREFIX_UPDATE_SQL).replace("?2", "?1"),
+            where_of(RELOCATE_PREFIX_SCOPE_COUNT_SQL),
+            "E2-T5a/relocate-count-where-is-the-update-where"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // E2-T5b — the relocate correctness twin, through the FFI: 5,000 rows
+    // under a root whose name carries a `_`, a neighbour that the `_` would
+    // match as a LIKE wildcard, a sibling root that shares its spelling, and
+    // the bare prefix row. The reported number is exactly the rows moved — and
+    // a pre-count rewritten in either old form (wildcard LIKE, or no `/`
+    // separator) is caught at runtime, not only by E2-T5a's text lock.
+    // ------------------------------------------------------------------
+    #[test]
+    fn e2_t5b_relocate_reports_exactly_the_rows_its_where_moves()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("t5b");
+        conn.execute_batch(
+            "INSERT INTO images (file_path, file_size, file_name, created_timestamp, \
+             modified_timestamp, directory_path) \
+             SELECT '/old/ro_t/sub/' || i || '.nef', 1, i || '.nef', 0, 0, '/old/ro_t/sub' \
+             FROM range(5000) t(i);",
+        )
+        .expect("the 5,000 in-scope rows");
+        // The `_` neighbour: a pre-count written in the old `LIKE ?1 || '/%'` form
+        // would let the root's `_` match this `X` (review T1).
+        insert_dated(&conn, "/old/roXt/other.nef", "2026:01:01 10:00:00");
+        // The spelling-prefix sibling: caught only by the `|| '/'` separator.
+        insert_dated(&conn, "/old/ro_tX/other.nef", "2026:01:01 10:00:00");
+        insert_dated(&conn, "/old/ro_t", "2026:01:01 10:00:00");
+        let _installed = Installed::new(&fixture, conn);
+
+        let result = futures::executor::block_on(relocate_file_path_prefix(
+            "/old/ro_t".to_string(),
+            "/new/root".to_string(),
+        ));
+        assert!(result.ok, "E2-T5b/ok: {}", result.message);
+        assert_eq!(result.updated, 5000, "E2-T5b/updated-is-exactly-the-moved-rows");
+
+        let catalogue = CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let conn = catalogue.as_ref().expect("installed catalogue");
+        let count = |sql: &str| -> i64 {
+            conn.query_row(sql, [], |row| row.get(0)).expect("count")
+        };
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM images WHERE starts_with(file_path, '/new/root/sub/') \
+                 AND directory_path = '/new/root/sub'"
+            ),
+            5000,
+            "E2-T5b/moved"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM images WHERE file_path = '/old/roXt/other.nef'"),
+            1,
+            "E2-T5b/wildcard-neighbour-untouched"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM images WHERE file_path = '/old/ro_tX/other.nef'"),
+            1,
+            "E2-T5b/sibling-untouched"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM images WHERE file_path = '/old/ro_t'"),
+            1,
+            "E2-T5b/bare-prefix-untouched"
+        );
+        assert_eq!(count("SELECT COUNT(*) FROM images"), 5003, "E2-T5b/nothing-lost");
+    }
+
+    // ------------------------------------------------------------------
+    // E2-T5c — the merge correctness twin: under backup-wins, the reported
+    // `images_replaced` equals the census's `colliding_image_count` AND the
+    // number of live rows that truly took the backup's values.
+    // ------------------------------------------------------------------
+    #[test]
+    fn e2_t5c_backup_wins_reports_exactly_the_replaced_rows()
+    {
+        let (live_fixture, live) = fresh_catalogue("t5c-live");
+        let (backup_fixture, backup) = fresh_catalogue("t5c-backup");
+
+        let set_rating = |conn: &Connection, path: &str, rating: i64| {
+            insert_dated(conn, path, "2026:01:01 10:00:00");
+            conn.execute(
+                "UPDATE images SET rating = ?1 WHERE file_path = ?2",
+                params![rating, path],
+            )
+            .expect("rating");
+        };
+        for path in ["/p/c1.jpg", "/p/c2.jpg", "/p/c3.jpg", "/p/live-only.jpg"]
+        {
+            set_rating(&live, path, 1);
+        }
+        for path in ["/p/c1.jpg", "/p/c2.jpg", "/p/c3.jpg", "/p/new1.jpg", "/p/new2.jpg"]
+        {
+            set_rating(&backup, path, 5);
+        }
+        drop(backup);
+        let backup_path = backup_fixture.catalogue.to_string_lossy().into_owned();
+
+        let counts = count_merge_candidates_impl(&live, &backup_path);
+        assert!(counts.backup_readable);
+        assert_eq!(counts.colliding_image_count, 3, "E2-T5c/census");
+
+        let (summary, _, _) =
+            merge_catalogue_sql(&live, &backup_path, MergeCollisionPolicy::BackupWins).expect("merge");
+        let truly_replaced: i64 = live
+            .query_row(
+                "SELECT COUNT(*) FROM images WHERE rating = 5 \
+                 AND file_path IN ('/p/c1.jpg', '/p/c2.jpg', '/p/c3.jpg')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("truth");
+        assert_eq!(
+            summary.images_replaced, counts.colliding_image_count,
+            "E2-T5c/replaced-equals-the-census"
+        );
+        assert_eq!(summary.images_replaced, truly_replaced as u64, "E2-T5c/replaced-equals-the-truth");
+        assert_eq!(summary.images_added, 2, "E2-T5c/added");
+        assert_eq!(summary.images_kept_current, 0, "E2-T5c/kept-current");
+        drop(live);
+        drop(live_fixture);
+    }
+
+    // ------------------------------------------------------------------
+    // E2-T6 — R-44: the guard's zeroing is THIS connection's alone, and on drop
+    // the connection is back on the value in force before it — a tuning, not
+    // the compiled-in default. Also proves the SESSION override is EFFECTIVE:
+    // the guarded connection stops choosing an index scan, the other does not.
+    // ------------------------------------------------------------------
+    #[test]
+    fn e2_t6_the_guard_keeps_a_tuned_value_and_touches_no_other_connection()
+    {
+        let (_fixture, conn) = fresh_catalogue("t6");
+        let other = conn.try_clone().expect("a second connection on the same instance");
+        fence_connection_against_extension_fetches(&other);
+        for n in 0..20
+        {
+            insert_dated(&conn, &format!("/p/{}.jpg", n), "2026:01:01 10:00:00");
+        }
+        let probe_id: i64 = conn
+            .query_row("SELECT MIN(id) FROM images", [], |row| row.get(0))
+            .expect("a probe id");
+
+        let read = |c: &Connection, name: &str| -> (String, String) {
+            c.query_row(
+                "SELECT value, scope FROM duckdb_settings() WHERE name = ?1",
+                params![name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap_or_else(|e| panic!("setting {} must exist on this engine: {}", name, e))
+        };
+        let pair = |value: &str, scope: &str| (value.to_string(), scope.to_string());
+        let uses_index_scan = |c: &Connection| -> bool {
+            let mut statement = c
+                .prepare(&format!("EXPLAIN ANALYZE SELECT COUNT(*) FROM images WHERE id = {}", probe_id))
+                .expect("explain analyze");
+            let plan: Vec<String> = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .expect("plan rows")
+                .filter_map(|row| row.ok())
+                .collect();
+            plan.join("\n").contains("Index Scan")
+        };
+
+        // A tuning, set the way an open-time `SET` would set it: database-wide.
+        conn.execute_batch("SET GLOBAL index_scan_max_count = 4242; SET GLOBAL index_scan_percentage = 0.25;")
+            .expect("tuning");
+        assert_eq!(read(&conn, "index_scan_max_count"), pair("4242", "GLOBAL"));
+        assert!(uses_index_scan(&conn), "E2-T6/control: the tuned PK lookup takes the index");
+
+        {
+            let guard = FocusWritebackIndexScansDisabled::new(&conn);
+            assert!(guard.active, "E2-T6/active");
+            assert_eq!(read(&conn, "index_scan_max_count"), pair("0", "LOCAL"), "E2-T6/zeroed-here");
+            assert_eq!(read(&conn, "index_scan_percentage"), pair("0.0", "LOCAL"), "E2-T6/zeroed-here");
+            assert_eq!(
+                read(&other, "index_scan_max_count"),
+                pair("4242", "GLOBAL"),
+                "E2-T6/no-leak: another connection must not see the guard's zeroing"
+            );
+            assert_eq!(read(&other, "index_scan_percentage"), pair("0.25", "GLOBAL"), "E2-T6/no-leak");
+            assert!(!uses_index_scan(&conn), "E2-T6/effective: the guarded connection scans sequentially");
+            assert!(uses_index_scan(&other), "E2-T6/effective-only-here: the other still takes the index");
+        }
+
+        assert_eq!(
+            read(&conn, "index_scan_max_count"),
+            pair("4242", "GLOBAL"),
+            "E2-T6/restores-the-tuned-value: not 2048, and no override left standing"
+        );
+        assert_eq!(
+            read(&conn, "index_scan_percentage"),
+            pair("0.25", "GLOBAL"),
+            "E2-T6/restores-the-tuned-value"
+        );
+        assert_eq!(read(&other, "index_scan_max_count"), pair("4242", "GLOBAL"), "E2-T6/other-unchanged");
+        assert!(uses_index_scan(&conn), "E2-T6/index-scans-back");
+
+        // The fail-closed seam's guard never applied anything; its Drop removes
+        // an override that does not exist, which leaves the tuning alone.
+        {
+            let guard = FocusWritebackIndexScansDisabled::inactive_for_test(&conn);
+            assert!(!guard.active);
+        }
+        assert_eq!(read(&conn, "index_scan_max_count"), pair("4242", "GLOBAL"), "E2-T6/inactive-harmless");
+        assert_eq!(read(&conn, "index_scan_percentage"), pair("0.25", "GLOBAL"), "E2-T6/inactive-harmless");
+
+        // Leave the instance clean.
+        conn.execute_batch("RESET index_scan_max_count; RESET index_scan_percentage;")
+            .expect("reset the tuning");
+        assert_eq!(read(&conn, "index_scan_max_count"), pair("2048", "GLOBAL"));
+        drop(other);
+    }
+
+    // ------------------------------------------------------------------
+    // E2-T7 — Q-03: no product `.execute(` passes a multi-statement literal.
+    //
+    // ⚠️ LIMITATION, stated honestly: a first argument that is a VARIABLE
+    // (`&sql`, `update_sql`, …) is invisible to this lock — the scan counts them
+    // and reports the number, but cannot see the SQL they hold. The const case
+    // IS covered: every product `const …: &str` whose name says SQL, and every
+    // const an `.execute(` names, is scanned by the same rule.
+    // ------------------------------------------------------------------
+    #[test]
+    fn e2_t7_no_product_execute_passes_a_multi_statement_literal()
+    {
+        match execute_semicolon_lock(include_str!("lib.rs"))
+        {
+            Ok(census) => eprintln!("E2-T7 census: {:?}", census),
+            Err(why) => panic!("{}", why),
+        }
+        let empty = execute_semicolon_lock("fn main()\n{\n}\n").expect_err("E2-T7/empty-extraction must FAIL");
+        assert!(empty.contains("not reading the crate"), "{}", empty);
+
+        // The rule itself, on the shapes it must tell apart.
+        assert_eq!(semicolon_offender("UPDATE t SET a = 1"), None, "E2-T7/rule: none");
+        assert_eq!(semicolon_offender("UPDATE t SET a = 1;"), None, "E2-T7/rule: one trailing");
+        assert_eq!(semicolon_offender("UPDATE t SET a = 'x;y'"), None, "E2-T7/rule: inside a SQL string");
+        assert_eq!(semicolon_offender("UPDATE t SET a = 'it''s;'"), None, "E2-T7/rule: ''-aware");
+        assert!(semicolon_offender("BEGIN; UPDATE t SET a = 1").is_some(), "E2-T7/rule: two statements");
+        assert!(semicolon_offender("DELETE FROM t; DELETE FROM u;").is_some(), "E2-T7/rule: two, trailing");
+    }
+}
+
+// ======================================================================
+// Slice P — the DuckDB ↔ LanceDB cross-store (R-18 · R-62 · R-50 · N-1…N-4 ·
+// R-77 pinned · Q-09), plus the §A-18 riders (ruling 5's `unreadable_half`,
+// R-30's `untaken_counts`).
+//
+// Every runtime fixture is a REAL temp-file catalogue opened through the
+// production `open_and_migrate_catalogue` and fenced (ENGINE TESTS NEVER
+// FETCH), and every store-side check runs against a REAL `vectors.lancedb`
+// beside it — there is no mock. Tests that resolve the store from the
+// process-global CATALOGUE_PATH, or call an FFI entry point, serialise on
+// `swallowed_failure_tests`' `GLOBAL_CATALOGUE_LOCK`, the one lock every such
+// module shares. The two injection seams (`FocusApplyProbe::failing_face_census`
+// and `OrphanSweepProbe`) are parameter-threaded and uninhabited in a
+// production build.
+//
+// The source locks (P11, P14) read `include_str!("lib.rs")` through the
+// stripper copied from `engine_contract_residue_tests` (itself copied from
+// `swallowed_failure_tests`: line and nested block comments, raw strings,
+// escapes, char literals vs lifetimes; every `#[cfg(test)]` item excised) and
+// FAIL LOUDLY on an empty extraction. Each has a runtime twin: P11's are P8
+// and P10b (a cached handle would make them flap), P14's is a real contention
+// test on the lock itself.
+// ======================================================================
+#[cfg(test)]
+mod cross_store_tests
+{
+    use super::*;
+    use std::collections::{BTreeSet, HashSet};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    const ALGO: &str = "cross-store-v1";
+    const OLD_ALGO: &str = "cross-store-v0";
+    const MODEL: &str = "model-p";
+    const PREP: &str = "prep-p";
+    const DIM: u32 = 4;
+
+    // ------------------------------------------------------------------
+    // Fixtures.
+    // ------------------------------------------------------------------
+
+    struct Fixture
+    {
+        dir: std::path::PathBuf,
+        catalogue: std::path::PathBuf,
+    }
+
+    impl Fixture
+    {
+        fn vectors(&self) -> std::path::PathBuf
+        {
+            self.dir.join("vectors.lancedb")
+        }
+
+        fn vectors_uri(&self) -> String
+        {
+            self.vectors().to_string_lossy().into_owned()
+        }
+
+        fn table_dir(&self) -> std::path::PathBuf
+        {
+            self.vectors().join(format!("{}.lance", FACE_EMBEDDING_TABLE))
+        }
+    }
+
+    impl Drop for Fixture
+    {
+        fn drop(&mut self)
+        {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A fresh REAL catalogue file in its own directory, through the production
+    /// open path, fenced. `vectors.lancedb` resolves beside it.
+    fn fresh_catalogue(tag: &str) -> (Fixture, Connection)
+    {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "plcore-slice-p-{}-{}-{}",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        let catalogue = dir.join("catalogue.db");
+        let conn = open_and_migrate_catalogue(&catalogue).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH.
+        fence_connection_against_extension_fetches(&conn);
+        (Fixture { dir, catalogue }, conn)
+    }
+
+    /// A second connection on the SAME database instance, fenced too.
+    fn second_connection(conn: &Connection) -> Connection
+    {
+        let other = conn.try_clone().expect("a second connection on the same instance");
+        fence_connection_against_extension_fetches(&other);
+        other
+    }
+
+    fn serial() -> std::sync::MutexGuard<'static, ()>
+    {
+        super::swallowed_failure_tests::GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The process-global catalogue, installed for the life of this value and
+    /// cleared on drop (panic or not).
+    struct Installed;
+
+    impl Installed
+    {
+        fn new(fixture: &Fixture, conn: Connection) -> Self
+        {
+            *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(conn);
+            *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(fixture.catalogue.clone());
+            CATALOGUE.clear_poison();
+            CATALOGUE_PATH.clear_poison();
+            Installed
+        }
+    }
+
+    impl Drop for Installed
+    {
+        fn drop(&mut self)
+        {
+            *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
+
+    fn block<F: std::future::Future>(future: F) -> F::Output
+    {
+        FACE_EMBEDDING_RUNTIME.block_on(future)
+    }
+
+    fn insert_image(conn: &Connection, file_path: &str, kind: &str) -> i64
+    {
+        let file_name = file_path.rsplit('/').next().unwrap_or(file_path).to_string();
+        let stem = file_name.split('.').next().unwrap_or(&file_name).to_string();
+        let directory = file_path[..file_path.len() - file_name.len() - 1].to_string();
+        conn.execute(
+            "INSERT INTO images (file_path, file_size, file_name, file_stem, image_kind, \
+             directory_path, created_timestamp, modified_timestamp, is_video) \
+             VALUES (?1, 10, ?2, ?3, ?4, ?5, 0, 0, FALSE)",
+            params![file_path, file_name, stem, kind, directory],
+        )
+        .expect("insert image");
+        conn.query_row(
+            "SELECT id FROM images WHERE file_path = ?1",
+            params![file_path],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("image id")
+    }
+
+    fn insert_face(
+        conn: &Connection,
+        image_id: i64,
+        analyzed_image_id: i64,
+        face_index: i64,
+        algorithm_version: &str,
+    ) -> i64
+    {
+        conn.query_row(
+            "INSERT INTO face_observation (
+                 image_id, analyzed_image_id, face_index, algorithm_version,
+                 analysis_run_id, bounding_box_x, bounding_box_y,
+                 bounding_box_width, bounding_box_height
+             ) VALUES (?1, ?2, ?3, ?4, 'run-0', 0.1, 0.1, 0.2, 0.2)
+             RETURNING id",
+            params![image_id, analyzed_image_id, face_index, algorithm_version],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("insert face observation")
+    }
+
+    /// Name faces through the PRODUCT assignment path, so the People keyword
+    /// projection (face-origin bit) is exactly what the app writes.
+    fn name_faces(conn: &Connection, face_ids: &[i64], name: &str)
+    {
+        let accepted = assign_face_observations_to_person_impl(conn, face_ids, name);
+        assert_eq!(accepted.status, "assigned", "fixture: naming {:?} {}: {}", face_ids, name, accepted.message);
+    }
+
+    fn add_cluster_member(conn: &Connection, run_id: &str, face_id: i64, image_id: i64)
+    {
+        conn.execute(
+            "INSERT INTO face_cluster_member (run_id, cluster_id, face_observation_id, image_id, \
+             analyzed_image_id, face_index, member_rank, cluster_size) \
+             VALUES (?1, 1, ?2, ?3, ?3, 0, 1, 2)",
+            params![run_id, face_id, image_id],
+        )
+        .expect("insert cluster member");
+    }
+
+    fn id_set(conn: &Connection, sql: &str) -> BTreeSet<i64>
+    {
+        let mut statement = conn.prepare(sql).expect("id query");
+        let rows = statement.query_map([], |row| row.get::<_, i64>(0)).expect("id rows");
+        let mut ids = BTreeSet::new();
+        for row in rows
+        {
+            ids.insert(row.expect("id row"));
+        }
+        ids
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64
+    {
+        conn.query_row(sql, [], |row| row.get::<_, i64>(0)).expect("count")
+    }
+
+    fn queued(conn: &Connection) -> BTreeSet<i64>
+    {
+        id_set(conn, "SELECT face_observation_id FROM face_vector_pending_delete")
+    }
+
+    fn orphan_assignments(conn: &Connection) -> i64
+    {
+        count(
+            conn,
+            "SELECT COUNT(*) FROM person_face_assignment a \
+             WHERE NOT EXISTS (SELECT 1 FROM face_observation f WHERE f.id = a.face_observation_id)",
+        )
+    }
+
+    /// (status, origin) of the active-or-hidden keyword row at `path`.
+    fn keyword_row(conn: &Connection, image_id: i64, path: &str) -> Option<(i64, i32)>
+    {
+        conn.query_row(
+            "SELECT status, origin FROM keyword WHERE image_id = ?1 AND path = ?2",
+            params![image_id, path],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i32>(1)?)),
+        )
+        .ok()
+    }
+
+    fn people_path(name: &str) -> String
+    {
+        ["People", name].join(KEYWORD_PATH_SEPARATOR)
+    }
+
+    fn observation(face_index: u32) -> FaceObservationResult
+    {
+        FaceObservationResult
+        {
+            face_index,
+            bounding_box_x: 0.1,
+            bounding_box_y: 0.2,
+            bounding_box_width: 0.3,
+            bounding_box_height: 0.4,
+            detection_confidence: Some(0.9),
+            face_capture_quality: Some(0.8),
+            face_focus_score: Some(50.0),
+            left_eye_open_score: None,
+            right_eye_open_score: None,
+            eyes_open_score: None,
+            blink_risk_score: None,
+            left_eye_x: None,
+            left_eye_y: None,
+            right_eye_x: None,
+            right_eye_y: None,
+            nose_x: None,
+            nose_y: None,
+            mouth_left_x: None,
+            mouth_left_y: None,
+            mouth_right_x: None,
+            mouth_right_y: None,
+        }
+    }
+
+    fn analysis(id: i64, status: &str, faces: u32) -> FocusAnalysisResult
+    {
+        let complete = status == "complete";
+        FocusAnalysisResult
+        {
+            id,
+            focus_score: if complete { Some(42.0) } else { None },
+            focus_basis: if complete { Some("human_face".to_string()) } else { None },
+            algorithm_version: ALGO.to_string(),
+            analysis_run_id: "attempt-p".to_string(),
+            status: status.to_string(),
+            focus_human_score: None,
+            focus_animal_score: None,
+            focus_foreground_score: None,
+            focus_saliency_score: None,
+            focus_animal_pose_score: None,
+            focus_whole_image_score: None,
+            face_count: if complete { Some(faces as i32) } else { None },
+            face_quality_best: None,
+            face_quality_average: None,
+            face_quality_min: None,
+            face_eyes_open_count: None,
+            face_blink_risk_count: None,
+            auto_keywords: Vec::new(),
+            face_observations: (0..faces).map(observation).collect(),
+        }
+    }
+
+    fn record(face_observation_id: i64, model_version: &str, value: f32) -> FaceEmbeddingVectorRecord
+    {
+        FaceEmbeddingVectorRecord
+        {
+            face_observation_id,
+            image_id: 1,
+            analyzed_image_id: 1,
+            face_index: 0,
+            model_name: "p-model".to_string(),
+            model_version: model_version.to_string(),
+            preprocessing_version: PREP.to_string(),
+            input_size: 112,
+            color_order: "rgb".to_string(),
+            normalization: "p".to_string(),
+            embedding_dimension: DIM,
+            embedding_l2_norm: 1.0,
+            vector: vec![value; DIM as usize],
+        }
+    }
+
+    async fn open_store(uri: &str) -> lancedb::Table
+    {
+        lancedb::connect(uri)
+            .execute()
+            .await
+            .expect("connect")
+            .open_table(FACE_EMBEDDING_TABLE)
+            .execute()
+            .await
+            .expect("open face table")
+    }
+
+    /// Every stored row as (id, model_version, vector[0]).
+    async fn stored_rows(uri: &str) -> Vec<(i64, String, f32)>
+    {
+        let table = open_store(uri).await;
+        let batches = table
+            .query()
+            .execute()
+            .await
+            .expect("scan")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect");
+        let mut rows = Vec::new();
+        for batch in batches
+        {
+            let ids = batch
+                .column_by_name("face_observation_id")
+                .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
+                .expect("ids");
+            let models = batch
+                .column_by_name("model_version")
+                .and_then(|a| a.as_any().downcast_ref::<StringArray>())
+                .expect("models");
+            let vectors = batch
+                .column_by_name("vector")
+                .and_then(|a| a.as_any().downcast_ref::<FixedSizeListArray>())
+                .expect("vectors");
+            let values = vectors
+                .values()
+                .as_any()
+                .downcast_ref::<arrow_array::Float32Array>()
+                .expect("values");
+            let width = vectors.value_length() as usize;
+            for row in 0..batch.num_rows()
+            {
+                rows.push((ids.value(row), models.value(row).to_string(), values.value(row * width)));
+            }
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        rows
+    }
+
+    fn stored_ids(uri: &str) -> BTreeSet<i64>
+    {
+        block(stored_rows(uri)).into_iter().map(|row| row.0).collect()
+    }
+
+    fn newest_manifest(fixture: &Fixture) -> std::path::PathBuf
+    {
+        let versions = fixture.table_dir().join("_versions");
+        let mut manifests = std::fs::read_dir(&versions)
+            .expect("_versions")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().map(|e| e == "manifest").unwrap_or(false))
+            .collect::<Vec<_>>();
+        // V2 manifest names encode u64::MAX - version, so the NEWEST sorts first.
+        manifests.sort();
+        manifests.into_iter().next().expect("a manifest")
+    }
+
+    // ------------------------------------------------------------------
+    // P1 · P2 · P3 — R-18, V2's L2-06 scenario on a real catalogue, through
+    // the production FFI. A lone RAW is analysed and its faces NAMED (Ada,
+    // Grace) and clustered; Ada is ALSO named on an older-version face of the
+    // same RAW, so her keyword stays face-backed. Then the JPEG lands: its
+    // writeback targets [JPEG, RAW] at the SAME algorithm version and
+    // replaces the RAW's observations.
+    // ------------------------------------------------------------------
+    #[test]
+    fn p1_p2_p3_twin_fan_out_writeback_cascades_and_keeps_names()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("p1");
+        let raw = insert_image(&conn, "/w/shot.nef", "raw");
+        let old_face = insert_face(&conn, raw, raw, 0, OLD_ALGO);
+        let ada = insert_face(&conn, raw, raw, 0, ALGO);
+        let grace = insert_face(&conn, raw, raw, 1, ALGO);
+        name_faces(&conn, &[ada], "Ada");
+        name_faces(&conn, &[old_face], "Ada");
+        name_faces(&conn, &[grace], "Grace");
+        add_cluster_member(&conn, "run-1", ada, raw);
+        add_cluster_member(&conn, "run-1", grace, raw);
+        let jpeg = insert_image(&conn, "/w/shot.jpg", "jpeg");
+        let doomed: BTreeSet<i64> = [ada, grace].into_iter().collect();
+        let check = second_connection(&conn);
+        assert_eq!(
+            keyword_row(&check, raw, &people_path("Grace")).map(|r| r.1 & KEYWORD_ORIGIN_FACE),
+            Some(KEYWORD_ORIGIN_FACE),
+            "fixture: the product naming path projects People/Grace with the face bit"
+        );
+        let _installed = Installed::new(&fixture, conn);
+
+        let receipt = futures::executor::block_on(update_focus_analysis_results(vec![analysis(
+            jpeg, "complete", 1,
+        )]));
+        assert_eq!(receipt.failure_stage, None, "P1/writeback: {:?}", receipt.failed_reason);
+        assert_eq!(receipt.updated, 2, "fixture: the JPEG's writeback fans out to [JPEG, RAW]");
+        assert_eq!(
+            count(&check, &format!("SELECT COUNT(*) FROM face_observation WHERE id IN ({}, {})", ada, grace)),
+            0,
+            "fixture: the twin fan-out replaced the RAW's named observations (V2's trigger)"
+        );
+
+        // P1 — no assignment names a face that no longer exists.
+        assert_eq!(orphan_assignments(&check), 0, "P1/no-orphan-assignment");
+        // P2 — EVERY destroyed id is queued: set equality against the census.
+        assert_eq!(queued(&check), doomed, "P2/queue-equals-the-doomed-set");
+        assert!(!queued(&check).contains(&old_face), "P2/the older version's face is not touched");
+        // P3 — no cluster member names a destroyed face.
+        assert_eq!(
+            count(&check, &format!(
+                "SELECT COUNT(*) FROM face_cluster_member WHERE face_observation_id IN ({}, {})",
+                ada, grace
+            )),
+            0,
+            "P3/no-cluster-member-for-a-destroyed-face"
+        );
+        // Ruling 16 — Grace is no longer named by any face: her name stays as
+        // the user's OWN keyword. Ada is still named (the older face): face-backed.
+        let grace_row = keyword_row(&check, raw, &people_path("Grace")).expect("People/Grace kept");
+        assert_eq!(grace_row.0, 1, "R16/grace-still-active");
+        assert_eq!(grace_row.1 & KEYWORD_ORIGIN_FACE, 0, "R16/grace-no-longer-claims-a-face");
+        assert_ne!(grace_row.1 & KEYWORD_ORIGIN_USER, 0, "R16/grace-is-the-user's-keyword");
+        let ada_row = keyword_row(&check, raw, &people_path("Ada")).expect("People/Ada kept");
+        assert_ne!(ada_row.1 & KEYWORD_ORIGIN_FACE, 0, "R16/ada-still-face-backed");
+        let people_row = keyword_row(&check, raw, "People").expect("People kept");
+        assert_ne!(people_row.1 & KEYWORD_ORIGIN_FACE, 0, "R16/people-root-still-face-backed");
+        // The replacement observations exist (the new pass's own rows).
+        assert_eq!(
+            count(&check, &format!(
+                "SELECT COUNT(*) FROM face_observation WHERE algorithm_version = '{}' AND image_id IN ({}, {})",
+                ALGO, raw, jpeg
+            )),
+            2,
+            "fixture: one new face row per target"
+        );
+        drop(check);
+    }
+
+    // ------------------------------------------------------------------
+    // P4 — the FAILURE path. A non-complete result targets only its own image
+    // (the planner fans out on "complete" alone), and still replaces that
+    // image's observations at the same version: the cascade runs there too.
+    // ------------------------------------------------------------------
+    #[test]
+    fn p4_a_failed_result_cascades_too()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("p4");
+        let image = insert_image(&conn, "/f/lone.jpg", "jpeg");
+        let linus = insert_face(&conn, image, image, 0, ALGO);
+        name_faces(&conn, &[linus], "Linus");
+        add_cluster_member(&conn, "run-4", linus, image);
+        let check = second_connection(&conn);
+        let _installed = Installed::new(&fixture, conn);
+
+        let receipt =
+            futures::executor::block_on(update_focus_analysis_results(vec![analysis(image, "failed", 0)]));
+        assert_eq!(receipt.failure_stage, None, "P4/writeback: {:?}", receipt.failed_reason);
+        assert_eq!(count(&check, "SELECT COUNT(*) FROM face_observation"), 0, "fixture: the failed result cleared the stale rows");
+        assert_eq!(orphan_assignments(&check), 0, "P4/no-orphan-assignment");
+        assert_eq!(queued(&check), [linus].into_iter().collect(), "P4/queue-equals-the-doomed-set");
+        assert_eq!(count(&check, "SELECT COUNT(*) FROM face_cluster_member"), 0, "P4/no-cluster-member");
+        // Ruling 16 with nothing left on the image: both rows become the user's.
+        for path in [people_path("Linus"), "People".to_string()]
+        {
+            let row = keyword_row(&check, image, &path).expect("kept");
+            assert_eq!((row.0, row.1 & KEYWORD_ORIGIN_FACE), (1, 0), "P4/R16 {:?}", path);
+            assert_ne!(row.1 & KEYWORD_ORIGIN_USER, 0, "P4/R16 user bit {:?}", path);
+        }
+        drop(check);
+    }
+
+    // ------------------------------------------------------------------
+    // P5 — a census that cannot be PERFORMED aborts the chunk: nothing is
+    // deleted, nothing is queued, and the transaction is rolled back. Driven
+    // through the writeback's product implementation with S179's probe
+    // pointing the census at a column that does not exist (a real per-row Err).
+    // ------------------------------------------------------------------
+    #[test]
+    fn p5_a_census_that_cannot_run_rolls_the_chunk_back()
+    {
+        let (_fixture, conn) = fresh_catalogue("p5");
+        let image = insert_image(&conn, "/f/census.jpg", "jpeg");
+        let face = insert_face(&conn, image, image, 0, ALGO);
+        name_faces(&conn, &[face], "Linus");
+        add_cluster_member(&conn, "run-5", face, image);
+
+        let probe = FocusApplyProbe::new(image, true, 1).failing_face_census();
+        let receipt = update_focus_analysis_results_impl(&conn, vec![analysis(image, "failed", 0)], Some(&probe));
+        assert_eq!(receipt.failure_stage.as_deref(), Some("apply"), "P5/stage");
+        assert_eq!(receipt.updated, 0, "P5/updated");
+        let reason = receipt.failed_reason.unwrap_or_default();
+        assert!(reason.contains("doomed face-id census lost"), "P5/reason: {}", reason);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM face_observation"), 1, "P5/the-observation-survives");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person_face_assignment"), 1, "P5/the-assignment-survives");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM face_cluster_member"), 1, "P5/the-member-survives");
+        assert!(queued(&conn).is_empty(), "P5/nothing-queued");
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM images WHERE id = {} AND focus_analysis_status IS NULL", image)),
+            1,
+            "P5/the-whole-chunk-rolled-back"
+        );
+
+        // Control: the same chunk without the probe succeeds.
+        let receipt = update_focus_analysis_results_impl(&conn, vec![analysis(image, "failed", 0)], None);
+        assert_eq!(receipt.failure_stage, None, "P5/control: {:?}", receipt.failed_reason);
+        assert_eq!(queued(&conn), [face].into_iter().collect(), "P5/control-queues");
+    }
+
+    // ------------------------------------------------------------------
+    // P6 · P7 · P8 — R-50: ONE commit, the three-column key.
+    // ------------------------------------------------------------------
+    #[test]
+    fn p6_the_merge_key_isolates_model_contracts()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("p6");
+        let _installed = Installed::new(&fixture, conn);
+        for (model, value) in [("m1", 1.0), ("m2", 2.0), ("m1", 3.0)]
+        {
+            let stored = block(upsert_face_embeddings_impl(vec![record(1, model, value)]));
+            assert_eq!(stored.status, "stored", "fixture: {}", stored.message);
+        }
+        assert_eq!(
+            block(stored_rows(&fixture.vectors_uri())),
+            vec![(1, "m1".to_string(), 3.0), (1, "m2".to_string(), 2.0)],
+            "P6/another-contract's-vector-survives"
+        );
+    }
+
+    #[test]
+    fn p7_the_upsert_is_idempotent_and_replaces()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("p7");
+        let _installed = Installed::new(&fixture, conn);
+        let uri = fixture.vectors_uri();
+        let first = block(upsert_face_embeddings_impl((1..=3).map(|id| record(id, MODEL, 1.0)).collect()));
+        assert_eq!((first.status.as_str(), first.stored_count), ("stored", 3));
+        let second = block(upsert_face_embeddings_impl((1..=3).map(|id| record(id, MODEL, 2.0)).collect()));
+        assert_eq!((second.status.as_str(), second.stored_count, second.total_count), ("stored", 3, 3), "P7/idempotent-count");
+        assert!(
+            block(stored_rows(&uri)).iter().all(|row| row.2 == 2.0),
+            "P7/the-second-batch's-values-won"
+        );
+        // A batch carrying one id twice replaces with the LAST — merge_insert
+        // would otherwise refuse the batch as ambiguous.
+        let duplicate = block(upsert_face_embeddings_impl(vec![record(1, MODEL, 5.0), record(1, MODEL, 6.0)]));
+        assert_eq!(duplicate.status, "stored", "P7/duplicate-in-batch: {}", duplicate.message);
+        let rows = block(stored_rows(&uri));
+        assert_eq!(rows.len(), 3, "P7/duplicate-in-batch-count");
+        assert_eq!(rows[0], (1, MODEL.to_string(), 6.0), "P7/duplicate-in-batch-last-wins");
+    }
+
+    #[test]
+    fn p8_the_upsert_is_one_commit()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("p8");
+        let _installed = Installed::new(&fixture, conn);
+        let uri = fixture.vectors_uri();
+        let seeded = block(upsert_face_embeddings_impl((1..=4).map(|id| record(id, MODEL, 1.0)).collect()));
+        assert_eq!(seeded.status, "stored");
+        let before = block(async { open_store(&uri).await.version().await.expect("version") });
+        let replaced = block(upsert_face_embeddings_impl((1..=6).map(|id| record(id, MODEL, 2.0)).collect()));
+        assert_eq!(replaced.status, "stored");
+        let after = block(async { open_store(&uri).await.version().await.expect("version") });
+        assert_eq!(after, before + 1, "P8/exactly-one-commit (a delete-then-add advances by 2)");
+    }
+
+    // ------------------------------------------------------------------
+    // P9 · P10 · P10b · P10c — R-62: create ONLY on a typed never-built.
+    // ------------------------------------------------------------------
+    #[test]
+    fn p9_a_store_path_that_is_a_file_is_named()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("p9");
+        std::fs::write(fixture.vectors(), b"x").expect("regular file at the store path");
+        let _installed = Installed::new(&fixture, conn);
+        let result = block(upsert_face_embeddings_impl(vec![record(1, MODEL, 1.0)]));
+        assert_eq!(result.status, "open_failed", "P9/status");
+        assert!(
+            result.message.contains("face-embedding store path is not a directory"),
+            "P9/names-the-cause: {}",
+            result.message
+        );
+        assert!(!result.message.contains("already exists"), "P9/never-already-exists: {}", result.message);
+        assert!(fixture.vectors().is_file(), "P9/the-file-is-untouched");
+    }
+
+    #[test]
+    fn p10_an_unreadable_store_is_reported_never_recreated()
+    {
+        let _serial = serial();
+
+        // (i) a corrupt newest manifest — the open itself fails.
+        let (fixture, conn) = fresh_catalogue("p10i");
+        let _installed = Installed::new(&fixture, conn);
+        let seeded = block(upsert_face_embeddings_impl(vec![record(1, MODEL, 1.0)]));
+        assert_eq!(seeded.status, "stored");
+        let manifest = newest_manifest(&fixture);
+        std::fs::write(&manifest, b"8 bytes!").expect("truncate the newest manifest");
+        let before = std::fs::read_dir(fixture.table_dir().join("_versions")).expect("list").count();
+        let result = block(upsert_face_embeddings_impl(vec![record(2, MODEL, 2.0)]));
+        assert_eq!(result.status, "open_failed", "P10/corrupt-status: {}", result.message);
+        assert!(result.message.contains("face-embedding table open failed"), "P10/names-the-open-failure: {}", result.message);
+        assert!(!result.message.contains("already exists"), "P10/never-already-exists: {}", result.message);
+        assert_eq!(std::fs::read(&manifest).expect("manifest"), b"8 bytes!".to_vec(), "P10/the-store-is-unchanged");
+        assert_eq!(
+            std::fs::read_dir(fixture.table_dir().join("_versions")).expect("list").count(),
+            before,
+            "P10/no-version-was-written"
+        );
+        drop(_installed);
+        drop(fixture);
+
+        // (ii) T4(c)'s recipe — an incompatible schema. ⚠️ Brief-vs-code: the
+        // OPEN of such a table succeeds, so this is `store_failed` at the write,
+        // not `open_failed`; what R-62 demands holds: the message names the real
+        // failure, never "already exists", and the store is unchanged.
+        let (fixture, conn) = fresh_catalogue("p10ii");
+        let uri = fixture.vectors_uri();
+        block(async {
+            let database = lancedb::connect(&uri).execute().await.expect("connect");
+            let schema = Arc::new(Schema::new(vec![Field::new("unrelated", DataType::Int64, false)]));
+            database
+                .create_empty_table(FACE_EMBEDDING_TABLE, schema)
+                .execute()
+                .await
+                .expect("create mismatched table");
+        });
+        let _installed = Installed::new(&fixture, conn);
+        let result = block(upsert_face_embeddings_impl(vec![record(1, MODEL, 1.0)]));
+        assert_eq!(result.status, "store_failed", "P10/schema-status: {}", result.message);
+        assert!(!result.message.contains("already exists"), "P10/schema-never-already-exists: {}", result.message);
+        let (names, fields) = block(async {
+            let database = lancedb::connect(&uri).execute().await.expect("connect");
+            let names = database.table_names().execute().await.expect("names");
+            let table = database.open_table(FACE_EMBEDDING_TABLE).execute().await.expect("open");
+            let schema = table.schema().await.expect("schema");
+            (names, schema.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>())
+        });
+        assert_eq!(names, vec![FACE_EMBEDDING_TABLE.to_string()], "P10/one-table");
+        assert_eq!(fields, vec!["unrelated".to_string()], "P10/still-the-mismatched-schema");
+    }
+
+    #[test]
+    fn p10b_p10c_benign_stores_are_created_and_stored()
+    {
+        let _serial = serial();
+
+        // (a) no store directory at all — the first-ever build.
+        let (fixture, conn) = fresh_catalogue("p10ba");
+        assert!(!fixture.vectors().exists());
+        let _installed = Installed::new(&fixture, conn);
+        let result = block(upsert_face_embeddings_impl(vec![record(1, MODEL, 1.0), record(2, MODEL, 1.0)]));
+        assert_eq!((result.status.as_str(), result.stored_count), ("stored", 2), "P10b(a): {}", result.message);
+        assert_eq!(stored_ids(&fixture.vectors_uri()), [1, 2].into_iter().collect(), "P10b(a)/stored");
+        drop(_installed);
+        drop(fixture);
+
+        // (b) a connectable store with no face table.
+        let (fixture, conn) = fresh_catalogue("p10bb");
+        std::fs::create_dir_all(fixture.vectors()).expect("empty store");
+        let _installed = Installed::new(&fixture, conn);
+        let result = block(upsert_face_embeddings_impl(vec![record(3, MODEL, 1.0)]));
+        assert_eq!((result.status.as_str(), result.stored_count), ("stored", 1), "P10b(b): {}", result.message);
+        assert_eq!(stored_ids(&fixture.vectors_uri()), [3].into_iter().collect(), "P10b(b)/stored");
+        drop(_installed);
+        drop(fixture);
+
+        // (c) A-6's P10c — a LOST `_versions` inside an existing table directory:
+        // TableNotFound by construction ⇒ never built ⇒ created and stored.
+        let (fixture, conn) = fresh_catalogue("p10c");
+        let _installed = Installed::new(&fixture, conn);
+        let seeded = block(upsert_face_embeddings_impl(vec![record(4, MODEL, 1.0)]));
+        assert_eq!(seeded.status, "stored");
+        std::fs::remove_dir_all(fixture.table_dir().join("_versions")).expect("lose _versions");
+        let result = block(upsert_face_embeddings_impl(vec![record(5, MODEL, 1.0)]));
+        assert_eq!((result.status.as_str(), result.stored_count), ("stored", 1), "P10c: {}", result.message);
+        assert_eq!(stored_ids(&fixture.vectors_uri()), [5].into_iter().collect(), "P10c/re-created");
+    }
+
+    // ------------------------------------------------------------------
+    // The stripper (copied from `engine_contract_residue_tests`).
+    // ------------------------------------------------------------------
+
+    struct Scan
+    {
+        code: Vec<u8>,
+    }
+
+    fn scan(source: &str) -> Scan
+    {
+        let bytes = source.as_bytes();
+        let mut code = bytes.to_vec();
+        let mut index = 0usize;
+        let blank = |view: &mut Vec<u8>, at: usize| {
+            if view[at] != b'\n'
+            {
+                view[at] = b' ';
+            }
+        };
+        while index < bytes.len()
+        {
+            if bytes[index] == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'/'
+            {
+                while index < bytes.len() && bytes[index] != b'\n'
+                {
+                    blank(&mut code, index);
+                    index += 1;
+                }
+                continue;
+            }
+            if bytes[index] == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*'
+            {
+                let mut depth = 1usize;
+                blank(&mut code, index);
+                blank(&mut code, index + 1);
+                index += 2;
+                while index < bytes.len() && depth > 0
+                {
+                    let opens = bytes[index] == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*';
+                    let closes = bytes[index] == b'*' && index + 1 < bytes.len() && bytes[index + 1] == b'/';
+                    if opens || closes
+                    {
+                        if opens
+                        {
+                            depth += 1;
+                        }
+                        else
+                        {
+                            depth -= 1;
+                        }
+                        blank(&mut code, index);
+                        blank(&mut code, index + 1);
+                        index += 2;
+                        continue;
+                    }
+                    blank(&mut code, index);
+                    index += 1;
+                }
+                continue;
+            }
+            if bytes[index] == b'r' && (index == 0 || !is_identifier_byte(bytes[index - 1]))
+            {
+                let mut hashes = 0usize;
+                let mut probe = index + 1;
+                while probe < bytes.len() && bytes[probe] == b'#'
+                {
+                    hashes += 1;
+                    probe += 1;
+                }
+                if probe < bytes.len() && bytes[probe] == b'"'
+                {
+                    index = probe + 1;
+                    'raw: while index < bytes.len()
+                    {
+                        if bytes[index] == b'"'
+                        {
+                            let mut seen = 0usize;
+                            while seen < hashes && index + 1 + seen < bytes.len() && bytes[index + 1 + seen] == b'#'
+                            {
+                                seen += 1;
+                            }
+                            if seen == hashes
+                            {
+                                index += 1 + hashes;
+                                break 'raw;
+                            }
+                        }
+                        blank(&mut code, index);
+                        index += 1;
+                    }
+                    continue;
+                }
+            }
+            if bytes[index] == b'"'
+            {
+                index += 1;
+                while index < bytes.len()
+                {
+                    if bytes[index] == b'\\'
+                    {
+                        blank(&mut code, index);
+                        if index + 1 < bytes.len()
+                        {
+                            blank(&mut code, index + 1);
+                        }
+                        index += 2;
+                        continue;
+                    }
+                    if bytes[index] == b'"'
+                    {
+                        index += 1;
+                        break;
+                    }
+                    blank(&mut code, index);
+                    index += 1;
+                }
+                continue;
+            }
+            if bytes[index] == b'\''
+            {
+                if let Some(end) = char_literal_end(bytes, index)
+                {
+                    for at in index + 1..end
+                    {
+                        blank(&mut code, at);
+                    }
+                    index = end + 1;
+                    continue;
+                }
+            }
+            index += 1;
+        }
+        Scan { code }
+    }
+
+    fn char_literal_end(bytes: &[u8], start: usize) -> Option<usize>
+    {
+        if start + 2 >= bytes.len()
+        {
+            return None;
+        }
+        if bytes[start + 1] == b'\\'
+        {
+            let mut index = start + 3;
+            while index < bytes.len() && index <= start + 11
+            {
+                if bytes[index] == b'\''
+                {
+                    return Some(index);
+                }
+                index += 1;
+            }
+            return None;
+        }
+        if bytes[start + 2] == b'\''
+        {
+            return Some(start + 2);
+        }
+        None
+    }
+
+    fn product_ranges(source: &str, code: &[u8]) -> Vec<(usize, usize)>
+    {
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut region_start = 0usize;
+        let mut offset = 0usize;
+        let mut pending_attribute: Option<usize> = None;
+        for line in source.split('\n')
+        {
+            let line_start = offset;
+            offset += line.len() + 1;
+            if line_start < region_start
+            {
+                continue;
+            }
+            if let Some(attribute_start) = pending_attribute
+            {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with("#[") || trimmed.starts_with("//")
+                {
+                    continue;
+                }
+                pending_attribute = None;
+                ranges.push((region_start, attribute_start));
+                region_start = end_of_item(code, line_start);
+                continue;
+            }
+            if line.trim() == "#[cfg(test)]"
+            {
+                pending_attribute = Some(line_start);
+            }
+        }
+        ranges.push((region_start, source.len()));
+        ranges.retain(|(start, end)| start < end);
+        ranges
+    }
+
+    fn end_of_item(code: &[u8], from: usize) -> usize
+    {
+        let mut depth = 0i32;
+        let mut saw_body = false;
+        let mut index = from;
+        while index < code.len()
+        {
+            match code[index]
+            {
+                b'{' =>
+                {
+                    depth += 1;
+                    saw_body = true;
+                }
+                b'[' | b'(' => depth += 1,
+                b'}' | b']' | b')' =>
+                {
+                    depth -= 1;
+                    if depth == 0 && saw_body
+                    {
+                        return index + 1;
+                    }
+                }
+                b';' if depth == 0 => return index + 1,
+                _ => {}
+            }
+            index += 1;
+        }
+        code.len()
+    }
+
+    fn is_identifier_byte(byte: u8) -> bool
+    {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+
+    /// The PRODUCT code view: stripped, every `#[cfg(test)]` item blanked,
+    /// whitespace squeezed OUT so `a ( b )` and `a(b)` read the same, with a
+    /// map from squeezed offsets back to source offsets.
+    struct Product
+    {
+        squeezed: String,
+        origin: Vec<usize>,
+    }
+
+    fn product_view(source: &str) -> Product
+    {
+        let scanned = scan(source);
+        let ranges = product_ranges(source, &scanned.code);
+        let mut squeezed = Vec::new();
+        let mut origin = Vec::new();
+        for (start, end) in ranges
+        {
+            for at in start..end
+            {
+                let byte = scanned.code[at];
+                if !byte.is_ascii_whitespace()
+                {
+                    squeezed.push(byte);
+                    origin.push(at);
+                }
+            }
+            // A range boundary must never glue two tokens together.
+            squeezed.push(b'\n');
+            origin.push(end);
+        }
+        Product { squeezed: String::from_utf8_lossy(&squeezed).into_owned(), origin }
+    }
+
+    /// True when the identifier run that ends at `at` (whitespace is squeezed
+    /// out, so `pub async fn` reads `pubasyncfn`) is empty or made only of
+    /// item qualifiers — so `fn`/`static` there starts a DECLARATION, and
+    /// `bar_fn` / `is_static` / `'static` do not.
+    fn declaration_starts_at(bytes: &[u8], at: usize) -> bool
+    {
+        if at > 0 && bytes[at - 1] == b'\''
+        {
+            return false;
+        }
+        let mut start = at;
+        while start > 0 && is_identifier_byte(bytes[start - 1])
+        {
+            start -= 1;
+        }
+        let mut run = &bytes[start..at];
+        while !run.is_empty()
+        {
+            let mut stripped = false;
+            for qualifier in [&b"pub"[..], b"async", b"unsafe", b"const", b"extern"]
+            {
+                if run.starts_with(qualifier)
+                {
+                    run = &run[qualifier.len()..];
+                    stripped = true;
+                    break;
+                }
+            }
+            if !stripped
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn occurrences(haystack: &str, needle: &str) -> Vec<usize>
+    {
+        let mut found = Vec::new();
+        let mut from = 0usize;
+        while let Some(at) = haystack[from..].find(needle)
+        {
+            found.push(from + at);
+            from += at + needle.len().max(1);
+        }
+        found
+    }
+
+    /// `[start, end)` of the ONE product function `name`'s body in the squeezed
+    /// view. Err — never a vacuous pass — when missing or ambiguous.
+    fn body_span(product: &Product, name: &str) -> Result<(usize, usize), String>
+    {
+        let bytes = product.squeezed.as_bytes();
+        let declarations = occurrences(&product.squeezed, &format!("fn{}", name))
+            .into_iter()
+            .filter(|at| {
+                let after = at + 2 + name.len();
+                declaration_starts_at(bytes, *at)
+                    && after < bytes.len()
+                    && (bytes[after] == b'(' || bytes[after] == b'<')
+            })
+            .collect::<Vec<_>>();
+        if declarations.len() != 1
+        {
+            return Err(format!(
+                "the source lock found {} product declarations of `fn {}` (expected 1) — it is not reading the crate, or the function moved",
+                declarations.len(),
+                name
+            ));
+        }
+        let mut open = declarations[0];
+        while open < bytes.len() && bytes[open] != b'{'
+        {
+            open += 1;
+        }
+        let mut depth = 0i32;
+        for index in open..bytes.len()
+        {
+            match bytes[index]
+            {
+                b'{' => depth += 1,
+                b'}' =>
+                {
+                    depth -= 1;
+                    if depth == 0
+                    {
+                        if index <= open + 1
+                        {
+                            return Err(format!("the body of `fn {}` extracted EMPTY", name));
+                        }
+                        return Ok((open + 1, index));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err(format!("the body of `fn {}` never closed", name))
+    }
+
+    fn inside(span: (usize, usize), at: usize) -> bool
+    {
+        span.0 <= at && at < span.1
+    }
+
+    // ------------------------------------------------------------------
+    // P11 — D7: no cached LanceDB handle, no `read_consistency_interval`.
+    // ------------------------------------------------------------------
+
+    fn cached_handle_lock(source: &str) -> Result<usize, String>
+    {
+        let product = product_view(source);
+        let text = &product.squeezed;
+        // The loud empty-extraction guard: the view must hold the statics this
+        // crate is known to declare, or it is not reading the crate.
+        for known in ["staticFACE_EMBEDDING_STORE_WRITE_LOCK:", "staticFACE_EMBEDDING_RUNTIME_SLOT:"]
+        {
+            if !text.contains(known)
+            {
+                return Err(format!("P11/empty-extraction: `{}` not found — the lock is not reading the crate", known));
+            }
+        }
+        if text.contains("read_consistency_interval")
+        {
+            return Err("P11/no-read-consistency-interval: product code sets a read-consistency interval".to_string());
+        }
+        // Every lancedb type must be spelled `lancedb::…`: no import may bring
+        // Table or Connection in under a bare name.
+        for at in occurrences(text, "uselancedb::")
+        {
+            let end = text[at..].find(';').map(|e| at + e).unwrap_or(text.len());
+            let import = &text[at..end];
+            if import.contains("Table") || import.contains("Connection") || import.contains('*')
+            {
+                return Err(format!("P11/no-bare-lancedb-handle-import: `{}`", import));
+            }
+        }
+        // Every static / thread_local / Lazy / OnceCell / OnceLock declaration
+        // must not name a lancedb type.
+        let mut statics = 0usize;
+        for needle in ["static", "Lazy<", "OnceCell<", "OnceLock<", "thread_local!"]
+        {
+            for at in occurrences(text, needle)
+            {
+                let bytes = text.as_bytes();
+                // Whitespace is squeezed out, so `static FOO` reads `staticFOO`;
+                // what decides a declaration is what PRECEDES the keyword.
+                if needle == "static" && !declaration_starts_at(bytes, at)
+                {
+                    continue;
+                }
+                statics += 1;
+                let end = text[at..]
+                    .find(|c: char| c == '=' || c == ';')
+                    .map(|e| at + e)
+                    .unwrap_or(text.len());
+                let declaration = &text[at..end];
+                if declaration.contains("lancedb::")
+                {
+                    return Err(format!(
+                        "P11/no-cached-lancedb-handle: `{}` (source offset {})",
+                        declaration, product.origin[at]
+                    ));
+                }
+            }
+        }
+        if statics < 3
+        {
+            return Err(format!("P11/empty-extraction: only {} static declarations seen", statics));
+        }
+        Ok(statics)
+    }
+
+    #[test]
+    fn p11_no_cached_lance_handle_source_lock()
+    {
+        let seen = cached_handle_lock(include_str!("lib.rs")).unwrap_or_else(|reason| panic!("{}", reason));
+        assert!(seen >= 3, "P11/statics-census");
+        // The lock goes RED on a real offender, however it is spaced …
+        let offender = "static  CACHED :\n  once_cell::sync::Lazy < lancedb :: Table > = todo!();\n\
+                        static FACE_EMBEDDING_STORE_WRITE_LOCK: () = ();\nstatic FACE_EMBEDDING_RUNTIME_SLOT: () = ();\nstatic X: () = ();\n";
+        assert!(cached_handle_lock(offender).is_err(), "P11/probe-offender");
+        let import = "use lancedb::Table as T;\nstatic FACE_EMBEDDING_STORE_WRITE_LOCK: () = ();\nstatic FACE_EMBEDDING_RUNTIME_SLOT: () = ();\nstatic X: () = ();\n";
+        assert!(cached_handle_lock(import).is_err(), "P11/probe-aliased-import");
+        let consistency = "fn f() { lancedb::connect(\"u\").read_consistency_interval(d); }\nstatic FACE_EMBEDDING_STORE_WRITE_LOCK: () = ();\nstatic FACE_EMBEDDING_RUNTIME_SLOT: () = ();\nstatic X: () = ();\n";
+        assert!(cached_handle_lock(consistency).is_err(), "P11/probe-consistency-interval");
+        // … and GREEN on the same text in a comment, a block comment, a string
+        // or a `#[cfg(test)]` item — none of which is product code.
+        let decoys = "// static C: Lazy<lancedb::Table> = x;\n/* static D: OnceCell<lancedb::Connection> = y; /* nested */ */\n\
+                      const S: &str = \"static E: Lazy<lancedb::Table> = z; read_consistency_interval\";\n\
+                      #[cfg(test)]\nstatic T: Lazy<lancedb::Table> = w;\n\
+                      static FACE_EMBEDDING_STORE_WRITE_LOCK: () = ();\nstatic FACE_EMBEDDING_RUNTIME_SLOT: () = ();\nstatic X: () = ();\n";
+        assert!(cached_handle_lock(decoys).is_ok(), "P11/probe-decoys: {:?}", cached_handle_lock(decoys));
+        // An empty extraction fails LOUDLY.
+        assert!(cached_handle_lock("").is_err(), "P11/probe-empty");
+        assert!(cached_handle_lock("fn main() {}").is_err(), "P11/probe-not-the-crate");
+    }
+
+    // ------------------------------------------------------------------
+    // P12 · P13 — the backup-wins merge. P12 pins slice B's two lines (R-77,
+    // B13 — pinned here, built by B); P13 pins N-1: the replaced ids are queued
+    // AT COMMIT, before any post-commit vector work, and the restore's cleanup
+    // goes through the durable queue (drain only — A-10).
+    // ------------------------------------------------------------------
+
+    struct MergeScene
+    {
+        live_fixture: Fixture,
+        backup_fixture: Fixture,
+        live: Connection,
+        replaced: BTreeSet<i64>,
+        collided_image: i64,
+    }
+
+    fn merge_scene(tag: &str) -> MergeScene
+    {
+        let (live_fixture, live) = fresh_catalogue(&format!("{}-live", tag));
+        let (backup_fixture, backup) = fresh_catalogue(&format!("{}-backup", tag));
+        let collided_image = insert_image(&live, "/r/c.jpg", "jpeg");
+        let f1 = insert_face(&live, collided_image, collided_image, 0, ALGO);
+        let f2 = insert_face(&live, collided_image, collided_image, 1, ALGO);
+        name_faces(&live, &[f1], "Ada");
+        add_cluster_member(&live, "run-m", f1, collided_image);
+        live.execute(
+            "INSERT INTO similar_photo_featureprint (image_id, algorithm_version, source_stamp, featureprint_blob) \
+             VALUES (?1, 'fp-1', 'stamp', '\\x00'::BLOB)",
+            params![collided_image],
+        )
+        .expect("featureprint");
+        live.execute(
+            "INSERT INTO similar_photo_group_member (image_id, group_id, representative_id, member_rank, algorithm_version, threshold) \
+             VALUES (?1, 7, ?1, 0, 'sg-1', 0.5)",
+            params![collided_image],
+        )
+        .expect("group member");
+        insert_image(&backup, "/r/c.jpg", "jpeg");
+        drop(backup);
+        MergeScene
+        {
+            live_fixture,
+            backup_fixture,
+            live,
+            replaced: [f1, f2].into_iter().collect(),
+            collided_image,
+        }
+    }
+
+    #[test]
+    fn p12_p13_backup_wins_merge_queues_at_commit_and_cleans_every_child()
+    {
+        // The SQL half, which COMMITS: the queue is read on the connection
+        // before any post-commit vector work exists.
+        let scene = merge_scene("p12");
+        let backup_path = scene.backup_fixture.catalogue.to_string_lossy().into_owned();
+        let (_summary, _merged, replaced) =
+            merge_catalogue_sql(&scene.live, &backup_path, MergeCollisionPolicy::BackupWins).expect("merge");
+        assert_eq!(replaced.iter().copied().collect::<BTreeSet<_>>(), scene.replaced, "fixture: the census");
+        // P13 — every replaced live face id is queued at COMMIT.
+        assert_eq!(queued(&scene.live), scene.replaced, "P13/queued-at-commit");
+        // P12 — B's lines (B13): face_cluster_member and similar_photo_featureprint
+        // are gone for the collided image, and the four tables B's predecessor
+        // covered are still covered.
+        let image = scene.collided_image;
+        for (table, column) in [
+            ("face_cluster_member", "image_id"),
+            ("similar_photo_featureprint", "image_id"),
+            ("similar_photo_group_member", "image_id"),
+            ("face_observation", "image_id"),
+        ]
+        {
+            assert_eq!(
+                count(&scene.live, &format!("SELECT COUNT(*) FROM {} WHERE {} = {}", table, column, image)),
+                0,
+                "P12/{}-cleared",
+                table
+            );
+        }
+        assert_eq!(orphan_assignments(&scene.live), 0, "P12/person_face_assignment-cleared");
+        assert_eq!(
+            count(&scene.live, &format!("SELECT COUNT(*) FROM keyword WHERE image_id = {}", image)),
+            0,
+            "P12/keyword-cleared"
+        );
+    }
+
+    #[test]
+    fn p13_the_restore_cleanup_goes_through_the_queue()
+    {
+        let _serial = serial();
+
+        // (a) a readable store: the replaced vectors are DELETED through the
+        // queue; an ORPHAN in the same store is NOT queued (drain only, A-10).
+        let scene = merge_scene("p13a");
+        let backup_path = scene.backup_fixture.catalogue.to_string_lossy().into_owned();
+        let backup_vectors = scene.backup_fixture.vectors_uri();
+        let uri = scene.live_fixture.vectors_uri();
+        let check = second_connection(&scene.live);
+        let _installed = Installed::new(&scene.live_fixture, scene.live);
+        let orphan = 9_000_001;
+        let mut seeded = scene.replaced.iter().map(|id| record(*id, MODEL, 1.0)).collect::<Vec<_>>();
+        seeded.push(record(orphan, MODEL, 1.0));
+        assert_eq!(block(upsert_face_embeddings_impl(seeded)).status, "stored");
+        let summary = futures::executor::block_on(merge_catalogue_from_backup(
+            backup_path,
+            backup_vectors,
+            MergeCollisionPolicy::BackupWins,
+        ));
+        assert!(summary.succeeded, "fixture: {}", summary.message);
+        assert_eq!(stored_ids(&uri), [orphan].into_iter().collect(), "P13/replaced-vectors-deleted-orphan-untouched");
+        assert!(queued(&check).is_empty(), "P13/queue-drained-and-no-orphan-queued (drain only)");
+        drop(check);
+        drop(_installed);
+
+        // (b) an UNREADABLE store: the replaced ids stay QUEUED — deferred, not
+        // lost (the old ad-hoc delete dropped them for good).
+        let scene = merge_scene("p13b");
+        let backup_path = scene.backup_fixture.catalogue.to_string_lossy().into_owned();
+        let backup_vectors = scene.backup_fixture.vectors_uri();
+        std::fs::write(scene.live_fixture.vectors(), b"x").expect("unreadable store");
+        let check = second_connection(&scene.live);
+        let _installed = Installed::new(&scene.live_fixture, scene.live);
+        let summary = futures::executor::block_on(merge_catalogue_from_backup(
+            backup_path,
+            backup_vectors,
+            MergeCollisionPolicy::BackupWins,
+        ));
+        assert!(summary.succeeded, "fixture: {}", summary.message);
+        assert_eq!(queued(&check), scene.replaced, "P13/deferred-not-lost");
+        drop(check);
+    }
+
+    // ------------------------------------------------------------------
+    // P14 — N-2: ONE store write lock. A real contention test on the lock
+    // itself (its three leaf writers cannot enter while it is held) and a
+    // source lock (each takes it exactly once; nothing else writes the store).
+    // ------------------------------------------------------------------
+
+    fn store_write_lock_census(source: &str) -> Result<(), String>
+    {
+        let product = product_view(source);
+        let text = &product.squeezed;
+        let acquisition = "FACE_EMBEDDING_STORE_WRITE_LOCK.lock().await";
+        let sites = occurrences(text, acquisition);
+        let writers = [
+            "upsert_face_embeddings_impl",
+            "retry_pending_face_vector_deletes_probed",
+            "delete_face_vectors_by_observation_ids",
+        ];
+        let mut spans = Vec::new();
+        for writer in writers
+        {
+            let span = body_span(&product, writer)?;
+            let inside_count = sites.iter().filter(|at| inside(span, **at)).count();
+            if inside_count != 1
+            {
+                return Err(format!("P14/each-writer-takes-the-lock-once: `{}` takes it {} time(s)", writer, inside_count));
+            }
+            spans.push((writer, span));
+        }
+        if sites.len() != writers.len()
+        {
+            return Err(format!("P14/exactly-three-acquisitions: {} in product code", sites.len()));
+        }
+        if text.contains("FACE_VECTOR_DELETE_RETRY_LOCK")
+        {
+            return Err("P14/one-lock: the retry-only lock is back".to_string());
+        }
+        // The store's writes live only inside a lock-holder (or under one).
+        let merge = body_span(&product, "upsert_face_embeddings_impl")?;
+        let drain = body_span(&product, "drain_pending_face_vector_deletes")?;
+        let delete = body_span(&product, "delete_face_vectors_by_observation_ids")?;
+        let create = body_span(&product, "open_or_create_face_embedding_table")?;
+        for (needle, allowed) in [
+            (".merge_insert(", vec![merge]),
+            (".delete(&", vec![drain, delete]),
+            (".create_empty_table(", vec![create]),
+        ]
+        {
+            for at in occurrences(text, needle)
+            {
+                if !allowed.iter().any(|span| inside(*span, at))
+                {
+                    return Err(format!("P14/no-unlocked-store-write: `{}` at source offset {}", needle, product.origin[at]));
+                }
+            }
+        }
+        for (needle, expected, holder) in [
+            ("drain_pending_face_vector_deletes()", 1usize, "retry_pending_face_vector_deletes_probed"),
+            ("open_or_create_face_embedding_table(", 1usize, "upsert_face_embeddings_impl"),
+        ]
+        {
+            let holder_span = body_span(&product, holder)?;
+            let calls = occurrences(text, needle)
+                .into_iter()
+                .filter(|at| !(*at >= 2 && &text[at - 2..*at] == "fn"))
+                .collect::<Vec<_>>();
+            if calls.len() != expected || !calls.iter().all(|at| inside(holder_span, *at))
+            {
+                return Err(format!("P14/only-under-the-lock: `{}` is called outside `{}`", needle, holder));
+            }
+        }
+        if text.contains(".add(")
+        {
+            return Err("P14/no-add: a second commit path (`.add(`) is back in product code".to_string());
+        }
+        let copy = body_span(&product, "copy_face_embeddings_for_merge")?;
+        if !text[copy.0..copy.1].contains("retry_pending_face_vector_deletes_drain_only().await")
+        {
+            return Err("P14/the-restore-cleanup-is-the-drain".to_string());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn p14_one_store_write_lock_source()
+    {
+        store_write_lock_census(include_str!("lib.rs")).unwrap_or_else(|reason| panic!("{}", reason));
+
+        // Adversarial probes on the source lock: a decoy acquisition in a
+        // comment / block comment / string does not count.
+        let source = include_str!("lib.rs");
+        let real = "FACE_EMBEDDING_STORE_WRITE_LOCK.lock().await";
+        let first = source.find(&format!("let _store_write = {};", real)).expect("an acquisition to decoy");
+        for decoy in [
+            format!("// let _store_write = {};", real),
+            format!("/* let _store_write = {}; /* nested */ */", real),
+            format!("let _s = \"{}\";", real),
+        ]
+        {
+            let mut mutated = source.to_string();
+            mutated.replace_range(first..first + format!("let _store_write = {};", real).len(), &decoy);
+            assert!(store_write_lock_census(&mutated).is_err(), "P14/probe-decoy {}", decoy);
+        }
+        assert!(store_write_lock_census("").is_err(), "P14/probe-empty");
+    }
+
+    /// P14's RUNTIME TWIN, its own test so a mutation that fails the source
+    /// lock cannot hide whether the lock is really contended: hold it, and none
+    /// of the three leaf writers can enter the store.
+    #[test]
+    fn p14_the_store_write_lock_is_contended_for_real()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("p14");
+        let _installed = Installed::new(&fixture, conn);
+        assert_eq!(block(upsert_face_embeddings_impl(vec![record(1, MODEL, 1.0)])).status, "stored");
+        let runtime = &*FACE_EMBEDDING_RUNTIME;
+        let guard = runtime.block_on(FACE_EMBEDDING_STORE_WRITE_LOCK.lock());
+        let upsert = runtime.spawn(upsert_face_embeddings_impl(vec![record(2, MODEL, 2.0)]));
+        let retry = runtime.spawn(retry_pending_face_vector_deletes_impl());
+        let delete = runtime.spawn(delete_face_vectors_by_observation_ids(vec![1], "p14"));
+        std::thread::sleep(std::time::Duration::from_millis(3_000));
+        assert!(!upsert.is_finished(), "P14/contention: the upsert entered the store while the lock was held");
+        assert!(!retry.is_finished(), "P14/contention: the retry entered the store while the lock was held");
+        assert!(!delete.is_finished(), "P14/contention: the delete entered the store while the lock was held");
+        drop(guard);
+        assert_eq!(runtime.block_on(upsert).expect("upsert").status, "stored", "P14/after-release");
+        runtime.block_on(retry).expect("retry");
+        assert_eq!(runtime.block_on(delete).expect("delete"), (1, false), "P14/after-release");
+    }
+
+    // ------------------------------------------------------------------
+    // P15 · P16 · P17 — N-4 / D6: the bounded orphan-vector sweep.
+    // ------------------------------------------------------------------
+
+    /// A store holding `live` (canonical), `twin` (a LIVE twin row canonicalize
+    /// left behind — its id must never be re-deleted), and two orphans whose
+    /// observations were deleted directly in SQL (the historical leak).
+    struct SweepScene
+    {
+        fixture: Fixture,
+        check: Connection,
+        live: i64,
+        twin: i64,
+        orphans: BTreeSet<i64>,
+    }
+
+    fn sweep_scene(tag: &str) -> (SweepScene, Installed)
+    {
+        let (fixture, conn) = fresh_catalogue(tag);
+        let raw = insert_image(&conn, "/s/a.nef", "raw");
+        let jpeg = insert_image(&conn, "/s/a.jpg", "jpeg");
+        let live = insert_face(&conn, jpeg, jpeg, 0, ALGO);
+        let twin = insert_face(&conn, raw, jpeg, 0, ALGO);
+        let gone_a = insert_face(&conn, jpeg, jpeg, 1, ALGO);
+        let gone_b = insert_face(&conn, jpeg, jpeg, 2, ALGO);
+        let check = second_connection(&conn);
+        let installed = Installed::new(&fixture, conn);
+        let stored = block(upsert_face_embeddings_impl(
+            [live, twin, gone_a, gone_b].iter().map(|id| record(*id, MODEL, 1.0)).collect(),
+        ));
+        assert_eq!(stored.status, "stored");
+        check
+            .execute(&format!("DELETE FROM face_observation WHERE id IN ({}, {})", gone_a, gone_b), [])
+            .expect("simulate the historical leak");
+        (
+            SweepScene
+            {
+                fixture,
+                check,
+                live,
+                twin,
+                orphans: [gone_a, gone_b].into_iter().collect(),
+            },
+            installed,
+        )
+    }
+
+    #[test]
+    fn p15_the_sweep_enqueues_exactly_the_orphans()
+    {
+        let _serial = serial();
+        let (scene, _installed) = sweep_scene("p15");
+        let probe = OrphanSweepProbe::new();
+        let result = block(retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, Some(&probe)));
+        assert!(result.orphan_scan_ran, "P15/ran: {}", result.message);
+        assert_eq!(result.orphans_enqueued, 2, "P15/enqueued: {}", result.message);
+        assert_eq!(queued(&scene.check), scene.orphans, "P15/exactly-the-orphans");
+        assert!(!queued(&scene.check).contains(&scene.twin), "P15/the-live-twin-is-not-an-orphan");
+        assert!(!queued(&scene.check).contains(&scene.live), "P15/the-live-row-is-not-an-orphan");
+        assert_eq!(result.remaining_count, 2, "P15/remaining-reports-the-queue");
+        assert!(result.message.contains("2 stored vector(s) belong to no face record"), "P15/message: {}", result.message);
+
+        // The NEXT retry deletes them through the existing acknowledged path.
+        let next = block(retry_pending_face_vector_deletes_impl());
+        assert_eq!(next.acknowledged_count, 2, "P15/next-retry-deletes: {}", next.message);
+        assert!(queued(&scene.check).is_empty(), "P15/queue-empty-after");
+        assert_eq!(
+            stored_ids(&scene.fixture.vectors_uri()),
+            [scene.live, scene.twin].into_iter().collect(),
+            "P15/the-store-keeps-the-live-and-the-twin"
+        );
+        // (The fixture's TWIN vector keeps the gate open — canonicalize deletes
+        // twin vectors in the product — so the next scan RUNS and finds nothing.)
+        assert_eq!(next.orphans_enqueued, 0, "P15/nothing-left-to-queue: {}", next.message);
+
+        // The cap (M17): 50,000 per run, and a smaller cap bounds the run.
+        assert_eq!(ORPHAN_VECTOR_SWEEP_CAP, 50_000, "P15/cap-is-50000");
+        drop(_installed);
+        let (scene, _installed) = sweep_scene("p15cap");
+        let mut capped = OrphanSweepProbe::new();
+        capped.cap = Some(1);
+        let result = block(retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, Some(&capped)));
+        assert_eq!(result.orphans_enqueued, 1, "P15/cap-bounds-the-run: {}", result.message);
+        assert_eq!(queued(&scene.check).len(), 1, "P15/cap-bounds-the-queue");
+        assert!(scene.orphans.contains(queued(&scene.check).iter().next().expect("one")), "P15/cap-takes-an-orphan");
+    }
+
+    #[test]
+    fn p16_a_shut_gate_issues_no_scan()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("p16");
+        let image = insert_image(&conn, "/g/a.jpg", "jpeg");
+        let faces = (0..3).map(|n| insert_face(&conn, image, image, n, ALGO)).collect::<Vec<_>>();
+        let _installed = Installed::new(&fixture, conn);
+        assert_eq!(
+            block(upsert_face_embeddings_impl(faces.iter().map(|id| record(*id, MODEL, 1.0)).collect())).status,
+            "stored"
+        );
+        let probe = OrphanSweepProbe::new();
+        let result = block(retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, Some(&probe)));
+        assert!(!result.orphan_scan_ran, "P16/not-ran: {}", result.message);
+        assert_eq!(result.orphans_enqueued, 0, "P16/nothing-enqueued");
+        assert_eq!(probe.scans.load(Ordering::SeqCst), 0, "P16/no-scan-was-issued (probe counter)");
+        assert_eq!(result.status, FaceVectorDeleteRetryStatus::NoPendingDeletes, "P16/status");
+    }
+
+    #[test]
+    fn p17_the_sweep_fails_open_and_fails_safe()
+    {
+        let _serial = serial();
+
+        // (a) a count failure SKIPS the sweep; the retry's own status is
+        // unchanged (control: the same scene without the probe).
+        let (scene, installed) = sweep_scene("p17a");
+        let mut probe = OrphanSweepProbe::new();
+        probe.fail_store_count = true;
+        let result = block(retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, Some(&probe)));
+        assert!(!result.orphan_scan_ran, "P17(a)/skipped: {}", result.message);
+        assert_eq!(probe.scans.load(Ordering::SeqCst), 0, "P17(a)/no-scan");
+        assert_eq!(result.status, FaceVectorDeleteRetryStatus::NoPendingDeletes, "P17(a)/status-unchanged");
+        assert!(result.message.contains("Orphan scan skipped"), "P17(a)/says-so: {}", result.message);
+        assert!(queued(&scene.check).is_empty(), "P17(a)/nothing-queued");
+        drop(installed);
+        drop(scene);
+
+        // (b) a live-id read that DROPPED rows abandons the sweep: NOTHING is
+        // queued — a short live set would queue live vectors.
+        let (scene, _installed) = sweep_scene("p17b");
+        let mut probe = OrphanSweepProbe::new();
+        probe.live_id_column = 7;
+        let result = block(retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, Some(&probe)));
+        assert_eq!(result.orphans_enqueued, 0, "P17(b)/nothing-enqueued: {}", result.message);
+        assert!(queued(&scene.check).is_empty(), "P17(b)/queue-empty");
+        assert!(result.message.contains("abandoned"), "P17(b)/says-abandoned: {}", result.message);
+    }
+
+    // ------------------------------------------------------------------
+    // P18 — the crash-rig row for `vectors.lancedb` (Q-09), asserted.
+    // ------------------------------------------------------------------
+    /// (a) a merge_insert is ADDITIVE: the pre-call version stays readable —
+    /// which is what makes a kill survivable.
+    #[test]
+    fn p18a_a_merge_insert_is_additive()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("p18a");
+        let _installed = Installed::new(&fixture, conn);
+        let uri = fixture.vectors_uri();
+        assert_eq!(block(upsert_face_embeddings_impl((1..=3).map(|id| record(id, MODEL, 1.0)).collect())).status, "stored");
+        let prior = block(async { open_store(&uri).await.version().await.expect("version") });
+        assert_eq!(block(upsert_face_embeddings_impl((1..=3).map(|id| record(id, MODEL, 2.0)).collect())).status, "stored");
+        let old_values = block(async {
+            let table = open_store(&uri).await;
+            table.checkout(prior).await.expect("checkout the prior version");
+            let batches = table
+                .query()
+                .execute()
+                .await
+                .expect("scan")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect");
+            let mut values = Vec::new();
+            for batch in batches
+            {
+                let vectors = batch
+                    .column_by_name("vector")
+                    .and_then(|a| a.as_any().downcast_ref::<FixedSizeListArray>())
+                    .expect("vectors");
+                let floats = vectors.values().as_any().downcast_ref::<arrow_array::Float32Array>().expect("floats");
+                for row in 0..batch.num_rows()
+                {
+                    values.push(floats.value(row * vectors.value_length() as usize));
+                }
+            }
+            values
+        });
+        assert_eq!(old_values, vec![1.0, 1.0, 1.0], "P18(a)/the-prior-version-is-intact");
+    }
+
+    /// (b) a truncated newest manifest ⇒ a NAMED read failure, never "never
+    /// built" — on the read side, the write side and the delete side. ⚠️ The
+    /// brief's debug-build underflow (`manifest.rs:70-71`) is NOT reached: an
+    /// 8-byte file fails the `< 16` length check first (`:58-63`) — `Err`, no
+    /// panic, in debug and release alike.
+    #[test]
+    fn p18b_a_corrupt_manifest_is_a_named_read_failure()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("p18b");
+        let _installed = Installed::new(&fixture, conn);
+        let uri = fixture.vectors_uri();
+        assert_eq!(block(upsert_face_embeddings_impl(vec![record(1, MODEL, 1.0)])).status, "stored");
+        std::fs::write(newest_manifest(&fixture), b"8 bytes!").expect("truncate");
+        match block(open_face_embedding_table_at_uri(&uri, "p18b"))
+        {
+            Err(message) => assert!(message.contains("face-embedding table open failed"), "P18(b)/read-named: {}", message),
+            Ok(FaceEmbeddingTableState::NeverBuilt) => panic!("P18(b)/read: a corrupt manifest read as NEVER BUILT"),
+            Ok(FaceEmbeddingTableState::Present(_)) => panic!("P18(b)/read: a corrupt manifest opened"),
+        }
+        assert!(block(open_face_vector_table_at_uri_for_delete(&uri, "p18b")).is_err(), "P18(b)/delete-defers");
+        assert_eq!(block(upsert_face_embeddings_impl(vec![record(2, MODEL, 1.0)])).status, "open_failed", "P18(b)/write");
+    }
+
+    /// (c) the whole `_versions` directory lost ⇒ TableNotFound ⇒ the READ
+    /// side answers EMPTY (self-heals by re-embedding) while the DELETE side
+    /// answers Err (defers its queue) — the deliberate asymmetry (Q-09 Q13).
+    /// The WRITE side's re-create is P10c.
+    #[test]
+    fn p18c_a_lost_versions_directory_is_never_built_to_read_and_deferred_to_delete()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("p18c");
+        let _installed = Installed::new(&fixture, conn);
+        let uri = fixture.vectors_uri();
+        assert_eq!(block(upsert_face_embeddings_impl(vec![record(1, MODEL, 1.0)])).status, "stored");
+        std::fs::remove_dir_all(fixture.table_dir().join("_versions")).expect("lose _versions");
+        assert!(
+            matches!(block(open_face_embedding_table_at_uri(&uri, "p18c")), Ok(FaceEmbeddingTableState::NeverBuilt)),
+            "P18(c)/read-side-answers-never-built"
+        );
+        assert!(block(open_face_vector_table_at_uri_for_delete(&uri, "p18c")).is_err(), "P18(c)/delete-side-defers");
+    }
+
+    // ------------------------------------------------------------------
+    // P18 RIG — a REAL crash: a child process runs the product upsert (and a
+    // Lance delete) in a loop against one store and is SIGKILLed at staggered
+    // points; after every kill the store must open and hold exactly one
+    // consistent version — every row from ONE batch, the id set either all of
+    // it or exactly the post-delete half, no partial batch, no half-delete.
+    // ------------------------------------------------------------------
+    const RIG_IDS: i64 = 64;
+    const RIG_CHILD_ENV: &str = "PL_P18_RIG_CHILD_DIR";
+
+    fn rig_child(dir: &std::path::Path) -> !
+    {
+        *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(dir.join("catalogue.db"));
+        let uri = dir.join("vectors.lancedb").to_string_lossy().into_owned();
+        let mut tag = 1.0f32;
+        loop
+        {
+            let stored = block(upsert_face_embeddings_impl((0..RIG_IDS).map(|id| record(id, MODEL, tag)).collect()));
+            if stored.status != "stored"
+            {
+                std::process::exit(3);
+            }
+            let _ = std::fs::write(dir.join("rig-started"), b"1");
+            tag += 1.0;
+            block(async {
+                let table = open_store(&uri).await;
+                let _ = table.delete(&format!("face_observation_id < {}", RIG_IDS / 2)).await;
+            });
+        }
+    }
+
+    #[test]
+    fn p18_rig_sigkill_mid_write_leaves_a_consistent_store()
+    {
+        if let Some(dir) = std::env::var_os(RIG_CHILD_ENV)
+        {
+            rig_child(std::path::Path::new(&dir));
+        }
+        let exe = std::env::current_exe().expect("the test binary");
+        let delays_ms = [0u64, 7, 19, 31, 47, 71, 97, 131, 173, 229, 293, 367];
+        let mut report = Vec::new();
+        for (iteration, delay) in delays_ms.iter().enumerate()
+        {
+            let (fixture, conn) = fresh_catalogue(&format!("p18rig{}", iteration));
+            drop(conn);
+            let mut child = std::process::Command::new(&exe)
+                .args(["--exact", "cross_store_tests::p18_rig_sigkill_mid_write_leaves_a_consistent_store", "--test-threads=1", "--nocapture"])
+                .env(RIG_CHILD_ENV, &fixture.dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn the rig child");
+            let started = std::time::Instant::now();
+            while !fixture.dir.join("rig-started").exists()
+            {
+                assert!(started.elapsed() < std::time::Duration::from_secs(60), "rig: the child never committed");
+                if let Ok(Some(status)) = child.try_wait()
+                {
+                    panic!("rig: the child exited early: {}", status);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(*delay));
+            child.kill().expect("SIGKILL the child");
+            let _ = child.wait();
+
+            let uri = fixture.vectors_uri();
+            let state = block(open_face_embedding_table_at_uri(&uri, "p18-rig"));
+            assert!(matches!(state, Ok(FaceEmbeddingTableState::Present(_))), "P18-rig/{}: the store must open after a kill", iteration);
+            let version = block(async { open_store(&uri).await.version().await.expect("version") });
+            let rows = block(stored_rows(&uri));
+            let ids = rows.iter().map(|row| row.0).collect::<Vec<_>>();
+            let distinct = ids.iter().copied().collect::<HashSet<_>>();
+            assert_eq!(distinct.len(), ids.len(), "P18-rig/{}: a duplicated row (partial merge)", iteration);
+            let full = (0..RIG_IDS).collect::<HashSet<_>>();
+            let half = (RIG_IDS / 2..RIG_IDS).collect::<HashSet<_>>();
+            assert!(distinct == full || distinct == half, "P18-rig/{}: a torn id set ({} rows)", iteration, distinct.len());
+            let tags = rows.iter().map(|row| row.2.to_bits()).collect::<HashSet<_>>();
+            assert_eq!(tags.len(), 1, "P18-rig/{}: rows from more than one batch", iteration);
+            let data_files = std::fs::read_dir(fixture.table_dir().join("data")).map(|d| d.count()).unwrap_or(0);
+            report.push(format!(
+                "kill {:>2} @+{:>3}ms: v{} {} rows tag {} data/ files {}",
+                iteration,
+                delay,
+                version,
+                rows.len(),
+                rows.first().map(|r| r.2).unwrap_or(0.0),
+                data_files
+            ));
+        }
+        println!("P18 rig:\n{}", report.join("\n"));
+    }
+
+    // ------------------------------------------------------------------
+    // R-30 (A2's S-1) and ruling 5 — the two appended-LAST fields.
+    // ------------------------------------------------------------------
+    #[test]
+    fn r30_backup_counts_say_which_counts_were_not_taken()
+    {
+        let _serial = serial();
+        // No catalogue at all: every count is untaken.
+        *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        let none = futures::executor::block_on(backup_manifest_counts());
+        assert_eq!(none.untaken_counts, 0b11_1111, "R30/uninitialized-all-untaken");
+
+        // A healthy catalogue with a never-built store: everything taken.
+        let (fixture, conn) = fresh_catalogue("r30");
+        let image = insert_image(&conn, "/b/a.jpg", "jpeg");
+        insert_face(&conn, image, image, 0, ALGO);
+        let check = second_connection(&conn);
+        let _installed = Installed::new(&fixture, conn);
+        let healthy = futures::executor::block_on(backup_manifest_counts());
+        assert_eq!(healthy.untaken_counts, 0, "R30/healthy-all-taken");
+        assert_eq!((healthy.image_count, healthy.face_observation_count, healthy.face_embedding_count), (1, 1, 0));
+
+        // An unreadable store and a failed person count: exactly those bits.
+        std::fs::write(fixture.vectors(), b"x").expect("unreadable store");
+        check.execute_batch("DROP TABLE person").expect("drop person");
+        let broken = futures::executor::block_on(backup_manifest_counts());
+        assert_eq!(
+            broken.untaken_counts,
+            BACKUP_COUNT_UNTAKEN_PERSON | BACKUP_COUNT_UNTAKEN_FACE_EMBEDDING,
+            "R30/exactly-the-failed-counts"
+        );
+        assert_eq!(broken.image_count, 1, "R30/the-others-still-counted");
+        drop(check);
+    }
+
+    #[test]
+    fn ruling5_the_work_set_names_the_unreadable_half()
+    {
+        let _serial = serial();
+
+        // The INDEX half: the store path is a regular file.
+        let (fixture, conn) = fresh_catalogue("r5i");
+        std::fs::write(fixture.vectors(), b"x").expect("unreadable store");
+        let _installed = Installed::new(&fixture, conn);
+        let set = futures::executor::block_on(face_embedding_missing_observation_page(
+            ALGO.to_string(), MODEL.to_string(), PREP.to_string(), 0,
+        ));
+        assert!(!set.store_ok);
+        assert_eq!(set.unreadable_half.as_deref(), Some("index"), "R5/index-half");
+        let error = set.store_error.unwrap_or_default();
+        assert!(error.starts_with("stored_face_embeddings:"), "R5/index-prefix-unchanged: {}", error);
+        drop(_installed);
+        drop(fixture);
+
+        // The CATALOGUE half: the store is never built, the face table is gone.
+        let (fixture, conn) = fresh_catalogue("r5c");
+        conn.execute_batch("DROP TABLE face_observation CASCADE").expect("drop face_observation");
+        let _installed = Installed::new(&fixture, conn);
+        let set = futures::executor::block_on(face_embedding_missing_observation_page(
+            ALGO.to_string(), MODEL.to_string(), PREP.to_string(), 0,
+        ));
+        assert!(!set.store_ok);
+        assert_eq!(set.unreadable_half.as_deref(), Some("catalogue"), "R5/catalogue-half");
+        let error = set.store_error.unwrap_or_default();
+        assert!(error.starts_with("face_embedding_missing_observations: prepare"), "R5/catalogue-prefix-unchanged: {}", error);
+        drop(_installed);
+        drop(fixture);
+
+        // Healthy: no half.
+        let (fixture, conn) = fresh_catalogue("r5ok");
+        let _installed = Installed::new(&fixture, conn);
+        let set = futures::executor::block_on(face_embedding_missing_observation_page(
+            ALGO.to_string(), MODEL.to_string(), PREP.to_string(), 0,
+        ));
+        assert!(set.store_ok);
+        assert_eq!(set.unreadable_half, None, "R5/healthy-no-half");
+    }
+
+    // ------------------------------------------------------------------
+    // MEASUREMENT (A-8, D6) — `#[ignore]`d; run in --release, one variant per
+    // process so `/usr/bin/time -l` reports that variant's peak RSS:
+    //   PL_P_MEASURE=merge|delete_add|sweep|gate  PL_P_MEASURE_ROWS (100000)
+    //   PL_P_MEASURE_FRAGMENTS (50)  PL_P_MEASURE_ORPHANS (1000)
+    // ------------------------------------------------------------------
+    #[test]
+    #[ignore]
+    fn p_measure_store_write_and_sweep_at_scale()
+    {
+        let variant = std::env::var("PL_P_MEASURE").unwrap_or_else(|_| "merge".to_string());
+        let rows: i64 = std::env::var("PL_P_MEASURE_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
+        let fragments: i64 = std::env::var("PL_P_MEASURE_FRAGMENTS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+        let orphans: i64 = std::env::var("PL_P_MEASURE_ORPHANS").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000);
+        const WIDE: u32 = 512;
+        let wide = |id: i64, value: f32| {
+            let mut r = record(id, MODEL, value);
+            r.embedding_dimension = WIDE;
+            r.vector = vec![value; WIDE as usize];
+            r
+        };
+
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("measure");
+        conn.execute_batch(&format!(
+            "INSERT INTO images (id, file_path, file_size, file_name, created_timestamp, modified_timestamp, is_video) \
+             SELECT i, '/m/' || i || '.jpg', 1, i || '.jpg', 0, 0, FALSE FROM range(1, {0} + 1) t(i); \
+             INSERT INTO face_observation (image_id, analyzed_image_id, face_index, algorithm_version, analysis_run_id, \
+             bounding_box_x, bounding_box_y, bounding_box_width, bounding_box_height) \
+             SELECT i, i, 0, 'm', 'r', 0, 0, 1, 1 FROM range(1, {0} + 1) t(i) ORDER BY i;",
+            rows
+        ))
+        .expect("measurement catalogue");
+        let check = second_connection(&conn);
+        let _installed = Installed::new(&fixture, conn);
+        let uri = fixture.vectors_uri();
+        let per = (rows + fragments - 1) / fragments;
+        let build = std::time::Instant::now();
+        let mut start = 1i64;
+        while start <= rows
+        {
+            let end = (start + per - 1).min(rows);
+            let stored = block(upsert_face_embeddings_impl((start..=end).map(|id| wide(id, 1.0)).collect()));
+            assert_eq!(stored.status, "stored", "{}", stored.message);
+            start = end + 1;
+        }
+        println!("MEASURE build: {} rows in {} fragments: {:.2?}", rows, fragments, build.elapsed());
+
+        match variant.as_str()
+        {
+            "merge" =>
+            {
+                let records = (1..=rows).map(|id| wide(id, 2.0)).collect::<Vec<_>>();
+                let timer = std::time::Instant::now();
+                let result = block(upsert_face_embeddings_impl(records));
+                let elapsed = timer.elapsed();
+                let replaced = block(async {
+                    open_store(&uri)
+                        .await
+                        .count_rows(Some("embedding_l2_norm = 1.0".to_string()))
+                        .await
+                        .expect("count")
+                });
+                let rows_now = block(stored_rows(&uri));
+                let second = rows_now.iter().filter(|row| row.2 == 2.0).count();
+                println!(
+                    "MEASURE merge_insert 100% overlap: {:.2?} status={} total={} rows={} carrying-the-new-values={} (l2 rows {})",
+                    elapsed, result.status, result.total_count, rows_now.len(), second, replaced
+                );
+            }
+            "delete_add" =>
+            {
+                let records = (1..=rows).map(|id| wide(id, 2.0)).collect::<Vec<_>>();
+                let timer = std::time::Instant::now();
+                block(async {
+                    let table = open_store(&uri).await;
+                    let filter = format!(
+                        "{} AND face_observation_id IN ({})",
+                        face_embedding_version_filter(MODEL, PREP),
+                        (1..=rows).map(|id| id.to_string()).collect::<Vec<_>>().join(",")
+                    );
+                    table.delete(&filter).await.expect("delete");
+                    let batch = face_embedding_batch(&records, WIDE).expect("batch");
+                    table.add(batch).execute().await.expect("add");
+                });
+                println!("MEASURE delete+add (pre-slice) 100% overlap: {:.2?}", timer.elapsed());
+            }
+            "sweep" | "gate" =>
+            {
+                if variant == "sweep"
+                {
+                    check
+                        .execute_batch(&format!("DELETE FROM face_observation WHERE id <= {}", orphans))
+                        .expect("orphans");
+                }
+                let timer = std::time::Instant::now();
+                let result = block(retry_pending_face_vector_deletes_impl());
+                println!(
+                    "MEASURE retry+{}: {:.2?} ran={} enqueued={} message={}",
+                    variant,
+                    timer.elapsed(),
+                    result.orphan_scan_ran,
+                    result.orphans_enqueued,
+                    result.message
+                );
+            }
+            "writeback" =>
+            {
+                // D3's cost on the culling hot path: every target now pays a
+                // doomed-id census (and, when it had faces, the cascade). With
+                // PL_P_MEASURE_PRIOR=replace (default) each image carries one
+                // face at ALGO, so every target cascades; with =none the prior
+                // face is at another version, so only the census runs (a
+                // first-time analysis).
+                let prior = std::env::var("PL_P_MEASURE_PRIOR").unwrap_or_else(|_| "replace".to_string());
+                check
+                    .execute_batch(&format!(
+                        "UPDATE face_observation SET algorithm_version = '{}'",
+                        if prior == "none" { OLD_ALGO } else { ALGO }
+                    ))
+                    .expect("prior faces");
+                drop(_installed);
+                let conn = second_connection(&check);
+                let timer = std::time::Instant::now();
+                let ids = (1..=rows).collect::<Vec<_>>();
+                for chunk in ids.chunks(64)
+                {
+                    let receipt = update_focus_analysis_results_impl(
+                        &conn,
+                        chunk.iter().map(|id| analysis(*id, "complete", 1)).collect(),
+                        None,
+                    );
+                    assert_eq!(receipt.failure_stage, None, "{:?}", receipt.failed_reason);
+                }
+                println!(
+                    "MEASURE writeback {} targets (prior face: {}) in 64-result chunks: {:.2?} queued={}",
+                    rows,
+                    prior,
+                    timer.elapsed(),
+                    queued(&conn).len()
+                );
+                return;
+            }
+            other => panic!("unknown PL_P_MEASURE {}", other),
+        }
+        drop(check);
     }
 }

@@ -836,7 +836,18 @@ namespace photolibrariancore {
     // "Remove from Catalogue" context-menu action. Deletes every row
     // matching the SAME path/date predicate `get_image_records_for_filters`
     // would have read — predicate parity-by-construction via the shared
-    // `build_path_date_predicate` builder. Touches NO files, NO thumbnails.
+    // `build_path_date_predicate` builder. Touches NO files on disk.
+    // ⭐ Slice B (S184): in ONE transaction it files every removed row's
+    // keyword rows and its rating / flag / colour label / rotation — with the
+    // file's size and capture date — into the removal tombstone (only for rows
+    // that carry work), removes the rows' face analysis (queueing their face
+    // vectors for deletion first), whole face-cluster runs, stack memberships
+    // and featureprints, then the rows; any failure rolls back all of it.
+    // After the commit it retries the queued `vectors.lancedb` deletions (a
+    // vector-store WRITE). The work returns when the same photograph — the
+    // same path and capture date; an undated one by its file size — is
+    // imported again; removing it again while its work waits merges the two.
+    // The cached thumbnails are Swift's (`RemovedRecordCacheHygiene`).
     //
     // Safety guard: if both prefixes are empty (would yield an empty
     // WHERE clause and risk a catalogue wipe), the call is refused and
@@ -870,8 +881,11 @@ namespace photolibrariancore {
     // remove_images_by_ids: catalogue-only DELETE of EXPLICIT image rows — the
     //   full-sync removal half. Swift has already stat-confirmed each file
     //   missing on a healthy (mounted, accessible) root AND shown the named
-    //   confirm. Keyword rows are never touched (S31/S65 doctrine). Touches
-    //   no files, no thumbnails. Refuses an empty list.
+    //   confirm. Touches no files on disk. ⭐ Slice B (S184): the same removal
+    //   as `remove_images_for_filters` — tombstone, cascade and DELETE in ONE
+    //   transaction, then the queued face vectors deleted from
+    //   `vectors.lancedb`; the cached thumbnails are Swift's. Refuses an empty
+    //   list.
     [Async]
     u64 remove_images_by_ids(sequence<i64> ids);
 
@@ -1017,6 +1031,12 @@ namespace photolibrariancore {
     // result carriers (FaceEmbeddingStoreResult is the in-repo precedent),
     // because a [Throws=] would change bindgen's emitted Swift signature and
     // force every existing call site to gain `try` in one commit.
+    // Slice F (2026-09-27, ruling 22) ratified this for the whole surface: a
+    // panic becomes an answer through ffi_panic_boundary at the 21
+    // carrier-returning functions (and, by delegation, at four legacy list
+    // twins — five until the closeout act removed
+    // face_embedding_missing_observations, Sep 30, 2026); the rest are not
+    // wrapped (ruling 23).
 
     // R-31 — how many rows the catalogue could not deserialize, cumulative
     // since this process started, per query site. NOT drained: a caller that
@@ -1258,12 +1278,23 @@ enum FaceVectorDeleteRetryStatus {
     "Failed",
 };
 
+// ⭐ Slice P / D6 (2026-09-30) — the orphan-vector sweep. After a COMPLETED
+// drain, the retry also reconciles the other direction: stored vectors whose
+// face_observation row no longer exists are queued for deletion (at most
+// 50,000 per run; the NEXT retry deletes them). orphan_scan_ran = the cheap
+// count gate opened and the store's ids were read; orphans_enqueued = orphan
+// ids confirmed on the queue after this pass. When it is non-zero,
+// remaining_count includes them; status still describes the drain. Both are
+// appended LAST with defaults so existing construction sites compile
+// untouched (S65); message folds the same numbers in words.
 dictionary FaceVectorDeleteRetryResult {
     FaceVectorDeleteRetryStatus status;
     u64 pending_count;
     u64 acknowledged_count;
     u64 remaining_count;
     string message;
+    u64 orphans_enqueued = 0;
+    boolean orphan_scan_ran = false;
 };
 
 dictionary SimilarPhotoStackSummary {
@@ -1867,6 +1898,8 @@ dictionary VideoDetails {
 // or query error) from a legitimate empty-result success — required because
 // this codebase signals errors via sentinel/wrapper dictionaries rather
 // than `[Throws]` (consistent with every other FFI surface in the .udl).
+// (…and a Rust PANIC inside one of these functions is reported through the
+// same ok/error_message — slice F.)
 //
 // Contract:
 // - ok == true: query succeeded. `paths` holds the matching file_path
@@ -1892,6 +1925,12 @@ dictionary RelocateResult {
 // === Backup / Restore (S111; Docs/DESIGN-Backup-Restore.md) ===
 
 // Catalogue counts for the backup manifest.
+// ⭐ Slice P / R-30's Rust half (A2's S-1, 2026-09-30) — untaken_counts is a
+// bitmask of the counts that could NOT be taken (the field then holds a
+// placeholder 0, not a count; the manifest must write it as an absent key):
+// 1 image_count · 2 video_count · 4 keyword_row_count · 8 person_count ·
+// 16 face_observation_count · 32 face_embedding_count. 0 = every count was
+// taken. Appended LAST with a default (S65).
 dictionary BackupCounts {
     u64 image_count;
     u64 video_count;
@@ -1899,6 +1938,7 @@ dictionary BackupCounts {
     u64 person_count;
     u64 face_observation_count;
     u64 face_embedding_count;
+    u32 untaken_counts = 0;
 };
 
 // Pre-merge census for the additive restore's confirmation / batch prompt.
@@ -2005,11 +2045,17 @@ dictionary FocusAnalysisCandidatePage {
 // — and store_error says which; observations is then EMPTY (never "everything
 // is missing", which would re-embed the whole catalogue). An index that was
 // never built is store_ok = true with an empty list.
+//
+// ⭐ Slice P / ruling 5's durable cure (2026-09-30) — unreadable_half names the
+// half that could not be read, structurally: "index" (the vector store) or
+// "catalogue" (the face records); null whenever store_ok. store_error keeps
+// its message prefixes unchanged. Appended LAST with a default (S65).
 dictionary FaceObservationWorkSet {
     sequence<FaceObservationRecord> observations;
     u64 dropped_rows;
     boolean store_ok;
     string? store_error;
+    string? unreadable_half = null;
 };
 
 // R-08 — a face search plus the vector store's reachability. ok = false means
