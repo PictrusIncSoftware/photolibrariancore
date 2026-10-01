@@ -902,16 +902,18 @@ public struct BackupCounts: Equatable, Hashable {
     public var personCount: UInt64
     public var faceObservationCount: UInt64
     public var faceEmbeddingCount: UInt64
+    public var untakenCounts: UInt32
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(imageCount: UInt64, videoCount: UInt64, keywordRowCount: UInt64, personCount: UInt64, faceObservationCount: UInt64, faceEmbeddingCount: UInt64) {
+    public init(imageCount: UInt64, videoCount: UInt64, keywordRowCount: UInt64, personCount: UInt64, faceObservationCount: UInt64, faceEmbeddingCount: UInt64, untakenCounts: UInt32 = UInt32(0)) {
         self.imageCount = imageCount
         self.videoCount = videoCount
         self.keywordRowCount = keywordRowCount
         self.personCount = personCount
         self.faceObservationCount = faceObservationCount
         self.faceEmbeddingCount = faceEmbeddingCount
+        self.untakenCounts = untakenCounts
     }
 
     
@@ -935,7 +937,8 @@ public struct FfiConverterTypeBackupCounts: FfiConverterRustBuffer {
                 keywordRowCount: FfiConverterUInt64.read(from: &buf), 
                 personCount: FfiConverterUInt64.read(from: &buf), 
                 faceObservationCount: FfiConverterUInt64.read(from: &buf), 
-                faceEmbeddingCount: FfiConverterUInt64.read(from: &buf)
+                faceEmbeddingCount: FfiConverterUInt64.read(from: &buf), 
+                untakenCounts: FfiConverterUInt32.read(from: &buf)
         )
     }
 
@@ -946,6 +949,7 @@ public struct FfiConverterTypeBackupCounts: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.personCount, into: &buf)
         FfiConverterUInt64.write(value.faceObservationCount, into: &buf)
         FfiConverterUInt64.write(value.faceEmbeddingCount, into: &buf)
+        FfiConverterUInt32.write(value.untakenCounts, into: &buf)
     }
 }
 
@@ -2148,14 +2152,16 @@ public struct FaceObservationWorkSet: Equatable, Hashable {
     public var droppedRows: UInt64
     public var storeOk: Bool
     public var storeError: String?
+    public var unreadableHalf: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(observations: [FaceObservationRecord], droppedRows: UInt64, storeOk: Bool, storeError: String?) {
+    public init(observations: [FaceObservationRecord], droppedRows: UInt64, storeOk: Bool, storeError: String?, unreadableHalf: String? = nil) {
         self.observations = observations
         self.droppedRows = droppedRows
         self.storeOk = storeOk
         self.storeError = storeError
+        self.unreadableHalf = unreadableHalf
     }
 
     
@@ -2177,7 +2183,8 @@ public struct FfiConverterTypeFaceObservationWorkSet: FfiConverterRustBuffer {
                 observations: FfiConverterSequenceTypeFaceObservationRecord.read(from: &buf), 
                 droppedRows: FfiConverterUInt64.read(from: &buf), 
                 storeOk: FfiConverterBool.read(from: &buf), 
-                storeError: FfiConverterOptionString.read(from: &buf)
+                storeError: FfiConverterOptionString.read(from: &buf), 
+                unreadableHalf: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -2186,6 +2193,7 @@ public struct FfiConverterTypeFaceObservationWorkSet: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.droppedRows, into: &buf)
         FfiConverterBool.write(value.storeOk, into: &buf)
         FfiConverterOptionString.write(value.storeError, into: &buf)
+        FfiConverterOptionString.write(value.unreadableHalf, into: &buf)
     }
 }
 
@@ -2343,15 +2351,19 @@ public struct FaceVectorDeleteRetryResult: Equatable, Hashable {
     public var acknowledgedCount: UInt64
     public var remainingCount: UInt64
     public var message: String
+    public var orphansEnqueued: UInt64
+    public var orphanScanRan: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(status: FaceVectorDeleteRetryStatus, pendingCount: UInt64, acknowledgedCount: UInt64, remainingCount: UInt64, message: String) {
+    public init(status: FaceVectorDeleteRetryStatus, pendingCount: UInt64, acknowledgedCount: UInt64, remainingCount: UInt64, message: String, orphansEnqueued: UInt64 = UInt64(0), orphanScanRan: Bool = false) {
         self.status = status
         self.pendingCount = pendingCount
         self.acknowledgedCount = acknowledgedCount
         self.remainingCount = remainingCount
         self.message = message
+        self.orphansEnqueued = orphansEnqueued
+        self.orphanScanRan = orphanScanRan
     }
 
     
@@ -2374,7 +2386,9 @@ public struct FfiConverterTypeFaceVectorDeleteRetryResult: FfiConverterRustBuffe
                 pendingCount: FfiConverterUInt64.read(from: &buf), 
                 acknowledgedCount: FfiConverterUInt64.read(from: &buf), 
                 remainingCount: FfiConverterUInt64.read(from: &buf), 
-                message: FfiConverterString.read(from: &buf)
+                message: FfiConverterString.read(from: &buf), 
+                orphansEnqueued: FfiConverterUInt64.read(from: &buf), 
+                orphanScanRan: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -2384,6 +2398,8 @@ public struct FfiConverterTypeFaceVectorDeleteRetryResult: FfiConverterRustBuffe
         FfiConverterUInt64.write(value.acknowledgedCount, into: &buf)
         FfiConverterUInt64.write(value.remainingCount, into: &buf)
         FfiConverterString.write(value.message, into: &buf)
+        FfiConverterUInt64.write(value.orphansEnqueued, into: &buf)
+        FfiConverterBool.write(value.orphanScanRan, into: &buf)
     }
 }
 
