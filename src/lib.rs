@@ -733,7 +733,8 @@ mod editor_saved_image_tests
              CREATE TABLE similar_photo_group_member (
                  image_id INTEGER PRIMARY KEY,
                  group_id INTEGER NOT NULL,
-                 representative_id INTEGER NOT NULL
+                 representative_id INTEGER NOT NULL,
+                 origin INTEGER
              );
              CREATE TABLE similar_photo_unit_checkpoint (
                  algorithm_version TEXT NOT NULL,
@@ -954,7 +955,7 @@ mod editor_saved_image_tests
             .expect("seed featureprint");
         }
         conn.execute(
-            "INSERT INTO similar_photo_group_member VALUES
+            "INSERT INTO similar_photo_group_member (image_id, group_id, representative_id) VALUES
                  (?1, ?1, ?1),
                  (?2, ?1, ?1)",
             params![jpeg_id, other_id],
@@ -3077,12 +3078,19 @@ fn open_and_migrate_catalogue_with_probe(
             distance_to_representative DOUBLE,
             algorithm_version TEXT NOT NULL,
             threshold DOUBLE NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            -- S24: who made the stack. 1 = by hand (Create Stack), 2 = automatic
+            -- (the grouping pass); keyword.origin's numbering, but NOT a bitmask.
+            -- LAST, nullable, no default (the S62 rule), no index.
+            origin INTEGER
         );
 
         CREATE INDEX IF NOT EXISTS idx_similar_photo_group ON similar_photo_group_member(group_id);
         CREATE INDEX IF NOT EXISTS idx_similar_photo_rep ON similar_photo_group_member(representative_id);
         CREATE INDEX IF NOT EXISTS idx_similar_photo_algorithm ON similar_photo_group_member(algorithm_version);
+        -- S24: the same column for an existing catalogue. Bare, no DEFAULT (S62);
+        -- existing rows are marked by the backfill after this batch.
+        ALTER TABLE similar_photo_group_member ADD COLUMN IF NOT EXISTS origin INTEGER;
 
         -- Durable Vision featureprints for resumable similar-photo grouping.
         -- The Swift runner owns the Vision observation bytes; core stores them
@@ -3512,6 +3520,45 @@ fn open_and_migrate_catalogue_with_probe(
                 "[migration] Failed to drop retired index {} ({}); the writeback will \
                  still run, but through the delete+insert path S179 retired",
                 index_name, e
+            );
+        }
+    }
+
+    // ⭐ S24 — mark every similar-photo membership row that predates the
+    // `origin` column, once. Create Stack has written `threshold = 0` since S96
+    // (Browse's twin since S110) and nothing else ever has — the automatic
+    // writer always stores a positive distance threshold, and the S111 merge
+    // and ruling 13's removal keep `threshold` as stored — so the threshold is
+    // a safe discriminator for rows written BEFORE this column existed. Every
+    // writer now sets `origin` explicitly, so after one successful open no
+    // NULL remains and this matches nothing.
+    //
+    // Placement and shape follow the S179 step above: the AUTOCOMMIT window
+    // before the migration `BEGIN TRANSACTION`, its own statement, log and
+    // continue. A failure leaves legacy rows unmarked (today's behaviour for
+    // them) and the next open retries it — `WHERE origin IS NULL` makes it
+    // idempotent. No marker and no index: `origin` is not indexed, so this
+    // UPDATE stays off the S179 delete+insert branch. The count is logged as
+    // a developer aid only; nothing branches on it (S179).
+    match conn.execute(
+        SIMILAR_STACK_ORIGIN_BACKFILL_SQL,
+        params![SIMILAR_STACK_ORIGIN_USER, SIMILAR_STACK_ORIGIN_AUTO],
+    )
+    {
+        Ok(marked) =>
+        {
+            eprintln!(
+                "[migration] similar-photo membership origin backfill reported {} row(s) \
+                 (a developer aid; not a control input)",
+                marked
+            );
+        }
+        Err(e) =>
+        {
+            eprintln!(
+                "[migration] Failed to mark similar-photo membership origins ({}); hand-made \
+                 stacks made before this build stay unprotected until a later open succeeds",
+                e
             );
         }
     }
@@ -4682,13 +4729,18 @@ fn editor_saved_image_invalidate_analysis(
     {
         format!("group_id IN ({})", similar_groups)
     };
+    // ⭐ S24 (W1-3): a stack a person made keeps every row — saving an edit over
+    // one of its photos does not dissolve it. An automatic stack dissolves
+    // exactly as before (it is re-formed by the next grouping pass), and a
+    // legacy mixed group loses only its automatic rows.
     conn.execute_batch(&format!(
         "DELETE FROM similar_photo_group_member
-         WHERE image_id IN ({0})
-            OR representative_id IN ({0})
-            OR {1};
+         WHERE (image_id IN ({0})
+                OR representative_id IN ({0})
+                OR {1})
+           AND {2};
          DELETE FROM similar_photo_unit_checkpoint;",
-        affected, group_predicate
+        affected, group_predicate, similar_row_is_not_hand_made_sql()
     ))
     .map_err(|e| format!("editor saved similar-photo invalidation failed: {}", e))?;
 
@@ -17252,6 +17304,203 @@ pub async fn accept_face_cluster_as_person(
     |panic| person_accept_error("failed", &ffi_panic_report("save this person", &panic)))
 }
 
+// ===========================================================================
+// ⭐ Slice S24 (R-105, review finding R13-F1) — hand-made stacks are durable
+// ===========================================================================
+//
+// Richard, Sep 27, 2026 (item 24, "All as recommended"): a stack a person
+// made with Create Stack is never deleted or rewritten by similar-photo
+// grouping. Every `similar_photo_group_member` row carries `origin`:
+// `SIMILAR_STACK_ORIGIN_USER` (made by hand) or `SIMILAR_STACK_ORIGIN_AUTO`
+// (the grouping pass). keyword.origin's numbering so provenance reads the
+// same everywhere — but NOT a bitmask: a row is one or the other.
+//
+// The WRITER decides the origin, never the caller (no `.udl` field):
+//   · `create_stack_writer_impl` (behind `replace_similar_photo_groups_for_ids`,
+//     whose only Swift callers are the two Create Stack commands) writes
+//     every row hand-made;
+//   · the two automatic writers (`upsert_similar_photo_groups_for_ids_impl`
+//     and `replace_similar_photo_groups_whole_impl`) write automatic rows and
+//     carry Guards 2 and 3;
+//   · the candidate queries carry Guard 1.
+// Every SQL fragment that tests the mark is built from the constants below,
+// once.
+
+/// `similar_photo_group_member.origin` for a row a person made (Create Stack).
+const SIMILAR_STACK_ORIGIN_USER: i32 = 1;
+/// `similar_photo_group_member.origin` for a row the grouping pass wrote.
+const SIMILAR_STACK_ORIGIN_AUTO: i32 = 2;
+
+/// The one-time origin backfill `open_and_migrate_catalogue_with_probe` runs in
+/// its autocommit window: `?1` = `SIMILAR_STACK_ORIGIN_USER` for a row Create
+/// Stack wrote (threshold 0, since S96), `?2` = `SIMILAR_STACK_ORIGIN_AUTO` for
+/// every other legacy row. Named so the timing evidence measures the exact
+/// production text.
+const SIMILAR_STACK_ORIGIN_BACKFILL_SQL: &str = "UPDATE similar_photo_group_member \
+    SET origin = CASE WHEN threshold = 0 THEN ?1 ELSE ?2 END \
+    WHERE origin IS NULL";
+
+/// Guard 1 — a photo that belongs to a stack a person made (any version) is
+/// never a grouping candidate, so the pass never featureprints, compares,
+/// unions or writes it. Version-agnostic on purpose: a hand-made row from an
+/// older version still means "a person grouped this". Written against the
+/// unaliased `images` table of both candidate queries.
+///
+/// Why at the candidate query and not in the writer: the pass's grouping is
+/// TRANSITIVE union-find, so stripping a hand-made photo out of a finished
+/// group could leave photos that were only connected through it.
+fn similar_candidate_excludes_hand_made_sql() -> String
+{
+    format!(
+        "NOT EXISTS (SELECT 1 FROM similar_photo_group_member hm \
+         WHERE hm.image_id = images.id AND hm.origin = {})",
+        SIMILAR_STACK_ORIGIN_USER
+    )
+}
+
+/// Guard 2 — the row-level exclusion every automatic DELETE carries (and the
+/// editor-save invalidation): NULL-safe, so a legacy row the backfill has not
+/// reached yet is treated as automatic, as it always was.
+fn similar_row_is_not_hand_made_sql() -> String
+{
+    format!("origin IS DISTINCT FROM {}", SIMILAR_STACK_ORIGIN_USER)
+}
+
+/// The census predicate for Guard 3.
+fn similar_row_is_hand_made_sql() -> String
+{
+    format!("origin = {}", SIMILAR_STACK_ORIGIN_USER)
+}
+
+/// A test seam in slice B's `RemovalProbe` shape: a plain PARAMETER, no global
+/// static, no `cfg!(test)` branch in production code, and an UNINHABITED
+/// referent outside `cfg(test)`, so every production call site can only pass
+/// `None`.
+///
+/// ⭐ THE KNOB SUBSTITUTES THE SQL; IT DOES NOT FAKE THE ERROR: the swapped
+/// statement is one the ENGINE rejects, so the fail-closed arm under test is
+/// driven by a real `Err` from a real call.
+#[cfg(test)]
+struct SimilarStackProbe
+{
+    /// Replace Guard 3's overlap census with THIS statement.
+    census_sql: Option<String>,
+    /// Replace Create Stack's leftover-plan read with THIS statement.
+    plan_sql: Option<String>,
+}
+
+#[cfg(test)]
+type SimilarStackProbeRef<'a> = Option<&'a SimilarStackProbe>;
+
+/// Uninhabited outside tests: every production call site passes `None`.
+#[cfg(not(test))]
+type SimilarStackProbeRef<'a> = Option<&'a std::convert::Infallible>;
+
+#[cfg(test)]
+fn similar_stack_probe_census_sql(probe: SimilarStackProbeRef<'_>) -> Option<String>
+{
+    probe.and_then(|probe| probe.census_sql.clone())
+}
+
+#[cfg(not(test))]
+fn similar_stack_probe_census_sql(_probe: SimilarStackProbeRef<'_>) -> Option<String>
+{
+    None
+}
+
+#[cfg(test)]
+fn similar_stack_probe_plan_sql(probe: SimilarStackProbeRef<'_>) -> Option<String>
+{
+    probe.and_then(|probe| probe.plan_sql.clone())
+}
+
+#[cfg(not(test))]
+fn similar_stack_probe_plan_sql(_probe: SimilarStackProbeRef<'_>) -> Option<String>
+{
+    None
+}
+
+/// Guard 3's census: how many HAND-MADE rows an automatic write would touch —
+/// a row whose `image_id` is an incoming member (the write would absorb that
+/// photo into an automatic group) or whose `group_id` is an incoming group id
+/// (the write would key an automatic group on a hand-made group's id — the
+/// legacy malformed shape). No `representative_id` limb: every writer keeps
+/// `representative_id = group_id`, so it would be an equivalent mutant.
+///
+/// Returns `Ok(0)` for an empty member list (nothing can overlap). A census is
+/// a QUERY RESULT, not a reported change count, so branching on it is
+/// legitimate (S179). ⛔ The caller treats `Err` exactly like an overlap.
+fn similar_hand_made_overlap_count(
+    conn: &Connection,
+    members: &[SimilarPhotoGroupMember],
+    probe: SimilarStackProbeRef<'_>,
+) -> Result<i64, String>
+{
+    if members.is_empty()
+    {
+        return Ok(0);
+    }
+
+    let mut image_ids: Vec<i64> = members.iter().map(|m| m.image_id).collect();
+    image_ids.sort_unstable();
+    image_ids.dedup();
+    let mut group_ids: Vec<i64> = members.iter().map(|m| m.group_id).collect();
+    group_ids.sort_unstable();
+    group_ids.dedup();
+
+    let sql = match similar_stack_probe_census_sql(probe)
+    {
+        Some(substituted) => substituted,
+        None => format!(
+            "SELECT COUNT(*) FROM similar_photo_group_member \
+             WHERE {} AND (image_id IN ({}) OR group_id IN ({}))",
+            similar_row_is_hand_made_sql(),
+            editor_saved_image_id_csv(&image_ids),
+            editor_saved_image_id_csv(&group_ids)
+        ),
+    };
+
+    conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
+        .map_err(|e| format!("the hand-made overlap census failed: {}", e))
+}
+
+/// Guard 3 at a call site: `true` when the automatic write may proceed. On an
+/// overlap OR a failed census the caller rolls back and writes nothing — the
+/// unit's previous automatic rows stay exactly as they were.
+fn similar_automatic_write_may_proceed(
+    conn: &Connection,
+    anchors: &[i64],
+    members: &[SimilarPhotoGroupMember],
+    site: &str,
+    probe: SimilarStackProbeRef<'_>,
+) -> bool
+{
+    let first = anchors.iter().copied().min().unwrap_or(0);
+    let last = anchors.iter().copied().max().unwrap_or(0);
+    match similar_hand_made_overlap_count(conn, members, probe)
+    {
+        Ok(0) => true,
+        Ok(overlapping) =>
+        {
+            eprintln!(
+                "{}: refused the unit over anchors {}…{} — its groups name {} hand-made \
+                 membership row(s); nothing deleted, nothing written (S24 Guard 3)",
+                site, first, last, overlapping
+            );
+            false
+        }
+        Err(e) =>
+        {
+            eprintln!(
+                "{}: refused the unit over anchors {}…{} — {}; treated as an overlap, nothing \
+                 deleted, nothing written (S24 Guard 3 fails closed)",
+                site, first, last, e
+            );
+            false
+        }
+    }
+}
+
 fn similar_photo_candidates_impl(
     conn: &Connection,
     algorithm_version: &str,
@@ -17269,6 +17518,8 @@ fn similar_photo_candidates_impl(
         "is_video IS NOT TRUE".to_string(),
         "focus_analysis_status = 'complete'".to_string(),
         "focus_algorithm_version = ?1".to_string(),
+        // ⭐ S24 Guard 1 — never offer a photo a person stacked by hand.
+        similar_candidate_excludes_hand_made_sql(),
     ];
     if let Some(filter) = id_filter {
         predicates.push(format!("({})", filter));
@@ -17751,7 +18002,12 @@ fn similar_photo_candidates_missing_neighborhood_impl(
     similar_algorithm_version: &str,
     radius: i64,
 ) -> Vec<SimilarPhotoCandidate> {
-    let mut stmt = match conn.prepare(
+    // ⭐ S24 Guard 1 sits in `ranked` — not only in the final SELECT — because
+    // `ranked` feeds BOTH the ROW_NUMBER() and the `missing` anti-join: the
+    // neighborhood's sort positions stay identical to the whole pass's (which
+    // excludes the same photos), and a hand-made photo with no featureprint can
+    // never count as "missing" and re-trigger a neighborhood on every pass.
+    let sql = format!(
         "WITH ranked AS (
              SELECT id, file_path, file_size, created_timestamp, capture_datetime,
                     directory_path, camera_model,
@@ -17766,6 +18022,7 @@ fn similar_photo_candidates_missing_neighborhood_impl(
              WHERE is_video IS NOT TRUE
                AND focus_analysis_status = 'complete'
                AND focus_algorithm_version = ?1
+               AND {}
          ),
          missing AS (
              SELECT r.rn
@@ -17779,7 +18036,9 @@ fn similar_photo_candidates_missing_neighborhood_impl(
          FROM ranked
          JOIN missing m ON ranked.rn BETWEEN m.rn - ?3 AND m.rn + ?3
          ORDER BY ranked.rn",
-    ) {
+        similar_candidate_excludes_hand_made_sql()
+    );
+    let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("similar_photo_candidates_missing_neighborhood: prepare {}", e);
@@ -17845,46 +18104,69 @@ fn similar_photo_member_is_valid(member: &SimilarPhotoGroupMember) -> bool {
             .unwrap_or(true)
 }
 
-fn replace_similar_photo_groups_impl(
+/// ⭐ S24 — the WHOLE-CATALOGUE writer: an AUTOMATIC writer, protected exactly
+/// like the per-unit upsert. It has no Swift caller today (pinned by
+/// `Spikes/DurableStackGate/` L2) but stays on the wire, so it must not be able
+/// to wipe hand-made stacks the day someone calls it:
+///   · Guard 3 — an incoming group that names a hand-made photo or a hand-made
+///     group's id rolls the whole write back; a census that cannot be read
+///     fails closed the same way;
+///   · Guard 2 — its version-wide DELETE never deletes a hand-made row;
+///   · every row it inserts is `SIMILAR_STACK_ORIGIN_AUTO`.
+fn replace_similar_photo_groups_whole_impl(
     conn: &Connection,
     members: Vec<SimilarPhotoGroupMember>,
     algorithm_version: &str,
-    scoped_ids: Option<&[i64]>,
-) -> u64 {
+) -> u64
+{
+    replace_similar_photo_groups_whole_impl_with_probe(conn, members, algorithm_version, None)
+}
+
+fn replace_similar_photo_groups_whole_impl_with_probe(
+    conn: &Connection,
+    members: Vec<SimilarPhotoGroupMember>,
+    algorithm_version: &str,
+    probe: SimilarStackProbeRef<'_>,
+) -> u64
+{
     let algorithm_version = algorithm_version.trim();
-    if algorithm_version.is_empty() {
+    if algorithm_version.is_empty()
+    {
         eprintln!("replace_similar_photo_groups: empty algorithm version");
         return 0;
     }
 
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
         eprintln!("replace_similar_photo_groups: begin {}", e);
         return 0;
     }
 
-    let delete_result = match scoped_ids {
-        Some(ids) => match id_in_list(ids) {
-            Some(filter) => {
-                let sql = format!("DELETE FROM similar_photo_group_member WHERE image_id IN (SELECT id FROM images WHERE {})", filter);
-                conn.execute(&sql, [])
-            }
-            None => Ok(0),
-        },
-        None => conn.execute(
-            "DELETE FROM similar_photo_group_member WHERE algorithm_version = ?1",
-            params![algorithm_version],
-        ),
-    };
+    let anchors: Vec<i64> = members.iter().map(|m| m.image_id).collect();
+    if !similar_automatic_write_may_proceed(conn, &anchors, &members, "replace_similar_photo_groups", probe)
+    {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return 0;
+    }
 
-    if let Err(e) = delete_result {
+    if let Err(e) = conn.execute(
+        &format!(
+            "DELETE FROM similar_photo_group_member WHERE algorithm_version = ?1 AND {}",
+            similar_row_is_not_hand_made_sql()
+        ),
+        params![algorithm_version],
+    )
+    {
         eprintln!("replace_similar_photo_groups: delete {}", e);
         let _ = conn.execute_batch("ROLLBACK;");
         return 0;
     }
 
     let mut inserted = 0u64;
-    for member in members {
-        if !similar_photo_member_is_valid(&member) {
+    for member in members
+    {
+        if !similar_photo_member_is_valid(&member)
+        {
             eprintln!(
                 "replace_similar_photo_groups: skipped invalid member image_id={}",
                 member.image_id
@@ -17895,9 +18177,9 @@ fn replace_similar_photo_groups_impl(
         match conn.execute(
             "INSERT INTO similar_photo_group_member (
                  image_id, group_id, representative_id, member_rank,
-                 distance_to_representative, algorithm_version, threshold
+                 distance_to_representative, algorithm_version, threshold, origin
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 member.image_id,
                 member.group_id,
@@ -17906,10 +18188,13 @@ fn replace_similar_photo_groups_impl(
                 member.distance_to_representative,
                 algorithm_version,
                 member.threshold,
+                SIMILAR_STACK_ORIGIN_AUTO,
             ],
-        ) {
+        )
+        {
             Ok(n) => inserted += n as u64,
-            Err(e) => {
+            Err(e) =>
+            {
                 eprintln!(
                     "replace_similar_photo_groups: insert image_id={} failed: {}",
                     member.image_id, e
@@ -17920,7 +18205,8 @@ fn replace_similar_photo_groups_impl(
         }
     }
 
-    if let Err(e) = conn.execute_batch("COMMIT;") {
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
         eprintln!("replace_similar_photo_groups: commit {}", e);
         return 0;
     }
@@ -17928,8 +18214,271 @@ fn replace_similar_photo_groups_impl(
     inserted
 }
 
-/// Replace all similar-photo group memberships for the supplied algorithm
-/// version. Used after whole-catalogue Intelligent Culling.
+/// ⭐ S24 — CREATE STACK'S WRITER. Its only Swift callers are the two Create
+/// Stack commands (`PhotosView.createStackFromSelection` and
+/// `BrowseView.createBrowseStackFromSelection` — pinned by
+/// `Spikes/DurableStackGate/` L1). Every row it inserts is
+/// `SIMILAR_STACK_ORIGIN_USER`, whatever the selected photos' previous rows
+/// said, so an automatic member taken into a Create Stack comes out hand-made.
+///
+/// Before inserting, it applies ruling 13's rule (W1-2) to every stack it
+/// takes photos from, from a plan read ONCE inside the transaction (the
+/// catalogue mutex is held, so the read is race-free — slice B's freeze
+/// argument) and kept in Rust memory:
+///   (i)   the selected photos' own rows go, plus any row of a touched group
+///         whose photo is already gone (ruling 13's sweep of dangling rows
+///         within its reach);
+///   (ii)  a touched group left with fewer than two member rows dissolves;
+///   (iii) a touched group with two or more left whose KEY photo was taken is
+///         re-keyed to the lowest of them, in both `group_id` and
+///         `representative_id` — rank, distance, threshold AND origin as
+///         stored (the S111 and ruling-13 precedent);
+///   (iv)  the new stack's rows are inserted.
+/// (ii) runs before (iii), exactly as ruling 13 orders them (B19f), so no
+/// dissolve keyed on an old group id can land on an id a re-key just moved a
+/// group to. After (iii) no row is keyed on a selected photo, so (iv) can
+/// never merge the new stack with its old stack's leftovers. Counts are ROWS,
+/// as ruling 13 and the S111 rule count them.
+///
+/// ⛔ Plan values are bound from the frozen read; no scalar subquery reads the
+/// table after the first write; no DDL; nothing reads a change count (S179).
+/// A plan read that fails or drops a row rolls back and writes nothing.
+fn create_stack_writer_impl(
+    conn: &Connection,
+    ids: &[i64],
+    members: Vec<SimilarPhotoGroupMember>,
+    algorithm_version: &str,
+) -> u64
+{
+    create_stack_writer_impl_with_probe(conn, ids, members, algorithm_version, None)
+}
+
+fn create_stack_writer_impl_with_probe(
+    conn: &Connection,
+    ids: &[i64],
+    members: Vec<SimilarPhotoGroupMember>,
+    algorithm_version: &str,
+    probe: SimilarStackProbeRef<'_>,
+) -> u64
+{
+    let algorithm_version = algorithm_version.trim();
+    if algorithm_version.is_empty()
+    {
+        eprintln!("replace_similar_photo_groups: empty algorithm version");
+        return 0;
+    }
+    let Some(selection_filter) = id_in_list(ids) else
+    {
+        return 0;
+    };
+    let selection_csv = editor_saved_image_id_csv(ids);
+    let selected: std::collections::HashSet<i64> = ids.iter().copied().collect();
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("replace_similar_photo_groups: begin {}", e);
+        return 0;
+    }
+
+    // --- The plan: every row of every group the selection touches — the
+    // census is `editor_saved_image_collect_similar_groups`'s three limbs, as
+    // slice B's removal plan uses them.
+    let plan_sql = match similar_stack_probe_plan_sql(probe)
+    {
+        Some(substituted) => substituted,
+        None => format!(
+            "SELECT m.group_id, m.image_id, \
+                    EXISTS (SELECT 1 FROM images i WHERE i.id = m.image_id) AS photo_exists \
+               FROM similar_photo_group_member m \
+              WHERE m.group_id IN (SELECT DISTINCT group_id FROM similar_photo_group_member \
+                                    WHERE image_id IN ({0}) OR group_id IN ({0}) \
+                                       OR representative_id IN ({0})) \
+              ORDER BY m.group_id, m.image_id",
+            selection_csv
+        ),
+    };
+    let plan_rows: Vec<(i64, i64, bool)> = {
+        let mut stmt = match conn.prepare(&plan_sql)
+        {
+            Ok(stmt) => stmt,
+            Err(e) =>
+            {
+                eprintln!("replace_similar_photo_groups: leftover plan prepare {}; nothing written", e);
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
+            }
+        };
+        let rows = match stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, bool>(2)?))
+        })
+        {
+            Ok(rows) => rows,
+            Err(e) =>
+            {
+                eprintln!("replace_similar_photo_groups: leftover plan query {}; nothing written", e);
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
+            }
+        };
+        let (kept, dropped) = collect_rows_counted(rows, "create_stack.leftover_plan");
+        if dropped > 0
+        {
+            eprintln!(
+                "replace_similar_photo_groups: the leftover plan dropped {} row(s); nothing written",
+                dropped
+            );
+            let _ = conn.execute_batch("ROLLBACK;");
+            return 0;
+        }
+        kept
+    };
+
+    // --- Per touched group, in Rust: the leftovers and whether its key went.
+    let mut leftovers_by_group: std::collections::BTreeMap<i64, Vec<i64>> =
+        std::collections::BTreeMap::new();
+    let mut dangling: Vec<i64> = Vec::new();
+    for (group_id, image_id, photo_exists) in &plan_rows
+    {
+        let leftovers = leftovers_by_group.entry(*group_id).or_default();
+        if !*photo_exists
+        {
+            dangling.push(*image_id);
+        }
+        else if !selected.contains(image_id)
+        {
+            leftovers.push(*image_id);
+        }
+    }
+    dangling.sort_unstable();
+    dangling.dedup();
+
+    let mut dissolve: Vec<i64> = Vec::new();
+    let mut rekey: Vec<(i64, i64)> = Vec::new();
+    for (group_id, leftovers) in &leftovers_by_group
+    {
+        if leftovers.len() < 2
+        {
+            dissolve.push(*group_id);
+        }
+        else if selected.contains(group_id)
+        {
+            if let Some(lowest) = leftovers.iter().copied().min()
+            {
+                rekey.push((*group_id, lowest));
+            }
+        }
+    }
+
+    // --- (i) the selected photos' rows, then the touched groups' dangling rows.
+    let mut writes: Vec<(String, Vec<i64>)> = vec![(
+        format!(
+            "DELETE FROM similar_photo_group_member WHERE image_id IN (SELECT id FROM images WHERE {})",
+            selection_filter
+        ),
+        Vec::new(),
+    )];
+    if !dangling.is_empty()
+    {
+        writes.push((
+            format!(
+                "DELETE FROM similar_photo_group_member WHERE image_id IN ({})",
+                editor_saved_image_id_csv(&dangling)
+            ),
+            Vec::new(),
+        ));
+    }
+    // --- (ii) dissolve, BEFORE (iii) re-key.
+    for group_id in &dissolve
+    {
+        writes.push((
+            "DELETE FROM similar_photo_group_member WHERE group_id = ?1".to_string(),
+            vec![*group_id],
+        ));
+    }
+    // --- (iii) re-key a group whose key photo was taken.
+    for (old_group, new_group) in &rekey
+    {
+        writes.push((
+            "UPDATE similar_photo_group_member \
+                SET group_id = ?1, representative_id = ?1 \
+              WHERE group_id = ?2"
+                .to_string(),
+            vec![*new_group, *old_group],
+        ));
+    }
+    for (sql, values) in &writes
+    {
+        let result = match values.as_slice()
+        {
+            [] => conn.execute(sql, []),
+            [only] => conn.execute(sql, params![only]),
+            [first, second] => conn.execute(sql, params![first, second]),
+            _ => Err(duckdb::Error::InvalidParameterCount(values.len(), 2)),
+        };
+        if let Err(e) = result
+        {
+            eprintln!("replace_similar_photo_groups: leftover rule failed: {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return 0;
+        }
+    }
+
+    // --- (iv) the new stack, made by hand.
+    let mut inserted = 0u64;
+    for member in members
+    {
+        if !similar_photo_member_is_valid(&member)
+        {
+            eprintln!(
+                "replace_similar_photo_groups: skipped invalid member image_id={}",
+                member.image_id
+            );
+            continue;
+        }
+
+        match conn.execute(
+            "INSERT INTO similar_photo_group_member (
+                 image_id, group_id, representative_id, member_rank,
+                 distance_to_representative, algorithm_version, threshold, origin
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                member.image_id,
+                member.group_id,
+                member.representative_id,
+                member.member_rank as i64,
+                member.distance_to_representative,
+                algorithm_version,
+                member.threshold,
+                SIMILAR_STACK_ORIGIN_USER,
+            ],
+        )
+        {
+            Ok(n) => inserted += n as u64,
+            Err(e) =>
+            {
+                eprintln!(
+                    "replace_similar_photo_groups: insert image_id={} failed: {}",
+                    member.image_id, e
+                );
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
+            }
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("replace_similar_photo_groups: commit {}", e);
+        return 0;
+    }
+
+    inserted
+}
+
+/// Replace all AUTOMATIC similar-photo group memberships for the supplied
+/// algorithm version. ⭐ S24: hand-made rows are never deleted or written over
+/// (see `replace_similar_photo_groups_whole_impl`). No Swift caller today.
 pub async fn replace_similar_photo_groups(
     members: Vec<SimilarPhotoGroupMember>,
     algorithm_version: String,
@@ -17943,11 +18492,15 @@ pub async fn replace_similar_photo_groups(
         }
     };
 
-    replace_similar_photo_groups_impl(conn, members, &algorithm_version, None)
+    replace_similar_photo_groups_whole_impl(conn, members, &algorithm_version)
 }
 
-/// Replace similar-photo group memberships for an explicit image-id selection.
-/// Empty selection clears nothing and inserts nothing.
+/// ⭐ S24 — Create Stack's writer (`create_stack_writer_impl`): its only Swift
+/// callers are `PhotosView.createStackFromSelection` and
+/// `BrowseView.createBrowseStackFromSelection` (pinned by
+/// `Spikes/DurableStackGate/` L1). Every row it writes is made by hand, and
+/// the stacks it takes photos from keep their remaining photos stacked while
+/// two or more remain. Empty selection clears nothing and inserts nothing.
 pub async fn replace_similar_photo_groups_for_ids(
     ids: Vec<i64>,
     members: Vec<SimilarPhotoGroupMember>,
@@ -17966,7 +18519,7 @@ pub async fn replace_similar_photo_groups_for_ids(
         }
     };
 
-    replace_similar_photo_groups_impl(conn, members, &algorithm_version, Some(&ids))
+    create_stack_writer_impl(conn, &ids, members, &algorithm_version)
 }
 
 fn upsert_similar_photo_groups_for_ids_impl(
@@ -17974,34 +18527,66 @@ fn upsert_similar_photo_groups_for_ids_impl(
     ids: &[i64],
     members: Vec<SimilarPhotoGroupMember>,
     algorithm_version: &str,
-) -> u64 {
+) -> u64
+{
+    upsert_similar_photo_groups_for_ids_impl_with_probe(conn, ids, members, algorithm_version, None)
+}
+
+/// ⭐ S24 — the grouping pass's per-unit writer is an AUTOMATIC writer:
+/// Guard 3 (an incoming group naming a hand-made photo or a hand-made group's
+/// id rolls the unit back whole, and a census that cannot be read fails
+/// closed the same way), Guard 2 (its anchor DELETE never deletes a hand-made
+/// row — reachable when a Create Stack commits after the pass loaded its
+/// candidates), and every row it writes is `SIMILAR_STACK_ORIGIN_AUTO`.
+fn upsert_similar_photo_groups_for_ids_impl_with_probe(
+    conn: &Connection,
+    ids: &[i64],
+    members: Vec<SimilarPhotoGroupMember>,
+    algorithm_version: &str,
+    probe: SimilarStackProbeRef<'_>,
+) -> u64
+{
     let algorithm_version = algorithm_version.trim();
-    if ids.is_empty() || algorithm_version.is_empty() {
+    if ids.is_empty() || algorithm_version.is_empty()
+    {
         return 0;
     }
-    let Some(filter) = id_in_list(ids) else {
+    let Some(filter) = id_in_list(ids) else
+    {
         return 0;
     };
 
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
         eprintln!("upsert_similar_photo_groups_for_ids: begin {}", e);
+        return 0;
+    }
+
+    if !similar_automatic_write_may_proceed(conn, ids, &members, "upsert_similar_photo_groups_for_ids", probe)
+    {
+        let _ = conn.execute_batch("ROLLBACK;");
         return 0;
     }
 
     let delete_sql = format!(
         "DELETE FROM similar_photo_group_member
-         WHERE algorithm_version = ?1 AND image_id IN (SELECT id FROM images WHERE {})",
-        filter
+         WHERE algorithm_version = ?1 AND image_id IN (SELECT id FROM images WHERE {})
+           AND {}",
+        filter,
+        similar_row_is_not_hand_made_sql()
     );
-    if let Err(e) = conn.execute(&delete_sql, params![algorithm_version]) {
+    if let Err(e) = conn.execute(&delete_sql, params![algorithm_version])
+    {
         eprintln!("upsert_similar_photo_groups_for_ids: delete {}", e);
         let _ = conn.execute_batch("ROLLBACK;");
         return 0;
     }
 
     let mut changed = 0u64;
-    for member in members {
-        if !similar_photo_member_is_valid(&member) {
+    for member in members
+    {
+        if !similar_photo_member_is_valid(&member)
+        {
             eprintln!(
                 "upsert_similar_photo_groups_for_ids: skipped invalid member image_id={}",
                 member.image_id
@@ -18011,9 +18596,9 @@ fn upsert_similar_photo_groups_for_ids_impl(
         match conn.execute(
             "INSERT INTO similar_photo_group_member (
                  image_id, group_id, representative_id, member_rank,
-                 distance_to_representative, algorithm_version, threshold
+                 distance_to_representative, algorithm_version, threshold, origin
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT (image_id)
              DO UPDATE SET
                  group_id = excluded.group_id,
@@ -18022,6 +18607,7 @@ fn upsert_similar_photo_groups_for_ids_impl(
                  distance_to_representative = excluded.distance_to_representative,
                  algorithm_version = excluded.algorithm_version,
                  threshold = excluded.threshold,
+                 origin = excluded.origin,
                  created_at = now()",
             params![
                 member.image_id,
@@ -18031,10 +18617,13 @@ fn upsert_similar_photo_groups_for_ids_impl(
                 member.distance_to_representative,
                 algorithm_version,
                 member.threshold,
+                SIMILAR_STACK_ORIGIN_AUTO,
             ],
-        ) {
+        )
+        {
             Ok(n) => changed += n as u64,
-            Err(e) => {
+            Err(e) =>
+            {
                 eprintln!(
                     "upsert_similar_photo_groups_for_ids: insert image_id={} failed: {}",
                     member.image_id, e
@@ -18045,7 +18634,8 @@ fn upsert_similar_photo_groups_for_ids_impl(
         }
     }
 
-    if let Err(e) = conn.execute_batch("COMMIT;") {
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
         eprintln!("upsert_similar_photo_groups_for_ids: commit {}", e);
         return 0;
     }
@@ -20103,7 +20693,8 @@ fn merge_catalogue_sql_inner(
     conn.execute_batch(&format!(
         "CREATE TEMPORARY TABLE plstack_copy AS \
          SELECT m.new_id AS image_id, s.group_id AS old_group, s.member_rank, \
-                s.distance_to_representative, s.algorithm_version, s.threshold, s.created_at \
+                s.distance_to_representative, s.algorithm_version, s.threshold, s.created_at, \
+                s.origin \
          FROM plbackup.similar_photo_group_member s \
          JOIN plmerge_map m ON m.old_id = s.image_id \
          WHERE {};",
@@ -20119,9 +20710,10 @@ fn merge_catalogue_sql_inner(
         conn.execute(
             "INSERT INTO similar_photo_group_member \
                  (image_id, group_id, representative_id, member_rank, \
-                  distance_to_representative, algorithm_version, threshold, created_at) \
+                  distance_to_representative, algorithm_version, threshold, created_at, origin) \
              SELECT sc.image_id, g.new_group, g.new_group, sc.member_rank, \
-                    sc.distance_to_representative, sc.algorithm_version, sc.threshold, sc.created_at \
+                    sc.distance_to_representative, sc.algorithm_version, sc.threshold, sc.created_at, \
+                    sc.origin \
              FROM plstack_copy sc \
              JOIN (SELECT old_group, MIN(image_id) AS new_group \
                    FROM plstack_copy GROUP BY old_group) g \
@@ -22605,49 +23197,263 @@ mod focus_analysis_queue_tests {
     }
 }
 
+// ⭐ Slice S24 (R-105, review finding R13-F1) — durable hand-made stacks.
+//
+// Every catalogue here is a REAL temp FILE opened through the production
+// `open_and_migrate_catalogue` and fenced against extension fetches — never a
+// hand-rolled in-memory schema, which could not carry the `origin` column
+// honestly. The three tests that used to live in `similar_photo_group_tests`
+// (a hand-rolled in-memory schema) moved here with every assertion kept.
 #[cfg(test)]
-mod similar_photo_group_tests {
+mod durable_stack_tests
+{
     use super::*;
-    use duckdb::Connection;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn setup() -> Connection {
-        let conn = Connection::open_in_memory().expect("in-memory db");
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    const V: &str = "similar-featureprint-v4";
+
+    /// Slice B's fixture shape: a fresh REAL catalogue file.
+    fn fresh_catalogue(tag: &str) -> (std::path::PathBuf, Connection)
+    {
+        let path = fixture_path(tag);
+        let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH.
+        fence_connection_against_extension_fetches(&conn);
+        (path, conn)
+    }
+
+    fn fixture_path(tag: &str) -> std::path::PathBuf
+    {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "plcore-durable-stack-test-{}-{}-{}.db",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+        path
+    }
+
+    fn reopen(path: &std::path::Path) -> Connection
+    {
+        let conn = open_and_migrate_catalogue(path).expect("reopened catalogue");
+        fence_connection_against_extension_fetches(&conn);
+        conn
+    }
+
+    fn cleanup(path: &std::path::Path)
+    {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+    }
+
+    fn insert_image(conn: &Connection, file_path: &str) -> i64
+    {
+        conn.execute(
+            "INSERT INTO images (file_path, file_size, file_name, created_timestamp, \
+             modified_timestamp) VALUES (?1, 1234, ?2, 0, 0)",
+            params![file_path, file_path.rsplit('/').next().unwrap_or(file_path)],
+        )
+        .expect("insert image");
+        conn.query_row(
+            "SELECT id FROM images WHERE file_path = ?1",
+            params![file_path],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("id of the inserted image")
+    }
+
+    fn insert_image_with_id(conn: &Connection, id: i64)
+    {
+        conn.execute(
+            "INSERT INTO images (id, file_path, file_size, file_name, created_timestamp, \
+             modified_timestamp) VALUES (?1, ?2, 1234, ?3, 0, 0)",
+            params![id, format!("/fixed/{}.jpg", id), format!("{}.jpg", id)],
+        )
+        .expect("insert image with id");
+    }
+
+    /// A still every candidate query accepts. All sort fields are equal, so
+    /// the deterministic ORDER BY ranks the stills by id.
+    fn insert_eligible_still(conn: &Connection, file_path: &str) -> i64
+    {
+        let id = insert_image(conn, file_path);
+        conn.execute(
+            "UPDATE images SET is_video = FALSE, focus_analysis_status = 'complete', \
+             focus_algorithm_version = 'v7', directory_path = '/d', camera_model = 'cam' \
+             WHERE id = ?1",
+            params![id],
+        )
+        .expect("make eligible");
+        id
+    }
+
+    fn insert_featureprint(conn: &Connection, image_id: i64)
+    {
+        conn.execute(
+            "INSERT INTO similar_photo_featureprint (image_id, algorithm_version, source_stamp, \
+             featureprint_blob) VALUES (?1, ?2, 's', 'b')",
+            params![image_id, V],
+        )
+        .expect("featureprint");
+    }
+
+    fn member(image_id: i64, group_id: i64, rank: u32, distance: Option<f64>, threshold: f64) -> SimilarPhotoGroupMember
+    {
+        SimilarPhotoGroupMember
+        {
+            image_id,
+            group_id,
+            representative_id: group_id,
+            member_rank: rank,
+            distance_to_representative: distance,
+            threshold,
+        }
+    }
+
+    /// Create Stack's own shape (`PhotosView.createStackFromSelection`): the
+    /// first id represents, threshold 0, distance 0 for the representative.
+    fn create_stack_members(ids: &[i64]) -> Vec<SimilarPhotoGroupMember>
+    {
+        let key = ids[0];
+        ids.iter()
+            .enumerate()
+            .map(|(rank, id)| member(*id, key, rank as u32, if *id == key { Some(0.0) } else { None }, 0.0))
+            .collect()
+    }
+
+    /// The grouping pass's shape: the lowest id represents, measured distances.
+    fn automatic_members(ids: &[i64]) -> Vec<SimilarPhotoGroupMember>
+    {
+        let key = ids[0];
+        ids.iter()
+            .enumerate()
+            .map(|(rank, id)| member(*id, key, rank as u32, Some(rank as f64 * 1.5), 8.5))
+            .collect()
+    }
+
+    /// The WHOLE membership row, `origin` and `created_at` included, so
+    /// "unchanged" means unchanged in every column.
+    type Row = (i64, i64, i64, i64, Option<f64>, String, f64, Option<String>, Option<i32>);
+
+    fn rows(conn: &Connection) -> Vec<Row>
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT image_id, group_id, representative_id, member_rank, \
+                        distance_to_representative, algorithm_version, threshold, \
+                        CAST(created_at AS VARCHAR), origin \
+                   FROM similar_photo_group_member ORDER BY image_id",
+            )
+            .expect("prepare rows");
+        let mapped = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            })
+            .expect("query rows");
+        let (kept, dropped) = collect_rows_counted(mapped, "durable_stack_tests.rows");
+        assert_eq!(dropped, 0, "the row snapshot must not drop rows");
+        kept
+    }
+
+    fn rows_for(conn: &Connection, ids: &[i64]) -> Vec<Row>
+    {
+        rows(conn).into_iter().filter(|row| ids.contains(&row.0)).collect()
+    }
+
+    fn origin_of(conn: &Connection, image_id: i64) -> Option<i32>
+    {
+        conn.query_row(
+            "SELECT origin FROM similar_photo_group_member WHERE image_id = ?1",
+            params![image_id],
+            |row| row.get::<_, Option<i32>>(0),
+        )
+        .unwrap_or_else(|e| panic!("origin of {}: {}", image_id, e))
+    }
+
+    fn has_row(conn: &Connection, image_id: i64) -> bool
+    {
+        conn.query_row(
+            "SELECT COUNT(*) FROM similar_photo_group_member WHERE image_id = ?1",
+            params![image_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("row count")
+            > 0
+    }
+
+    /// (image_id, group_id) as the gallery's stack reader expands `id`'s stack.
+    fn stack(conn: &Connection, id: i64) -> Vec<(i64, i64)>
+    {
+        similar_photo_stack_members_for_ids_impl(conn, &[id], V)
+            .into_iter()
+            .map(|m| (m.image_id, m.group_id))
+            .collect()
+    }
+
+    fn checkpoint_count(conn: &Connection) -> i64
+    {
+        conn.query_row("SELECT COUNT(*) FROM similar_photo_unit_checkpoint", [], |row| row.get::<_, i64>(0))
+            .expect("checkpoint count")
+    }
+
+    fn mark_checkpoint(conn: &Connection, key: &str)
+    {
+        assert!(mark_similar_photo_unit_checkpoint_impl(
+            conn,
+            V,
+            SimilarPhotoUnitCheckpoint
+            {
+                unit_key: key.to_string(),
+                start_image_id: 1,
+                end_image_id: 200,
+                anchor_count: 200,
+                member_count: 3,
+            }
+        ));
+    }
+
+    fn insert_raw_member(conn: &Connection, image_id: i64, group_id: i64, threshold: f64, origin: Option<i32>)
+    {
+        conn.execute(
+            "INSERT INTO similar_photo_group_member (image_id, group_id, representative_id, \
+             member_rank, distance_to_representative, algorithm_version, threshold, origin) \
+             VALUES (?1, ?2, ?2, 1, NULL, ?3, ?4, ?5)",
+            params![image_id, group_id, V, threshold, origin],
+        )
+        .expect("raw member");
+    }
+
+    // ---------------------------------------------------------------------
+    // The three tests that lived in `similar_photo_group_tests`, on a real
+    // catalogue. Their rows are written with `origin` NULL — a legacy row, as
+    // the old hand-rolled schema wrote them — which every guard treats as
+    // automatic, so each assertion carries over unchanged.
+    // ---------------------------------------------------------------------
+
+    fn legacy_setup(tag: &str) -> (std::path::PathBuf, Connection)
+    {
+        let (path, conn) = fresh_catalogue(tag);
+        for id in [1, 2, 3, 4, 9]
+        {
+            insert_image_with_id(&conn, id);
+        }
         conn.execute_batch(
-            "CREATE TABLE images (id INTEGER PRIMARY KEY);
-            INSERT INTO images (id) VALUES (1), (2), (3), (4), (9);
-            CREATE TABLE similar_photo_group_member (
-                image_id INTEGER PRIMARY KEY,
-                group_id INTEGER NOT NULL,
-                representative_id INTEGER NOT NULL,
-                member_rank INTEGER NOT NULL,
-                distance_to_representative DOUBLE,
-                algorithm_version TEXT NOT NULL,
-                threshold DOUBLE NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE similar_photo_featureprint (
-                image_id INTEGER NOT NULL,
-                algorithm_version TEXT NOT NULL,
-                source_stamp TEXT NOT NULL,
-                featureprint_blob BLOB NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (image_id, algorithm_version)
-            );
-            CREATE TABLE similar_photo_group_work_unit (
-                algorithm_version TEXT NOT NULL,
-                scope_key TEXT NOT NULL,
-                unit_index BIGINT NOT NULL,
-                start_image_id INTEGER NOT NULL,
-                end_image_id INTEGER NOT NULL,
-                candidate_count BIGINT NOT NULL,
-                member_count BIGINT NOT NULL,
-                status TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (algorithm_version, scope_key, unit_index)
-            );
-            INSERT INTO similar_photo_group_member
+            "INSERT INTO similar_photo_group_member
                 (image_id, group_id, representative_id, member_rank, distance_to_representative, algorithm_version, threshold)
             VALUES
                 (1, 1, 1, 0, 0.0, 'old-v1', 2.35),
@@ -22655,13 +23461,14 @@ mod similar_photo_group_tests {
                 (3, 2, 2, 1, 1.25, 'old-v1', 2.35),
                 (9, 9, 9, 0, 0.0, 'other-v', 2.35);",
         )
-        .expect("similar-photo DDL");
-        conn
+        .expect("legacy similar-photo rows");
+        (path, conn)
     }
 
     #[test]
-    fn stack_members_expand_selected_groups_and_keep_singletons() {
-        let conn = setup();
+    fn stack_members_expand_selected_groups_and_keep_singletons()
+    {
+        let (path, conn) = legacy_setup("moved-members");
         let members = similar_photo_stack_members_for_ids_impl(&conn, &[2, 4], "old-v1");
         let actual: Vec<(i64, i64, i64, u32)> = members
             .into_iter()
@@ -22669,11 +23476,14 @@ mod similar_photo_group_tests {
             .collect();
 
         assert_eq!(actual, vec![(2, 2, 2, 0), (3, 2, 2, 1), (4, 4, 4, 0)]);
+        drop(conn);
+        cleanup(&path);
     }
 
     #[test]
-    fn replace_similar_groups_replaces_only_target_algorithm() {
-        let conn = setup();
+    fn replace_similar_groups_replaces_only_target_algorithm()
+    {
+        let (path, conn) = legacy_setup("moved-replace");
         let members = vec![
             SimilarPhotoGroupMember {
                 image_id: 2,
@@ -22694,7 +23504,7 @@ mod similar_photo_group_tests {
         ];
 
         assert_eq!(
-            replace_similar_photo_groups_impl(&conn, members, "old-v1", None),
+            replace_similar_photo_groups_whole_impl(&conn, members, "old-v1"),
             2
         );
 
@@ -22718,11 +23528,14 @@ mod similar_photo_group_tests {
                 (9, "other-v".to_string()),
             ]
         );
+        drop(conn);
+        cleanup(&path);
     }
 
     #[test]
-    fn progressive_grouping_state_upserts_featureprints_units_and_members() {
-        let conn = setup();
+    fn progressive_grouping_state_upserts_featureprints_units_and_members()
+    {
+        let (path, conn) = legacy_setup("moved-progressive");
         let featureprints = vec![
             SimilarPhotoFeatureprint {
                 image_id: 1,
@@ -22784,6 +23597,829 @@ mod similar_photo_group_tests {
         let units = completed_similar_photo_work_units_impl(&conn, "new-v1", "whole:test");
         assert_eq!(units.len(), 1);
         assert_eq!(units[0].member_count, 2);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    // ---------------------------------------------------------------------
+    // D1 … D13
+    // ---------------------------------------------------------------------
+
+    /// D1 — Create Stack's writer writes hand-made rows.
+    #[test]
+    fn d1_create_stack_writes_hand_made_rows()
+    {
+        let (path, conn) = fresh_catalogue("d1");
+        let a = insert_image(&conn, "/d1/a.jpg");
+        let b = insert_image(&conn, "/d1/b.jpg");
+        let c = insert_image(&conn, "/d1/c.jpg");
+
+        assert_eq!(create_stack_writer_impl(&conn, &[b, a, c], create_stack_members(&[b, a, c]), V), 3);
+        let written = rows(&conn);
+        assert_eq!(written.len(), 3);
+        for row in &written
+        {
+            assert_eq!(row.8, Some(SIMILAR_STACK_ORIGIN_USER), "row {} must be made by hand", row.0);
+            assert_eq!(row.6, 0.0, "the threshold is stored as given");
+            assert_eq!(row.1, b, "keyed on the first selected photo");
+        }
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// D2 — ⭐ R13-F1's probe P3, CLOSED: a hand-made stack survives a removal
+    /// that clears every checkpoint and the recompute that follows.
+    #[test]
+    fn d2_r13_f1_a_recompute_after_a_removal_leaves_a_hand_made_stack_alone()
+    {
+        let (path, conn) = fresh_catalogue("d2");
+        let h: Vec<i64> = (1..=4).map(|n| insert_image(&conn, &format!("/d2/h{}.jpg", n))).collect();
+        let a: Vec<i64> = (1..=3).map(|n| insert_image(&conn, &format!("/d2/a{}.jpg", n))).collect();
+        assert_eq!(create_stack_writer_impl(&conn, &h, create_stack_members(&h), V), 4);
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &a, automatic_members(&a), V), 3);
+        mark_checkpoint(&conn, "unit-before-removal");
+
+        // Ruling 13: removing one hand-made member keeps the other three.
+        assert_eq!(remove_images_by_ids_impl(&conn, &[h[3]]), 1);
+        assert_eq!(checkpoint_count(&conn), 0, "every removal clears every checkpoint (W1-11)");
+        let survivors = vec![h[0], h[1], h[2]];
+        let hand_before = rows_for(&conn, &survivors);
+        assert_eq!(hand_before.len(), 3);
+
+        // The recomputed unit: every surviving photo of both stacks is an anchor.
+        let mut anchors = survivors.clone();
+        anchors.extend(a.iter().copied());
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &anchors, automatic_members(&a), V), 3);
+        assert_eq!(
+            rows_for(&conn, &survivors),
+            hand_before,
+            "the three hand-made rows are byte-identical in every column, origin and created_at included"
+        );
+        for id in &a
+        {
+            assert_eq!(origin_of(&conn, *id), Some(SIMILAR_STACK_ORIGIN_AUTO), "the automatic rows are the ones written");
+        }
+
+        // P3 verbatim: the recomputed unit found NO groups at all.
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &anchors, Vec::new(), V), 0);
+        assert_eq!(rows_for(&conn, &survivors), hand_before, "keys=[] no longer erases the hand-made stack");
+        assert_eq!(stack(&conn, h[1]).len(), 3, "the gallery still expands the hand-made stack of three");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// D3 — Guard 3: an incoming automatic group that names a hand-made photo
+    /// is refused whole. D3b: one keyed on a hand-made group's id (the legacy
+    /// malformed shape) is refused the same way.
+    #[test]
+    fn d3_an_automatic_write_that_would_absorb_a_hand_made_photo_is_refused_whole()
+    {
+        let (path, conn) = fresh_catalogue("d3");
+        let h1 = insert_image(&conn, "/d3/h1.jpg");
+        let h2 = insert_image(&conn, "/d3/h2.jpg");
+        let a1 = insert_image(&conn, "/d3/a1.jpg");
+        let a2 = insert_image(&conn, "/d3/a2.jpg");
+        assert_eq!(create_stack_writer_impl(&conn, &[h1, h2], create_stack_members(&[h1, h2]), V), 2);
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &[a1, a2], automatic_members(&[a1, a2]), V), 2);
+        let before = rows(&conn);
+
+        assert_eq!(
+            upsert_similar_photo_groups_for_ids_impl(&conn, &[a1, a2, h1], automatic_members(&[a1, a2, h1]), V),
+            0
+        );
+        assert_eq!(rows(&conn), before, "nothing deleted (not even the unit's automatic anchors), nothing written");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn d3b_an_automatic_write_keyed_on_a_hand_made_groups_id_is_refused_whole()
+    {
+        let (path, conn) = fresh_catalogue("d3b");
+        let x = insert_image(&conn, "/d3b/x.jpg");
+        let y = insert_image(&conn, "/d3b/y.jpg");
+        let p = insert_image(&conn, "/d3b/p.jpg");
+        let q = insert_image(&conn, "/d3b/q.jpg");
+        // The malformed legacy shape: a hand-made group keyed on x, while x has
+        // no hand-made row of its own.
+        insert_raw_member(&conn, p, x, 0.0, Some(SIMILAR_STACK_ORIGIN_USER));
+        insert_raw_member(&conn, q, x, 0.0, Some(SIMILAR_STACK_ORIGIN_USER));
+        let before = rows(&conn);
+
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &[x, y], automatic_members(&[x, y]), V), 0);
+        assert_eq!(rows(&conn), before, "the hand-made group's key is not written over");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// D4 — Guard 1: a hand-made photo is never a candidate, through the whole
+    /// pass, the selection scope or the incremental neighborhood.
+    #[test]
+    fn d4_a_hand_made_photo_is_never_offered_to_the_grouping_pass()
+    {
+        let (path, conn) = fresh_catalogue("d4");
+        let ids: Vec<i64> = (1..=6).map(|n| insert_eligible_still(&conn, &format!("/d/f{}.jpg", n))).collect();
+        let hand = vec![ids[2], ids[3]];
+        assert_eq!(create_stack_writer_impl(&conn, &hand, create_stack_members(&hand), V), 2);
+        let expected: Vec<i64> = ids.iter().copied().filter(|id| !hand.contains(id)).collect();
+
+        let whole: Vec<i64> = similar_photo_candidates_impl(&conn, "v7", None).iter().map(|c| c.id).collect();
+        assert_eq!(whole, expected, "the whole pass sees the pre-slice ordering minus the hand-made photos");
+        let scoped: Vec<i64> = similar_photo_candidates_impl(&conn, "v7", Some(&ids)).iter().map(|c| c.id).collect();
+        assert_eq!(scoped, expected, "the selection scope never offers them either");
+
+        // Featureprint everything but ids[0] (not hand-made) → its neighborhood.
+        for id in ids.iter().skip(1)
+        {
+            insert_featureprint(&conn, *id);
+        }
+        let hood: Vec<i64> = similar_photo_candidates_missing_neighborhood_impl(&conn, "v7", V, 64)
+            .iter()
+            .map(|c| c.id)
+            .collect();
+        assert!(!hood.is_empty(), "the neighborhood is not vacuously empty");
+        assert!(hood.iter().all(|id| !hand.contains(id)), "the neighborhood offers no hand-made photo: {:?}", hood);
+        assert_eq!(hood, expected, "and its ranks are the whole pass's ranks");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// D4b — a hand-made photo with no featureprint never triggers a
+    /// neighborhood (Guard 1 sits in `ranked`, which feeds `missing`).
+    #[test]
+    fn d4b_a_hand_made_photo_without_a_featureprint_triggers_no_neighborhood()
+    {
+        let (path, conn) = fresh_catalogue("d4b");
+        let ids: Vec<i64> = (1..=6).map(|n| insert_eligible_still(&conn, &format!("/d/g{}.jpg", n))).collect();
+        let hand = vec![ids[2], ids[3]];
+        assert_eq!(create_stack_writer_impl(&conn, &hand, create_stack_members(&hand), V), 2);
+        for id in ids.iter().filter(|id| !hand.contains(id))
+        {
+            insert_featureprint(&conn, *id);
+        }
+        assert!(
+            similar_photo_candidates_missing_neighborhood_impl(&conn, "v7", V, 2).is_empty(),
+            "every non-hand-made still is featureprinted, so nothing is new"
+        );
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// D5 — Guard 2 on the whole-catalogue writer.
+    #[test]
+    fn d5_the_whole_catalogue_writer_never_deletes_a_hand_made_row()
+    {
+        let (path, conn) = fresh_catalogue("d5");
+        let h1 = insert_image(&conn, "/d5/h1.jpg");
+        let h2 = insert_image(&conn, "/d5/h2.jpg");
+        let a1 = insert_image(&conn, "/d5/a1.jpg");
+        let a2 = insert_image(&conn, "/d5/a2.jpg");
+        let b1 = insert_image(&conn, "/d5/b1.jpg");
+        let b2 = insert_image(&conn, "/d5/b2.jpg");
+        assert_eq!(create_stack_writer_impl(&conn, &[h1, h2], create_stack_members(&[h1, h2]), V), 2);
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &[a1, a2], automatic_members(&[a1, a2]), V), 2);
+        let hand_before = rows_for(&conn, &[h1, h2]);
+
+        assert_eq!(replace_similar_photo_groups_whole_impl(&conn, automatic_members(&[b1, b2]), V), 2);
+        assert_eq!(rows_for(&conn, &[h1, h2]), hand_before, "hand-made rows byte-identical");
+        assert!(!has_row(&conn, a1) && !has_row(&conn, a2), "every other current-version row is replaced");
+        assert_eq!(origin_of(&conn, b1), Some(SIMILAR_STACK_ORIGIN_AUTO));
+        assert_eq!(origin_of(&conn, b2), Some(SIMILAR_STACK_ORIGIN_AUTO));
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// D6 — ruling 13 keeps the mark: B's removal of a hand-made stack's
+    /// representative re-keys the survivors and leaves `origin` as stored.
+    #[test]
+    fn d6_ruling_13_keeps_the_mark_through_a_promotion()
+    {
+        let (path, conn) = fresh_catalogue("d6");
+        let r = insert_image(&conn, "/d6/r.jpg");
+        let s = insert_image(&conn, "/d6/s.jpg");
+        let t = insert_image(&conn, "/d6/t.jpg");
+        assert_eq!(create_stack_writer_impl(&conn, &[r, s, t], create_stack_members(&[r, s, t]), V), 3);
+
+        assert_eq!(remove_images_by_ids_impl(&conn, &[r]), 1);
+        let low = s.min(t);
+        for id in [s, t]
+        {
+            let row = rows_for(&conn, &[id]).pop().expect("a survivor row");
+            assert_eq!((row.1, row.2), (low, low), "re-keyed to the lowest survivor (B's behaviour)");
+            assert_eq!(row.8, Some(SIMILAR_STACK_ORIGIN_USER), "and still made by hand");
+        }
+        let after_removal = rows(&conn);
+
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &[s, t], Vec::new(), V), 0);
+        assert_eq!(rows(&conn), after_removal, "the recompute leaves the stack of two alone");
+        assert_eq!(low, s, "s was catalogued before t");
+        assert_eq!(stack(&conn, t), vec![(s, s), (t, s)], "still one stack of two");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// D7a — Create Stack takes the key photo of an automatic stack: the photos
+    /// left behind keep their stack, re-keyed to the lowest of them.
+    #[test]
+    fn d7a_the_photos_left_behind_keep_their_stack_re_keyed()
+    {
+        let (path, conn) = fresh_catalogue("d7a");
+        let ids: Vec<i64> = ["k", "m", "x", "y", "z"].iter().map(|n| insert_image(&conn, &format!("/d7a/{}.jpg", n))).collect();
+        let (k, m, x, y, z) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &ids, automatic_members(&ids), V), 5);
+        let before = rows(&conn);
+
+        assert_eq!(create_stack_writer_impl(&conn, &[k, m], create_stack_members(&[k, m]), V), 2);
+        for id in [k, m]
+        {
+            let row = rows_for(&conn, &[id]).pop().expect("a new row");
+            assert_eq!((row.1, row.2, row.8), (k, k, Some(SIMILAR_STACK_ORIGIN_USER)));
+        }
+        let low = x.min(y).min(z);
+        for id in [x, y, z]
+        {
+            let now = rows_for(&conn, &[id]).pop().expect("a leftover row");
+            let was = before.iter().find(|row| row.0 == id).expect("the old row").clone();
+            assert_eq!((now.1, now.2), (low, low), "re-keyed in BOTH columns");
+            assert_eq!(
+                (now.3, now.4, now.5.clone(), now.6, now.8),
+                (was.3, was.4, was.5.clone(), was.6, was.8),
+                "rank, distance, version, threshold and origin as stored"
+            );
+        }
+        assert_eq!(stack(&conn, k).len(), 2, "the gallery reads the person's stack of two");
+        assert_eq!(stack(&conn, y).len(), 3, "and the leftover stack of three — two stacks, not one of five");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// D7b — a stack left with one photo dissolves.
+    #[test]
+    fn d7b_a_stack_left_with_one_photo_dissolves()
+    {
+        let (path, conn) = fresh_catalogue("d7b");
+        let ids: Vec<i64> = ["k", "m", "x"].iter().map(|n| insert_image(&conn, &format!("/d7b/{}.jpg", n))).collect();
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &ids, automatic_members(&ids), V), 3);
+
+        assert_eq!(create_stack_writer_impl(&conn, &ids[..2], create_stack_members(&ids[..2]), V), 2);
+        assert!(!has_row(&conn, ids[2]), "x keeps no row");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// D7c — a stack whose key photo was NOT taken is left byte-identical.
+    #[test]
+    fn d7c_a_stack_whose_key_was_not_taken_is_untouched()
+    {
+        let (path, conn) = fresh_catalogue("d7c");
+        let ids: Vec<i64> = ["a", "b", "c", "d"].iter().map(|n| insert_image(&conn, &format!("/d7c/{}.jpg", n))).collect();
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &ids, automatic_members(&ids), V), 4);
+        let left = rows_for(&conn, &ids[..2]);
+
+        assert_eq!(create_stack_writer_impl(&conn, &ids[2..], create_stack_members(&ids[2..]), V), 2);
+        assert_eq!(rows_for(&conn, &ids[..2]), left, "a and b byte-identical");
+
+        // A hand-made stack whose chosen key is NOT its lowest photo: {p, q, r, s}
+        // keyed s. Create Stack [q, r] leaves p and s; the key stays, so they
+        // must not be re-keyed to p.
+        let more: Vec<i64> = ["p", "q", "r", "s"].iter().map(|n| insert_image(&conn, &format!("/d7c/{}.jpg", n))).collect();
+        let (p, q, r, s) = (more[0], more[1], more[2], more[3]);
+        assert_eq!(create_stack_writer_impl(&conn, &[s, p, q, r], create_stack_members(&[s, p, q, r]), V), 4);
+        let kept = rows_for(&conn, &[p, s]);
+        assert_eq!(create_stack_writer_impl(&conn, &[q, r], create_stack_members(&[q, r]), V), 2);
+        assert_eq!(rows_for(&conn, &[p, s]), kept, "p and s still keyed s, byte-identical");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// D7d — the B19f analogue: a dissolve never undoes a re-key. Group 1 is
+    /// keyed k; its leftovers' lowest is a. Group 2 is the malformed legacy
+    /// shape keyed on a (a's own row sits in group 1) with members e and f.
+    /// Create Stack [k, f]: group 1 re-keys to a; group 2 keeps one leftover
+    /// (e) and dissolves. Dissolving first keeps {a, b}; re-keying first would
+    /// move {a, b} onto key a and the dissolve would then delete them.
+    #[test]
+    fn d7d_a_dissolve_never_undoes_a_re_key()
+    {
+        let (path, conn) = fresh_catalogue("d7d");
+        let ids: Vec<i64> = ["k", "a", "b", "e", "f"].iter().map(|n| insert_image(&conn, &format!("/d7d/{}.jpg", n))).collect();
+        let (k, a, b, e, f) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
+        insert_raw_member(&conn, k, k, 8.5, Some(SIMILAR_STACK_ORIGIN_AUTO));
+        insert_raw_member(&conn, a, k, 8.5, Some(SIMILAR_STACK_ORIGIN_AUTO));
+        insert_raw_member(&conn, b, k, 8.5, Some(SIMILAR_STACK_ORIGIN_AUTO));
+        insert_raw_member(&conn, e, a, 8.5, Some(SIMILAR_STACK_ORIGIN_AUTO));
+        insert_raw_member(&conn, f, a, 8.5, Some(SIMILAR_STACK_ORIGIN_AUTO));
+
+        assert_eq!(create_stack_writer_impl(&conn, &[k, f], create_stack_members(&[k, f]), V), 2);
+        for id in [a, b]
+        {
+            let row = rows_for(&conn, &[id]).pop().expect("the re-keyed group survives");
+            assert_eq!((row.1, row.2), (a, a));
+        }
+        assert!(!has_row(&conn, e), "the malformed group, one leftover short, dissolved first");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// D7e — splitting a HAND-MADE stack: the leftovers stay made by hand.
+    #[test]
+    fn d7e_leftovers_of_a_hand_made_stack_stay_hand_made()
+    {
+        let (path, conn) = fresh_catalogue("d7e");
+        let h: Vec<i64> = (1..=4).map(|n| insert_image(&conn, &format!("/d7e/h{}.jpg", n))).collect();
+        assert_eq!(create_stack_writer_impl(&conn, &h, create_stack_members(&h), V), 4);
+
+        assert_eq!(create_stack_writer_impl(&conn, &h[..2], create_stack_members(&h[..2]), V), 2);
+        let low = h[2].min(h[3]);
+        for id in &h[2..]
+        {
+            let row = rows_for(&conn, &[*id]).pop().expect("a leftover row");
+            assert_eq!((row.1, row.8), (low, Some(SIMILAR_STACK_ORIGIN_USER)));
+        }
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// D8 — Create Stack over automatic members converts them.
+    #[test]
+    fn d8_create_stack_converts_automatic_members_to_hand_made()
+    {
+        let (path, conn) = fresh_catalogue("d8");
+        let ids: Vec<i64> = (1..=3).map(|n| insert_image(&conn, &format!("/d8/{}.jpg", n))).collect();
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &ids, automatic_members(&ids), V), 3);
+        for id in &ids
+        {
+            assert_eq!(origin_of(&conn, *id), Some(SIMILAR_STACK_ORIGIN_AUTO));
+        }
+
+        assert_eq!(create_stack_writer_impl(&conn, &ids, create_stack_members(&ids), V), 3);
+        for id in &ids
+        {
+            assert_eq!(origin_of(&conn, *id), Some(SIMILAR_STACK_ORIGIN_USER));
+        }
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// D9 — the S111 merge carries the mark. The backup goes through
+    /// `open_and_migrate_catalogue` before it is merged, exactly as
+    /// `merge_catalogue_from_backup` does, so its legacy row arrives marked.
+    #[test]
+    fn d9_the_backup_merge_carries_the_mark()
+    {
+        let (backup_path, backup) = fresh_catalogue("d9-backup");
+        let h: Vec<i64> = (1..=2).map(|n| insert_image(&backup, &format!("/d9/h{}.jpg", n))).collect();
+        let a: Vec<i64> = (1..=2).map(|n| insert_image(&backup, &format!("/d9/a{}.jpg", n))).collect();
+        let l: Vec<i64> = (1..=2).map(|n| insert_image(&backup, &format!("/d9/l{}.jpg", n))).collect();
+        assert_eq!(create_stack_writer_impl(&backup, &h, create_stack_members(&h), V), 2);
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&backup, &a, automatic_members(&a), V), 2);
+        insert_raw_member(&backup, l[0], l[0], 0.0, None);
+        insert_raw_member(&backup, l[1], l[0], 0.0, None);
+        backup.execute_batch("CHECKPOINT;").expect("checkpoint the backup");
+        drop(backup);
+        drop(reopen(&backup_path)); // the production migration of the backup file
+
+        let (live_path, live) = fresh_catalogue("d9-live");
+        merge_catalogue_sql(&live, backup_path.to_string_lossy().as_ref(), MergeCollisionPolicy::CurrentWins)
+            .expect("merge");
+        let origin_by_path = |p: &str| -> Option<i32>
+        {
+            live.query_row(
+                "SELECT m.origin FROM similar_photo_group_member m JOIN images i ON i.id = m.image_id \
+                 WHERE i.file_path = ?1",
+                params![p],
+                |row| row.get::<_, Option<i32>>(0),
+            )
+            .unwrap_or_else(|e| panic!("origin for {}: {}", p, e))
+        };
+        assert_eq!(origin_by_path("/d9/h1.jpg"), Some(SIMILAR_STACK_ORIGIN_USER));
+        assert_eq!(origin_by_path("/d9/a1.jpg"), Some(SIMILAR_STACK_ORIGIN_AUTO));
+        assert_eq!(origin_by_path("/d9/l1.jpg"), Some(SIMILAR_STACK_ORIGIN_USER), "the legacy hand-made row arrives marked");
+        drop(live);
+        cleanup(&live_path);
+        cleanup(&backup_path);
+    }
+
+    /// D10 — the backfill, on a REAL pre-S24 vintage: the previous identity
+    /// control's frozen fixture (V7), which has no `origin` column.
+    #[test]
+    fn d10_the_backfill_marks_a_pre_s24_catalogue_once()
+    {
+        let path = fixture_path("d10");
+        {
+            let old = Connection::open(&path).expect("the pre-S24 file");
+            // ⭐ ENGINE TESTS NEVER FETCH — a raw connection is fenced by hand.
+            fence_connection_against_extension_fetches(&old);
+            old.execute_batch(include_str!("schema_fixtures/sha256-435bd241a6e6.sql"))
+                .expect("the V7 batch replays");
+            let has_origin: i64 = old
+                .query_row(
+                    "SELECT COUNT(*) FROM duckdb_columns() WHERE table_name = 'similar_photo_group_member' \
+                     AND column_name = 'origin'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("column probe");
+            assert_eq!(has_origin, 0, "the vintage predates the column");
+            old.execute_batch(
+                "INSERT INTO similar_photo_group_member (image_id, group_id, representative_id, member_rank, \
+                 algorithm_version, threshold) VALUES \
+                 (11, 11, 11, 0, 'similar-featureprint-v4', 0.0), \
+                 (12, 11, 11, 1, 'similar-featureprint-v4', 0.0), \
+                 (21, 21, 21, 0, 'similar-featureprint-v4', 8.5), \
+                 (22, 21, 21, 1, 'similar-featureprint-v4', 8.5); \
+                 CHECKPOINT;",
+            )
+            .expect("legacy rows");
+        }
+
+        let conn = reopen(&path);
+        for (id, expected) in [(11, 1), (12, 1), (21, 2), (22, 2)]
+        {
+            assert_eq!(origin_of(&conn, id), Some(expected), "row {}", id);
+        }
+        let first = rows(&conn);
+        drop(conn);
+
+        let conn = reopen(&path);
+        assert_eq!(rows(&conn), first, "a second open changes nothing");
+        insert_raw_member(&conn, 31, 31, 0.0, None);
+        drop(conn);
+
+        let conn = reopen(&path);
+        assert_eq!(origin_of(&conn, 31), Some(SIMILAR_STACK_ORIGIN_USER), "a NULL row is marked on the next open");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// D11 — an editor save over one photo of a hand-made stack keeps it; over
+    /// an automatic stack it dissolves as before (pinned).
+    #[test]
+    fn d11_an_editor_save_keeps_a_hand_made_stack_together()
+    {
+        let (path, conn) = fresh_catalogue("d11");
+        let k = insert_image(&conn, "/d11/k.jpg");
+        let m = insert_image(&conn, "/d11/m.jpg");
+        let x = insert_image(&conn, "/d11/x.jpg");
+        let y = insert_image(&conn, "/d11/y.jpg");
+        assert_eq!(create_stack_writer_impl(&conn, &[k, m], create_stack_members(&[k, m]), V), 2);
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &[x, y], automatic_members(&[x, y]), V), 2);
+        let hand_before = rows_for(&conn, &[k, m]);
+
+        let refresh = |file_path: &str|
+        {
+            let mut saved = record(file_path);
+            saved.file_size = 9_999;
+            upsert_editor_saved_image_database(&conn, &saved, false).expect("refresh")
+        };
+        assert_eq!(refresh("/d11/m.jpg").status, EditorSavedImageCatalogueStatus::Refreshed);
+        assert_eq!(rows_for(&conn, &[k, m]), hand_before, "k and m byte-identical");
+
+        assert_eq!(refresh("/d11/x.jpg").status, EditorSavedImageCatalogueStatus::Refreshed);
+        assert!(!has_row(&conn, x) && !has_row(&conn, y), "the automatic stack dissolves (today's behaviour)");
+        assert_eq!(rows_for(&conn, &[k, m]), hand_before);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// D12 — Guard 3 fails CLOSED, and so does Create Stack's plan read. The
+    /// probe swaps each read for a statement the ENGINE rejects.
+    #[test]
+    fn d12_a_census_or_plan_that_cannot_be_read_writes_nothing()
+    {
+        let (path, conn) = fresh_catalogue("d12");
+        let h1 = insert_image(&conn, "/d12/h1.jpg");
+        let h2 = insert_image(&conn, "/d12/h2.jpg");
+        let a1 = insert_image(&conn, "/d12/a1.jpg");
+        let a2 = insert_image(&conn, "/d12/a2.jpg");
+        assert_eq!(create_stack_writer_impl(&conn, &[h1, h2], create_stack_members(&[h1, h2]), V), 2);
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &[a1, a2], automatic_members(&[a1, a2]), V), 2);
+        let before = rows(&conn);
+
+        let failing_census = SimilarStackProbe
+        {
+            census_sql: Some("SELECT pl_no_such_function()".to_string()),
+            plan_sql: None,
+        };
+        // Incoming members INCLUDE a hand-made photo: an error arm that
+        // proceeded would overwrite h1's row and delete-and-rewrite a1/a2.
+        assert_eq!(
+            upsert_similar_photo_groups_for_ids_impl_with_probe(
+                &conn,
+                &[a1, a2, h1],
+                automatic_members(&[a1, a2, h1]),
+                V,
+                Some(&failing_census)
+            ),
+            0
+        );
+        assert_eq!(rows(&conn), before, "a failed census writes nothing");
+        assert_eq!(
+            replace_similar_photo_groups_whole_impl_with_probe(&conn, automatic_members(&[a1, h1]), V, Some(&failing_census)),
+            0
+        );
+        assert_eq!(rows(&conn), before, "nor does the whole-catalogue writer");
+
+        let failing_plan = SimilarStackProbe
+        {
+            census_sql: None,
+            plan_sql: Some("SELECT pl_no_such_function()".to_string()),
+        };
+        assert_eq!(
+            create_stack_writer_impl_with_probe(&conn, &[a1, h1], create_stack_members(&[a1, h1]), V, Some(&failing_plan)),
+            0
+        );
+        assert_eq!(rows(&conn), before, "a failed plan read makes Create Stack write nothing");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// D12b — fix round 1, ADOPTED VERBATIM from the S24 Round-1 reviewer's
+    /// `s24-review/proposed_tests.rs` (finding F1): a plan read that DROPS a row (a real decode
+    /// failure: the engine returns a NULL group id) writes nothing.
+    #[test]
+    fn d12b_a_plan_that_drops_a_row_writes_nothing()
+    {
+        let (path, conn) = fresh_catalogue("d12b");
+        let h1 = insert_image(&conn, "/d12b/h1.jpg");
+        let a1 = insert_image(&conn, "/d12b/a1.jpg");
+        let a2 = insert_image(&conn, "/d12b/a2.jpg");
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &[a1, a2], automatic_members(&[a1, a2]), V), 2);
+        let before = rows(&conn);
+        let dropping_plan = SimilarStackProbe
+        {
+            census_sql: None,
+            plan_sql: Some("SELECT NULL::BIGINT, 1::BIGINT, TRUE".to_string()),
+        };
+        assert_eq!(
+            create_stack_writer_impl_with_probe(&conn, &[a1, h1], create_stack_members(&[a1, h1]), V, Some(&dropping_plan)),
+            0
+        );
+        assert_eq!(rows(&conn), before, "a plan that dropped a row makes Create Stack write nothing");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// D7f — fix round 1, ADOPTED from the S24 Round-1 reviewer's
+    /// `s24-review/proposed_tests.rs` (finding F2; first fixture verbatim, a
+    /// second fixture added by the implementer): ruling 13's sweep inside Create Stack: a row of a
+    /// touched group whose photo is already gone (the pre-slice-B bare-delete
+    /// shape) is deleted and never counts as a leftover.
+    #[test]
+    fn d7f_a_dangling_row_is_swept_and_never_counts_as_a_leftover()
+    {
+        let (path, conn) = fresh_catalogue("d7f");
+        let ids: Vec<i64> = ["k", "m", "x", "y", "g"].iter().map(|n| insert_image(&conn, &format!("/d7f/{}.jpg", n))).collect();
+        let (k, m, x, y, g) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &ids, automatic_members(&ids), V), 5);
+        conn.execute("DELETE FROM images WHERE id = ?1", params![g]).expect("bare delete (legacy shape)");
+
+        assert_eq!(create_stack_writer_impl(&conn, &[k, m], create_stack_members(&[k, m]), V), 2);
+        assert!(!has_row(&conn, g), "the dangling row is swept");
+        let low = x.min(y);
+        for id in [x, y]
+        {
+            let row = rows_for(&conn, &[id]).pop().expect("a leftover row");
+            assert_eq!((row.1, row.2), (low, low), "re-keyed to the lowest EXISTING leftover");
+        }
+
+        // Implementer's addition (fix round 1): a dead row never props a stack
+        // up to "two or more". {k2, m2, x2, g2} with g2 already gone: Create
+        // Stack [k2, m2] leaves ONE real photo, so the stack dissolves — x2
+        // keeps no row. (Catches a variant the reviewer's R4 does not: the dead
+        // row counted as a leftover but still swept.)
+        let more: Vec<i64> = ["k2", "m2", "x2", "g2"].iter().map(|n| insert_image(&conn, &format!("/d7f/{}.jpg", n))).collect();
+        let (k2, m2, x2, g2) = (more[0], more[1], more[2], more[3]);
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &more, automatic_members(&more), V), 4);
+        conn.execute("DELETE FROM images WHERE id = ?1", params![g2]).expect("bare delete (legacy shape)");
+        assert_eq!(create_stack_writer_impl(&conn, &[k2, m2], create_stack_members(&[k2, m2]), V), 2);
+        assert!(!has_row(&conn, g2), "the dangling row is swept");
+        assert!(!has_row(&conn, x2), "one real photo left: the stack dissolves; the dead row did not count");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// D3c — fix round 1, ADOPTED VERBATIM from the S24 Round-1 reviewer's
+    /// `s24-review/proposed_tests.rs` (finding F3): Guard 3 on the WHOLE-catalogue writer, through
+    /// the limb its plain INSERT cannot catch by itself (the group_id limb).
+    #[test]
+    fn d3c_the_whole_catalogue_writer_refuses_a_group_keyed_on_a_hand_made_groups_id()
+    {
+        let (path, conn) = fresh_catalogue("d3c");
+        let x = insert_image(&conn, "/d3c/x.jpg");
+        let y = insert_image(&conn, "/d3c/y.jpg");
+        let p = insert_image(&conn, "/d3c/p.jpg");
+        let q = insert_image(&conn, "/d3c/q.jpg");
+        insert_raw_member(&conn, p, x, 0.0, Some(SIMILAR_STACK_ORIGIN_USER));
+        insert_raw_member(&conn, q, x, 0.0, Some(SIMILAR_STACK_ORIGIN_USER));
+        let before = rows(&conn);
+        assert_eq!(replace_similar_photo_groups_whole_impl(&conn, automatic_members(&[x, y]), V), 0);
+        assert_eq!(rows(&conn), before, "the hand-made group's key is not written over");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// D13 — the schema: `origin` exists, INTEGER, nullable, no default, LAST,
+    /// and unindexed — on a fresh catalogue AND on an upgraded vintage.
+    #[test]
+    fn d13_origin_is_the_last_nullable_unindexed_column_without_a_default()
+    {
+        let assert_shape = |conn: &Connection, what: &str|
+        {
+            let (data_type, nullable, default, index, last): (String, bool, Option<String>, i64, i64) = conn
+                .query_row(
+                    "SELECT c.data_type, c.is_nullable, c.column_default, c.column_index, \
+                            (SELECT MAX(column_index) FROM duckdb_columns() \
+                              WHERE table_name = 'similar_photo_group_member') \
+                       FROM duckdb_columns() c \
+                      WHERE c.table_name = 'similar_photo_group_member' AND c.column_name = 'origin'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                )
+                .unwrap_or_else(|e| panic!("{}: the origin column is missing: {}", what, e));
+            assert_eq!(data_type, "INTEGER", "{}", what);
+            assert!(nullable, "{}: origin must be nullable", what);
+            assert_eq!(default, None, "{}: origin must have NO default (S62)", what);
+            assert_eq!(index, last, "{}: origin must be the LAST column", what);
+            let indexed: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM duckdb_indexes() WHERE table_name = 'similar_photo_group_member' \
+                     AND lower(expressions) LIKE '%origin%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("index probe");
+            assert_eq!(indexed, 0, "{}: no index names origin", what);
+            let indexes: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM duckdb_indexes() WHERE table_name = 'similar_photo_group_member'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("index count");
+            assert_eq!(indexes, 3, "{}: the three existing indexes, and only those", what);
+        };
+
+        let (path, conn) = fresh_catalogue("d13-fresh");
+        assert_shape(&conn, "fresh");
+        drop(conn);
+        cleanup(&path);
+
+        let old_path = fixture_path("d13-vintage");
+        {
+            let old = Connection::open(&old_path).expect("the pre-S24 file");
+            fence_connection_against_extension_fetches(&old);
+            old.execute_batch(include_str!("schema_fixtures/sha256-435bd241a6e6.sql"))
+                .expect("the V7 batch replays");
+            old.execute_batch("CHECKPOINT;").expect("checkpoint");
+        }
+        let upgraded = reopen(&old_path);
+        assert_shape(&upgraded, "upgraded from V7");
+        drop(upgraded);
+        cleanup(&old_path);
+    }
+
+    fn record(file_path: &str) -> ImageMetadata
+    {
+        ImageMetadata
+        {
+            file_path: file_path.to_string(),
+            file_size: 1234,
+            file_name: file_path.rsplit('/').next().unwrap_or(file_path).to_string(),
+            file_extension: Some("jpg".to_string()),
+            created_timestamp: 1_700_000_000,
+            modified_timestamp: 1_700_000_001,
+            camera_make: None,
+            camera_model: None,
+            lens_model: None,
+            focal_length: None,
+            aperture: None,
+            shutter_speed: None,
+            iso: None,
+            capture_datetime: None,
+            pixel_width: None,
+            pixel_height: None,
+            color_space: None,
+            bit_depth: None,
+            gps_latitude: None,
+            gps_longitude: None,
+            gps_altitude: None,
+            copyright: None,
+            creator: None,
+            description: None,
+            rating: None,
+            flag: None,
+            color_label: None,
+            rotation: None,
+            is_video: false,
+            duration_seconds: None,
+            frame_rate: None,
+            video_kind: None,
+            video_codec: None,
+            video_bitrate: None,
+            color_primaries: None,
+            color_transfer: None,
+            color_matrix: None,
+            color_range: None,
+            dv_profile: None,
+            has_audio: None,
+            audio_codec: None,
+            audio_channels: None,
+            audio_sample_rate: None,
+            audio_bitrate: None,
+            live_photo_id: None,
+            external_source_id: None,
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Evidence, not pins — run explicitly in the release profile:
+    //   cargo test --release --lib durable_stack_tests::e -- --ignored --nocapture
+    // ---------------------------------------------------------------------
+
+    /// E1 — the backfill's no-op cost on a 100k-row membership table (every
+    /// row already marked). STOP-AND-REPORT above 20 ms.
+    #[test]
+    #[ignore]
+    fn e1_the_backfill_no_op_costs_on_a_100k_row_table()
+    {
+        let (path, conn) = fresh_catalogue("e1");
+        conn.execute_batch(
+            "INSERT INTO similar_photo_group_member (image_id, group_id, representative_id, member_rank, \
+             distance_to_representative, algorithm_version, threshold, origin) \
+             SELECT i, i - (i % 4), i - (i % 4), i % 4, 1.0, 'similar-featureprint-v4', \
+                    CASE WHEN i % 10 = 0 THEN 0.0 ELSE 8.5 END, \
+                    CASE WHEN i % 10 = 0 THEN 1 ELSE 2 END \
+               FROM range(1, 100001) t(i); CHECKPOINT;",
+        )
+        .expect("100k rows");
+        drop(conn);
+        let conn = reopen(&path); // the open itself ran the no-op once
+        let mut samples = Vec::new();
+        for _ in 0..7
+        {
+            let started = std::time::Instant::now();
+            let changed = conn
+                .execute(
+                    SIMILAR_STACK_ORIGIN_BACKFILL_SQL,
+                    params![SIMILAR_STACK_ORIGIN_USER, SIMILAR_STACK_ORIGIN_AUTO],
+                )
+                .expect("backfill");
+            samples.push(started.elapsed());
+            assert_eq!(changed, 0);
+        }
+        samples.sort();
+        println!("E1 backfill no-op on 100,000 rows: samples {:?}; median {:?}", samples, samples[3]);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// E2 — the whole-catalogue candidate query with and without Guard 1, on a
+    /// 100k-still fixture with 1,000 hand-made rows.
+    #[test]
+    #[ignore]
+    fn e2_the_candidate_query_with_and_without_guard_1()
+    {
+        let (path, conn) = fresh_catalogue("e2");
+        conn.execute_batch(
+            "INSERT INTO images (id, file_path, file_size, file_name, created_timestamp, modified_timestamp, \
+             is_video, focus_analysis_status, focus_algorithm_version, directory_path, camera_model) \
+             SELECT i, '/e2/' || i || '.jpg', 1234, i || '.jpg', i, i, FALSE, 'complete', 'v7', \
+                    '/e2/' || (i // 500), 'cam' \
+               FROM range(1, 100001) t(i); \
+             INSERT INTO similar_photo_group_member (image_id, group_id, representative_id, member_rank, \
+             algorithm_version, threshold, origin) \
+             SELECT i, i - (i % 2), i - (i % 2), i % 2, 'similar-featureprint-v4', 0.0, 1 \
+               FROM range(2, 1002) t(i); CHECKPOINT;",
+        )
+        .expect("100k stills");
+        let without = "SELECT id, file_path, file_size, created_timestamp, capture_datetime, directory_path, camera_model \
+             FROM images WHERE is_video IS NOT TRUE AND focus_analysis_status = 'complete' \
+             AND focus_algorithm_version = ?1 \
+             ORDER BY directory_path ASC NULLS LAST, camera_model ASC NULLS LAST, \
+                      capture_datetime ASC NULLS LAST, created_timestamp ASC, id ASC";
+        let mut with_guard = Vec::new();
+        let mut without_guard = Vec::new();
+        for _ in 0..5
+        {
+            let started = std::time::Instant::now();
+            let n = similar_photo_candidates_impl(&conn, "v7", None).len();
+            with_guard.push(started.elapsed());
+            assert_eq!(n, 99_000);
+            let started = std::time::Instant::now();
+            let mut stmt = conn.prepare(without).expect("prepare");
+            let count = stmt.query_map(params!["v7"], |row| row.get::<_, i64>(0)).expect("query").count();
+            without_guard.push(started.elapsed());
+            assert_eq!(count, 100_000);
+        }
+        with_guard.sort();
+        without_guard.sort();
+        println!(
+            "E2 candidates on 100,000 stills: with Guard 1 median {:?} {:?}; without median {:?} {:?}",
+            with_guard[2], with_guard, without_guard[2], without_guard
+        );
+        drop(conn);
+        cleanup(&path);
     }
 }
 
@@ -34504,49 +36140,42 @@ mod pipeline_scale_hardening_tests {
         assert_eq!(completed_similar_photo_unit_checkpoints_impl(&conn, "v4").len(), 2);
     }
 
-    fn neighborhood_conn() -> Connection {
-        let conn = Connection::open_in_memory().expect("in-memory db");
-        conn.execute_batch(
-            "CREATE TABLE images (
-                 id INTEGER PRIMARY KEY,
-                 file_path TEXT NOT NULL,
-                 file_size BIGINT NOT NULL,
-                 created_timestamp BIGINT NOT NULL,
-                 capture_datetime TEXT,
-                 directory_path TEXT,
-                 camera_model TEXT,
-                 is_video BOOLEAN,
-                 focus_analysis_status TEXT,
-                 focus_algorithm_version TEXT
-             );
-             CREATE TABLE similar_photo_featureprint (
-                 image_id INTEGER NOT NULL,
-                 algorithm_version TEXT NOT NULL,
-                 source_stamp TEXT NOT NULL,
-                 featureprint_blob BLOB NOT NULL,
-                 PRIMARY KEY (image_id, algorithm_version)
-             );",
-        )
-        .expect("schema");
-        conn
+    /// ⭐ S24: a REAL temp-file catalogue through the production open path —
+    /// the neighborhood query now reads `similar_photo_group_member` (Guard 1),
+    /// which the old hand-rolled in-memory fixture did not have.
+    fn neighborhood_catalogue() -> (std::path::PathBuf, Connection) {
+        let path = std::env::temp_dir().join(format!(
+            "plcore-pipeline-neighborhood-test-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+        let conn = open_and_migrate_catalogue(&path).expect("neighborhood catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH.
+        fence_connection_against_extension_fetches(&conn);
+        (path, conn)
     }
 
     #[test]
     fn missing_neighborhood_returns_radius_window_only() {
-        let conn = neighborhood_conn();
+        let (path, conn) = neighborhood_catalogue();
         // Ten eligible stills; identical sort fields except id, so the
         // deterministic ORDER BY ranks them 1..=10 by id.
         for id in 1..=10 {
             conn.execute(
-                "INSERT INTO images VALUES (?1, ?2, 100, ?1, NULL, '/d', 'cam', FALSE, 'complete', 'v7')",
-                params![id, format!("/d/f{}.jpg", id)],
+                "INSERT INTO images (id, file_path, file_size, file_name, created_timestamp, \
+                 modified_timestamp, capture_datetime, directory_path, camera_model, is_video, \
+                 focus_analysis_status, focus_algorithm_version) \
+                 VALUES (?1, ?2, 100, ?3, ?1, 0, NULL, '/d', 'cam', FALSE, 'complete', 'v7')",
+                params![id, format!("/d/f{}.jpg", id), format!("f{}.jpg", id)],
             )
             .expect("image row");
         }
         // Featureprints exist for everything EXCEPT ids 5 and 6.
         for id in [1i64, 2, 3, 4, 7, 8, 9, 10] {
             conn.execute(
-                "INSERT INTO similar_photo_featureprint VALUES (?1, 'v4', 's', 'b')",
+                "INSERT INTO similar_photo_featureprint (image_id, algorithm_version, source_stamp, \
+                 featureprint_blob) VALUES (?1, 'v4', 's', 'b')",
                 params![id],
             )
             .expect("fp row");
@@ -34563,12 +36192,16 @@ mod pipeline_scale_hardening_tests {
         // Fully featureprinted corpus = empty neighborhood (nothing new).
         for id in [5i64, 6] {
             conn.execute(
-                "INSERT INTO similar_photo_featureprint VALUES (?1, 'v4', 's', 'b')",
+                "INSERT INTO similar_photo_featureprint (image_id, algorithm_version, source_stamp, \
+                 featureprint_blob) VALUES (?1, 'v4', 's', 'b')",
                 params![id],
             )
             .expect("fp row");
         }
         assert!(similar_photo_candidates_missing_neighborhood_impl(&conn, "v7", "v4", 2).is_empty());
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
     }
 
     fn face_conn() -> Connection {
@@ -36960,8 +38593,9 @@ mod schema_upgrade_fixture_tests
     /// S127 was a fresh-catalogue baseline). Fingerprinting every commit that
     /// touched the schema batch collapses the post-2026-07-03 window into SIX
     /// distinct committed states, V1…V6; V7 is slice B's removal tombstone
-    /// (S184, committed in 5bad24c): the identity control, and the first
-    /// fixture named by its content hash (ruling 32).
+    /// (S184, committed in 5bad24c), the first fixture named by its content
+    /// hash (ruling 32); V8 is slice S24's `similar_photo_group_member.origin`
+    /// (2026-10-02): the identity control.
     ///
     /// ⚠️ NARROWED in fix round 1 (2026-09-25, reviewer finding K-F1). ⛔ The old
     /// wording, "the reachable window OPENS on 2026-07-03", does **not** follow
@@ -36980,7 +38614,7 @@ mod schema_upgrade_fixture_tests
     /// one column comment — which is why the fixture is named for 8193d5d and is
     /// byte-exact against 8193d5d's blob. 8193d5d is also the S111 commit at which
     /// such a catalogue first became BACKUP-able.
-    const VINTAGES: [Vintage; 9] = [
+    const VINTAGES: [Vintage; 10] = [
         Vintage
         {
             tag: "V1",
@@ -37043,7 +38677,8 @@ mod schema_upgrade_fixture_tests
         },
         // ⭐ V7 — slice B's removal tombstone (S184, 2026-09-26): the two
         // `removed_image_tombstone*` tables and their index, CREATE-time only.
-        // THE IDENTITY CONTROL, and the first fixture named by the SHA-256 of
+        // The identity control until slice S24 (its flag and its identity
+        // assertion moved to V8), and the first fixture named by the SHA-256 of
         // its own bytes (ruling 32): `shasum -a 256` of the file begins
         // 435bd241a6e6, and the naming pin re-checks that on every run. Cut
         // from the working tree as `PENDING-B.sql` (S184), renamed
@@ -37060,6 +38695,24 @@ mod schema_upgrade_fixture_tests
             date: "2026-09-26",
             file: "sha256-435bd241a6e6.sql",
             ddl: include_str!("schema_fixtures/sha256-435bd241a6e6.sql"),
+            allowed: &[],
+            is_identity_control: false,
+        },
+        // ⭐ V8 — slice S24's durable hand-made stacks (2026-10-02): the
+        // `origin INTEGER` column LAST in the `similar_photo_group_member`
+        // CREATE body plus its bare `ALTER … ADD COLUMN IF NOT EXISTS origin
+        // INTEGER` (no default — S62). THE IDENTITY CONTROL. Named by the
+        // SHA-256 of its own bytes (ruling 32): `shasum -a 256` of the file
+        // begins bfb49cce6d91. Cut from the working tree; `source_commit` stays
+        // `None` until a commit carries it (it MAY then be filled in — never a
+        // rename).
+        Vintage
+        {
+            tag: "V8",
+            source_commit: None,
+            date: "2026-10-02",
+            file: "sha256-bfb49cce6d91.sql",
+            ddl: include_str!("schema_fixtures/sha256-bfb49cce6d91.sql"),
             allowed: &[],
             is_identity_control: true,
         },
@@ -37122,7 +38775,7 @@ mod schema_upgrade_fixture_tests
     /// `VINTAGES` row is added or removed without updating it. The detector for a
     /// moved schema batch is
     /// `the_identity_control_fixture_is_byte_identical_to_the_in_tree_schema_batch`.
-    const EXPECTED_VINTAGE_COUNT: usize = 9;
+    const EXPECTED_VINTAGE_COUNT: usize = 10;
 
     /// ⭐ RULING 32 (2026-09-27) — the ONLY fixtures that keep a COMMIT name,
     /// because their provenance is real: each reproduces byte-for-byte from its
@@ -37643,7 +39296,7 @@ mod schema_upgrade_fixture_tests
             "exactly one vintage must be the identity control (the working tree's own \
              schema batch); without it a green sweep proves nothing about the comparison"
         );
-        for tag in ["V1", "V2", "V3", "V4", "V5", "V6", "V7", "TIER3-4599235", "GENESIS"]
+        for tag in ["V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "TIER3-4599235", "GENESIS"]
         {
             let v = vintage(tag);
             assert!(
@@ -37756,17 +39409,26 @@ mod schema_upgrade_fixture_tests
         assert_vintage_upgrades(vintage("V6"));
     }
 
-    /// K-2 — THE IDENTITY CONTROL. V7 is the working tree's own schema batch, so
+    /// V7 — slice B's state (S184, 2026-09-26). It was the identity control
+    /// until slice S24's schema addition made V8 the working tree; its identity
+    /// assertion moved to V8's test with the flag (S24).
+    #[test]
+    fn v7_2026_09_26_upgrades_to_the_current_schema()
+    {
+        assert_vintage_upgrades(vintage("V7"));
+    }
+
+    /// K-2 — THE IDENTITY CONTROL. V8 is the working tree's own schema batch, so
     /// its upgrade must produce ZERO divergence. This is the assertion that
     /// proves a green K-1 means something rather than that the comparison is
     /// broken.
     #[test]
-    fn v7_the_identity_control_upgrades_to_a_byte_identical_schema()
+    fn v8_the_identity_control_upgrades_to_a_byte_identical_schema()
     {
-        let v = vintage("V7");
+        let v = vintage("V8");
         assert!(
             v.is_identity_control,
-            "V7 must be flagged as the identity control"
+            "V8 must be flagged as the identity control"
         );
         assert_vintage_upgrades(v);
     }
@@ -43961,6 +45623,67 @@ mod cross_store_tests
     }
 
     // ------------------------------------------------------------------
+    // ⭐ Fix round 1 (review F5) — the NAMED-PEOPLE census fails closed too.
+    // A real per-row decode failure, with no product seam: the person's
+    // `display_name` is made NULL (the fixture rebuilds `person` without its
+    // NOT NULL), so its census row cannot decode as a String and `collect_rows_counted`
+    // counts it dropped. A census that lost a row must abort the chunk —
+    // otherwise the cascade deletes the assignment and leaves `People/<Name>`
+    // claiming a face nothing backs.
+    // ------------------------------------------------------------------
+    #[test]
+    fn p5b_a_named_people_census_that_loses_a_row_rolls_the_chunk_back()
+    {
+        let (_fixture, conn) = fresh_catalogue("p5b");
+        let image = insert_image(&conn, "/f/people-census.jpg", "jpeg");
+        let face = insert_face(&conn, image, image, 0, ALGO);
+        name_faces(&conn, &[face], "Linus");
+        add_cluster_member(&conn, "run-5b", face, image);
+        let person_path = people_path("Linus");
+        let origin_before = keyword_row(&conn, image, &person_path).expect("fixture: People/Linus projected").1;
+        assert_ne!(origin_before & KEYWORD_ORIGIN_FACE, 0, "fixture: People/Linus carries the face bit");
+        // DuckDB refuses `ALTER … DROP NOT NULL` while `idx_person_normalized_name`
+        // depends on the table, so the fixture rebuilds `person` unconstrained,
+        // same columns and ids, with the name NULL.
+        conn.execute_batch(
+            "CREATE TABLE person_fixture AS SELECT * FROM person; \
+             DROP TABLE person; \
+             CREATE TABLE person AS \
+                 SELECT id, CAST(NULL AS TEXT) AS display_name, normalized_name, created_at, updated_at \
+                 FROM person_fixture;",
+        )
+        .expect("fixture: an undecodable named-people census row");
+
+        let receipt = update_focus_analysis_results_impl(&conn, vec![analysis(image, "failed", 0)], None);
+        assert_eq!(receipt.failure_stage.as_deref(), Some("apply"), "P5b/stage: {:?}", receipt.failed_reason);
+        assert_eq!(receipt.updated, 0, "P5b/updated");
+        let reason = receipt.failed_reason.unwrap_or_default();
+        assert!(reason.contains("named-people census lost 1 row(s)"), "P5b/reason: {}", reason);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM face_observation"), 1, "P5b/the-observation-survives");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person_face_assignment"), 1, "P5b/the-assignment-survives");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM face_cluster_member"), 1, "P5b/the-member-survives");
+        assert!(queued(&conn).is_empty(), "P5b/nothing-queued");
+        assert_eq!(
+            keyword_row(&conn, image, &person_path).map(|row| row.1),
+            Some(origin_before),
+            "P5b/the-keyword-is-untouched"
+        );
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM images WHERE id = {} AND focus_analysis_status IS NULL", image)),
+            1,
+            "P5b/the-whole-chunk-rolled-back"
+        );
+
+        // Control: the name restored, the same chunk succeeds and re-origins.
+        conn.execute_batch("UPDATE person SET display_name = 'Linus';").expect("restore the name");
+        let receipt = update_focus_analysis_results_impl(&conn, vec![analysis(image, "failed", 0)], None);
+        assert_eq!(receipt.failure_stage, None, "P5b/control: {:?}", receipt.failed_reason);
+        assert_eq!(queued(&conn), [face].into_iter().collect(), "P5b/control-queues");
+        let row = keyword_row(&conn, image, &person_path).expect("People/Linus kept");
+        assert_eq!(row.1 & KEYWORD_ORIGIN_FACE, 0, "P5b/control-re-origins");
+    }
+
+    // ------------------------------------------------------------------
     // P6 · P7 · P8 — R-50: ONE commit, the three-column key.
     // ------------------------------------------------------------------
     #[test]
@@ -44867,14 +46590,21 @@ mod cross_store_tests
     // ------------------------------------------------------------------
 
     /// A store holding `live` (canonical), `twin` (a LIVE twin row canonicalize
-    /// left behind — its id must never be re-deleted), and two orphans whose
-    /// observations were deleted directly in SQL (the historical leak).
+    /// left behind — its id must never be re-deleted), `old_live` (a LIVE face
+    /// analysed under an EARLIER culling version — vectors are keyed by model,
+    /// not by algorithm version, so its vector is live too), and two orphans
+    /// whose observations were deleted directly in SQL (the historical leak).
+    ///
+    /// ⭐ Fix round 1 (review F1): `old_live` makes a live-id read narrowed to
+    /// the current algorithm version visible — under that narrowing it would be
+    /// queued for deletion, the worst direction D6 names.
     struct SweepScene
     {
         fixture: Fixture,
         check: Connection,
         live: i64,
         twin: i64,
+        old_live: i64,
         orphans: BTreeSet<i64>,
     }
 
@@ -44883,14 +46613,16 @@ mod cross_store_tests
         let (fixture, conn) = fresh_catalogue(tag);
         let raw = insert_image(&conn, "/s/a.nef", "raw");
         let jpeg = insert_image(&conn, "/s/a.jpg", "jpeg");
+        let older = insert_image(&conn, "/s/b.jpg", "jpeg");
         let live = insert_face(&conn, jpeg, jpeg, 0, ALGO);
         let twin = insert_face(&conn, raw, jpeg, 0, ALGO);
+        let old_live = insert_face(&conn, older, older, 0, OLD_ALGO);
         let gone_a = insert_face(&conn, jpeg, jpeg, 1, ALGO);
         let gone_b = insert_face(&conn, jpeg, jpeg, 2, ALGO);
         let check = second_connection(&conn);
         let installed = Installed::new(&fixture, conn);
         let stored = block(upsert_face_embeddings_impl(
-            [live, twin, gone_a, gone_b].iter().map(|id| record(*id, MODEL, 1.0)).collect(),
+            [live, twin, old_live, gone_a, gone_b].iter().map(|id| record(*id, MODEL, 1.0)).collect(),
         ));
         assert_eq!(stored.status, "stored");
         check
@@ -44903,6 +46635,7 @@ mod cross_store_tests
                 check,
                 live,
                 twin,
+                old_live,
                 orphans: [gone_a, gone_b].into_iter().collect(),
             },
             installed,
@@ -44917,6 +46650,14 @@ mod cross_store_tests
         let probe = OrphanSweepProbe::new();
         let result = block(retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, Some(&probe)));
         assert!(result.orphan_scan_ran, "P15/ran: {}", result.message);
+        // ⭐ Fix round 1 (F1): a live face from an EARLIER algorithm version is
+        // not an orphan — the anti-join is "no row with this id at all", never
+        // "no row at the current version".
+        assert!(
+            !queued(&scene.check).contains(&scene.old_live),
+            "P15/the-older-version's-live-face-is-not-an-orphan: {}",
+            result.message
+        );
         assert_eq!(result.orphans_enqueued, 2, "P15/enqueued: {}", result.message);
         assert_eq!(queued(&scene.check), scene.orphans, "P15/exactly-the-orphans");
         assert!(!queued(&scene.check).contains(&scene.twin), "P15/the-live-twin-is-not-an-orphan");
@@ -44930,12 +46671,17 @@ mod cross_store_tests
         assert!(queued(&scene.check).is_empty(), "P15/queue-empty-after");
         assert_eq!(
             stored_ids(&scene.fixture.vectors_uri()),
-            [scene.live, scene.twin].into_iter().collect(),
-            "P15/the-store-keeps-the-live-and-the-twin"
+            [scene.live, scene.twin, scene.old_live].into_iter().collect(),
+            "P15/the-store-keeps-the-live-the-twin-and-the-older-version's-face"
         );
         // (The fixture's TWIN vector keeps the gate open — canonicalize deletes
         // twin vectors in the product — so the next scan RUNS and finds nothing.)
         assert_eq!(next.orphans_enqueued, 0, "P15/nothing-left-to-queue: {}", next.message);
+        assert!(
+            !queued(&scene.check).contains(&scene.old_live),
+            "P15/the-older-version's-face-survives-the-next-retry: {}",
+            next.message
+        );
 
         // The cap (M17): 50,000 per run, and a smaller cap bounds the run.
         assert_eq!(ORPHAN_VECTOR_SWEEP_CAP, 50_000, "P15/cap-is-50000");
@@ -44997,6 +46743,138 @@ mod cross_store_tests
         assert_eq!(result.orphans_enqueued, 0, "P17(b)/nothing-enqueued: {}", result.message);
         assert!(queued(&scene.check).is_empty(), "P17(b)/queue-empty");
         assert!(result.message.contains("abandoned"), "P17(b)/says-abandoned: {}", result.message);
+    }
+
+    /// Every directory under `root` (inclusive) made read-only for the life of
+    /// this value, restored on drop (panic or not) so the fixture can delete
+    /// itself. Reads still work (r-x); a LanceDB commit cannot write.
+    struct ReadOnlyTree
+    {
+        dirs: Vec<std::path::PathBuf>,
+    }
+
+    impl ReadOnlyTree
+    {
+        fn new(root: &std::path::Path) -> Self
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut dirs = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(dir) = stack.pop()
+            {
+                for entry in std::fs::read_dir(&dir).expect("read store directory")
+                {
+                    let path = entry.expect("store entry").path();
+                    if path.is_dir()
+                    {
+                        stack.push(path);
+                    }
+                }
+                dirs.push(dir);
+            }
+            for dir in &dirs
+            {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555))
+                    .expect("make the store directory read-only");
+            }
+            ReadOnlyTree { dirs }
+        }
+    }
+
+    impl Drop for ReadOnlyTree
+    {
+        fn drop(&mut self)
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for dir in &self.dirs
+            {
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // ⭐ Fix round 1 (review F4) — the sweep runs ONLY after a COMPLETED drain.
+    // (c) a DEFERRED drain: one orphan queued, the store readable but not
+    //     writable, so the queued delete cannot commit. The sweep could run
+    //     (the gate is open and the store reads) — it must not.
+    // (d) a FAILED drain: the queue table cannot be read.
+    // Each case's control shows the same scene WOULD sweep once the drain
+    // completes. (`VectorTableAbsent` is not pinned: with no table the sweep's
+    // own open finds the same absence, so a sweep after it is unobservable.)
+    // ------------------------------------------------------------------
+    #[test]
+    fn p17c_p17d_the_sweep_runs_only_after_a_completed_drain()
+    {
+        let _serial = serial();
+
+        // (c) Deferred.
+        let (scene, installed) = sweep_scene("p17c");
+        let first_orphan = *scene.orphans.iter().next().expect("an orphan");
+        scene
+            .check
+            .execute(
+                "INSERT INTO face_vector_pending_delete (face_observation_id) VALUES (?1)",
+                params![first_orphan],
+            )
+            .expect("queue one orphan");
+        let stored_before = stored_ids(&scene.fixture.vectors_uri());
+        {
+            let _read_only = ReadOnlyTree::new(&scene.fixture.vectors());
+            let probe = OrphanSweepProbe::new();
+            let result =
+                block(retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, Some(&probe)));
+            assert_eq!(
+                result.status,
+                FaceVectorDeleteRetryStatus::Deferred,
+                "fixture: a read-only store defers the queued delete: {}",
+                result.message
+            );
+            assert!(!result.orphan_scan_ran, "P17(c)/no-sweep-after-a-deferred-drain: {}", result.message);
+            assert_eq!(probe.scans.load(Ordering::SeqCst), 0, "P17(c)/no-store-scan-after-a-deferred-drain");
+            assert_eq!(result.orphans_enqueued, 0, "P17(c)/nothing-enqueued: {}", result.message);
+            assert_eq!(
+                queued(&scene.check),
+                [first_orphan].into_iter().collect(),
+                "P17(c)/the-queue-holds-only-what-was-queued"
+            );
+        }
+        assert_eq!(stored_ids(&scene.fixture.vectors_uri()), stored_before, "P17(c)/the-store-is-unchanged");
+        // Control: the store is writable again → the drain completes and the
+        // sweep runs, queueing the other orphan.
+        let probe = OrphanSweepProbe::new();
+        let control = block(retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, Some(&probe)));
+        assert_eq!(control.acknowledged_count, 1, "P17(c)/control-drains: {}", control.message);
+        assert!(control.orphan_scan_ran, "P17(c)/control-sweeps: {}", control.message);
+        assert_eq!(control.orphans_enqueued, 1, "P17(c)/control-queues-the-other-orphan: {}", control.message);
+        drop(installed);
+        drop(scene);
+
+        // (d) Failed.
+        let (scene, _installed) = sweep_scene("p17d");
+        scene
+            .check
+            .execute_batch("ALTER TABLE face_vector_pending_delete RENAME TO face_vector_pending_delete_aside;")
+            .expect("hide the queue table");
+        let probe = OrphanSweepProbe::new();
+        let result = block(retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, Some(&probe)));
+        assert_eq!(
+            result.status,
+            FaceVectorDeleteRetryStatus::Failed,
+            "fixture: an unreadable queue fails the drain: {}",
+            result.message
+        );
+        assert!(!result.orphan_scan_ran, "P17(d)/no-sweep-after-a-failed-drain: {}", result.message);
+        assert_eq!(probe.scans.load(Ordering::SeqCst), 0, "P17(d)/no-store-scan-after-a-failed-drain");
+        // Control: the queue is back → the drain completes and the sweep runs.
+        scene
+            .check
+            .execute_batch("ALTER TABLE face_vector_pending_delete_aside RENAME TO face_vector_pending_delete;")
+            .expect("restore the queue table");
+        let probe = OrphanSweepProbe::new();
+        let control = block(retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, Some(&probe)));
+        assert!(control.orphan_scan_ran, "P17(d)/control-sweeps: {}", control.message);
+        assert_eq!(control.orphans_enqueued, 2, "P17(d)/control-queues-both-orphans: {}", control.message);
     }
 
     // ------------------------------------------------------------------
@@ -45258,6 +47136,40 @@ mod cross_store_tests
         ));
         assert!(set.store_ok);
         assert_eq!(set.unreadable_half, None, "R5/healthy-no-half");
+    }
+
+    // ------------------------------------------------------------------
+    // ⭐ Fix round 1 (review F8) — drive Batch 3's census through the BUNDLED
+    // engine (1.5.5), never the Homebrew CLI (1.5.2 against a 1.5.5-written
+    // catalogue). `#[ignore]`d and gated on `PL_P_CENSUS_DB`, which must point
+    // at a disposable COPY (catalogue.db + catalogue.db.wal) — opening it
+    // replays the WAL into that copy. Read-only SQL; prints one line.
+    // ------------------------------------------------------------------
+    #[test]
+    #[ignore]
+    fn p_drive_census_on_a_catalogue_copy()
+    {
+        let path = std::env::var("PL_P_CENSUS_DB")
+            .expect("set PL_P_CENSUS_DB to a disposable copy of catalogue.db");
+        let conn = Connection::open(&path).expect("open the catalogue copy");
+        fence_connection_against_extension_fetches(&conn);
+        let version = conn
+            .query_row("SELECT version()", [], |row| row.get::<_, String>(0))
+            .expect("engine version");
+        let orphan_assignments = orphan_assignments(&conn);
+        let orphan_cluster_members = count(
+            &conn,
+            "SELECT COUNT(*) FROM face_cluster_member m \
+             WHERE NOT EXISTS (SELECT 1 FROM face_observation f WHERE f.id = m.face_observation_id)",
+        );
+        let queued = count(&conn, "SELECT COUNT(*) FROM face_vector_pending_delete");
+        // The total, so the drive can see the fan-out happened (it falls by the
+        // RAW's named faces) — without it a "did not grow" PASS can be vacuous.
+        let assignments = count(&conn, "SELECT COUNT(*) FROM person_face_assignment");
+        println!(
+            "P-CENSUS engine={} assignments={} orphan_assignments={} orphan_cluster_members={} queued={}",
+            version, assignments, orphan_assignments, orphan_cluster_members, queued
+        );
     }
 
     // ------------------------------------------------------------------
