@@ -2422,12 +2422,24 @@ pub(crate) fn apply_extension_autoload_policy(conn: &Connection) {
 ///
 /// Production never constructs one: outside `cfg(test)` the referent type is
 /// uninhabited, so `MigrationProbeRef` can only ever be `None`.
+///
+/// ⭐ E3 (ruling 15) added the two row-migration fields below and
+/// `#[derive(Default)]`, so a test names only the knob it turns.
 #[cfg(test)]
+#[derive(Default)]
 struct MigrationProbe
 {
     /// When `Some`, the `directory_path` repair runs THIS statement instead of
     /// `directory_path_backfill_sql()`.
     forced_repair_sql: Option<String>,
+    /// E3 — at this step, run a statement the ENGINE fails with this class
+    /// IN PLACE OF the step's own SQL, inside the migration transaction, on
+    /// the real connection (E3 fix round 1: the step's own execute-and-`?`
+    /// line carries the failure).
+    fail_migration_step: Option<(MigrationStep, InducedFailure)>,
+    /// E3 — replace the migration's ROLLBACK text (only to make the ROLLBACK
+    /// itself fail).
+    rollback_sql_override: Option<&'static str>,
 }
 
 #[cfg(test)]
@@ -2448,6 +2460,193 @@ fn forced_repair_sql(probe: MigrationProbeRef<'_>) -> Option<String>
 fn forced_repair_sql(_probe: MigrationProbeRef<'_>) -> Option<String>
 {
     None
+}
+
+/// ⭐ E3 / ruling 15 — the row migration's steps, named for the log and the
+/// test seam. `BackfillUpdate` carries the row's position in Step 1's loop so a
+/// test can fail the SECOND row, after one UPDATE has already landed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MigrationStep
+{
+    BackfillSelect,
+    BackfillUpdate
+    {
+        row_index: usize,
+    },
+    ExtensionLowercase,
+    ReclassifyDng,
+    ReclassifyPsd,
+    ReclassifyTiff,
+    ReclassifyPng,
+}
+
+/// What the row migration did, printed only after its COMMIT returned Ok.
+#[derive(Debug)]
+struct MigrationCounts
+{
+    backfilled: u64,
+    extension_lowercased: u64,
+    reclassified_dng: u64,
+    reclassified_psd: u64,
+    reclassified_tiff: u64,
+    reclassified_png: u64,
+}
+
+#[derive(Debug)]
+enum CatalogueMigrationOutcome
+{
+    Applied(MigrationCounts),
+    /// The reason names the step that failed and carries the engine's text.
+    RolledBack(String),
+}
+
+/// ⭐ E3 / slice D3 — the failures the seams induce, by ENGINE class. The
+/// class is the whole point: an execution-class error ABORTS a DuckDB 1.5.5
+/// transaction (every later statement fails "aborted" and COMMIT then returns
+/// Ok while discarding everything); a catalog-class error does NOT abort, so a
+/// COMMIT after it publishes a PARTIAL migration. A pin that only ever induced
+/// the first would stay green under "COMMIT instead of ROLLBACK", because the
+/// engine discards the work anyway. `the_induced_failures_have_the_engine_
+/// classes_the_pins_rely_on` pins both meanings against an engine bump.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InducedFailure
+{
+    /// "Conversion Error" — ABORTS the transaction (E3 probe A3).
+    ExecutionClass,
+    /// "Catalog Error" — does NOT abort (E3 probes A5/A12).
+    CatalogClass,
+}
+
+/// The parameterless statement the ENGINE rejects with the requested class.
+#[cfg(test)]
+fn induced_failure_sql(failure: InducedFailure) -> &'static str
+{
+    match failure
+    {
+        InducedFailure::ExecutionClass =>
+        {
+            "SELECT CAST('E3 induced execution-class failure' AS INTEGER);"
+        }
+        InducedFailure::CatalogClass => "SELECT pl_e3_no_such_function();",
+    }
+}
+
+/// The statement a test runs IN PLACE OF a row-migration step's own SQL. It
+/// has the step's shape, so the step's own execute line takes it unchanged:
+/// Step 1's UPDATE binds three parameters, so its substitute binds the same
+/// three; every other step's substitute is parameterless. Each text's engine
+/// class, in the exact form its step runs it, is pinned by
+/// `every_substituted_step_statement_has_the_engine_class_the_pins_rely_on`.
+#[cfg(test)]
+fn induced_step_sql(step: MigrationStep, failure: InducedFailure) -> &'static str
+{
+    match (step, failure)
+    {
+        (MigrationStep::BackfillUpdate { .. }, InducedFailure::ExecutionClass) =>
+        {
+            "UPDATE images SET file_stem = ?1, image_kind = ?2 \
+             WHERE id = ?3 AND CAST('E3 induced execution-class failure' AS INTEGER) = 0"
+        }
+        (MigrationStep::BackfillUpdate { .. }, InducedFailure::CatalogClass) =>
+        {
+            "UPDATE images SET file_stem = pl_e3_no_such_function(?1), image_kind = ?2 WHERE id = ?3"
+        }
+        (_, failure) => induced_failure_sql(failure),
+    }
+}
+
+/// Run a statement the ENGINE rejects with the requested class, on the real
+/// connection, and return the engine's `Err` (K's rule: the knob substitutes
+/// the SQL, it never fakes the error).
+#[cfg(test)]
+fn run_induced_failure(conn: &Connection, failure: InducedFailure) -> duckdb::Error
+{
+    let sql = induced_failure_sql(failure);
+    match conn.execute_batch(sql)
+    {
+        Ok(()) => panic!(
+            "E3: the induced {:?} failure ({}) unexpectedly SUCCEEDED, so the seam \
+             induces nothing and every pin built on it proves nothing",
+            failure, sql
+        ),
+        Err(e) => e,
+    }
+}
+
+/// ⭐ E3 / D3 — the migration seam as SHARED-BODY dispatch (review G-2's
+/// lesson). This function and `migration_rollback_sql` below are the
+/// production-reachable code; the only cfg-split code is behind the
+/// uninhabited `MigrationProbeRef` referent, dead by construction in
+/// production.
+///
+/// ⭐ E3 fix round 1 (review MED-1) — the seam SUBSTITUTES THE STEP'S OWN SQL
+/// (slice K's rule). It used to run a separate failing statement BEFORE the
+/// step, so the step's real execute-and-`?` line never ran under any test and
+/// a log-and-continue on it — R2-C1 itself — stayed green. Now the step's own
+/// `conn.execute(..)` / `conn.prepare(..)` and its `map_err(..)?` carry the
+/// induced engine error. `real_sql` is the ONE copy of each step's statement:
+/// production passes it straight through, and a test probe that names a
+/// different step passes the same copy through.
+fn migration_step_sql(
+    probe: MigrationProbeRef<'_>,
+    step: MigrationStep,
+    real_sql: &'static str,
+) -> &'static str
+{
+    probe
+        .and_then(|probe| migration_probe_step_sql(probe, step))
+        .unwrap_or(real_sql)
+}
+
+/// The migration's ROLLBACK text.
+///
+/// ⭐ E3 fix round 1 (review MED-2) — `"ROLLBACK;"` is written ONCE and
+/// reached on BOTH paths: production (`None`) and every test probe without an
+/// override fall through to the same `unwrap_or` literal, so every failing
+/// E3-M1 case executes the very statement production runs. (It used to be
+/// written twice, and the production copy was compiled but never executed by
+/// any test: `"COMMIT;"` there passed all 317.)
+fn migration_rollback_sql(probe: MigrationProbeRef<'_>) -> &'static str
+{
+    probe
+        .and_then(migration_probe_rollback_sql)
+        .unwrap_or("ROLLBACK;")
+}
+
+/// Substitutes only at the EXACT step named (for `BackfillUpdate`, the exact
+/// `row_index` too).
+#[cfg(test)]
+fn migration_probe_step_sql(probe: &MigrationProbe, step: MigrationStep) -> Option<&'static str>
+{
+    match probe.fail_migration_step
+    {
+        Some((target, failure)) if target == step => Some(induced_step_sql(step, failure)),
+        _ => None,
+    }
+}
+
+/// Unreachable by type: `&Infallible` cannot exist.
+#[cfg(not(test))]
+fn migration_probe_step_sql(
+    probe: &std::convert::Infallible,
+    _step: MigrationStep,
+) -> Option<&'static str>
+{
+    match *probe {}
+}
+
+#[cfg(test)]
+fn migration_probe_rollback_sql(probe: &MigrationProbe) -> Option<&'static str>
+{
+    probe.rollback_sql_override
+}
+
+/// Unreachable by type: `&Infallible` cannot exist.
+#[cfg(not(test))]
+fn migration_probe_rollback_sql(probe: &std::convert::Infallible) -> Option<&'static str>
+{
+    match *probe {}
 }
 
 /// ⭐ Slice K — ENGINE TESTS NEVER FETCH, closed **for test builds** at the one
@@ -2507,6 +2706,17 @@ fn open_and_migrate_catalogue_with_probe(
     path: &std::path::Path,
     probe: MigrationProbeRef<'_>,
 ) -> Option<Connection> {
+    open_and_migrate_catalogue_reporting(path, probe).map(|(conn, _)| conn)
+}
+
+/// ⭐ E3 / ruling 15 — the whole open, also handing back what the row
+/// migration did, so a test can tell an Applied migration from one that rolled
+/// back. Every existing call site goes through the two delegating forms above
+/// and is unchanged (slice K's precedent).
+fn open_and_migrate_catalogue_reporting(
+    path: &std::path::Path,
+    probe: MigrationProbeRef<'_>,
+) -> Option<(Connection, CatalogueMigrationOutcome)> {
     // Open or create the database
     // DuckDB's bundled feature ensures the database engine is statically linked
     // (no system library dependency — required for App Store sandboxing)
@@ -3587,43 +3797,161 @@ fn open_and_migrate_catalogue_with_probe(
     //      `idx_images_directory_path` can be built right after it (DuckDB
     //      refuses CREATE INDEX inside a transaction with outstanding updates
     //      to the same table) and so that a repair failure cannot roll back
-    //      Steps 1/2/4. The step marker below records the move.
+    //      Steps 1/2/4. The step marker in the body records the move.
     //
     // Idempotency: the WHERE clauses on every step mean that running this
     // block a second time has no work to do — rows with non-NULL file_stem
     // and image_kind are skipped, and rows whose file_extension already
     // matches LOWER(file_extension) are skipped.
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
-        eprintln!("[migration] Failed to begin transaction: {}", e);
-        return None;
-    }
-
-    // Step 1: backfill file_stem and image_kind.
-    let rows_needing_backfill: Vec<(i64, String)> = match conn
-        .prepare("SELECT id, file_name FROM images WHERE file_stem IS NULL OR image_kind IS NULL")
+    //
+    // ⭐ E3 / ruling 15: inside this transaction no step may log and continue.
+    // On the bundled 1.5.5, an execution-class error aborts the transaction and
+    // COMMIT then returns Ok while discarding everything
+    // (`physical_transaction.cpp` turns COMMIT into ROLLBACK). So the first
+    // `Err` rolls the whole migration back, the open continues un-migrated as it
+    // always could, and the next launch retries. Never decide by asking the
+    // engine whether the transaction survived: nothing promises an answer.
+    //
+    // The steps live in `migrate_catalogue_rows_body` — the same SQL in the same
+    // order in the same single transaction — and `migrate_catalogue_rows` wraps
+    // them in BEGIN and COMMIT-or-ROLLBACK (the `removal_transaction` shape).
+    // ⛔ No DDL goes in that body: index DDL is refused inside a transaction
+    // with outstanding updates, which is why the S173 repair + marker and the
+    // S179 drops sit in the autocommit window ABOVE.
+    let outcome = match migrate_catalogue_rows(&conn, probe)
     {
-        Ok(mut stmt) => {
-            match stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            }) {
-                Ok(mapped) => collect_rows(
-                    mapped,
-                    "open_and_migrate_catalogue.file_stem_backfill",
-                ),
-                Err(e) => {
-                    eprintln!("[migration] Failed to query rows needing backfill: {}", e);
-                    Vec::new()
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("[migration] Failed to prepare backfill query: {}", e);
-            Vec::new()
+        Ok(outcome) => outcome,
+        Err(message) =>
+        {
+            // BEGIN, COMMIT or the ROLLBACK itself failed: the open returns
+            // None, exactly as a failed BEGIN or COMMIT always has.
+            eprintln!("{}", message);
+            return None;
         }
     };
 
-    let mut backfilled_count = 0u64;
-    for (row_id, file_name) in &rows_needing_backfill {
+    // ⭐ E3 — the six counts print only now, after COMMIT returned Ok, so no
+    // line claims work a discarded transaction never kept.
+    match &outcome
+    {
+        CatalogueMigrationOutcome::Applied(counts) =>
+        {
+            eprintln!(
+                "[migration] backfilled file_stem/image_kind for {} rows",
+                counts.backfilled
+            );
+            eprintln!(
+                "[migration] file_extension lowercased: {} rows",
+                counts.extension_lowercased
+            );
+            eprintln!("[migration] reclassified {} dng rows", counts.reclassified_dng);
+            eprintln!("[migration] reclassified {} psd rows", counts.reclassified_psd);
+            eprintln!("[migration] reclassified {} tiff rows", counts.reclassified_tiff);
+            eprintln!("[migration] reclassified {} png rows", counts.reclassified_png);
+        }
+        CatalogueMigrationOutcome::RolledBack(reason) => eprintln!(
+            "[migration] the row migration did not apply — {}. It was rolled back as a \
+             whole: nothing from Steps 1, 2 and 4 is in the catalogue, which opens as \
+             before, and the next launch retries it.",
+            reason
+        ),
+    }
+
+    // DuckDB 1.2.2 can fail WAL replay when a pending ALTER TABLE ADD COLUMN is
+    // replayed against a table whose primary key default references a sequence.
+    // Checkpoint after startup schema/migration work so future launches do not
+    // depend on replaying those DDL records.
+    //
+    // ⭐ E3 — this runs on BOTH outcomes: the schema batch's ALTERs were
+    // autocommitted before BEGIN, and a rolled-back row migration never touched
+    // them, so they still need folding out of the WAL (S62).
+    if let Err(e) = conn.execute_batch("CHECKPOINT;") {
+        eprintln!(
+            "[migration] Failed to checkpoint catalogue after schema migration: {}",
+            e
+        );
+        return None;
+    }
+    // --- End backfill migration --------------------------------------------
+
+    Some((conn, outcome))
+}
+
+/// ⭐ E3 / ruling 15 — `BEGIN`, the row migration's body, then `COMMIT` on Ok
+/// or `ROLLBACK` on Err (the `removal_transaction` precedent). After BEGIN any
+/// `Err` from any statement means ROLLBACK, never COMMIT: on the bundled 1.5.5
+/// a COMMIT after an execution-class error returns Ok and silently discards
+/// everything, and a COMMIT after a catalog-class error publishes a partial
+/// migration.
+///
+/// `Err` here means the transaction could not be begun, committed or rolled
+/// back; the open returns None, exactly as a failed BEGIN or COMMIT does today.
+fn migrate_catalogue_rows(
+    conn: &Connection,
+    probe: MigrationProbeRef<'_>,
+) -> Result<CatalogueMigrationOutcome, String>
+{
+    conn.execute_batch("BEGIN TRANSACTION;")
+        .map_err(|e| format!("[migration] Failed to begin transaction: {}", e))?;
+    match migrate_catalogue_rows_body(conn, probe)
+    {
+        // A COMMIT that fails is reported as it always was, with no ROLLBACK
+        // issued here (today's behaviour).
+        Ok(counts) => match conn.execute_batch("COMMIT;")
+        {
+            Ok(()) => Ok(CatalogueMigrationOutcome::Applied(counts)),
+            Err(e) => Err(format!(
+                "[migration] Failed to commit migration transaction: {}",
+                e
+            )),
+        },
+        Err(reason) => match conn.execute_batch(migration_rollback_sql(probe))
+        {
+            Ok(()) => Ok(CatalogueMigrationOutcome::RolledBack(reason)),
+            Err(e) => Err(format!(
+                "[migration] {}; its ROLLBACK failed ({}), so the catalogue's state is \
+                 not known",
+                reason, e
+            )),
+        },
+    }
+}
+
+/// Steps 1, 2 and 4 of the row migration, lifted verbatim (same SQL, same
+/// order) out of `open_and_migrate_catalogue_reporting`. The FIRST `Err` ends
+/// the body; no step logs and continues (E3).
+fn migrate_catalogue_rows_body(
+    conn: &Connection,
+    probe: MigrationProbeRef<'_>,
+) -> Result<MigrationCounts, String>
+{
+    // Step 1: backfill file_stem and image_kind.
+    //
+    // ⭐ E3 — an outer `prepare` / `query_map` Err fails the migration: results
+    // are materialised, so that is how an ENGINE error arrives. A row that only
+    // fails to DECODE is a Rust-side error that never aborts the transaction; it
+    // is censused by the collector as before, and committing the other rows is
+    // truthful.
+    let select_label = "Step 1 (file_stem/image_kind backfill query)";
+    let mut stmt = conn
+        .prepare(migration_step_sql(
+            probe,
+            MigrationStep::BackfillSelect,
+            "SELECT id, file_name FROM images WHERE file_stem IS NULL OR image_kind IS NULL",
+        ))
+        .map_err(|e| format!("{} failed: {}", select_label, e))?;
+    let mapped = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| format!("{} failed: {}", select_label, e))?;
+    let rows_needing_backfill: Vec<(i64, String)> =
+        collect_rows(mapped, "open_and_migrate_catalogue.file_stem_backfill");
+    drop(stmt);
+
+    let mut backfilled = 0u64;
+    for (row_index, (row_id, file_name)) in rows_needing_backfill.iter().enumerate()
+    {
         let parsed = parse_filename(file_name.clone());
         let kind_str = match parsed.kind {
             ImageKind::Jpeg => "jpeg",
@@ -3635,30 +3963,34 @@ fn open_and_migrate_catalogue_with_probe(
             ImageKind::Tiff => "tiff",
             ImageKind::Png => "png",
         };
-        match conn.execute(
-            "UPDATE images SET file_stem = ?1, image_kind = ?2 WHERE id = ?3",
+        conn.execute(
+            migration_step_sql(
+                probe,
+                MigrationStep::BackfillUpdate { row_index },
+                "UPDATE images SET file_stem = ?1, image_kind = ?2 WHERE id = ?3",
+            ),
             params![parsed.stem, kind_str, row_id],
-        ) {
-            Ok(_) => backfilled_count += 1,
-            Err(e) => eprintln!("[migration] Failed to update row id={}: {}", row_id, e),
-        }
+        )
+        .map_err(|e| {
+            format!(
+                "Step 1 (file_stem/image_kind backfill of row id={}) failed: {}",
+                row_id, e
+            )
+        })?;
+        backfilled += 1;
     }
-    eprintln!(
-        "[migration] backfilled file_stem/image_kind for {} rows",
-        backfilled_count
-    );
 
     // Step 2: idempotent lowercase normalization of file_extension.
     // The WHERE clause restricts the UPDATE to rows that actually differ;
     // DuckDB returns the count of changed rows in `changed`.
-    match conn.execute(
+    let extension_lowercased = migration_step_execute(
+        conn,
+        probe,
+        MigrationStep::ExtensionLowercase,
+        "Step 2 (file_extension lowercase)",
         "UPDATE images SET file_extension = LOWER(file_extension) \
          WHERE file_extension IS NOT NULL AND file_extension != LOWER(file_extension)",
-        [],
-    ) {
-        Ok(changed) => eprintln!("[migration] file_extension lowercased: {} rows", changed),
-        Err(e) => eprintln!("[migration] Failed to normalize file_extension: {}", e),
-    }
+    )?;
 
     // Step 3: directory_path — MOVED above this transaction in S173.
     //
@@ -3679,55 +4011,62 @@ fn open_and_migrate_catalogue_with_probe(
     // idx_file_extension. Idempotent: the `image_kind <> …` guard no-ops re-runs.
     // (Rows with a NULL file_extension are skipped — they keep their parse-time
     // kind; this matches the §7a documented edge.)
-    match conn.execute(
+    let reclassified_dng = migration_step_execute(
+        conn,
+        probe,
+        MigrationStep::ReclassifyDng,
+        "Step 4 (reclassify dng)",
         "UPDATE images SET image_kind = 'dng' WHERE file_extension = 'dng' AND image_kind <> 'dng'",
-        [],
-    ) {
-        Ok(changed) => eprintln!("[migration] reclassified {} dng rows", changed),
-        Err(e) => eprintln!("[migration] Failed to reclassify dng: {}", e),
-    }
-    match conn.execute(
+    )?;
+    let reclassified_psd = migration_step_execute(
+        conn,
+        probe,
+        MigrationStep::ReclassifyPsd,
+        "Step 4 (reclassify psd)",
         "UPDATE images SET image_kind = 'psd' WHERE file_extension = 'psd' AND image_kind <> 'psd'",
-        [],
-    ) {
-        Ok(changed) => eprintln!("[migration] reclassified {} psd rows", changed),
-        Err(e) => eprintln!("[migration] Failed to reclassify psd: {}", e),
-    }
-    match conn.execute(
+    )?;
+    let reclassified_tiff = migration_step_execute(
+        conn,
+        probe,
+        MigrationStep::ReclassifyTiff,
+        "Step 4 (reclassify tiff)",
         "UPDATE images SET image_kind = 'tiff' WHERE file_extension IN ('tif','tiff') AND image_kind <> 'tiff'",
-        [],
-    )
-    {
-        Ok(changed) => eprintln!("[migration] reclassified {} tiff rows", changed),
-        Err(e) => eprintln!("[migration] Failed to reclassify tiff: {}", e),
-    }
-    match conn.execute(
+    )?;
+    let reclassified_png = migration_step_execute(
+        conn,
+        probe,
+        MigrationStep::ReclassifyPng,
+        "Step 4 (reclassify png)",
         "UPDATE images SET image_kind = 'png' WHERE file_extension = 'png' AND image_kind <> 'png'",
-        [],
-    ) {
-        Ok(changed) => eprintln!("[migration] reclassified {} png rows", changed),
-        Err(e) => eprintln!("[migration] Failed to reclassify png: {}", e),
-    }
+    )?;
 
-    if let Err(e) = conn.execute_batch("COMMIT;") {
-        eprintln!("[migration] Failed to commit migration transaction: {}", e);
-        return None;
-    }
+    Ok(MigrationCounts
+    {
+        backfilled,
+        extension_lowercased,
+        reclassified_dng,
+        reclassified_psd,
+        reclassified_tiff,
+        reclassified_png,
+    })
+}
 
-    // DuckDB 1.2.2 can fail WAL replay when a pending ALTER TABLE ADD COLUMN is
-    // replayed against a table whose primary key default references a sequence.
-    // Checkpoint after startup schema/migration work so future launches do not
-    // depend on replaying those DDL records.
-    if let Err(e) = conn.execute_batch("CHECKPOINT;") {
-        eprintln!(
-            "[migration] Failed to checkpoint catalogue after schema migration: {}",
-            e
-        );
-        return None;
-    }
-    // --- End backfill migration --------------------------------------------
-
-    Some(conn)
+/// One parameterless row-migration statement, its `Err` naming the step. The
+/// seam can only substitute the statement's text (`migration_step_sql`), so
+/// an induced failure comes back through THIS execute-and-`map_err` line.
+/// Returns the reported count, which is printed only (S179 — never a control
+/// input).
+fn migration_step_execute(
+    conn: &Connection,
+    probe: MigrationProbeRef<'_>,
+    step: MigrationStep,
+    label: &str,
+    sql: &'static str,
+) -> Result<u64, String>
+{
+    conn.execute(migration_step_sql(probe, step, sql), [])
+        .map(|changed| changed as u64)
+        .map_err(|e| format!("{} failed: {}", label, e))
 }
 
 // =====================================================================
@@ -4870,8 +5209,8 @@ pub async fn upsert_editor_saved_image(
 {
     // ⭐ Slice F / R-07 — the panic boundary around the synchronous catalogue
     // segment. A caught panic becomes the `Err(message)` arm below (status
-    // `Failed` + the reason); the awaited vector cleanup after it is
-    // `retry_pending_face_vector_deletes`, which carries its own boundary.
+    // `Failed` + the reason); the awaited vector cleanup after it carries its
+    // own boundary.
     let database_outcome = match ffi_panic_boundary(
         "upsert_editor_saved_image.panic.query_failed",
         || -> Result<Result<EditorSavedImageDatabaseOutcome, String>, EditorSavedImageCatalogueResult>
@@ -4916,10 +5255,29 @@ pub async fn upsert_editor_saved_image(
         }
     };
 
+    // ===== ⭐ EDITOR-SAVE DRAIN-ONLY (slice P fix round 1, PART 2) — BEGIN =====
+    // RULED YES Oct 4, 2026 (ruling 8 — Richard: "Yes to all, and yes to
+    // ruling 8"). Built in fix round 1 ahead of the ruling as this separable
+    // block; it now stands as the editor save's cleanup.
+    // The save used to await the FFI `retry_pending_face_vector_deletes`: the
+    // drain AND the orphan sweep (store count, and when the gate opened a full
+    // id scan + an enqueue of up to 50,000), inside the user's save. When that
+    // sweep found orphans it left them queued, `remaining_count > 0` set the
+    // warning below, and Swift's closeout showed a FALSE "Photo saved, but
+    // closeout needs attention" on a clean save. Now: the drain ONLY, the
+    // same spawned pass Remove from Catalogue runs (review F3); the sweep stays
+    // at launch recovery and the index build. The warning still fires when the
+    // DRAIN leaves ids queued or is Deferred / Failed (pinned by P21 in
+    // `cross_store_tests`: (a) a clean save reads clean, (b) a Deferred drain
+    // warns, (c) a Failed drain with nothing remaining warns).
     let mut vector_cleanup_warning = None;
-    if database_outcome.enqueued_face_vector_delete_count > 0
+    if let Some(cleanup) = retry_removal_face_vector_deletes(
+        database_outcome.enqueued_face_vector_delete_count,
+        "upsert_editor_saved_image",
+        None,
+    )
+    .await
     {
-        let cleanup = retry_pending_face_vector_deletes().await;
         if cleanup.remaining_count > 0
             || matches!(
                 cleanup.status,
@@ -4932,6 +5290,7 @@ pub async fn upsert_editor_saved_image(
             ));
         }
     }
+    // ===== ⭐ EDITOR-SAVE DRAIN-ONLY (PART 2) — END =====
 
     EditorSavedImageCatalogueResult
     {
@@ -13642,12 +14001,13 @@ static FACE_EMBEDDING_RUNTIME: once_cell::sync::Lazy<&'static tokio::runtime::Ru
 /// `upsert_face_embeddings_impl` (around its open + `merge_insert` + count),
 /// `retry_pending_face_vector_deletes_probed` (the queue drain, and the orphan
 /// sweep that runs inside it) and `delete_face_vectors_by_observation_ids`
-/// (canonicalize's Phase 2). The restore's cleanup is the retry itself
-/// (`copy_face_embeddings_for_merge` calls the drain), so it inherits the lock
-/// and adds none. ⛔ No CALLER of those three may hold it — a nested take
+/// (canonicalize's Phase 2). The restore's and Remove from Catalogue's
+/// cleanups are the retry itself (`copy_face_embeddings_for_merge` and
+/// `retry_removal_face_vector_deletes` run the drain), so they inherit the lock
+/// and add none. ⛔ No CALLER of those three may hold it — a nested take
 /// deadlocks: `canonicalize_face_embeddings_probed` releases the catalogue
 /// mutex before Phase 2 and holds nothing; `copy_face_embeddings_for_merge`
-/// holds nothing.
+/// and `retry_removal_face_vector_deletes` hold nothing.
 ///
 /// ⚠️ Held across `await`s BY DESIGN — that is why it is a `tokio::sync::Mutex`
 /// and never a `std::sync::Mutex`. It does not guard against another PROCESS;
@@ -15824,18 +16184,25 @@ fn acknowledge_pending_face_vector_deletes_from_catalogue(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OrphanSweepMode
 {
-    /// Launch recovery and the index build (the FFI): drain the queue, then
-    /// reconcile orphan vectors (D6).
+    /// The FFI `retry_pending_face_vector_deletes`: drain the queue, then
+    /// reconcile orphan vectors (D6). Its callers: Swift's launch recovery
+    /// (`ContentView`) and the index build (`FaceRecognitionIndexBuilder`,
+    /// before it embeds). (An editor save that replaced faces runs DrainOnly —
+    /// ruling 8, Oct 4, 2026; see `upsert_editor_saved_image`.)
     DrainAndSweep,
-    /// The additive restore's cleanup: drain ONLY. A full store scan has no
-    /// place inside a Restore the user is waiting on; the next launch or index
-    /// build sweeps.
+    /// Drain ONLY — for a cleanup inside an action the user is waiting on,
+    /// where a store scan has no place; the next launch or index build sweeps.
+    /// Its callers: the additive restore (`copy_face_embeddings_for_merge`,
+    /// A-10) and `retry_removal_face_vector_deletes` (review F3 — both
+    /// removal FFIs, and the editor save that replaced faces, ruling 8,
+    /// Oct 4, 2026). ⚠️ "No sweep" is not "no backlog": the drain empties the
+    /// WHOLE queue, including orphan ids an earlier sweep queued.
     DrainOnly,
 }
 
 /// The FFI's retry: drain the durable queue, then reconcile orphan vectors.
 /// The ONLY production drain-and-sweep call — the probe type is uninhabited
-/// outside tests.
+/// outside tests. Who reaches it: `OrphanSweepMode::DrainAndSweep`.
 async fn retry_pending_face_vector_deletes_impl() -> FaceVectorDeleteRetryResult
 {
     retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, None).await
@@ -15843,7 +16210,9 @@ async fn retry_pending_face_vector_deletes_impl() -> FaceVectorDeleteRetryResult
 
 /// ⭐ Slice P / D4.2 + A-10 — the additive restore's cleanup: the queue drain
 /// WITHOUT the orphan sweep. `copy_face_embeddings_for_merge` calls it after
-/// the merge committed its replaced ids into the queue.
+/// the merge committed its replaced ids into the queue. (Remove from Catalogue
+/// runs the same drain-only pass, spawned with its test seam threaded through:
+/// `retry_removal_face_vector_deletes`.)
 async fn retry_pending_face_vector_deletes_drain_only() -> FaceVectorDeleteRetryResult
 {
     retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainOnly, None).await
@@ -15949,6 +16318,37 @@ struct OrphanSweepProbe
     /// P16: how many times the store's ids were SCANNED. An atomic, not a
     /// `Cell`: the retry future is spawned on the runtime and must stay `Send`.
     scans: std::sync::atomic::AtomicU32,
+    /// P19 (fix round 1, review finding 5): how many times the gate's store
+    /// `count_rows` was REACHED — so "no store count inside a removal" is
+    /// observed, not inferred from the scan counter that sits after it.
+    counts: std::sync::atomic::AtomicU32,
+    /// F6 pin: the enqueue's INSERT for this chunk (0-based) names a table
+    /// that does not exist — a real statement failure mid-loop.
+    fail_enqueue_insert_at_chunk: Option<usize>,
+    /// F6 pin: the enqueue's per-chunk VERIFICATION read for this chunk fails
+    /// the same way (its INSERT has already landed in the transaction).
+    fail_enqueue_verify_at_chunk: Option<usize>,
+    /// F6 pin: the failure arm's ROLLBACK becomes a statement that FAILS, so
+    /// the transaction is left open — the report must then say the count is
+    /// unconfirmed, never "nothing was queued", and must not count the open
+    /// transaction's own uncommitted rows. ⚠️ Stricter than the engine: a
+    /// real `ROLLBACK;` that errors has already left the transaction
+    /// (bundled 1.5.5, `TransactionContext::Rollback` clears it before the
+    /// rollback can throw) — see `enqueue_orphan_face_vectors_from_catalogue`.
+    rollback_fails: bool,
+    /// F6 pin (fix round 1, review finding 3): the failure arm's ROLLBACK
+    /// becomes a `COMMIT;` — a statement that SUCCEEDS and leaves the pass's
+    /// rows on the table, so the after-rollback count disagrees with the
+    /// count read before BEGIN. Unreachable in production (the catalogue lock
+    /// admits no other writer); it makes the mismatch arm executable.
+    rollback_keeps_the_rows: bool,
+    /// F6 pin (fix round 2, review G-3): the failure arm's ROLLBACK SUCCEEDS
+    /// (a real `ROLLBACK;`), and the same batch then renames the queue table
+    /// out of the way, so the after-rollback re-read fails — the "rolled
+    /// back, but the queue could not be re-read" arm, which must report the
+    /// outcome as unconfirmed, never "nothing was queued". The test renames
+    /// the table back to inspect what the rollback left.
+    fail_reread_after_rollback: bool,
 }
 
 #[cfg(test)]
@@ -15962,6 +16362,12 @@ impl OrphanSweepProbe
             live_id_column: 0,
             cap: None,
             scans: std::sync::atomic::AtomicU32::new(0),
+            counts: std::sync::atomic::AtomicU32::new(0),
+            fail_enqueue_insert_at_chunk: None,
+            fail_enqueue_verify_at_chunk: None,
+            rollback_fails: false,
+            rollback_keeps_the_rows: false,
+            fail_reread_after_rollback: false,
         }
     }
 }
@@ -16022,6 +16428,69 @@ fn orphan_sweep_probe_note_scan(probe: OrphanSweepProbeRef<'_>)
 #[cfg(not(test))]
 fn orphan_sweep_probe_note_scan(_probe: OrphanSweepProbeRef<'_>) {}
 
+#[cfg(test)]
+fn orphan_sweep_probe_note_count(probe: OrphanSweepProbeRef<'_>)
+{
+    if let Some(probe) = probe
+    {
+        probe.counts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(not(test))]
+fn orphan_sweep_probe_note_count(_probe: OrphanSweepProbeRef<'_>) {}
+
+/// The queue table the orphan enqueue's INSERT (`verify == false`) or its
+/// verification read (`verify == true`) names for chunk `chunk` — the real
+/// table, except where the F6 pin's probe asks for a statement failure.
+#[cfg(test)]
+fn orphan_enqueue_queue_table(probe: OrphanSweepProbeRef<'_>, chunk: usize, verify: bool) -> &'static str
+{
+    let failing = probe
+        .and_then(|probe| if verify { probe.fail_enqueue_verify_at_chunk } else { probe.fail_enqueue_insert_at_chunk });
+    if failing == Some(chunk)
+    {
+        "face_vector_pending_delete_injected_failure"
+    }
+    else
+    {
+        "face_vector_pending_delete"
+    }
+}
+
+#[cfg(not(test))]
+fn orphan_enqueue_queue_table(_probe: OrphanSweepProbeRef<'_>, _chunk: usize, _verify: bool) -> &'static str
+{
+    "face_vector_pending_delete"
+}
+
+#[cfg(test)]
+fn orphan_enqueue_rollback_sql(probe: OrphanSweepProbeRef<'_>) -> &'static str
+{
+    if probe.map(|probe| probe.rollback_fails).unwrap_or(false)
+    {
+        "SELECT * FROM face_vector_pending_delete_injected_rollback_failure;"
+    }
+    else if probe.map(|probe| probe.rollback_keeps_the_rows).unwrap_or(false)
+    {
+        "COMMIT;"
+    }
+    else if probe.map(|probe| probe.fail_reread_after_rollback).unwrap_or(false)
+    {
+        "ROLLBACK; ALTER TABLE face_vector_pending_delete RENAME TO face_vector_pending_delete_hidden_from_the_reread;"
+    }
+    else
+    {
+        "ROLLBACK;"
+    }
+}
+
+#[cfg(not(test))]
+fn orphan_enqueue_rollback_sql(_probe: OrphanSweepProbeRef<'_>) -> &'static str
+{
+    "ROLLBACK;"
+}
+
 /// ⭐ Slice P / D6 (N-4) — the bounded orphan-vector reconciliation.
 ///
 /// Vector-LESS rows are already swept: `face_embedding_missing_observation_page`
@@ -16053,8 +16522,9 @@ fn orphan_sweep_probe_note_scan(_probe: OrphanSweepProbeRef<'_>) {}
 ///    ABANDONS the sweep: a short live set would queue LIVE vectors for
 ///    deletion, the worst failure direction there is.
 /// 4. ENQUEUE, capped at `ORPHAN_VECTOR_SWEEP_CAP` per run, in 500-id
-///    statements; the existing acknowledged-only retry deletes them next time.
-///    P adds no second delete path.
+///    statements inside ONE transaction (review F6: all or nothing, the
+///    rollback verified on the table); the existing acknowledged-only retry
+///    deletes them next time. P adds no second delete path.
 ///
 /// Holds the store write lock (its caller's) and never the catalogue mutex
 /// across an `await`: every DuckDB touch is a synchronous `*_from_catalogue`
@@ -16071,6 +16541,7 @@ async fn reconcile_orphan_face_vectors(
         note: format!("Orphan scan skipped: {}", reason),
     };
 
+    orphan_sweep_probe_note_count(probe);
     let store_count = if orphan_sweep_probe_fails_store_count(probe)
     {
         Err("the store's row count failed (injected by the test probe)".to_string())
@@ -16134,14 +16605,47 @@ async fn reconcile_orphan_face_vectors(
                 )
             },
         },
-        Err(reason) => OrphanSweep
+        // ⭐ Review F6 — the note and the count say what the TABLE says.
+        // ⭐ Fix round 1 (review finding 2): and a failure reaches a READER.
+        // The note travels only in `message`, which Swift prints only when
+        // ids remain — and a failed enqueue leaves none — so every failure is
+        // also logged here, and an UNCONFIRMED one is written to the
+        // dropped-row census (Q-17: stdout is not a record). A verified
+        // rollback lost nothing, so it is logged but not censused.
+        Err(failure) =>
         {
-            ran: true,
-            enqueued: 0,
-            note: format!("Orphan scan abandoned, nothing was queued: {}", reason),
-        },
+            eprintln!("reconcile_orphan_face_vectors: {}", failure.reason);
+            if failure.nothing_queued
+            {
+                OrphanSweep
+                {
+                    ran: true,
+                    enqueued: 0,
+                    note: format!("Orphan scan abandoned, nothing was queued: {}", failure.reason),
+                }
+            }
+            else
+            {
+                record_dropped_rows(ORPHAN_ENQUEUE_UNCONFIRMED_SITE, 1);
+                OrphanSweep
+                {
+                    ran: true,
+                    enqueued: 0,
+                    note: format!(
+                        "Orphan scan abandoned; whether any orphan id stayed queued could not be confirmed: {}",
+                        failure.reason
+                    ),
+                }
+            }
+        }
     }
 }
+
+/// The census site for an orphan enqueue whose outcome could not be
+/// confirmed on the table (fix round 1, review finding 2). It ends
+/// `.query_failed`: it counts FAILED OPERATIONS, each of which may have left
+/// an unknown number of orphan ids queued — never rows.
+const ORPHAN_ENQUEUE_UNCONFIRMED_SITE: &str = "reconcile_orphan_face_vectors.enqueue.query_failed";
 
 /// Every `face_observation_id` the store holds, projected to that ONE column.
 async fn stored_face_vector_ids(
@@ -16193,36 +16697,98 @@ fn canonical_face_observation_count_from_catalogue() -> Result<u64, String>
     .map_err(|error| format!("the canonical face-record count failed: {}", error))
 }
 
+/// Why the orphan enqueue stopped, and what it can say about the queue
+/// afterwards — ⭐ review F6: never "nothing was queued" unless the TABLE says
+/// so. `nothing_queued` = the failure came before any write, or the rollback
+/// succeeded AND the table's count matches the count read before BEGIN (the
+/// verified all-or-nothing answer). `false` = the outcome is UNCONFIRMED: the
+/// ROLLBACK failed, the table could not be re-read, or it disagrees.
+/// ⭐ Fix round 1 (review finding 3): a disagreement used to be reported as
+/// "the difference stayed queued", but under the catalogue lock no other
+/// writer exists, so a difference would be unexplained (an engine fault), not
+/// this pass's confirmed rows — there is no partial count this pass can vouch
+/// for, hence a flag and not a number.
+struct OrphanEnqueueFailure
+{
+    reason: String,
+    nothing_queued: bool,
+}
+
+impl OrphanEnqueueFailure
+{
+    /// A failure before anything was written: nothing can have been queued.
+    fn before_any_write(reason: String) -> Self
+    {
+        OrphanEnqueueFailure { reason, nothing_queued: true }
+    }
+}
+
 /// Steps 3 and 4 under ONE synchronous catalogue-lock acquisition: the live
 /// ids, the anti-join, and the capped enqueue. Returns (orphans found, orphan
 /// ids confirmed on the queue table after the insert).
+///
+/// ⭐ Review F6 (ruled Oct 3, 2026; built Oct 4) — ALL OR NOTHING. The 500-id
+/// INSERTs used to autocommit one by one, so a failure at chunk k > 1 left
+/// chunks 1…k−1 queued while the report said "nothing was queued" with
+/// `orphans_enqueued: 0`. They now run in ONE transaction with their per-chunk
+/// verification; any failure (an INSERT, a verification read, the COMMIT) is
+/// ROLLED BACK and the rollback VERIFIED: the ROLLBACK must succeed (else the
+/// count is reported as unconfirmed — never "nothing was queued"), and then
+/// the TABLE's row count must equal the count read before BEGIN (S179 — a
+/// statement's word is not the table's). Chosen over "report the partial
+/// count" because only the transaction makes the report true on every arm —
+/// when chunk k's verification read fails, its INSERT has landed but cannot be
+/// counted, so a partial count could not be confirmed. Engine doctrine:
+/// INSERTs and COUNT reads only — no UPDATE (no delete+insert change count to
+/// distrust), no DDL inside the transaction, no scalar subquery over a row this
+/// transaction changed. The writeback's own enqueue
+/// (`editor_saved_image_enqueue_face_vector_deletes`) already runs inside a
+/// transaction; this is the same statement shape.
+///
+/// ⚠️ A FAILED ROLLBACK (fix round 1, review finding 2) — the S179 rule
+/// (`rollback_focus_analysis_failure`): report it, and run nothing more on the
+/// connection in this pass; no re-read, no second ROLLBACK, no replay. On the
+/// bundled 1.5.5 a real `ROLLBACK;` errors in only three ways, and none leaves
+/// a usable transaction open: no transaction was active (`cannot rollback - no
+/// transaction is active`; the connection is in autocommit — executed), the
+/// engine's rollback threw (`TransactionContext::Rollback` has already
+/// cleared the transaction and restored autocommit before it runs — engine
+/// source), or the database instance is invalidated (every later statement
+/// fails until the catalogue is reopened, whatever this pass does). So there
+/// is nothing a statement here could repair. The probe's open-transaction
+/// model is stricter than the engine (P20).
 fn enqueue_orphan_face_vectors_from_catalogue(
     store_ids: &std::collections::HashSet<i64>,
     cap: usize,
     probe: OrphanSweepProbeRef<'_>,
-) -> Result<(u64, u64), String>
+) -> Result<(u64, u64), OrphanEnqueueFailure>
 {
     const SITE: &str = "reconcile_orphan_face_vectors.live_ids";
 
     let catalogue = lock_catalogue();
-    let conn = catalogue
-        .as_ref()
-        .ok_or_else(|| "the catalogue is not initialized".to_string())?;
+    let conn = catalogue.as_ref().ok_or_else(|| {
+        OrphanEnqueueFailure::before_any_write("the catalogue is not initialized".to_string())
+    })?;
 
-    let mut statement = conn
-        .prepare("SELECT id FROM face_observation")
-        .map_err(|error| format!("the face-record id read could not be prepared: {}", error))?;
+    let mut statement = conn.prepare("SELECT id FROM face_observation").map_err(|error| {
+        OrphanEnqueueFailure::before_any_write(format!(
+            "the face-record id read could not be prepared: {}",
+            error
+        ))
+    })?;
     let column = orphan_sweep_probe_live_id_column(probe);
     let rows = statement
         .query_map([], move |row| row.get::<_, i64>(column))
-        .map_err(|error| format!("the face-record id read failed: {}", error))?;
+        .map_err(|error| {
+            OrphanEnqueueFailure::before_any_write(format!("the face-record id read failed: {}", error))
+        })?;
     let (live_ids, dropped) = collect_rows_counted(rows, SITE);
     if dropped > 0
     {
-        return Err(format!(
+        return Err(OrphanEnqueueFailure::before_any_write(format!(
             "{} face record(s) could not be read, so the live set is short and a live vector could be mistaken for an orphan",
             dropped
-        ));
+        )));
     }
     let live_ids = live_ids.into_iter().collect::<std::collections::HashSet<i64>>();
 
@@ -16234,38 +16800,108 @@ fn enqueue_orphan_face_vectors_from_catalogue(
     orphans.sort_unstable();
     let found = orphans.len() as u64;
     orphans.truncate(cap);
-
-    let mut enqueued = 0u64;
-    for chunk in orphans.chunks(500)
+    if orphans.is_empty()
     {
-        let values = chunk
-            .iter()
-            .map(|id| format!("({}, CURRENT_TIMESTAMP)", id))
-            .collect::<Vec<_>>()
-            .join(", ");
-        conn.execute(
-            &format!(
-                "INSERT OR IGNORE INTO face_vector_pending_delete (face_observation_id, enqueued_at) VALUES {}",
-                values
-            ),
-            [],
-        )
-        .map_err(|error| format!("the orphan enqueue failed: {}", error))?;
-        // S179 — the INSERT's change count is a hint (an id already queued is
-        // IGNORED, not counted); the TABLE says what is queued.
-        let confirmed = conn
-            .query_row(
+        return Ok((found, 0));
+    }
+
+    // The rollback's yardstick, read before anything is written.
+    let queue_before = pending_face_vector_delete_count_impl(conn)
+        .map_err(OrphanEnqueueFailure::before_any_write)?;
+    conn.execute_batch("BEGIN TRANSACTION;").map_err(|error| {
+        OrphanEnqueueFailure::before_any_write(format!("the orphan enqueue could not begin: {}", error))
+    })?;
+
+    let enqueue_all = || -> Result<u64, String>
+    {
+        let mut enqueued = 0u64;
+        for (index, chunk) in orphans.chunks(500).enumerate()
+        {
+            let values = chunk
+                .iter()
+                .map(|id| format!("({}, CURRENT_TIMESTAMP)", id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            conn.execute(
                 &format!(
-                    "SELECT COUNT(*) FROM face_vector_pending_delete WHERE face_observation_id IN ({})",
-                    editor_saved_image_id_csv(chunk)
+                    "INSERT OR IGNORE INTO {} (face_observation_id, enqueued_at) VALUES {}",
+                    orphan_enqueue_queue_table(probe, index, false),
+                    values
                 ),
                 [],
-                |row| row.get::<_, i64>(0),
             )
-            .map_err(|error| format!("the orphan enqueue could not be verified: {}", error))?;
-        enqueued += confirmed.max(0) as u64;
+            .map_err(|error| format!("the orphan enqueue failed: {}", error))?;
+            // S179 — the INSERT's change count is a hint (an id already queued
+            // is IGNORED, not counted); the TABLE says what is queued.
+            let confirmed = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {} WHERE face_observation_id IN ({})",
+                        orphan_enqueue_queue_table(probe, index, true),
+                        editor_saved_image_id_csv(chunk)
+                    ),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| format!("the orphan enqueue could not be verified: {}", error))?;
+            enqueued += confirmed.max(0) as u64;
+        }
+        conn.execute_batch("COMMIT;")
+            .map_err(|error| format!("the orphan enqueue could not commit: {}", error))?;
+        Ok(enqueued)
+    };
+
+    match enqueue_all()
+    {
+        Ok(enqueued) => Ok((found, enqueued)),
+        Err(reason) =>
+        {
+            // Verified, in two steps: the ROLLBACK must SUCCEED (S179's
+            // `rollback_focus_analysis_failure` rule — after a failed ROLLBACK
+            // the connection's transaction state is not ours to vouch for, and
+            // a read inside a still-open transaction would count its own
+            // uncommitted rows), and then the TABLE must hold what it held
+            // before BEGIN.
+            if let Err(error) = conn.execute_batch(orphan_enqueue_rollback_sql(probe))
+            {
+                return Err(OrphanEnqueueFailure
+                {
+                    reason: format!(
+                        "{}; its ROLLBACK failed ({}), so what stayed queued cannot be confirmed",
+                        reason, error
+                    ),
+                    nothing_queued: false,
+                });
+            }
+            Err(match pending_face_vector_delete_count_impl(conn)
+            {
+                Ok(queue_after) if queue_after == queue_before => OrphanEnqueueFailure
+                {
+                    reason: format!("{}; the pass was rolled back", reason),
+                    nothing_queued: true,
+                },
+                // Fix round 1 (review finding 3): UNCONFIRMED, never "the
+                // difference stayed queued" — nothing else can write under this
+                // lock, so this pass cannot vouch for the difference.
+                Ok(queue_after) => OrphanEnqueueFailure
+                {
+                    reason: format!(
+                        "{}; after the rollback the queue holds {} row(s) where it held {} before this pass",
+                        reason, queue_after, queue_before
+                    ),
+                    nothing_queued: false,
+                },
+                Err(error) => OrphanEnqueueFailure
+                {
+                    reason: format!(
+                        "{}; the pass was rolled back, but the queue could not be re-read to confirm it ({})",
+                        reason, error
+                    ),
+                    nothing_queued: false,
+                },
+            })
+        }
     }
-    Ok((found, enqueued))
 }
 
 /// The queue drain — until slice P, the whole of
@@ -16471,7 +17107,10 @@ async fn drain_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
 /// unconfirmed store error; the API is safe to call at launch, before an index
 /// build, and immediately after an editor-refresh transaction commits.
 /// ⭐ Slice P / D6: after a completed drain it also runs the bounded orphan
-/// sweep (`reconcile_orphan_face_vectors`) — ruling 15, Sep 30, 2026.
+/// sweep (`reconcile_orphan_face_vectors`) — ruling 15, Sep 30, 2026. Its
+/// callers: launch recovery and the index build (Swift). Remove from Catalogue,
+/// the additive restore and the editor save that replaced faces (ruling 8,
+/// Oct 4, 2026) drain WITHOUT the sweep (`OrphanSweepMode::DrainOnly`).
 pub async fn retry_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
 {
     // ⭐ Slice F — L2 + L3. The runtime is acquired fallibly (R-25: an
@@ -32631,8 +33270,9 @@ pub async fn get_image_records_for_filters(
 /// captured into the tombstone, the derived analysis is cascaded, and the
 /// rows are deleted — all in ONE transaction (this path used to be a single
 /// bare `DELETE` outside any transaction; R-76). After the commit, the LanceDB
-/// vectors the cascade queued are deleted through the existing retry
-/// (`retry_pending_face_vector_deletes`), exactly as an editor save does.
+/// vectors the cascade queued are deleted through the durable queue's DRAIN
+/// (`retry_removal_face_vector_deletes` — drain only since slice P's F3: no
+/// orphan sweep inside the user's removal).
 ///
 /// **Return.** Number of rows deleted, as i64. Returns 0 on every
 /// failure mode (catalogue not initialized, empty-predicate refusal,
@@ -32664,7 +33304,7 @@ pub async fn remove_images_for_filters(path_prefix: String, date_prefix: String)
     {
         Some(outcome) =>
         {
-            retry_removal_face_vector_deletes(&outcome, "remove_images_for_filters").await;
+            retry_removal_face_vector_deletes(outcome.doomed_faces, "remove_images_for_filters", None).await;
             outcome.deleted as i64
         }
         None => 0,
@@ -32776,14 +33416,32 @@ pub async fn directory_sync_states() -> Vec<DirectorySyncState> {
 
 /// Body of `update_directory_sync_states` against an explicit connection (the
 /// impl/wrapper pattern). Per row: check-then-UPDATE-or-INSERT keyed on
-/// `directory_path` (the S46 house pattern — never ON CONFLICT), all in one
-/// transaction. After the upserts, one bounded housekeeping DELETE prunes rows
-/// whose directory no longer exists in the catalogue (post-relocate prefixes,
-/// fully-removed roots) — harmless if skipped, tidy if kept; the table stays
-/// a few thousand rows. Returns rows changed (updated + inserted; the prune
-/// does not count). 0 on any failure (failure-as-zero, transaction rolled
-/// back).
-fn update_directory_sync_states_impl(conn: &Connection, states: &[DirectorySyncState]) -> u64 {
+/// `directory_path` (the S46 house pattern — never ON CONFLICT). The upserts
+/// commit as ONE transaction and the function returns rows changed (updated +
+/// inserted), or 0 when they rolled back (failure-as-zero).
+///
+/// ⭐ E3 / ruling 15 — AFTER that commit, one bounded housekeeping DELETE
+/// prunes rows whose directory no longer exists in the catalogue
+/// (post-relocate prefixes, fully-removed roots) in a transaction of its own —
+/// harmless if skipped, tidy if kept; the table stays a few thousand rows. Its
+/// failure is rolled back and logged and does not change the return. It used
+/// to run INSIDE the upsert transaction with log-and-continue, and on the
+/// bundled 1.5.5 an execution-class prune failure aborted that transaction, so
+/// the COMMIT returned Ok while silently discarding every upsert and the
+/// caller was told N rows changed. Both transactions run under the caller's
+/// one catalogue guard, so nothing interleaves; a crash between the two
+/// commits leaves only stale rows, which are inert and pruned on the next call.
+fn update_directory_sync_states_impl(conn: &Connection, states: &[DirectorySyncState]) -> u64
+{
+    update_directory_sync_states_impl_with_probe(conn, states, None)
+}
+
+fn update_directory_sync_states_impl_with_probe(
+    conn: &Connection,
+    states: &[DirectorySyncState],
+    probe: DirectorySyncProbeRef<'_>,
+) -> u64
+{
     if states.is_empty() {
         return 0;
     }
@@ -32827,29 +33485,121 @@ fn update_directory_sync_states_impl(conn: &Connection, states: &[DirectorySyncS
         }
     }
 
-    // Housekeeping: drop bookkeeping rows for directories that have left the
-    // catalogue entirely (relocated prefixes, removed roots). The sweep never
-    // consults them (its worklist is the catalogue's distinct directories) —
-    // this just keeps the table from accreting dead paths across relocates.
-    if let Err(e) = conn.execute(
-        "DELETE FROM directory_sync_state \
-         WHERE directory_path NOT IN (\
-             SELECT DISTINCT directory_path FROM images \
-             WHERE directory_path IS NOT NULL)",
-        [],
-    ) {
-        // Non-fatal: the upserts above are the contract; stale rows are inert.
-        eprintln!(
-            "update_directory_sync_states: prune failed (non-fatal): {}",
-            e
-        );
-    }
-
+    // ⭐ E3 — the upserts are the contract, so they COMMIT before the prune is
+    // attempted at all.
     if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("update_directory_sync_states: commit failed: {}", e);
         return 0;
     }
+
+    // Housekeeping: drop bookkeeping rows for directories that have left the
+    // catalogue entirely (relocated prefixes, removed roots). The sweep never
+    // consults them (its worklist is the catalogue's distinct directories) —
+    // this just keeps the table from accreting dead paths across relocates.
+    //
+    // ⭐ E3 — in its OWN transaction (every DELETE inside a transaction), and
+    // any Err ⇒ ROLLBACK, never COMMIT. Every arm returns `changed`: the
+    // baselines above are already committed whatever happens here.
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!(
+            "update_directory_sync_states: prune skipped — could not begin ({}); the {} \
+             baseline row(s) were already committed",
+            e, changed
+        );
+        return changed;
+    }
+    match directory_sync_prune_checkpoint(conn, probe).and_then(|()|
+    {
+        conn.execute(
+            "DELETE FROM directory_sync_state \
+             WHERE directory_path NOT IN (\
+                 SELECT DISTINCT directory_path FROM images \
+                 WHERE directory_path IS NOT NULL)",
+            [],
+        )
+    })
+    {
+        Ok(_) =>
+        {
+            if let Err(e) = conn.execute_batch("COMMIT;")
+            {
+                eprintln!(
+                    "update_directory_sync_states: prune could not commit ({}); the {} \
+                     baseline row(s) were already committed",
+                    e, changed
+                );
+            }
+        }
+        Err(e) => match conn.execute_batch("ROLLBACK;")
+        {
+            Ok(()) => eprintln!(
+                "update_directory_sync_states: prune failed and was rolled back (non-fatal; \
+                 the {} baseline row(s) were already committed): {}",
+                changed, e
+            ),
+            Err(rollback_error) => eprintln!(
+                "update_directory_sync_states: prune failed and was rolled back (non-fatal; \
+                 the {} baseline row(s) were already committed): {}; its ROLLBACK also \
+                 failed: {}",
+                changed, e, rollback_error
+            ),
+        },
+    }
     changed
+}
+
+/// ⭐ E3 / D3 — the prune's test seam, on the `MigrationProbe` shared-body
+/// pattern: a plain parameter, no static, no `cfg!(test)` branch. Outside
+/// `cfg(test)` the referent type is uninhabited, so every production call site
+/// can only pass `None`.
+#[cfg(test)]
+struct DirectorySyncProbe
+{
+    /// Fire this failure INSIDE the prune transaction, immediately before the
+    /// DELETE, on the real connection.
+    fail_prune: Option<InducedFailure>,
+}
+
+#[cfg(test)]
+type DirectorySyncProbeRef<'a> = Option<&'a DirectorySyncProbe>;
+
+/// Uninhabited outside tests: every production call site passes `None` and no
+/// other value can exist.
+#[cfg(not(test))]
+type DirectorySyncProbeRef<'a> = Option<&'a std::convert::Infallible>;
+
+/// The shared body — compiled and exercised under `cargo test`.
+fn directory_sync_prune_checkpoint(
+    conn: &Connection,
+    probe: DirectorySyncProbeRef<'_>,
+) -> Result<(), duckdb::Error>
+{
+    match probe
+    {
+        None => Ok(()),
+        Some(probe) => directory_sync_probe_fire(conn, probe),
+    }
+}
+
+#[cfg(test)]
+fn directory_sync_probe_fire(conn: &Connection, probe: &DirectorySyncProbe) -> Result<(), duckdb::Error>
+{
+    match probe.fail_prune
+    {
+        Some(failure) => Err(run_induced_failure(conn, failure)),
+        None => Ok(()),
+    }
+}
+
+/// Unreachable by type: `&Infallible` cannot exist.
+#[cfg(not(test))]
+fn directory_sync_probe_fire(
+    _conn: &Connection,
+    probe: &std::convert::Infallible,
+) -> Result<(), duckdb::Error>
+{
+    match *probe {}
 }
 
 /// Record the post-walk truth for a batch of directories: their on-disk
@@ -32933,7 +33683,8 @@ fn remove_images_by_ids_impl_with_probe(
 ///
 /// ⭐ Slice B: the removal keeps the user's work in the tombstone and cascades
 /// the derived analysis (see `remove_catalogue_rows`); after the commit, the
-/// face vectors it queued are deleted from LanceDB through the existing retry.
+/// face vectors it queued are deleted from LanceDB through the queue's drain
+/// (`retry_removal_face_vector_deletes` — drain only, no orphan sweep; F3).
 pub async fn remove_images_by_ids(ids: Vec<i64>) -> u64
 {
     let outcome =
@@ -32956,7 +33707,7 @@ pub async fn remove_images_by_ids(ids: Vec<i64>) -> u64
     {
         Some(outcome) =>
         {
-            retry_removal_face_vector_deletes(&outcome, "remove_images_by_ids").await;
+            retry_removal_face_vector_deletes(outcome.doomed_faces, "remove_images_by_ids", None).await;
             outcome.deleted
         }
         None => 0,
@@ -33545,26 +34296,102 @@ fn removal_drop_temp_tables(conn: &Connection)
     }
 }
 
-/// After a removal COMMITS: delete the LanceDB vectors its cascade queued,
-/// through the existing retry — the `upsert_editor_saved_image` precedent,
-/// which also awaits it inside the FFI call. Decided by the frozen face census
-/// (a table read), never by a change count. Store errors are non-destructive:
-/// unconfirmed ids stay queued for the launch / face-index retries.
-async fn retry_removal_face_vector_deletes(outcome: &CatalogueRemovalOutcome, operation: &str)
+/// After an action that REMOVED face records COMMITS: delete the LanceDB
+/// vectors it queued, through the durable queue's drain, awaited inside the
+/// FFI call. `removed_faces` is the caller's count of the face records it
+/// removed; for both removal FFIs that is the frozen face census
+/// (`CatalogueRemovalOutcome::doomed_faces`, a table read, never a change
+/// count); for the editor save it is the replaced faces' enqueued vector-delete
+/// count. Store errors are non-destructive: unconfirmed ids stay queued for
+/// the launch / face-index retries.
+///
+/// ⭐ Slice P review F3 (ruled Oct 3, 2026; built Oct 4) — DRAIN ONLY. This
+/// used to await the FFI `retry_pending_face_vector_deletes`, i.e. the drain
+/// AND the orphan sweep, so every Remove from Catalogue that removed faces could
+/// pay a store count and, when the gate opened, a full store id scan inside the
+/// action the user is waiting on (A-10's concern, on a path A-10 did not list).
+/// The sweep stays at launch recovery and the index build.
+///
+/// ⚠️ Fix round 1 (review finding 1) — what "drain only" does NOT promise. The
+/// drain empties the WHOLE queue, with no cap: this action's own ids AND
+/// whatever an earlier pass left queued — including up to
+/// `ORPHAN_VECTOR_SWEEP_CAP` (50,000) orphan ids a launch or index-build sweep
+/// queued after its own drain, i.e. up to 100 LanceDB delete commits of 500
+/// ids while the user waits. And it takes `FACE_EMBEDDING_STORE_WRITE_LOCK`,
+/// so it can wait behind a launch or index-build sweep that is holding that
+/// lock across its store count and id scan. No sweep runs here; sweep WORK
+/// that an earlier sweep queued can still be paid for here.
+///
+/// The removal FFIs are polled by Swift's executor, not by the face runtime,
+/// and LanceDB needs a tokio runtime: the drain hops onto it exactly as the FFI
+/// retry does, inside its own panic boundary (neither removal FFI is on F's
+/// wrap list, so a panic here must become an answer, never an abort — R-07).
+/// The drain takes `FACE_EMBEDDING_STORE_WRITE_LOCK` itself; nothing here
+/// holds a lock (every caller releases the catalogue guard before awaiting).
+///
+/// `probe` is the orphan sweep's test seam (uninhabited outside tests, so
+/// production provably passes `None`); `'static` because the drain is spawned.
+/// Returns the drain's result (`None` when no face record was removed); the
+/// removal FFIs ignore it. The editor save (ruling 8, Oct 4, 2026) passes its
+/// replaced-face count and turns a drain that leaves ids queued or ends
+/// Deferred / Failed into its `vector_cleanup_warning`.
+async fn retry_removal_face_vector_deletes(
+    removed_faces: u64,
+    operation: &str,
+    probe: OrphanSweepProbeRef<'static>,
+) -> Option<FaceVectorDeleteRetryResult>
 {
-    if outcome.doomed_faces == 0
+    if removed_faces == 0
     {
-        return;
+        return None;
     }
-    let cleanup = retry_pending_face_vector_deletes().await;
+    let failed = |message: String| FaceVectorDeleteRetryResult
+    {
+        status: FaceVectorDeleteRetryStatus::Failed,
+        pending_count: 0,
+        acknowledged_count: 0,
+        remaining_count: 0,
+        message,
+        orphans_enqueued: 0,
+        orphan_scan_ran: false,
+    };
+    let spawned = ffi_panic_boundary(
+        "retry_removal_face_vector_deletes.panic.query_failed",
+        ||
+        {
+            face_embedding_runtime(
+                "retry_removal_face_vector_deletes.face_runtime_unavailable.query_failed",
+            )
+            .map(|runtime|
+            {
+                runtime.spawn(retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainOnly, probe))
+            })
+            .map_err(|message| format!("Face-vector cleanup could not start: {}", message))
+        },
+        |panic| Err(ffi_panic_report("clean up the removed face records' vectors", &panic)),
+    );
+    let cleanup = match spawned
+    {
+        Ok(task) => match task.await
+        {
+            Ok(result) => result,
+            Err(error) => failed(format!("Face-vector cleanup runtime failed: {}", error)),
+        },
+        Err(message) => failed(message),
+    };
     if cleanup.remaining_count > 0
+        || matches!(
+            cleanup.status,
+            FaceVectorDeleteRetryStatus::Deferred | FaceVectorDeleteRetryStatus::Failed
+        )
     {
         eprintln!(
-            "[WARN faceVectorCleanup] after {}: pending={} acknowledged={} remaining={} message={}",
-            operation, cleanup.pending_count, cleanup.acknowledged_count, cleanup.remaining_count,
-            cleanup.message
+            "[WARN faceVectorCleanup] after {}: {:?} pending={} acknowledged={} remaining={} message={}",
+            operation, cleanup.status, cleanup.pending_count, cleanup.acknowledged_count,
+            cleanup.remaining_count, cleanup.message
         );
     }
+    Some(cleanup)
 }
 
 // --- The re-attach -----------------------------------------------------------
@@ -39042,17 +39869,22 @@ mod schema_upgrade_fixture_tests
         // --- (a) THE S93 PIN. A failing statement anywhere in the batch aborts
         // --- it and this is `None` — which in the product is an empty library
         // --- on every existing catalogue, or a silently failed additive restore.
-        let upgraded = open_and_migrate_catalogue(&old_path).unwrap_or_else(|| {
-            panic!(
-                "⭐ ASSERTION (a) FAILED for {} ({}, {}): open_and_migrate_catalogue \
-                 returned None. The schema batch aborted on this historical \
-                 catalogue — in the product this is an EMPTY LIBRARY on every \
-                 existing catalogue (S93), or an additive restore that silently \
-                 does nothing. Run with --nocapture: the engine's error is on \
-                 stderr above.",
-                v.tag, v.file, v.date
-            )
-        });
+        //
+        // ⭐ E3 — opened through `_reporting` so assertion (f) below can read what
+        // the row migration did; the call path is the same one the two
+        // delegating forms take.
+        let (upgraded, outcome) = open_and_migrate_catalogue_reporting(&old_path, None)
+            .unwrap_or_else(|| {
+                panic!(
+                    "⭐ ASSERTION (a) FAILED for {} ({}, {}): open_and_migrate_catalogue \
+                     returned None. The schema batch aborted on this historical \
+                     catalogue — in the product this is an EMPTY LIBRARY on every \
+                     existing catalogue (S93), or an additive restore that silently \
+                     does nothing. Run with --nocapture: the engine's error is on \
+                     stderr above.",
+                    v.tag, v.file, v.date
+                )
+            });
 
         // --- (b) every seeded row still readable, with its values intact.
         for row in SEED_ROWS.iter()
@@ -39121,6 +39953,40 @@ mod schema_upgrade_fixture_tests
                  takes the delete+insert branch S179 retired",
                 v.tag,
                 retired
+            );
+        }
+
+        // --- (f) ⭐ E3 — the row migration APPLIED on this vintage, and its
+        // --- Step 1 backfill is in the table. A healthy catalogue of every
+        // --- vintage must take the Applied arm; a RolledBack here would mean the
+        // --- migration silently never lands on that vintage.
+        match &outcome
+        {
+            CatalogueMigrationOutcome::Applied(_) => {}
+            CatalogueMigrationOutcome::RolledBack(reason) => panic!(
+                "[E3-F/outcome-is-applied] {}: the row migration ROLLED BACK on a healthy \
+                 catalogue of this vintage: {}",
+                v.tag, reason
+            ),
+        }
+        for (id, expected_stem, expected_kind) in [(4001_i64, "one", "raw"), (4002_i64, "two", "jpeg")]
+        {
+            let found: (Option<String>, Option<String>) = upgraded
+                .query_row(
+                    "SELECT file_stem, image_kind FROM images WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+                .unwrap_or_else(|e| {
+                    panic!("[E3-F/backfill-landed] {}: reading row {} failed: {}", v.tag, id, e)
+                });
+            assert_eq!(
+                found,
+                (Some(expected_stem.to_string()), Some(expected_kind.to_string())),
+                "[E3-F/backfill-landed] {}: row {}'s file_stem/image_kind backfill did not \
+                 land",
+                v.tag,
+                id
             );
         }
 
@@ -39731,6 +40597,7 @@ mod schema_upgrade_fixture_tests
         let probe = MigrationProbe
         {
             forced_repair_sql: Some(engine_rejected_repair_sql()),
+            ..Default::default()
         };
         let conn = open_and_migrate_catalogue_with_probe(&path, Some(&probe))
             .expect("a FAILED directory_path repair must not fail the catalogue open");
@@ -39764,6 +40631,7 @@ mod schema_upgrade_fixture_tests
             let probe = MigrationProbe
             {
                 forced_repair_sql: Some(engine_rejected_repair_sql()),
+                ..Default::default()
             };
             let failed = open_and_migrate_catalogue_with_probe(&path, Some(&probe))
                 .expect("open with the forced failure");
@@ -39976,6 +40844,766 @@ mod schema_upgrade_fixture_tests
         cleanup(&live_path);
         cleanup(&backup_path);
     }
+
+    // -----------------------------------------------------------------------
+    // E3 — commit-after-abort (ruling 15): the row migration is BEGIN + a
+    // `?`-propagating body + COMMIT-or-ROLLBACK, EXECUTED through the real open.
+    //
+    // Every assertion message starts with its check name in brackets, so a
+    // mutation-ledger row can quote the exact check that failed.
+    // -----------------------------------------------------------------------
+
+    /// Every row-migration step, with the label its failure reason must carry
+    /// (E3 brief §3 D1). `BackfillUpdate` fails the SECOND row, so the first
+    /// row's UPDATE has already landed inside the transaction and must be
+    /// discarded with the rest; its label is matched up to the row id.
+    const E3_STEPS: [(MigrationStep, &str); 7] = [
+        (MigrationStep::BackfillSelect, "Step 1 (file_stem/image_kind backfill query)"),
+        (
+            MigrationStep::BackfillUpdate { row_index: 1 },
+            "Step 1 (file_stem/image_kind backfill of row id=",
+        ),
+        (MigrationStep::ExtensionLowercase, "Step 2 (file_extension lowercase)"),
+        (MigrationStep::ReclassifyDng, "Step 4 (reclassify dng)"),
+        (MigrationStep::ReclassifyPsd, "Step 4 (reclassify psd)"),
+        (MigrationStep::ReclassifyTiff, "Step 4 (reclassify tiff)"),
+        (MigrationStep::ReclassifyPng, "Step 4 (reclassify png)"),
+    ];
+
+    const E3_CLASSES: [InducedFailure; 2] =
+        [InducedFailure::ExecutionClass, InducedFailure::CatalogClass];
+
+    /// A V1 catalogue with work for every row-migration step:
+    /// - 4001 / 4002 (the `SEED_ROWS`): NULL `file_stem` / `image_kind` → Step 1;
+    /// - 4001's `file_extension` is `'NEF'` → Step 2's marker;
+    /// - 4003 is a `.dng` already carrying a stem and the OLD kind `'raw'`, so
+    ///   Step 1 skips it and only Step 4 moves it → Step 4's marker;
+    /// - 4004 is `four.PSD` with extension `'PSD'` and the OLD kind `'other'`:
+    ///   Step 4's `file_extension = 'psd'` sees it ONLY after Step 2 has
+    ///   lowercased it, so it pins the Step 2 → Step 4 ORDER (E3 fix round 1,
+    ///   review LOW-1 — reordering the steps used to pass every test).
+    ///
+    /// V1's schema batch performs real ALTERs at open, so the WAL is non-empty
+    /// before the open's CHECKPOINT (what `[E3-M1/wal-folded]` needs).
+    fn catalogue_needing_row_migration() -> std::path::PathBuf
+    {
+        let path = build_old_catalogue(vintage("V1"), &SEED_ROWS);
+        let conn = Connection::open(&path).expect("reopen the V1 fixture raw");
+        // ⭐ ENGINE TESTS NEVER FETCH — a raw open, fenced by hand.
+        fence_connection_against_extension_fetches(&conn);
+        conn.execute("UPDATE images SET file_extension = 'NEF' WHERE id = 4001", [])
+            .expect("the Step 2 marker");
+        conn.execute(
+            "INSERT INTO images (id, file_path, file_size, file_name, file_extension, \
+             file_stem, image_kind, created_timestamp, modified_timestamp, rating) \
+             VALUES (4003, '/photos/vintage/three.dng', 4321, 'three.dng', 'dng', \
+             'three', 'raw', 1700000200, 1700000201, 4)",
+            [],
+        )
+        .expect("the Step 4 marker");
+        conn.execute(
+            "INSERT INTO images (id, file_path, file_size, file_name, file_extension, \
+             file_stem, image_kind, created_timestamp, modified_timestamp, rating) \
+             VALUES (4004, '/photos/vintage/four.PSD', 5432, 'four.PSD', 'PSD', \
+             'four', 'other', 1700000300, 1700000301, 2)",
+            [],
+        )
+        .expect("the Step 2 → Step 4 order marker");
+        conn.execute_batch("CHECKPOINT;").expect("checkpoint the fixture");
+        drop(conn);
+        path
+    }
+
+    /// Every marker the row migration touches, in one read.
+    #[derive(Debug, PartialEq)]
+    struct RowMigrationMarkers
+    {
+        row_4001: (Option<String>, Option<String>, Option<String>),
+        row_4002: (Option<String>, Option<String>),
+        kind_4003: Option<String>,
+        /// (file_extension, image_kind) of the Step 2 → Step 4 order marker.
+        row_4004: (Option<String>, Option<String>),
+    }
+
+    fn row_migration_markers(conn: &Connection, check: &str) -> RowMigrationMarkers
+    {
+        let read = |id: i64| -> (Option<String>, Option<String>, Option<String>)
+        {
+            conn.query_row(
+                "SELECT file_stem, image_kind, file_extension FROM images WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .unwrap_or_else(|e| panic!("[{}] reading row {} failed: {}", check, id, e))
+        };
+        let row_4001 = read(4001);
+        let (stem_4002, kind_4002, _) = read(4002);
+        let (_, kind_4003, _) = read(4003);
+        let (_, kind_4004, ext_4004) = read(4004);
+        RowMigrationMarkers
+        {
+            row_4001,
+            row_4002: (stem_4002, kind_4002),
+            kind_4003,
+            row_4004: (ext_4004, kind_4004),
+        }
+    }
+
+    /// The state when the migration APPLIED. Confirmed once against the
+    /// parser (`parse_filename` / `classify_extension`): "one.NEF" → ("one",
+    /// raw), "two.JPG" → ("two", jpeg); Step 2 lowercases 4001's extension and
+    /// Step 4 moves 4003 to dng; Step 2 then Step 4 move 4004 to (psd, psd).
+    fn applied_markers() -> RowMigrationMarkers
+    {
+        RowMigrationMarkers
+        {
+            row_4001: (Some("one".into()), Some("raw".into()), Some("nef".into())),
+            row_4002: (Some("two".into()), Some("jpeg".into())),
+            kind_4003: Some("dng".into()),
+            row_4004: (Some("psd".into()), Some("psd".into())),
+        }
+    }
+
+    /// The state when the migration ROLLED BACK: exactly the fixture as built.
+    fn rolled_back_markers() -> RowMigrationMarkers
+    {
+        RowMigrationMarkers
+        {
+            row_4001: (None, None, Some("NEF".into())),
+            row_4002: (None, None),
+            kind_4003: Some("raw".into()),
+            row_4004: (Some("PSD".into()), Some("other".into())),
+        }
+    }
+
+    fn wal_path(path: &std::path::Path) -> std::path::PathBuf
+    {
+        std::path::PathBuf::from(format!("{}.wal", path.display()))
+    }
+
+    /// The fixture's expectations, checked against the parser itself once, so
+    /// `applied_markers` cannot drift from the code it describes.
+    #[test]
+    fn the_e3_applied_markers_agree_with_the_parser()
+    {
+        let one = parse_filename("one.NEF".to_string());
+        let two = parse_filename("two.JPG".to_string());
+        assert_eq!((one.stem.as_str(), one.kind), ("one", ImageKind::Raw));
+        assert_eq!((two.stem.as_str(), two.kind), ("two", ImageKind::Jpeg));
+        assert_eq!(classify_extension("dng".to_string()), ImageKind::Dng);
+        assert_eq!(classify_extension("psd".to_string()), ImageKind::Psd);
+    }
+
+    /// E3-P0 — the seams hand PRODUCTION its own SQL. Every other E3 pin runs
+    /// with `Some(probe)`; this one calls the two shared bodies exactly as a
+    /// release build does (`None`), so the production path of each is executed
+    /// under `cargo test` (E3 fix round 1, review MED-2: the production
+    /// `"ROLLBACK;"` arm used to be compiled but never run, and `"COMMIT;"`
+    /// there passed all 317). A probe that names no step, or a different step,
+    /// must hand back the same text.
+    #[test]
+    fn the_seams_hand_production_its_own_sql()
+    {
+        let inert = MigrationProbe::default();
+        assert_eq!(
+            (migration_rollback_sql(None), migration_rollback_sql(Some(&inert))),
+            ("ROLLBACK;", "ROLLBACK;"),
+            "[E3-P0/rollback-text] a failed row migration must be ROLLED BACK on the \
+             production path and on the test path alike"
+        );
+
+        const SENTINEL: &str = "E3-P0 sentinel: the step's own statement";
+        let elsewhere = MigrationProbe
+        {
+            fail_migration_step: Some((MigrationStep::ReclassifyTiff, InducedFailure::CatalogClass)),
+            ..Default::default()
+        };
+        for (step, _) in E3_STEPS
+        {
+            assert_eq!(
+                migration_step_sql(None, step, SENTINEL),
+                SENTINEL,
+                "[E3-P0/step-sql-passes-through] {:?}: production does not run the step's own SQL",
+                step
+            );
+            assert_eq!(
+                migration_step_sql(Some(&inert), step, SENTINEL),
+                SENTINEL,
+                "[E3-P0/step-sql-passes-through] {:?}: an inert probe changed the step's SQL",
+                step
+            );
+            if step != MigrationStep::ReclassifyTiff
+            {
+                assert_eq!(
+                    migration_step_sql(Some(&elsewhere), step, SENTINEL),
+                    SENTINEL,
+                    "[E3-P0/step-sql-passes-through] {:?}: a probe aimed at ReclassifyTiff \
+                     changed another step's SQL",
+                    step
+                );
+            }
+        }
+        assert_eq!(
+            migration_step_sql(Some(&elsewhere), MigrationStep::BackfillUpdate { row_index: 0 }, SENTINEL),
+            SENTINEL,
+            "[E3-P0/step-sql-passes-through] the substitution must hit only the exact row_index"
+        );
+    }
+
+    /// E3-M1 — ⭐ THE SLICE'S CENTRAL PIN. All 7 steps × both engine classes:
+    /// a failed step rolls the WHOLE migration back, the catalogue still opens,
+    /// the log reason names the step, the WAL is folded and no transaction is
+    /// left open.
+    ///
+    /// ⭐ The CatalogClass leg is what catches "COMMIT instead of ROLLBACK": a
+    /// catalog-class error does NOT abort the transaction, so a COMMIT after it
+    /// would publish the steps before it. The ExecutionClass leg alone would
+    /// stay green under that mutation, because the engine discards anyway.
+    #[test]
+    fn a_failed_migration_step_rolls_the_whole_migration_back_opens_and_says_so()
+    {
+        let mut cases = 0usize;
+        for (step, label) in E3_STEPS
+        {
+            for class in E3_CLASSES
+            {
+                let context = format!("(step {:?}, class {:?})", step, class);
+                let path = catalogue_needing_row_migration();
+                let probe = MigrationProbe
+                {
+                    fail_migration_step: Some((step, class)),
+                    ..Default::default()
+                };
+
+                let (conn, outcome) = open_and_migrate_catalogue_reporting(&path, Some(&probe))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "[E3-M1/opens-anyway] {}: a rolled-back row migration must not \
+                             fail the catalogue open (that is the S93 empty library)",
+                            context
+                        )
+                    });
+
+                // Before any other statement, so nothing can have re-dirtied it.
+                assert!(
+                    !wal_path(&path).exists(),
+                    "[E3-M1/wal-folded] {}: {} still exists, so the open's CHECKPOINT did \
+                     not run after the rollback and the schema batch's ALTERs are left \
+                     to WAL replay (S62)",
+                    context,
+                    wal_path(&path).display()
+                );
+
+                let reason = match outcome
+                {
+                    CatalogueMigrationOutcome::RolledBack(reason) => reason,
+                    CatalogueMigrationOutcome::Applied(counts) => panic!(
+                        "[E3-M1/outcome-is-rolled-back] {}: the migration reported \
+                         Applied ({:?}) although a step failed",
+                        context, counts
+                    ),
+                };
+                assert!(
+                    reason.contains(label),
+                    "[E3-M1/reason-names-the-step] {}: the reason does not name {:?}: {}",
+                    context,
+                    label,
+                    reason
+                );
+
+                assert!(
+                    conn.execute_batch("BEGIN TRANSACTION; ROLLBACK;").is_ok(),
+                    "[E3-M1/no-transaction-left-open] {}: the connection the open handed \
+                     back is still inside a transaction",
+                    context
+                );
+
+                assert_eq!(
+                    row_migration_markers(&conn, "E3-M1/no-step-landed"),
+                    rolled_back_markers(),
+                    "[E3-M1/no-step-landed] {}: part of a rolled-back migration is in the \
+                     catalogue",
+                    context
+                );
+
+                assert!(
+                    index_present(&conn, "idx_images_directory_path"),
+                    "[E3-M1/schema-current] {}: the S173 marker is absent, so the \
+                     autocommit steps before BEGIN were disturbed",
+                    context
+                );
+
+                drop(conn);
+                cleanup(&path);
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 14, "[E3-M1/matrix] the matrix must run 7 steps × 2 classes");
+    }
+
+    /// E3-M2 — a rolled-back migration is retried, and APPLIES, on the next open.
+    #[test]
+    fn the_next_open_after_a_rolled_back_migration_applies_it()
+    {
+        let path = catalogue_needing_row_migration();
+        {
+            let probe = MigrationProbe
+            {
+                fail_migration_step: Some((MigrationStep::ReclassifyPng, InducedFailure::ExecutionClass)),
+                ..Default::default()
+            };
+            let (failed, outcome) = open_and_migrate_catalogue_reporting(&path, Some(&probe))
+                .expect("[E3-M2/setup] the failing open still opens");
+            assert!(
+                matches!(outcome, CatalogueMigrationOutcome::RolledBack(_)),
+                "[E3-M2/setup] the induced failure did not roll the migration back: {:?}",
+                outcome
+            );
+            drop(failed);
+        }
+
+        let (conn, outcome) = open_and_migrate_catalogue_reporting(&path, None)
+            .expect("[E3-M2/outcome-is-applied] the retry open returned None");
+        assert!(
+            matches!(outcome, CatalogueMigrationOutcome::Applied(_)),
+            "[E3-M2/outcome-is-applied] the retry did not apply the migration: {:?}",
+            outcome
+        );
+        assert_eq!(
+            row_migration_markers(&conn, "E3-M2/every-step-landed"),
+            applied_markers(),
+            "[E3-M2/every-step-landed] the retry reported Applied without landing every step"
+        );
+
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// E3-M3 — the healthy path, with no probe and with an inert probe: Applied,
+    /// every step's work is in the table, and the WAL is folded.
+    ///
+    /// ⭐ `[E3-M3/wal-folded]` (E3 fix round 1, review LOW-2) pins the
+    /// CHECKPOINT on the APPLIED arm: V1's schema batch performs real ALTERs at
+    /// open, so the WAL is non-empty until that CHECKPOINT folds it, and an
+    /// Applied-only early return before it used to pass every test (S62).
+    #[test]
+    fn a_healthy_migration_reports_applied_and_lands_every_step()
+    {
+        let inert = MigrationProbe::default();
+        for (name, probe) in [("no probe", None), ("an inert probe", Some(&inert))]
+        {
+            let path = catalogue_needing_row_migration();
+            let (conn, outcome) = open_and_migrate_catalogue_reporting(&path, probe)
+                .unwrap_or_else(|| panic!("[E3-M3/outcome-is-applied] {}: the open returned None", name));
+            // Before any other statement, so nothing can have re-dirtied it.
+            assert!(
+                !wal_path(&path).exists(),
+                "[E3-M3/wal-folded] {}: {} still exists, so the open's CHECKPOINT did not run \
+                 after the applied migration and the schema batch's ALTERs are left to WAL \
+                 replay (S62)",
+                name,
+                wal_path(&path).display()
+            );
+            match &outcome
+            {
+                CatalogueMigrationOutcome::Applied(counts) =>
+                {
+                    eprintln!("[E3-M3] {}: {:?}", name, counts);
+                }
+                CatalogueMigrationOutcome::RolledBack(reason) => panic!(
+                    "[E3-M3/outcome-is-applied] {}: a healthy migration rolled back: {}",
+                    name, reason
+                ),
+            }
+            assert_eq!(
+                row_migration_markers(&conn, "E3-M3/every-step-landed"),
+                applied_markers(),
+                "[E3-M3/every-step-landed] {}: a step's work is missing",
+                name
+            );
+            drop(conn);
+            cleanup(&path);
+        }
+    }
+
+    /// E3-M5 — a ROLLBACK that itself fails leaves the catalogue's state
+    /// unknown, so the open is REFUSED (`None`), exactly as a failed COMMIT
+    /// always was. The override's second ROLLBACK errs "no transaction is
+    /// active".
+    #[test]
+    fn a_rollback_that_fails_refuses_the_open()
+    {
+        let path = catalogue_needing_row_migration();
+        let probe = MigrationProbe
+        {
+            fail_migration_step: Some((MigrationStep::ReclassifyDng, InducedFailure::CatalogClass)),
+            rollback_sql_override: Some("ROLLBACK; ROLLBACK;"),
+            ..Default::default()
+        };
+        let opened = open_and_migrate_catalogue_reporting(&path, Some(&probe));
+        assert!(
+            opened.is_none(),
+            "[E3-M5/refuses] the open returned Some although the migration's ROLLBACK \
+             failed: {:?}",
+            opened.as_ref().map(|(_, outcome)| outcome)
+        );
+        drop(opened);
+        cleanup(&path);
+    }
+}
+
+// ===========================================================================
+// E3 / ruling 15 — commit-after-abort (2026-10-04)
+// ===========================================================================
+//
+// The engine facts the slice rests on, pinned against an engine bump, and the
+// folder-sync prune's own transaction. The row-migration tests live in
+// `schema_upgrade_fixture_tests` (section "E3 — commit-after-abort"), next to
+// the vintage fixtures they reuse. Every fixture here is a real temp-file
+// catalogue opened through `open_and_migrate_catalogue` (fenced: ENGINE TESTS
+// NEVER FETCH).
+#[cfg(test)]
+mod commit_after_abort_tests
+{
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn fixture_path(tag: &str) -> std::path::PathBuf
+    {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "plcore-commit-after-abort-test-{}-{}-{}.db",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+        path
+    }
+
+    fn cleanup(path: &std::path::Path)
+    {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+    }
+
+    fn catalogue(tag: &str) -> (std::path::PathBuf, Connection)
+    {
+        let path = fixture_path(tag);
+        let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+        conn.execute_batch("CREATE TABLE e3_scratch (x INTEGER);")
+            .expect("scratch table, in autocommit");
+        (path, conn)
+    }
+
+    fn scratch_rows(conn: &Connection) -> i64
+    {
+        conn.query_row("SELECT COUNT(*) FROM e3_scratch", [], |r| r.get::<_, i64>(0))
+            .expect("count the scratch table")
+    }
+
+    /// E3-E0 — pins the PROBE'S OWN MEANING. Every E3 pin assumes the
+    /// ExecutionClass failure ABORTS a transaction and the CatalogClass one does
+    /// NOT; if an engine bump moves either class, the pins built on them prove
+    /// something else, so this goes red first.
+    #[test]
+    fn the_induced_failures_have_the_engine_classes_the_pins_rely_on()
+    {
+        let (path, conn) = catalogue("e0");
+
+        conn.execute_batch("BEGIN TRANSACTION;").expect("begin");
+        conn.execute("INSERT INTO e3_scratch VALUES (1)", []).expect("insert");
+        let induced = run_induced_failure(&conn, InducedFailure::ExecutionClass);
+        match conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))
+        {
+            Ok(_) => panic!(
+                "[E3-E0/execution-class-aborts] after the induced ExecutionClass failure \
+                 ({}) the transaction is still live, so it is not an execution-class error \
+                 on this engine",
+                induced
+            ),
+            Err(e) => assert!(
+                e.to_string().contains("aborted"),
+                "[E3-E0/execution-class-aborts] the statement after the induced failure \
+                 erred, but not as an aborted transaction: {}",
+                e
+            ),
+        }
+        conn.execute_batch("ROLLBACK;")
+            .expect("[E3-E0/execution-class-aborts] ROLLBACK of an aborted transaction must be Ok");
+
+        conn.execute_batch("BEGIN TRANSACTION;").expect("begin");
+        conn.execute("INSERT INTO e3_scratch VALUES (2)", []).expect("insert");
+        let induced = run_induced_failure(&conn, InducedFailure::CatalogClass);
+        let live = conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0));
+        assert!(
+            live.is_ok(),
+            "[E3-E0/catalog-class-does-not-abort] after the induced CatalogClass failure \
+             ({}) the transaction is aborted ({:?}), so the CatalogClass leg of every E3 pin \
+             no longer reaches the partial-commit hazard",
+            induced,
+            live
+        );
+        conn.execute_batch("ROLLBACK;").expect("rollback");
+
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// E3-E2 — the statements the migration seam SUBSTITUTES for a step's own
+    /// SQL (E3 fix round 1, review MED-1) have the engine classes the E3-M1
+    /// matrix relies on, run in the EXACT form the step runs them: Step 1's
+    /// query through `prepare` + `query_map`, Step 1's UPDATE through `execute`
+    /// with its three bound parameters against a real row, every other step
+    /// through a parameterless `execute`.
+    #[test]
+    fn every_substituted_step_statement_has_the_engine_class_the_pins_rely_on()
+    {
+        let (path, conn) = catalogue("e2");
+        conn.execute(
+            "INSERT INTO images (file_path, file_size, file_name, created_timestamp, \
+             modified_timestamp) VALUES ('/E2/e2.jpg', 1, 'e2.jpg', 0, 0)",
+            [],
+        )
+        .expect("the row Step 1's UPDATE targets, in autocommit");
+        let row_id: i64 = conn
+            .query_row("SELECT id FROM images WHERE file_path = '/E2/e2.jpg'", [], |r| r.get(0))
+            .expect("the row's id");
+
+        let steps = [
+            MigrationStep::BackfillSelect,
+            MigrationStep::BackfillUpdate { row_index: 1 },
+            MigrationStep::ExtensionLowercase,
+            MigrationStep::ReclassifyDng,
+            MigrationStep::ReclassifyPsd,
+            MigrationStep::ReclassifyTiff,
+            MigrationStep::ReclassifyPng,
+        ];
+        let mut cases = 0usize;
+        for step in steps
+        {
+            for class in [InducedFailure::ExecutionClass, InducedFailure::CatalogClass]
+            {
+                let sql = induced_step_sql(step, class);
+                conn.execute_batch("BEGIN TRANSACTION;").expect("begin");
+                conn.execute("INSERT INTO e3_scratch VALUES (1)", []).expect("insert");
+                let ran: Result<(), duckdb::Error> = match step
+                {
+                    MigrationStep::BackfillSelect => match conn.prepare(sql)
+                    {
+                        Err(e) => Err(e),
+                        Ok(mut stmt) =>
+                        {
+                            let queried = stmt
+                                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                                .map(|_| ());
+                            queried
+                        }
+                    },
+                    MigrationStep::BackfillUpdate { .. } => conn
+                        .execute(sql, params!["e2", "jpeg", row_id])
+                        .map(|_| ()),
+                    _ => conn.execute(sql, []).map(|_| ()),
+                };
+                let failed = match ran
+                {
+                    Ok(()) => panic!(
+                        "[E3-E2/statement-fails] ({:?}, {:?}) the substituted statement ({}) \
+                         SUCCEEDED, so that E3-M1 case induces nothing",
+                        step, class, sql
+                    ),
+                    Err(e) => e,
+                };
+                let live = conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0));
+                match class
+                {
+                    InducedFailure::ExecutionClass => assert!(
+                        matches!(&live, Err(e) if e.to_string().contains("aborted")),
+                        "[E3-E2/execution-class-aborts] ({:?}) the substituted statement \
+                         failed ({}) but did not abort the transaction ({:?})",
+                        step, failed, live
+                    ),
+                    InducedFailure::CatalogClass => assert!(
+                        live.is_ok(),
+                        "[E3-E2/catalog-class-does-not-abort] ({:?}) the substituted statement \
+                         failed ({}) and aborted the transaction ({:?})",
+                        step, failed, live
+                    ),
+                }
+                conn.execute_batch("ROLLBACK;").expect("rollback");
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 14, "[E3-E2/matrix] 7 steps × 2 classes");
+        assert_eq!(scratch_rows(&conn), 0, "[E3-E2/matrix] every case was rolled back");
+
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// E3-E1 — THE CANARY for the hazard itself, in the `duckdb_upgrade_tests`
+    /// spirit: on the bundled engine a COMMIT after an execution-class error
+    /// returns Ok and silently discards everything since BEGIN.
+    ///
+    /// If this goes RED after an engine bump, the engine changed what COMMIT
+    /// does after an abort; re-read §1.1 of the E3 brief before touching
+    /// anything.
+    #[test]
+    fn commit_after_an_execution_class_error_discards_silently_on_the_bundled_engine()
+    {
+        let (path, conn) = catalogue("e1");
+
+        conn.execute_batch("BEGIN TRANSACTION;").expect("begin");
+        conn.execute("INSERT INTO e3_scratch VALUES (1)", []).expect("insert");
+        let _ = run_induced_failure(&conn, InducedFailure::ExecutionClass);
+        let committed = conn.execute_batch("COMMIT;");
+        assert!(
+            committed.is_ok(),
+            "[E3-E1/commit-returns-ok] COMMIT after an aborted transaction now errs ({:?}); \
+             the engine changed — re-read the E3 brief §1.1",
+            committed
+        );
+        assert_eq!(
+            scratch_rows(&conn),
+            0,
+            "[E3-E1/nothing-landed] the INSERT before the abort was committed; the engine \
+             changed — re-read the E3 brief §1.1"
+        );
+
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// The prune fixture: `images` rows in /A and /B, and baselines for /A and
+    /// for /Gone, a directory no image lives in (the prune's target).
+    fn sync_state_catalogue(tag: &str) -> (std::path::PathBuf, Connection)
+    {
+        let path = fixture_path(tag);
+        let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+        conn.execute_batch(
+            "INSERT INTO images (file_path, file_size, file_name, directory_path, \
+             created_timestamp, modified_timestamp) VALUES \
+             ('/A/a.jpg', 1, 'a.jpg', '/A', 0, 0), \
+             ('/B/b.jpg', 1, 'b.jpg', '/B', 0, 0); \
+             INSERT INTO directory_sync_state (directory_path, last_sync_mtime) VALUES \
+             ('/A', 100), ('/Gone', 1);",
+        )
+        .expect("seed images and baselines");
+        (path, conn)
+    }
+
+    fn new_baselines() -> Vec<DirectorySyncState>
+    {
+        vec![
+            DirectorySyncState
+            {
+                directory_path: "/A".into(),
+                last_sync_mtime: 600,
+            },
+            DirectorySyncState
+            {
+                directory_path: "/B".into(),
+                last_sync_mtime: 700,
+            },
+        ]
+    }
+
+    fn baseline_of(conn: &Connection, directory: &str, check: &str) -> Option<i64>
+    {
+        let rows = directory_sync_states_impl(conn);
+        let found: Vec<i64> = rows
+            .iter()
+            .filter(|row| row.directory_path == directory)
+            .map(|row| row.last_sync_mtime)
+            .collect();
+        assert!(found.len() <= 1, "[{}] more than one baseline row for {}", check, directory);
+        found.first().copied()
+    }
+
+    /// E3-S1 — a prune that FAILS (either engine class) keeps every baseline the
+    /// upserts committed, rolls itself back, and the count stays true.
+    #[test]
+    fn a_failed_prune_keeps_every_committed_baseline_and_reports_the_true_count()
+    {
+        for class in [InducedFailure::ExecutionClass, InducedFailure::CatalogClass]
+        {
+            let (path, conn) = sync_state_catalogue(&format!("s1-{:?}", class));
+            let probe = DirectorySyncProbe { fail_prune: Some(class) };
+
+            let changed =
+                update_directory_sync_states_impl_with_probe(&conn, &new_baselines(), Some(&probe));
+            assert_eq!(
+                changed, 2,
+                "[E3-S1/count-is-true] ({:?}) the caller was told {} row(s) changed",
+                class, changed
+            );
+
+            // First, so a transaction left open (aborted or live) is reported
+            // as itself rather than as a failed read.
+            assert!(
+                conn.execute_batch("BEGIN TRANSACTION; ROLLBACK;").is_ok(),
+                "[E3-S1/no-transaction-left-open] ({:?}) the failed prune left a transaction \
+                 open on the catalogue connection",
+                class
+            );
+
+            assert_eq!(
+                (
+                    baseline_of(&conn, "/A", "E3-S1/every-baseline-committed"),
+                    baseline_of(&conn, "/B", "E3-S1/every-baseline-committed")
+                ),
+                (Some(600), Some(700)),
+                "[E3-S1/every-baseline-committed] ({:?}) a baseline the upserts wrote is not \
+                 in the table, so the failed prune discarded it",
+                class
+            );
+            assert_eq!(
+                baseline_of(&conn, "/Gone", "E3-S1/prune-rolled-back"),
+                Some(1),
+                "[E3-S1/prune-rolled-back] ({:?}) /Gone was pruned although the prune failed",
+                class
+            );
+
+            drop(conn);
+            cleanup(&path);
+        }
+    }
+
+    /// E3-S2 — the healthy prune, now in its own transaction after the upserts
+    /// commit: the count, the baselines and the prune all land.
+    #[test]
+    fn a_healthy_prune_runs_after_the_upserts_commit()
+    {
+        let (path, conn) = sync_state_catalogue("s2");
+
+        let changed = update_directory_sync_states_impl_with_probe(&conn, &new_baselines(), None);
+        assert_eq!(changed, 2, "[E3-S2/count-is-true] the caller was told {} row(s) changed", changed);
+        assert_eq!(
+            baseline_of(&conn, "/Gone", "E3-S2/stale-row-pruned"),
+            None,
+            "[E3-S2/stale-row-pruned] /Gone survived a healthy prune"
+        );
+        assert_eq!(
+            (
+                baseline_of(&conn, "/A", "E3-S2/every-baseline-committed"),
+                baseline_of(&conn, "/B", "E3-S2/every-baseline-committed")
+            ),
+            (Some(600), Some(700)),
+            "[E3-S2/every-baseline-committed] a baseline is missing after a healthy call"
+        );
+
+        drop(conn);
+        cleanup(&path);
+    }
 }
 
 
@@ -40117,7 +41745,9 @@ mod swallowed_failure_tests
         .expect("insert face observation");
     }
 
-    fn image_metadata(file_path: &str) -> ImageMetadata
+    /// `pub(super)` since slice P's fix round 1: `cross_store_tests` P21 saves
+    /// through the editor FFI with it.
+    pub(super) fn image_metadata(file_path: &str) -> ImageMetadata
     {
         ImageMetadata
         {
@@ -46876,6 +48506,443 @@ mod cross_store_tests
         assert!(control.orphan_scan_ran, "P17(d)/control-sweeps: {}", control.message);
         assert_eq!(control.orphans_enqueued, 2, "P17(d)/control-queues-both-orphans: {}", control.message);
     }
+
+    // ------------------------------------------------------------------
+    // ⭐ P19 — review F3 (ruled Oct 3, 2026; built Oct 4): Remove from
+    // Catalogue's vector cleanup is the queue's DRAIN ONLY — no store count,
+    // no store id scan, no orphan enqueue inside the action the user waits on.
+    // (a) the probe, threaded through the PRODUCTION cleanup
+    //     (`retry_removal_face_vector_deletes`: its boundary, its runtime hop,
+    //     its spawn) on a scene whose sweep gate is OPEN; the control shows the
+    //     same scene WOULD sweep at launch / before an index build.
+    // (b) end to end through the FFI `remove_images_by_ids`, polled off the
+    //     face runtime as Swift's executor polls it (the probe cannot cross
+    //     the FFI; the queue and the store are the observation).
+    // Fix round 1 (review finding 5): "no store count" is OBSERVED — the
+    // probe counts the gate's `count_rows` reach (`counts`) as well as the id
+    // scan (`scans`), so a removal that ran the gate alone fails too.
+    // ------------------------------------------------------------------
+    #[test]
+    fn p19_remove_from_catalogue_drains_without_the_orphan_sweep()
+    {
+        let _serial = serial();
+        let older_image = |check: &Connection| -> i64
+        {
+            check
+                .query_row("SELECT id FROM images WHERE file_path = '/s/b.jpg'", [], |row| row.get::<_, i64>(0))
+                .expect("the older photo")
+        };
+
+        // (a) the probe.
+        let (scene, installed) = sweep_scene("p19a");
+        let older = older_image(&scene.check);
+        let outcome = remove_images_by_ids_impl_with_probe(&scene.check, &[older], None)
+            .expect("fixture: the removal commits");
+        assert_eq!(outcome.doomed_faces, 1, "fixture: the removal took the older photo's face");
+        assert_eq!(
+            queued(&scene.check),
+            [scene.old_live].into_iter().collect(),
+            "fixture: the removal queued exactly its own face's vector"
+        );
+        // `'static` because the production cleanup SPAWNS the drain; one small
+        // probe per test run, leaked on purpose.
+        let probe: &'static OrphanSweepProbe = Box::leak(Box::new(OrphanSweepProbe::new()));
+        let cleanup = futures::executor::block_on(retry_removal_face_vector_deletes(outcome.doomed_faces, "p19", Some(probe)))
+            .expect("faces were removed, so the cleanup runs");
+        assert_eq!(probe.counts.load(Ordering::SeqCst), 0, "P19/no-store-count-inside-a-removal (probe counter)");
+        assert_eq!(probe.scans.load(Ordering::SeqCst), 0, "P19/no-store-scan-inside-a-removal (probe counter)");
+        assert!(!cleanup.orphan_scan_ran, "P19/no-sweep-inside-a-removal: {}", cleanup.message);
+        assert_eq!(cleanup.orphans_enqueued, 0, "P19/no-orphan-enqueued-by-a-removal: {}", cleanup.message);
+        assert!(queued(&scene.check).is_empty(), "P19/the-queue-holds-no-orphan-after-a-removal");
+        assert_eq!(cleanup.acknowledged_count, 1, "P19/the-removal's-own-vector-is-drained: {}", cleanup.message);
+        let mut kept = scene.orphans.clone();
+        kept.insert(scene.live);
+        kept.insert(scene.twin);
+        assert_eq!(
+            stored_ids(&scene.fixture.vectors_uri()),
+            kept,
+            "P19/the-removed-face's-vector-is-gone-the-rest-untouched"
+        );
+        // Control: the SAME scene's gate is open — the launch / index-build
+        // retry scans and queues both orphans.
+        let control_probe = OrphanSweepProbe::new();
+        let control = block(retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, Some(&control_probe)));
+        assert_eq!(control_probe.counts.load(Ordering::SeqCst), 1, "P19/control-the-gate-counted: {}", control.message);
+        assert_eq!(control_probe.scans.load(Ordering::SeqCst), 1, "P19/control-the-gate-was-open: {}", control.message);
+        assert_eq!(control.orphans_enqueued, 2, "P19/control-sweeps-the-orphans: {}", control.message);
+        drop(installed);
+        drop(scene);
+
+        // (b) the FFI, end to end.
+        let (scene, _installed) = sweep_scene("p19b");
+        let older = older_image(&scene.check);
+        let removed = futures::executor::block_on(remove_images_by_ids(vec![older]));
+        assert_eq!(removed, 1, "fixture: the FFI removed the photo");
+        assert!(queued(&scene.check).is_empty(), "P19/ffi: no-orphan-queued-by-a-removal");
+        let mut kept = scene.orphans.clone();
+        kept.insert(scene.live);
+        kept.insert(scene.twin);
+        assert_eq!(
+            stored_ids(&scene.fixture.vectors_uri()),
+            kept,
+            "P19/ffi: the-removed-face's-vector-is-drained-the-orphans-untouched"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // ⭐ P20 — review F6 (ruled Oct 3, 2026; built Oct 4): a mid-loop failure
+    // of the orphan enqueue leaves the QUEUE and the REPORTED COUNT in
+    // agreement — all or nothing, the rollback verified on the table.
+    // 1,001 orphans = three 500-id chunks; the failure is injected at the
+    // SECOND (chunk index 1), after chunk 0 has been written:
+    // (a) its INSERT fails; (b) its verification read fails (its INSERT has
+    // landed); (c) its INSERT fails AND the ROLLBACK fails, leaving the
+    // transaction open — the report must say the count is unconfirmed, never
+    // "nothing was queued", and must not count the open transaction's rows.
+    // Control: no failure → all 1,001 queued.
+    // Fix round 1 (review findings 2 and 3): (d) the "ROLLBACK" SUCCEEDS but
+    // leaves chunk 0 on the table (the probe makes it a COMMIT), so the
+    // after-rollback count disagrees with the count before BEGIN — the
+    // report says UNCONFIRMED, never "n stayed queued" and never "nothing
+    // was queued"; and every unconfirmed outcome — (c) and (d) — is written
+    // to the dropped-row census exactly once, while a VERIFIED rollback (a),
+    // (b) and the control write nothing there.
+    // Fix round 2 (review G-3): (e) the ROLLBACK succeeds but the queue
+    // cannot be re-read — UNCONFIRMED and censused once, never "nothing was
+    // queued".
+    // ------------------------------------------------------------------
+    struct ManyOrphans
+    {
+        _fixture: Fixture,
+        check: Connection,
+        orphans: BTreeSet<i64>,
+    }
+
+    /// The cumulative census count at the unconfirmed-enqueue site; tests
+    /// read it before and after (the census never drains).
+    fn unconfirmed_enqueue_census() -> u64
+    {
+        let report = futures::executor::block_on(dropped_row_report());
+        report
+            .site_names
+            .iter()
+            .position(|name| name == ORPHAN_ENQUEUE_UNCONFIRMED_SITE)
+            .map(|index| report.site_counts[index])
+            .unwrap_or(0)
+    }
+
+    fn many_orphans_scene(tag: &str) -> (ManyOrphans, Installed)
+    {
+        let (fixture, conn) = fresh_catalogue(tag);
+        let image = insert_image(&conn, "/m/a.jpg", "jpeg");
+        let live = insert_face(&conn, image, image, 0, ALGO);
+        let check = second_connection(&conn);
+        let installed = Installed::new(&fixture, conn);
+        let orphans = (8_000_000..8_001_001).collect::<BTreeSet<i64>>();
+        let mut records = orphans.iter().map(|id| record(*id, MODEL, 1.0)).collect::<Vec<_>>();
+        records.push(record(live, MODEL, 1.0));
+        assert_eq!(block(upsert_face_embeddings_impl(records)).status, "stored");
+        (ManyOrphans { _fixture: fixture, check, orphans }, installed)
+    }
+
+    #[test]
+    fn p20_a_mid_loop_enqueue_failure_keeps_the_queue_and_the_report_in_agreement()
+    {
+        let _serial = serial();
+
+        for (case, insert_fails, verify_fails) in [("insert", true, false), ("verify", false, true)]
+        {
+            let (scene, installed) = many_orphans_scene(&format!("p20{}", case));
+            let mut probe = OrphanSweepProbe::new();
+            probe.fail_enqueue_insert_at_chunk = if insert_fails { Some(1) } else { None };
+            probe.fail_enqueue_verify_at_chunk = if verify_fails { Some(1) } else { None };
+            let census_before = unconfirmed_enqueue_census();
+            let result = block(retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, Some(&probe)));
+            assert!(result.orphan_scan_ran, "fixture/{}: the gate opened: {}", case, result.message);
+            assert_eq!(
+                unconfirmed_enqueue_census(),
+                census_before,
+                "P20({})/a-verified-rollback-is-not-censused: {}",
+                case,
+                result.message
+            );
+            assert_eq!(
+                queued(&scene.check).len() as u64,
+                result.orphans_enqueued,
+                "P20({})/the-queue-and-the-reported-count-agree: {}",
+                case,
+                result.message
+            );
+            assert!(
+                queued(&scene.check).is_empty(),
+                "P20({})/all-or-nothing: chunk 0 must not stay queued: {}",
+                case,
+                result.message
+            );
+            assert_eq!(result.remaining_count, 0, "P20({})/remaining-agrees: {}", case, result.message);
+            assert!(
+                result.message.contains("nothing was queued") && result.message.contains("rolled back"),
+                "P20({})/says-so: {}",
+                case,
+                result.message
+            );
+            drop(installed);
+            drop(scene);
+        }
+
+        // (c) a ROLLBACK that fails is never reported as one, and the open
+        // transaction's own rows are never counted as queued.
+        let (scene, installed) = many_orphans_scene("p20rollback");
+        let mut probe = OrphanSweepProbe::new();
+        probe.fail_enqueue_insert_at_chunk = Some(1);
+        probe.rollback_fails = true;
+        let census_before = unconfirmed_enqueue_census();
+        let result = block(retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, Some(&probe)));
+        assert_eq!(
+            unconfirmed_enqueue_census(),
+            census_before + 1,
+            "P20(rollback)/the-unconfirmed-outcome-is-censused-once: {}",
+            result.message
+        );
+        assert!(
+            !result.message.contains("nothing was queued"),
+            "P20(rollback)/a-failed-rollback-is-not-reported-as-nothing-queued: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("cannot be confirmed"),
+            "P20(rollback)/says-the-count-is-unconfirmed: {}",
+            result.message
+        );
+        drop(installed);
+        // The global connection (and the transaction it could not roll back)
+        // is gone; what was COMMITTED is what the report must not contradict.
+        assert_eq!(
+            queued(&scene.check).len() as u64,
+            result.orphans_enqueued,
+            "P20(rollback)/the-committed-queue-and-the-reported-count-agree: {}",
+            result.message
+        );
+        drop(scene);
+
+        // (d) the "rollback" succeeds, yet the table disagrees with the count
+        // read before BEGIN: unexplained, so UNCONFIRMED.
+        let (scene, installed) = many_orphans_scene("p20mismatch");
+        let mut probe = OrphanSweepProbe::new();
+        probe.fail_enqueue_insert_at_chunk = Some(1);
+        probe.rollback_keeps_the_rows = true;
+        let census_before = unconfirmed_enqueue_census();
+        let result = block(retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, Some(&probe)));
+        assert_eq!(
+            queued(&scene.check).len(),
+            500,
+            "fixture: the probe's COMMIT kept chunk 0 on the table: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("could not be confirmed"),
+            "P20(mismatch)/a-disagreeing-table-is-reported-as-unconfirmed: {}",
+            result.message
+        );
+        assert!(
+            !result.message.contains("nothing was queued") && !result.message.contains("stayed queued for deletion"),
+            "P20(mismatch)/never-nothing-and-never-a-vouched-difference: {}",
+            result.message
+        );
+        assert_eq!(result.orphans_enqueued, 0, "P20(mismatch)/no-count-is-vouched-for: {}", result.message);
+        assert_eq!(
+            unconfirmed_enqueue_census(),
+            census_before + 1,
+            "P20(mismatch)/the-unconfirmed-outcome-is-censused-once: {}",
+            result.message
+        );
+        drop(installed);
+        drop(scene);
+
+        // (e) fix round 2 (review G-3): the ROLLBACK SUCCEEDS, but the queue
+        // cannot be re-read to confirm it — UNCONFIRMED, never "nothing was
+        // queued", censused once. Then the table is put back and must show the
+        // rollback held (nothing of the pass stayed queued).
+        let (scene, installed) = many_orphans_scene("p20reread");
+        let mut probe = OrphanSweepProbe::new();
+        probe.fail_enqueue_insert_at_chunk = Some(1);
+        probe.fail_reread_after_rollback = true;
+        let census_before = unconfirmed_enqueue_census();
+        let result = block(retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, Some(&probe)));
+        assert!(
+            result.message.contains("could not be re-read"),
+            "fixture: the re-read-failed arm was reached: {}",
+            result.message
+        );
+        assert!(
+            result.message.contains("could not be confirmed"),
+            "P20(reread)/an-unreadable-queue-is-reported-as-unconfirmed: {}",
+            result.message
+        );
+        assert!(
+            !result.message.contains("nothing was queued"),
+            "P20(reread)/never-reported-as-nothing-queued: {}",
+            result.message
+        );
+        assert_eq!(result.orphans_enqueued, 0, "P20(reread)/no-count-is-vouched-for: {}", result.message);
+        assert_eq!(
+            unconfirmed_enqueue_census(),
+            census_before + 1,
+            "P20(reread)/the-unconfirmed-outcome-is-censused-once: {}",
+            result.message
+        );
+        drop(installed);
+        scene
+            .check
+            .execute_batch(
+                "ALTER TABLE face_vector_pending_delete_hidden_from_the_reread RENAME TO face_vector_pending_delete;",
+            )
+            .expect("fixture: put the queue table back");
+        assert!(
+            queued(&scene.check).is_empty(),
+            "fixture: the real ROLLBACK held — chunk 0 is not on the table: {}",
+            result.message
+        );
+        drop(scene);
+
+        // Control: no failure → every orphan queued, and the report says so.
+        let (scene, _installed) = many_orphans_scene("p20control");
+        let census_before = unconfirmed_enqueue_census();
+        let result = block(retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, None));
+        assert_eq!(result.orphans_enqueued, 1_001, "P20/control-queues-all: {}", result.message);
+        assert_eq!(queued(&scene.check), scene.orphans, "P20/control-exactly-the-orphans");
+        assert_eq!(unconfirmed_enqueue_census(), census_before, "P20/control-nothing-censused");
+    }
+
+    // ==================================================================
+    // ⭐ P21 — EDITOR-SAVE DRAIN-ONLY (slice P fix round 1, PART 2 —
+    // RULED YES Oct 4, 2026, ruling 8: "Yes to all, and yes to ruling 8";
+    // it pins the PART 2 block in `upsert_editor_saved_image`). An editor save of a
+    // photo WITH FACES, through the FFI `upsert_editor_saved_image` polled off
+    // the face runtime as Swift polls it, on a scene whose sweep gate is OPEN
+    // (the probe cannot cross the FFI; the queue and the store are the
+    // observation, as in P19(b)):
+    // (a) the drain completes → no orphan is queued by the save, the replaced
+    //     faces' vectors are gone, the orphans and the other photo's vector
+    //     are untouched, and the result is what Swift's closeout
+    //     (`FloatingImageEditor`) reads as CLEAN: the expected status
+    //     (`Refreshed`), an image id, and NO `vector_cleanup_warning` — the
+    //     one field that, non-empty, becomes a closeout issue and the "Photo
+    //     saved, but closeout needs attention" alert;
+    // (b) the drain is DEFERRED (a read-only store) → the warning still
+    //     fires: the change removed the sweep, not the honest warning;
+    // (c) fix round 2 (review G-1): the drain is FAILED with nothing
+    //     remaining (the face runtime cannot be built) → the warning still
+    //     fires, through the `Failed` term alone.
+    // ==================================================================
+    #[test]
+    fn p21_an_editor_save_drains_without_the_orphan_sweep()
+    {
+        let _serial = serial();
+        let save = || futures::executor::block_on(upsert_editor_saved_image(
+            super::swallowed_failure_tests::image_metadata("/s/a.jpg"),
+            false,
+        ));
+
+        // (a) the drain completes.
+        let (scene, installed) = sweep_scene("p21a");
+        let result = save();
+        assert_eq!(
+            result.status,
+            EditorSavedImageCatalogueStatus::Refreshed,
+            "fixture: the save refreshed the existing record: {}",
+            result.message
+        );
+        assert!(result.image_id.is_some(), "P21/the-closeout-reads-an-image-id: {}", result.message);
+        assert_eq!(
+            result.vector_cleanup_warning,
+            None,
+            "P21/a-clean-save-raises-no-closeout-warning"
+        );
+        assert!(queued(&scene.check).is_empty(), "P21/no-orphan-queued-by-an-editor-save");
+        let mut kept = scene.orphans.clone();
+        kept.insert(scene.old_live);
+        assert_eq!(
+            stored_ids(&scene.fixture.vectors_uri()),
+            kept,
+            "P21/the-replaced-faces'-vectors-are-drained-the-rest-untouched"
+        );
+        drop(installed);
+        drop(scene);
+
+        // (b) the drain is deferred: the warning is kept.
+        let (scene, _installed) = sweep_scene("p21b");
+        let stored_before = stored_ids(&scene.fixture.vectors_uri());
+        let result = {
+            let _read_only = ReadOnlyTree::new(&scene.fixture.vectors());
+            save()
+        };
+        assert_eq!(
+            result.status,
+            EditorSavedImageCatalogueStatus::Refreshed,
+            "fixture: the catalogue half commits even when the store is read-only: {}",
+            result.message
+        );
+        assert!(
+            result.vector_cleanup_warning.as_deref().is_some_and(|warning| warning.contains("still queued")),
+            "P21/a-deferred-drain-still-warns: {:?}",
+            result.vector_cleanup_warning
+        );
+        assert_eq!(
+            queued(&scene.check),
+            [scene.live, scene.twin].into_iter().collect(),
+            "P21/deferred: the-queue-holds-the-save's-own-ids-and-no-orphan"
+        );
+        assert_eq!(stored_ids(&scene.fixture.vectors_uri()), stored_before, "P21/deferred: the-store-is-unchanged");
+        drop(_installed);
+        drop(scene);
+
+        // (c) fix round 2 (review G-1): the drain is FAILED
+        // with NOTHING remaining — the face runtime cannot be built on this
+        // thread (slice F's R4 seam), so the cleanup never starts and answers
+        // `Failed`, `remaining_count == 0`. Only the `Failed` term of the
+        // save's warning test can carry that to Swift's closeout.
+        fn the_runtime_cannot_be_built() -> std::io::Result<tokio::runtime::Runtime>
+        {
+            Err(std::io::Error::other("P21(c): simulated runtime build failure"))
+        }
+        struct RuntimeOverridden;
+        impl Drop for RuntimeOverridden
+        {
+            fn drop(&mut self)
+            {
+                FACE_EMBEDDING_RUNTIME_OVERRIDE.with(|entry| entry.set(None));
+            }
+        }
+        let (scene, _installed) = sweep_scene("p21c");
+        let stored_before = stored_ids(&scene.fixture.vectors_uri());
+        let result = {
+            let slot: &'static once_cell::sync::OnceCell<tokio::runtime::Runtime> =
+                Box::leak(Box::new(once_cell::sync::OnceCell::new()));
+            FACE_EMBEDDING_RUNTIME_OVERRIDE.with(|entry| entry.set(Some((slot, the_runtime_cannot_be_built))));
+            let _overridden = RuntimeOverridden;
+            save()
+        };
+        assert_eq!(
+            result.status,
+            EditorSavedImageCatalogueStatus::Refreshed,
+            "fixture: the catalogue half commits even when the cleanup cannot start: {}",
+            result.message
+        );
+        assert!(result.image_id.is_some(), "fixture: the closeout reads an image id: {}", result.message);
+        assert_eq!(
+            queued(&scene.check),
+            [scene.live, scene.twin].into_iter().collect(),
+            "fixture: the drain never ran — the save's own ids stay queued, and no orphan"
+        );
+        assert_eq!(stored_ids(&scene.fixture.vectors_uri()), stored_before, "fixture: the store is unchanged");
+        assert!(
+            result.vector_cleanup_warning.as_deref().is_some_and(|warning| warning.contains("still queued")),
+            "P21/a-failed-drain-with-nothing-remaining-still-warns: {:?}",
+            result.vector_cleanup_warning
+        );
+    }
+    // ===== P21 — END =====
 
     // ------------------------------------------------------------------
     // P18 — the crash-rig row for `vectors.lancedb` (Q-09), asserted.
