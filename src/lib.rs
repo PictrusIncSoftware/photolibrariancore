@@ -5284,9 +5284,13 @@ pub async fn upsert_editor_saved_image(
                 FaceVectorDeleteRetryStatus::Deferred | FaceVectorDeleteRetryStatus::Failed
             )
         {
+            // ⭐ W4-R / R-133 — this warning quotes the delete-retry message to
+            // the user (the editor's save closeout), so it is stripped like the
+            // retry FFI's own. The `[WARN faceVectorCleanup]` console line in
+            // `retry_removal_face_vector_deletes` keeps it RAW.
             vector_cleanup_warning = Some(format!(
                 "The catalogue was refreshed, but obsolete face-vector cleanup is still queued. PhotoLibrarian will retry at launch and before the next face-index build. {}",
-                cleanup.message
+                strip_rust_source_locations(&cleanup.message)
             ));
         }
     }
@@ -9574,6 +9578,131 @@ pub async fn keyword_management_rows(
     keyword_management_rows_impl(conn, origin.as_str(), include_collections, include_orphaned)
 }
 
+/// ⭐ W4-R — person delete, option (i) (PLAN-Wave-4 §2 H; decision 12, RULED
+/// Oct 9, 2026 — ruling 52). Which `person` rows a deleted keyword path ALSO
+/// deletes.
+///
+/// A named face search writes the person (`get_or_create_person_impl`) AND the
+/// `People<sep><Name>` keyword (`assign_face_search_matches_to_person_impl`).
+/// Help tells people the keyword IS the person, but deleting the keyword used to
+/// delete keyword rows only: the person stayed in the name autocomplete,
+/// pre-filled the face picker, and a search run with that pre-filled name wrote
+/// the deleted keyword straight back. The person now goes with its keyword.
+///
+/// ⭐ Mirrored in Swift by `DestructiveConfirmPolicy.isPersonKeywordPath`, which
+/// decides whether the delete confirmation adds its People sentence
+/// (decision 13) — keep the two in step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PeopleKeywordScope
+{
+    /// Not a person keyword: no `person` row is touched. This covers every
+    /// non-People path, a lowercase `people`, a blank name, and a DEEPER path
+    /// (`People<sep>Name<sep>…`), which names a sub-keyword, not a person.
+    NotAPerson,
+    /// The bare `People` root: every person and every face assignment.
+    EveryPerson,
+    /// `People<sep>Name`: the person whose `normalized_name` matches the name,
+    /// normalized exactly as a person's name is when it is created.
+    OnePerson(String),
+}
+
+/// The root segment the face system writes for every person keyword
+/// (`["People", name]`), matched exactly.
+const PEOPLE_KEYWORD_ROOT: &str = "People";
+
+/// The `PeopleKeywordScope` of an already-trimmed keyword `path`.
+fn people_keyword_scope(path: &str) -> PeopleKeywordScope
+{
+    let mut segments = path.split(KEYWORD_PATH_SEPARATOR);
+    if segments.next() != Some(PEOPLE_KEYWORD_ROOT)
+    {
+        return PeopleKeywordScope::NotAPerson;
+    }
+    match (segments.next(), segments.next())
+    {
+        (None, _) => PeopleKeywordScope::EveryPerson,
+        (Some(name), None) => match clean_person_display_name(name)
+        {
+            Some(display_name) => PeopleKeywordScope::OnePerson(normalized_person_name(&display_name)),
+            None => PeopleKeywordScope::NotAPerson,
+        },
+        (Some(_), Some(_)) => PeopleKeywordScope::NotAPerson,
+    }
+}
+
+/// ⭐ Fix round 1 (REVIEW-1 F1; ruling 60, RULED Oct 9, 2026) — true when a
+/// People keyword that STILL EXISTS names the same person as `normalized_name`.
+///
+/// The three person writers reuse a person by its NORMALIZED name but write the
+/// keyword with the TYPED name, so one person can carry several keywords
+/// (`People␟James Wagner` and `People␟james wagner`). The person goes only with
+/// the LAST of them: this reads the surviving keyword rows ON THE TABLE, inside
+/// the caller's transaction, after this path's own keyword DELETE — never a
+/// change count (S179). Every status counts (a hidden row is still a keyword
+/// the person stands behind), which errs toward keeping data.
+///
+/// ⛔ Fails CLOSED: a row that cannot be read could be the surviving variant, so
+/// it is an `Err`, and the caller rolls the whole delete back.
+fn surviving_people_keyword_names(conn: &Connection, normalized_name: &str) -> Result<bool, String>
+{
+    let prefix = format!("{}{}", PEOPLE_KEYWORD_ROOT, KEYWORD_PATH_SEPARATOR);
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT path FROM keyword WHERE starts_with(path, ?1)")
+        .map_err(|e| format!("surviving People keywords: prepare {}", e))?;
+    let rows = stmt
+        .query_map(params![prefix], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("surviving People keywords: query {}", e))?;
+    let (paths, dropped) = collect_rows_counted(rows, "delete_keyword_paths.surviving_people_keywords");
+    if dropped > 0
+    {
+        return Err(format!("surviving People keywords: {} row(s) could not be read", dropped));
+    }
+    let wanted = PeopleKeywordScope::OnePerson(normalized_name.to_string());
+    Ok(paths.iter().any(|path| people_keyword_scope(path.trim()) == wanted))
+}
+
+/// Deletes the person(s) a deleted keyword `path` names — assignments FIRST,
+/// then the person — inside the CALLER's transaction. Any `Err` is the caller's
+/// cue to ROLLBACK the whole delete (S187: never COMMIT after an error).
+///
+/// ⭐ Ruling 60: a `People<sep>Name` delete removes the person only when no other
+/// People keyword still names it; the bare `People` root still deletes everyone.
+///
+/// ⛔ No change count is read, and nothing is decided from one (S179). No
+/// LanceDB work: the vector store holds no person ids (PLAN-Wave-4 §2 H).
+fn delete_people_named_by_keyword_path(conn: &Connection, path: &str) -> Result<(), String>
+{
+    match people_keyword_scope(path)
+    {
+        PeopleKeywordScope::NotAPerson => Ok(()),
+        PeopleKeywordScope::EveryPerson =>
+        {
+            conn.execute("DELETE FROM person_face_assignment", [])
+                .map_err(|e| format!("assignments: {}", e))?;
+            conn.execute("DELETE FROM person", []).map_err(|e| format!("people: {}", e))?;
+            Ok(())
+        }
+        PeopleKeywordScope::OnePerson(normalized_name) =>
+        {
+            if surviving_people_keyword_names(conn, &normalized_name)?
+            {
+                // Another spelling of this person's keyword survives: the
+                // person — and every face assignment it has gathered — stays.
+                return Ok(());
+            }
+            conn.execute(
+                "DELETE FROM person_face_assignment
+                 WHERE person_id IN (SELECT id FROM person WHERE normalized_name = ?1)",
+                params![normalized_name],
+            )
+            .map_err(|e| format!("assignments: {}", e))?;
+            conn.execute("DELETE FROM person WHERE normalized_name = ?1", params![normalized_name])
+                .map_err(|e| format!("person: {}", e))?;
+            Ok(())
+        }
+    }
+}
+
 fn delete_keyword_paths_impl(conn: &Connection, paths: &[String]) -> u64 {
     if paths.is_empty() {
         return 0;
@@ -9602,10 +9731,22 @@ fn delete_keyword_paths_impl(conn: &Connection, paths: &[String]) -> u64 {
                 return 0;
             }
         }
+        // ⭐ W4-R (decision 12) — the person goes with its People keyword, in
+        // THIS transaction: a failure here undoes the keyword delete too.
+        if let Err(e) = delete_people_named_by_keyword_path(conn, trimmed)
+        {
+            eprintln!("delete_keyword_paths: person delete failed: {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return 0;
+        }
     }
 
     if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("delete_keyword_paths: commit failed: {}", e);
+        // S187 — never leave the shared connection inside a transaction: a
+        // failed COMMIT is followed by a ROLLBACK (a no-op when the engine has
+        // already ended the transaction).
+        let _ = conn.execute_batch("ROLLBACK;");
         return 0;
     }
     deleted
@@ -14325,6 +14466,129 @@ fn face_embedding_batch(
     Ok(batch)
 }
 
+// ======================================================================
+// ⭐ W4-R / R-133 (LOW; ruling 33, decision 17 — RULED Oct 9, 2026) — a Rust
+// source location in user-facing text.
+//
+// A lance / lancedb error's `Display` ends with lance's own source location,
+// e.g. `…, /Users/<builder>/.cargo/registry/src/index.crates.io-…/lance-io-8.0.0/
+// src/object_store.rs:754:21`. Formatted straight into a result's message, that
+// put the BUILD machine's home path and a crate source file in the face-index
+// alert and in View ▸ Logging (Oct 7 drive, Batch H, Observation H-2).
+//
+// `strip_rust_source_locations` removes ONLY `, <path>.rs:<line>:<col>` pieces
+// and is applied where the three user-facing results are built (decision 17 =
+// all three): the store result (`upsert_face_embeddings`), the search
+// `error_message` (`FaceEmbeddingSearchResult::from_search`) and the
+// delete-retry message (`retry_pending_face_vector_deletes`, plus the editor
+// save's warning that quotes it). ⛔ `eprintln!` lines stay RAW — the location
+// is exactly what a developer reading the console needs.
+//
+// Hand-written (the crate carries no `regex`), and panic-free on any input:
+// every slice goes through `str::get`, so a future edit cannot turn a bad index
+// into an app-killing panic across the FFI (every call site is `try!`, R-07).
+// ======================================================================
+
+/// `text` with every `, <path>.rs:<line>:<col>` piece removed and nothing else
+/// changed.
+///
+/// A piece is: the LAST `", "` before a `.rs:` · a non-empty path holding no
+/// `"` and no control character · `.rs:` · one or more ASCII digits · `:` · one
+/// or more ASCII digits. Anything else — a store path such as
+/// `/Volumes/X/vectors.lancedb`, a `.rs:` with no line and column, a location
+/// with no `", "` before it — is left exactly as it was. Applied to a fixed
+/// point, so running it twice changes nothing.
+fn strip_rust_source_locations(text: &str) -> String
+{
+    let mut current = text.to_string();
+    // Terminates: a pass that changes the text removes at least one whole piece
+    // (never fewer than ten bytes), so the length strictly falls.
+    loop
+    {
+        let next = strip_rust_source_locations_once(&current);
+        if next == current
+        {
+            return current;
+        }
+        current = next;
+    }
+}
+
+/// One left-to-right pass of `strip_rust_source_locations`.
+fn strip_rust_source_locations_once(text: &str) -> String
+{
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((start, end)) = next_rust_source_location(rest)
+    {
+        match (rest.get(..start), rest.get(end..))
+        {
+            (Some(before), Some(after)) =>
+            {
+                out.push_str(before);
+                rest = after;
+            }
+            // Unreachable — `start` and `end` sit beside ASCII bytes, so both
+            // are char boundaries — but a pass that cannot slice keeps the text
+            // rather than guessing.
+            _ => break,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The byte range `[start, end)` of the first `, <path>.rs:<line>:<col>` piece
+/// in `text`, where `start` is the `,` and `end` is one past the column's last
+/// digit.
+fn next_rust_source_location(text: &str) -> Option<(usize, usize)>
+{
+    const MARKER: &str = ".rs:";
+    let mut search_from = 0usize;
+    while let Some(found) = text.get(search_from..).and_then(|tail| tail.find(MARKER))
+    {
+        let marker_at = search_from + found;
+        let digits_from = marker_at + MARKER.len();
+        if let Some(end) = rust_line_and_column_end(text.as_bytes(), digits_from)
+        {
+            if let Some(comma) = text.get(..marker_at).and_then(|head| head.rfind(", "))
+            {
+                let path = text.get(comma + 2..marker_at).unwrap_or("");
+                if !path.is_empty() && !path.chars().any(|c| c == '"' || c.is_control())
+                {
+                    return Some((comma, end));
+                }
+            }
+        }
+        search_from = digits_from;
+    }
+    None
+}
+
+/// One past the last digit of `<line>:<col>` starting at `from`, or `None` when
+/// the bytes there are not a non-empty digit run, `:`, and a non-empty digit run.
+fn rust_line_and_column_end(bytes: &[u8], from: usize) -> Option<usize>
+{
+    let line_end = ascii_digit_run_end(bytes, from)?;
+    if bytes.get(line_end) != Some(&b':')
+    {
+        return None;
+    }
+    ascii_digit_run_end(bytes, line_end + 1)
+}
+
+/// One past a NON-EMPTY run of ASCII digits starting at `from`; `None` when no
+/// digit is there.
+fn ascii_digit_run_end(bytes: &[u8], from: usize) -> Option<usize>
+{
+    let mut index = from;
+    while bytes.get(index).map_or(false, |byte| byte.is_ascii_digit())
+    {
+        index += 1;
+    }
+    (index > from).then_some(index)
+}
+
 pub async fn upsert_face_embeddings(
     records: Vec<FaceEmbeddingVectorRecord>,
 ) -> FaceEmbeddingStoreResult {
@@ -14352,7 +14616,7 @@ pub async fn upsert_face_embeddings(
         },
         |panic| Err(ffi_panic_report("store the face embeddings", &panic)),
     );
-    match spawned
+    let mut result = match spawned
     {
         Ok(task) => match task.await
         {
@@ -14360,7 +14624,13 @@ pub async fn upsert_face_embeddings(
             Err(e) => store_failed(format!("Face embedding runtime task failed: {}", e)),
         },
         Err(message) => store_failed(message),
-    }
+    };
+    // ⭐ W4-R / R-133 — the store result's message is the alert body and the
+    // View ▸ Logging entry (`FaceRecognitionIndexBuilder` → `FaceIndexLogReport`):
+    // no build-machine source location may reach either. Every arm above —
+    // including the runtime and panic arms — leaves through this one line.
+    result.message = strip_rust_source_locations(&result.message);
+    result
 }
 
 async fn upsert_face_embeddings_impl(
@@ -14829,11 +15099,15 @@ impl FaceEmbeddingSearchResult
             },
             Err(message) =>
             {
+                // ⛔ The console line stays RAW (W4-R / R-133): the source
+                // location is what a developer reading it needs.
                 eprintln!("{}", message);
                 FaceEmbeddingSearchResult
                 {
                     ok: false,
-                    error_message: Some(message),
+                    // ⭐ W4-R / R-133 — the search error reaches the user (the
+                    // face-search failure text); no build-machine path in it.
+                    error_message: Some(strip_rust_source_locations(&message)),
                     matches: Vec::new(),
                 }
             }
@@ -17103,6 +17377,18 @@ async fn drain_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
     }
 }
 
+/// ⭐ W4-R / R-133 — the delete-retry result as it leaves for Swift: its
+/// message reaches the user (View ▸ Logging's face-vector cleanup entries,
+/// `FaceIndexLogReport.cleanup`), so no build-machine source location may ride
+/// in it. Both of `retry_pending_face_vector_deletes`' exits go through here.
+fn face_vector_delete_retry_result_for_user(
+    mut result: FaceVectorDeleteRetryResult,
+) -> FaceVectorDeleteRetryResult
+{
+    result.message = strip_rust_source_locations(&result.message);
+    result
+}
+
 /// Retry every durable obsolete-face-vector id. Queue rows survive every
 /// unconfirmed store error; the API is safe to call at launch, before an index
 /// build, and immediately after an editor-refresh transaction commits.
@@ -17132,7 +17418,7 @@ pub async fn retry_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
     {
         Ok(task) => match task.await
         {
-            Ok(result) => return result,
+            Ok(result) => return face_vector_delete_retry_result_for_user(result),
             Err(error) => format!("Face-vector cleanup runtime failed: {}", error),
         },
         Err(message) => message,
@@ -17144,7 +17430,7 @@ pub async fn retry_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
     // through `lock_catalogue()`, which heals a poisoned lock instead of
     // panicking, so the re-lock that used to kill the app is safe — and it runs
     // inside the boundary too, so no panic of its own can escape.
-    ffi_panic_boundary(
+    face_vector_delete_retry_result_for_user(ffi_panic_boundary(
         "retry_pending_face_vector_deletes.panic.query_failed",
         ||
         {
@@ -17174,7 +17460,7 @@ pub async fn retry_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
                 ffi_panic_report("count the queued face vectors", &panic)
             ),
         },
-    )
+    ))
 }
 
 /// Delete canonical-migration twin vectors from LanceDB. Unlike the historical
@@ -26849,6 +27135,918 @@ mod keyword_tests {
         assert_eq!(count_for(&dil("2", "months")), 1);
         // 2 years reaches the 400-day row as well.
         assert_eq!(count_for(&dil("2", "years")), 2);
+    }
+}
+
+// ======================================================================
+// ⭐ W4-R / R-133 — the source-location strip (PLAN-Wave-4 §2 I3; ruling 33,
+// decision 17). The helper's pins (the exact Oct 7 record, idempotence, a store
+// path left alone), the decoys it must leave alone, and RUNTIME proofs that the
+// three user-facing builders apply it: the search builder directly, and the
+// store and delete-retry FFIs end to end over a REAL incompatible LanceDB table
+// whose lance error carries lance's own `.rs:<line>:<col>`.
+// ======================================================================
+#[cfg(test)]
+mod rust_source_location_tests
+{
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// The Oct 7, 2026 record, VERBATIM (`Docs/DRIVE-RESULTS-2026-10-01.md`,
+    /// Batch H, Observation H-2; register R-133) — the `…` elisions are the
+    /// record's own.
+    const OCT_7_RECORD: &str = "Failed to store face embeddings: lance error: LanceError(IO): \
+        Permission denied (os error 13) at path \"…/vectors.lancedb/face_embeddings.lance/data/.tmpXIGb6o\", \
+        /Users/richardwagner/.cargo/registry/src/index.crates.io-…/lance-io-8.0.0/src/object_store.rs:754:21";
+
+    /// What the user must see instead: every byte before the location, kept.
+    const OCT_7_KEPT: &str = "Failed to store face embeddings: lance error: LanceError(IO): \
+        Permission denied (os error 13) at path \"…/vectors.lancedb/face_embeddings.lance/data/.tmpXIGb6o\"";
+
+    #[test]
+    fn the_oct_7_record_loses_its_source_location_and_keeps_the_text_before()
+    {
+        let stripped = strip_rust_source_locations(OCT_7_RECORD);
+        assert_eq!(stripped, OCT_7_KEPT, "R-133/oct-7: the text before the location is kept, byte for byte");
+        assert!(!stripped.contains(".rs:"), "R-133/oct-7: no `.rs:` survives: {}", stripped);
+        assert!(!stripped.contains("/.cargo/"), "R-133/oct-7: no `/.cargo/` survives: {}", stripped);
+
+        // The same error un-elided, as lance actually prints it on the build
+        // machine: the absolute registry path and the container path in quotes.
+        let full = "Failed to store face embeddings: lance error: LanceError(IO): Permission denied \
+            (os error 13) at path \"/Users/someone/Library/Containers/com.archiveoptics.PhotoLibrarian/Data/\
+            Library/Application Support/PhotoLibrarian/vectors.lancedb/face_embeddings.lance/data/.tmpXIGb6o\", \
+            /Users/richardwagner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/lance-io-8.0.0/src/object_store.rs:754:21";
+        let kept = "Failed to store face embeddings: lance error: LanceError(IO): Permission denied \
+            (os error 13) at path \"/Users/someone/Library/Containers/com.archiveoptics.PhotoLibrarian/Data/\
+            Library/Application Support/PhotoLibrarian/vectors.lancedb/face_embeddings.lance/data/.tmpXIGb6o\"";
+        assert_eq!(strip_rust_source_locations(full), kept, "R-133/oct-7-unelided");
+    }
+
+    #[test]
+    fn stripping_twice_changes_nothing()
+    {
+        for text in [
+            OCT_7_RECORD,
+            OCT_7_KEPT,
+            "lance error: outer, /a/lance-8.0.0/src/x.rs:1:2: inner, /b/lance-io-8.0.0/src/y.rs:33:4",
+            // Pathological: removing the inner piece makes `, x.rs:3:4` — the
+            // fixed point removes that too, so a SECOND call has nothing left.
+            "q, x.rs, /p/y.rs:1:2:3:4",
+            "",
+            "plain text",
+        ]
+        {
+            let once = strip_rust_source_locations(text);
+            let twice = strip_rust_source_locations(&once);
+            assert_eq!(once, twice, "R-133/idempotent: `{}`", text);
+        }
+    }
+
+    #[test]
+    fn a_store_path_and_other_ordinary_text_are_left_alone()
+    {
+        for text in [
+            "Failed to open LanceDB face embedding table: lance error: Not found: /Volumes/X/vectors.lancedb",
+            "Face-vector deletion was deferred: at path \"/Volumes/X/vectors.lancedb\", try again later",
+            "stored beside the catalogue, /Volumes/X/vectors.lancedb",
+            "upsert_face_embeddings: face-embedding store path is not a directory: /Volumes/X/vectors.lancedb",
+            "Queued obsolete face vectors were deleted and acknowledged.",
+            "",
+        ]
+        {
+            assert_eq!(strip_rust_source_locations(text), text, "R-133/untouched: `{}`", text);
+        }
+    }
+
+    #[test]
+    fn every_location_piece_goes_and_nothing_else_does()
+    {
+        // A nested lance error carries one location per layer; both go.
+        assert_eq!(
+            strip_rust_source_locations(
+                "lance error: outer, /a/lance-8.0.0/src/x.rs:1:2: inner cause, /b/lance-io-8.0.0/src/y.rs:33:4"
+            ),
+            "lance error: outer: inner cause"
+        );
+        // A home folder with a space in it, and a relative path.
+        assert_eq!(
+            strip_rust_source_locations("boom, /Users/John Smith/.cargo/registry/src/x/lance-8.0.0/src/a.rs:9:1"),
+            "boom"
+        );
+        assert_eq!(strip_rust_source_locations("boom, src/dataset/write.rs:120:17 then more"), "boom then more");
+        // ⭐ Fix round 1 (REVIEW-1 F2) — the piece starts at the LAST `", "` before
+        // the location, never the first: lance's real retry text lists fields
+        // with commas ("Valid fields are unrelated, _rowid, …"), and a
+        // first-comma strip would delete the user's text after "unrelated".
+        assert_eq!(
+            strip_rust_source_locations("Valid fields are a, b, c., /p/lance-8.0.0/src/x.rs:1:2"),
+            "Valid fields are a, b, c.",
+            "R-133/last-comma: every byte before the location's own `, ` is kept"
+        );
+
+        // Not the `, <path>.rs:<line>:<col>` shape — untouched.
+        for text in [
+            "boom, /p/x.rs:12",               // a line but no column
+            "boom, /p/x.rs:x:1",              // not digits
+            "boom, /p/x.rs:1:",               // an empty column
+            "boom /p/x.rs:1:2",               // no `, ` before the path
+            "boom, \"/p/x\".rs:1:2",          // a quote in the path
+            "boom, /p/x.rsx:1:2",             // not `.rs:`
+            "rust files end in .rs: see 1:2", // prose
+        ]
+        {
+            assert_eq!(strip_rust_source_locations(text), text, "R-133/not-a-location: `{}`", text);
+        }
+    }
+
+    #[test]
+    fn the_search_error_message_is_stripped()
+    {
+        let failed = FaceEmbeddingSearchResult::from_search(Err(OCT_7_RECORD.to_string()));
+        assert!(!failed.ok);
+        assert_eq!(failed.error_message.as_deref(), Some(OCT_7_KEPT), "R-133/search-error-message");
+        assert!(failed.matches.is_empty());
+
+        let succeeded = FaceEmbeddingSearchResult::from_search(Ok(Vec::new()));
+        assert!(succeeded.ok);
+        assert_eq!(succeeded.error_message, None);
+    }
+
+    // ------------------------------------------------------------------
+    // End to end: the store and delete-retry FFIs over a REAL LanceDB table
+    // whose schema is incompatible (the P10(ii) recipe), so lance's own error
+    // — with lance's own source location — is what the builders receive.
+    // ------------------------------------------------------------------
+
+    struct Fixture
+    {
+        dir: std::path::PathBuf,
+        catalogue: std::path::PathBuf,
+    }
+
+    impl Drop for Fixture
+    {
+        fn drop(&mut self)
+        {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn fresh_catalogue(tag: &str) -> (Fixture, Connection)
+    {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "plcore-w4r-r133-{}-{}-{}",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        let catalogue = dir.join("catalogue.db");
+        let conn = open_and_migrate_catalogue(&catalogue).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH.
+        fence_connection_against_extension_fetches(&conn);
+        (Fixture { dir, catalogue }, conn)
+    }
+
+    fn serial() -> std::sync::MutexGuard<'static, ()>
+    {
+        super::swallowed_failure_tests::GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The process-global catalogue, installed for the life of this value and
+    /// cleared on drop (panic or not).
+    struct Installed;
+
+    impl Installed
+    {
+        fn new(fixture: &Fixture, conn: Connection) -> Self
+        {
+            *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(conn);
+            *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(fixture.catalogue.clone());
+            CATALOGUE.clear_poison();
+            CATALOGUE_PATH.clear_poison();
+            Installed
+        }
+    }
+
+    impl Drop for Installed
+    {
+        fn drop(&mut self)
+        {
+            *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
+
+    /// A `vectors.lancedb` beside the fixture's catalogue holding a
+    /// `face_embeddings` table with an UNRELATED schema: the open succeeds, and
+    /// every write or delete against it fails inside lance.
+    fn incompatible_store(fixture: &Fixture)
+    {
+        let uri = fixture.dir.join("vectors.lancedb").to_string_lossy().into_owned();
+        FACE_EMBEDDING_RUNTIME.block_on(async {
+            let database = lancedb::connect(&uri).execute().await.expect("connect");
+            let schema = Arc::new(Schema::new(vec![Field::new("unrelated", DataType::Int64, false)]));
+            database
+                .create_empty_table(FACE_EMBEDDING_TABLE, schema)
+                .execute()
+                .await
+                .expect("create the incompatible table");
+        });
+    }
+
+    fn record(face_observation_id: i64) -> FaceEmbeddingVectorRecord
+    {
+        FaceEmbeddingVectorRecord
+        {
+            face_observation_id,
+            image_id: 1,
+            analyzed_image_id: 1,
+            face_index: 0,
+            model_name: "w4r-model".to_string(),
+            model_version: "w4r-model-version".to_string(),
+            preprocessing_version: "w4r-preprocessing".to_string(),
+            input_size: 112,
+            color_order: "rgb".to_string(),
+            normalization: "w4r".to_string(),
+            embedding_dimension: 4,
+            embedding_l2_norm: 1.0,
+            vector: vec![0.5; 4],
+        }
+    }
+
+    /// True when `text` still carries a Rust source location of the stripped
+    /// shape — the fixture controls below use it to prove the RAW text did.
+    fn carries_a_location(text: &str) -> bool
+    {
+        strip_rust_source_locations(text) != text
+    }
+
+    #[test]
+    fn the_store_result_reaching_swift_carries_no_source_location()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("store");
+        incompatible_store(&fixture);
+        let _installed = Installed::new(&fixture, conn);
+
+        // The fixture control: the builder's RAW input really does carry a
+        // location here — without it, the FFI assertion below would prove
+        // nothing.
+        let raw = FACE_EMBEDDING_RUNTIME.block_on(upsert_face_embeddings_impl(vec![record(1)]));
+        assert_eq!(raw.status, "store_failed", "fixture: {}", raw.message);
+        assert!(
+            carries_a_location(&raw.message),
+            "fixture: the incompatible store's lance error no longer carries a `.rs:<line>:<col>` \
+             location, so this test cannot see the strip — find another recipe: {}",
+            raw.message
+        );
+
+        let result = futures::executor::block_on(upsert_face_embeddings(vec![record(1)]));
+        assert_eq!(result.status, "store_failed", "R-133/store: {}", result.message);
+        assert!(!result.message.contains(".rs:"), "R-133/store: no `.rs:` reaches Swift: {}", result.message);
+        assert!(!result.message.contains("/.cargo/"), "R-133/store: no `/.cargo/` reaches Swift: {}", result.message);
+        assert!(
+            result.message.starts_with("Failed to store face embeddings: "),
+            "R-133/store: the text before the location is kept: {}",
+            result.message
+        );
+        assert_eq!(result.message, strip_rust_source_locations(&raw.message), "R-133/store: exactly the strip");
+        // ⭐ Fix round 1 (REVIEW-1 F2) — and EXACTLY the text before the
+        // location's own `", /"`, computed WITHOUT the helper, so a strip that
+        // starts at an earlier comma cannot agree with itself and pass.
+        let location_at = raw.message.rfind(", /").expect("fixture: the raw text ends `, /<path>.rs:L:C`");
+        assert_eq!(result.message, raw.message[..location_at], "R-133/store: every byte before the location is kept");
+    }
+
+    #[test]
+    fn the_delete_retry_result_reaching_swift_carries_no_source_location()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("retry");
+        incompatible_store(&fixture);
+        conn.execute("INSERT INTO face_vector_pending_delete (face_observation_id) VALUES (?1)", params![41_i64])
+            .expect("queue an obsolete id");
+        let _installed = Installed::new(&fixture, conn);
+
+        // The fixture control, as above: the drain's RAW message carries lance's
+        // location (the delete against the incompatible table fails in lance).
+        let raw = FACE_EMBEDDING_RUNTIME.block_on(retry_pending_face_vector_deletes_impl());
+        assert!(matches!(raw.status, FaceVectorDeleteRetryStatus::Deferred), "fixture: {:?} {}", raw.status, raw.message);
+        assert!(
+            carries_a_location(&raw.message),
+            "fixture: the incompatible store's delete error no longer carries a `.rs:<line>:<col>` \
+             location, so this test cannot see the strip — find another recipe: {}",
+            raw.message
+        );
+
+        let result = futures::executor::block_on(retry_pending_face_vector_deletes());
+        assert!(matches!(result.status, FaceVectorDeleteRetryStatus::Deferred), "R-133/retry: {:?}", result.status);
+        assert!(!result.message.contains(".rs:"), "R-133/retry: no `.rs:` reaches Swift: {}", result.message);
+        assert!(!result.message.contains("/.cargo/"), "R-133/retry: no `/.cargo/` reaches Swift: {}", result.message);
+        assert!(
+            result.message.starts_with("Face-vector deletion was deferred: "),
+            "R-133/retry: the text before the location is kept: {}",
+            result.message
+        );
+        // ⭐ Fix round 1 (REVIEW-1 F2) — EXACTLY the text before the location's
+        // own `", /"`, computed WITHOUT the helper. Lance's real retry text is
+        // "…Valid fields are unrelated, _rowid, _rowaddr, …, /…/scanner.rs:L:C":
+        // a strip that started at the FIRST comma would delete the field list.
+        let location_at = raw.message.rfind(", /").expect("fixture: the raw text ends `, /<path>.rs:L:C`");
+        assert!(
+            raw.message[..location_at].contains(", "),
+            "fixture: the raw retry text must carry an EARLIER `, ` for this check to bite: {}",
+            raw.message
+        );
+        assert_eq!(result.message, raw.message[..location_at], "R-133/retry: every byte before the location is kept");
+    }
+
+    // ------------------------------------------------------------------
+    // The SOURCE LOCK — what the runtime tests above cannot reach: the retry
+    // FFI's failure exit, the editor save's warning, and that every console
+    // line stays RAW. Read over PRODUCT code with comments AND string-literal
+    // bodies blanked (`swallowed_failure_tests`' hardened stripper and its
+    // `product_ranges`, reused rather than re-invented) and whitespace squeezed
+    // out, so a `//` or `/* … */` decoy, or a string literal holding the text,
+    // can never satisfy it. Every needle is matched in its squeezed form.
+    // ------------------------------------------------------------------
+
+    /// The product code — comments and literal bodies blanked, every
+    /// `#[cfg(test)]` item excised — with whitespace squeezed out.
+    fn squeezed_product(source: &str) -> String
+    {
+        let blanked = super::swallowed_failure_tests::blank_comments_and_string_bodies(source);
+        let mut out: Vec<u8> = Vec::new();
+        for (start, end) in super::swallowed_failure_tests::product_ranges(source)
+        {
+            out.extend(blanked[start..end].iter().copied().filter(|byte| !byte.is_ascii_whitespace()));
+            // A range boundary never glues two tokens together.
+            out.push(b'\n');
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// The squeezed body of the ONE product function whose squeezed declaration
+    /// head is `head` (`fn<name>(`). Err — never a vacuous pass — when it is
+    /// missing, ambiguous or unclosed.
+    fn body_of(product: &str, head: &str) -> Result<String, String>
+    {
+        let found: Vec<usize> = product.match_indices(head).map(|(at, _)| at).collect();
+        if found.len() != 1
+        {
+            return Err(format!("found {} product declarations `{}` (expected 1)", found.len(), head));
+        }
+        let bytes = product.as_bytes();
+        let mut open = found[0];
+        while open < bytes.len() && bytes[open] != b'{'
+        {
+            open += 1;
+        }
+        let mut depth = 0i32;
+        for index in open..bytes.len()
+        {
+            match bytes[index]
+            {
+                b'{' => depth += 1,
+                b'}' =>
+                {
+                    depth -= 1;
+                    if depth == 0
+                    {
+                        return Ok(product[open..=index].to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err(format!("the body of `{}` never closes", head))
+    }
+
+    /// Every argument list of an `eprintln!(` in product code.
+    fn eprintln_arguments(product: &str) -> Vec<String>
+    {
+        let bytes = product.as_bytes();
+        let mut found = Vec::new();
+        for (at, needle) in product.match_indices("eprintln!(")
+        {
+            let open = at + needle.len() - 1;
+            let mut depth = 0i32;
+            for index in open..bytes.len()
+            {
+                match bytes[index]
+                {
+                    b'(' => depth += 1,
+                    b')' =>
+                    {
+                        depth -= 1;
+                        if depth == 0
+                        {
+                            found.push(product[open..=index].to_string());
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        found
+    }
+
+    fn application_lock(source: &str) -> Result<(), String>
+    {
+        let product = squeezed_product(source);
+        let strip = "strip_rust_source_locations(";
+
+        // The store FFI: every arm leaves through the one strip line.
+        let upsert = body_of(&product, "fnupsert_face_embeddings(")?;
+        if !upsert.contains("result.message=strip_rust_source_locations(&result.message);")
+        {
+            return Err("R-133-lock/store: `upsert_face_embeddings` no longer strips its result's message".to_string());
+        }
+
+        // The search builder: the user's text stripped, the console line RAW.
+        let search = body_of(&product, "fnfrom_search(")?;
+        if !search.contains("error_message:Some(strip_rust_source_locations(&message)),")
+        {
+            return Err("R-133-lock/search: `from_search` no longer strips `error_message`".to_string());
+        }
+        if !search.contains("eprintln!(\"\",message);")
+        {
+            return Err("R-133-lock/search: `from_search`'s console line no longer prints the RAW message".to_string());
+        }
+
+        // The delete-retry FFI: BOTH exits go through the stripping helper.
+        let retry = body_of(&product, "fnretry_pending_face_vector_deletes(")?;
+        if !retry.contains("Ok(result)=>returnface_vector_delete_retry_result_for_user(result),")
+        {
+            return Err("R-133-lock/retry: the retry FFI's success exit no longer strips".to_string());
+        }
+        // ⭐ Fix round 1 (REVIEW-1 F3) — anchored to the WHOLE tail expression,
+        // not a mention: it must open right after the `let failure = …;`
+        // statement's closing `};` and close the function body (`))}`), and the
+        // body holds exactly the two boundaries (the spawn and this fallback) —
+        // so the wrapper text parked in a dead `let` cannot satisfy it.
+        if !retry.contains("};face_vector_delete_retry_result_for_user(ffi_panic_boundary(")
+            || !retry.ends_with("))}")
+            || retry.matches("ffi_panic_boundary(").count() != 2
+        {
+            return Err("R-133-lock/retry: the retry FFI's failure exit no longer strips".to_string());
+        }
+        let helper = body_of(&product, "fnface_vector_delete_retry_result_for_user(")?;
+        if !helper.contains("result.message=strip_rust_source_locations(&result.message);")
+        {
+            return Err("R-133-lock/retry: `face_vector_delete_retry_result_for_user` no longer strips".to_string());
+        }
+
+        // The editor save's warning quotes the delete-retry message.
+        // ⭐ Fix round 1 (REVIEW-1 F3) — the WHOLE assignment statement, and the
+        // only one: an unused `let _ = strip_…(&cleanup.message);` beside a
+        // `format!` that quotes the RAW message cannot satisfy it.
+        let editor = body_of(&product, "fnupsert_editor_saved_image(")?;
+        if !editor.contains(
+            "vector_cleanup_warning=Some(format!(\"\",strip_rust_source_locations(&cleanup.message)));",
+        ) || editor.matches("vector_cleanup_warning=Some(").count() != 1
+        {
+            return Err("R-133-lock/editor: the editor save's cleanup warning no longer strips the retry message".to_string());
+        }
+
+        // ⛔ Every console line stays RAW.
+        let lines = eprintln_arguments(&product);
+        if lines.len() < 100
+        {
+            return Err(format!("R-133-lock/raw-console: only {} `eprintln!` sites found — not reading the crate", lines.len()));
+        }
+        if let Some(stripped) = lines.iter().find(|arguments| arguments.contains(strip))
+        {
+            return Err(format!("R-133-lock/raw-console: an `eprintln!` strips its text: {}", stripped));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_strip_is_applied_at_every_user_facing_builder_and_never_to_a_console_line()
+    {
+        let source = include_str!("lib.rs");
+        application_lock(source).unwrap_or_else(|why| panic!("{}", why));
+
+        // The lock is RUN against known-bad inputs: each decoy below is the real
+        // crate with ONE mutation, applied in memory, and each must go RED.
+        //
+        // ⚠️ Every anchor is assembled from TWO literals (`[a, b].concat()`):
+        // this test lives in lib.rs too, so a whole-anchor literal here would be
+        // a SECOND occurrence of the very text it must find exactly once.
+        fn replace_once(text: &str, anchor: &[&str], replacement: &str) -> String
+        {
+            let anchor = anchor.concat();
+            assert_eq!(text.matches(anchor.as_str()).count(), 1, "decoy anchor must be unique: `{}`", anchor);
+            text.replacen(anchor.as_str(), replacement, 1)
+        }
+        let mutate = |anchor: &[&str], replacement: &str| -> String { replace_once(source, anchor, replacement) };
+        let decoys = [
+            // ⭐ Fix round 1 (REVIEW-1 F3, decoy PD3): the editor warning quotes
+            // the RAW message while an UNUSED strip call sits beside it.
+            replace_once(
+                &mutate(
+                    &["\n                strip_rust_source_locations(&cleanup.", "message)\n"],
+                    "\n                cleanup.message\n",
+                ),
+                &["            vector_cleanup_warning = Some(", "format!(\n"],
+                "            let _unused = strip_rust_source_locations(&cleanup.message);\n            vector_cleanup_warning = Some(format!(\n",
+            ),
+            // ⭐ Fix round 1 (REVIEW-1 F3, decoy PD8): the retry's failure exit
+            // returns the RAW boundary while the wrapper text sits in a dead `let`.
+            mutate(
+                &["    face_vector_delete_retry_result_for_", "user(ffi_panic_boundary(\n"],
+                "    let _dead = |fallback: FaceVectorDeleteRetryResult| face_vector_delete_retry_result_for_user(ffi_panic_boundary(\"dead\", || fallback, |_| unreachable!()));\n    (ffi_panic_boundary(\n",
+            ),
+            // The search strip parked in a `//` comment.
+            mutate(
+                &["error_message: Some(strip_rust_source_", "locations(&message)),"],
+                "error_message: Some(message), // strip_rust_source_locations(&message)),",
+            ),
+            // The store strip parked in a string literal.
+            mutate(
+                &[
+                    "leaves through this one line.\n    result.message = strip_rust_source_",
+                    "locations(&result.message);",
+                ],
+                "leaves through this one line.\n    let _decoy = \"result.message = strip_rust_source_locations(&result.message);\";",
+            ),
+            // The retry's success exit returning the raw result.
+            mutate(
+                &["Ok(result) => return face_vector_delete_retry_", "result_for_user(result),"],
+                "Ok(result) => return result,",
+            ),
+            // The editor warning quoting the raw message, the strip in a `/* */`.
+            mutate(
+                &["\n                strip_rust_source_locations(&cleanup.", "message)\n"],
+                "\n                /* strip_rust_source_locations( */ cleanup.message\n",
+            ),
+            // A console line stripped.
+            mutate(
+                &[
+                    "// location is what a developer reading it needs.\n                eprintln!(\"{}\", ",
+                    "message);",
+                ],
+                "// location is what a developer reading it needs.\n                eprintln!(\"{}\", strip_rust_source_locations(&message));",
+            ),
+        ];
+        for (index, decoy) in decoys.iter().enumerate()
+        {
+            assert!(application_lock(decoy).is_err(), "R-133-lock: decoy {} stayed GREEN", index);
+        }
+    }
+}
+
+// ======================================================================
+// ⭐ W4-R — person delete, option (i) (PLAN-Wave-4 §2 H; decision 12). The
+// pins the plan names: `People<sep>Name` removes that person and its
+// assignments and keeps the others; `People` removes all; a failed statement
+// rolls back the WHOLE delete. Every fixture is a REAL temp-file catalogue
+// through the production `open_and_migrate_catalogue`, fenced.
+// ======================================================================
+#[cfg(test)]
+mod person_keyword_delete_tests
+{
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture
+    {
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for Fixture
+    {
+        fn drop(&mut self)
+        {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn fresh_catalogue(tag: &str) -> (Fixture, Connection)
+    {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "plcore-w4r-person-{}-{}-{}",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        let conn = open_and_migrate_catalogue(&dir.join("catalogue.db")).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH.
+        fence_connection_against_extension_fetches(&conn);
+        (Fixture { dir }, conn)
+    }
+
+    fn people(name: &str) -> String
+    {
+        ["People", name].join(KEYWORD_PATH_SEPARATOR)
+    }
+
+    fn keyword(conn: &Connection, image_id: i64, path: &str, origin: i32)
+    {
+        let label = path.rsplit(KEYWORD_PATH_SEPARATOR).next().unwrap_or(path);
+        conn.execute(
+            "INSERT INTO keyword (image_id, label, path, status, origin) VALUES (?1, ?2, ?3, 1, ?4)",
+            params![image_id, label, path, origin],
+        )
+        .expect("insert keyword");
+    }
+
+    fn assign(conn: &Connection, face_observation_id: i64, person_id: i64, image_id: i64)
+    {
+        conn.execute(
+            "INSERT INTO person_face_assignment
+                 (face_observation_id, person_id, image_id, analyzed_image_id, face_index, assignment_source)
+             VALUES (?1, ?2, ?3, ?3, 0, 'face_search_match')",
+            params![face_observation_id, person_id, image_id],
+        )
+        .expect("insert assignment");
+    }
+
+    /// Two named people exactly as a named face search writes them — the person
+    /// row (through the production `get_or_create_person_impl`), its face
+    /// assignments, and the `People` / `People<sep>Name` keyword rows on each
+    /// image — plus an unrelated keyword. Returns (james_id, paige_id).
+    fn seed(conn: &Connection) -> (i64, i64)
+    {
+        let james = get_or_create_person_impl(conn, "James Wagner", &normalized_person_name("James Wagner"))
+            .expect("james");
+        let paige = get_or_create_person_impl(conn, "Paige", &normalized_person_name("Paige"))
+            .expect("paige");
+        assign(conn, 101, james, 1);
+        assign(conn, 102, james, 2);
+        assign(conn, 201, paige, 3);
+        for image_id in [1_i64, 2]
+        {
+            keyword(conn, image_id, "People", KEYWORD_ORIGIN_FACE);
+            keyword(conn, image_id, &people("James Wagner"), KEYWORD_ORIGIN_FACE);
+        }
+        keyword(conn, 3, "People", KEYWORD_ORIGIN_FACE);
+        keyword(conn, 3, &people("Paige"), KEYWORD_ORIGIN_FACE);
+        keyword(conn, 4, &["Animals", "Dogs"].join(KEYWORD_PATH_SEPARATOR), KEYWORD_ORIGIN_USER);
+        (james, paige)
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64
+    {
+        conn.query_row(sql, [], |row| row.get(0)).expect("count")
+    }
+
+    fn count_with(conn: &Connection, sql: &str, value: &str) -> i64
+    {
+        conn.query_row(sql, params![value], |row| row.get(0)).expect("count")
+    }
+
+    #[test]
+    fn deleting_people_name_removes_that_person_and_its_assignments_and_keeps_the_others()
+    {
+        let (_fixture, conn) = fresh_catalogue("one");
+        let (james, paige) = seed(&conn);
+
+        delete_keyword_paths_impl(&conn, &[people("James Wagner")]);
+
+        // Verified on the TABLES, never from a reported change count (S179).
+        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM person WHERE id = {}", james)), 0, "H/one: the person is gone");
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM person_face_assignment WHERE person_id = {}", james)),
+            0,
+            "H/one: its assignments are gone"
+        );
+        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM person WHERE id = {}", paige)), 1, "H/one: the other person stays");
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM person_face_assignment WHERE person_id = {}", paige)),
+            1,
+            "H/one: the other person's assignment stays"
+        );
+        assert_eq!(count_with(&conn, "SELECT COUNT(*) FROM keyword WHERE path = ?1", &people("James Wagner")), 0, "H/one: its keyword rows are gone");
+        assert_eq!(count_with(&conn, "SELECT COUNT(*) FROM keyword WHERE path = ?1", &people("Paige")), 1, "H/one: the other keyword stays");
+        assert_eq!(count_with(&conn, "SELECT COUNT(*) FROM keyword WHERE path = ?1", "People"), 3, "H/one: the People root rows are the keyword delete's business, unchanged (W1)");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM keyword WHERE label = 'Dogs'"), 1, "H/one: an unrelated keyword stays");
+    }
+
+    #[test]
+    fn the_person_is_matched_through_normalized_person_name()
+    {
+        let (_fixture, conn) = fresh_catalogue("normalized");
+        let (james, paige) = seed(&conn);
+
+        // A keyword spelled differently in case and spacing still names the
+        // same person: the path's name is normalized exactly as a person's name
+        // is when it is created. (Fix round 1, ruling 60: the variant is James's
+        // ONLY keyword here — with another spelling surviving, the person would
+        // rightly stay; that rule is `a_person_goes_only_with_the_last_…`.)
+        conn.execute("DELETE FROM keyword WHERE path = ?1", params![people("James Wagner")])
+            .expect("make the variant the only spelling");
+        keyword(&conn, 1, &people("james   WAGNER"), KEYWORD_ORIGIN_FACE);
+        delete_keyword_paths_impl(&conn, &[people("james   WAGNER")]);
+
+        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM person WHERE id = {}", james)), 0, "H/normalized: matched and deleted");
+        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM person WHERE id = {}", paige)), 1, "H/normalized: the other person stays");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person_face_assignment"), 1, "H/normalized: only Paige's assignment is left");
+    }
+
+    #[test]
+    fn deleting_the_people_root_removes_every_person_and_assignment()
+    {
+        let (_fixture, conn) = fresh_catalogue("all");
+        seed(&conn);
+
+        delete_keyword_paths_impl(&conn, &["People".to_string()]);
+
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person"), 0, "H/all: every person is gone");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person_face_assignment"), 0, "H/all: every assignment is gone");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM keyword WHERE path = 'People' OR starts_with(path, 'People' || chr(31))"), 0, "H/all: every People keyword is gone");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM keyword WHERE label = 'Dogs'"), 1, "H/all: an unrelated keyword stays");
+    }
+
+    #[test]
+    fn a_non_people_or_deeper_keyword_touches_no_person()
+    {
+        let (_fixture, conn) = fresh_catalogue("none");
+        seed(&conn);
+        keyword(&conn, 1, &[people("James Wagner"), "Childhood".to_string()].join(KEYWORD_PATH_SEPARATOR), KEYWORD_ORIGIN_USER);
+
+        delete_keyword_paths_impl(
+            &conn,
+            &[
+                ["Animals", "Dogs"].join(KEYWORD_PATH_SEPARATOR),
+                [people("James Wagner"), "Childhood".to_string()].join(KEYWORD_PATH_SEPARATOR),
+            ],
+        );
+
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person"), 2, "H/none: no person is touched");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person_face_assignment"), 3, "H/none: no assignment is touched");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM keyword WHERE label IN ('Dogs', 'Childhood')"), 0, "H/none: the keywords themselves are deleted");
+    }
+
+    #[test]
+    fn people_keyword_scope_mirrors_the_face_systems_paths()
+    {
+        let sep = KEYWORD_PATH_SEPARATOR;
+        assert_eq!(people_keyword_scope("People"), PeopleKeywordScope::EveryPerson);
+        assert_eq!(
+            people_keyword_scope(&format!("People{sep}James Wagner")),
+            PeopleKeywordScope::OnePerson("james wagner".to_string())
+        );
+        assert_eq!(
+            people_keyword_scope(&format!("People{sep} James   Wagner ")),
+            PeopleKeywordScope::OnePerson("james wagner".to_string())
+        );
+        for not_a_person in [
+            format!("people{sep}James"),
+            format!("People{sep}James{sep}Childhood"),
+            format!("People{sep}"),
+            format!("People{sep}   "),
+            format!("Animals{sep}Dogs"),
+            "Peoples".to_string(),
+            String::new(),
+        ]
+        {
+            assert_eq!(people_keyword_scope(&not_a_person), PeopleKeywordScope::NotAPerson, "`{}`", not_a_person);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // A failed statement rolls back the WHOLE delete.
+    //
+    // ⚠️ The failure is induced with a CATALOG error (the `person` table is
+    // dropped), deliberately NOT an execution error. On the bundled DuckDB
+    // 1.5.5 an execution error ABORTS the transaction, after which a COMMIT
+    // returns Ok and silently discards everything (S187) — so a test built on
+    // one would stay green even if the failure arm COMMITTED. A catalog error
+    // does not abort: a COMMIT there really would persist the keyword and
+    // assignment deletes, which is exactly what this test must be able to see.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_failed_person_delete_rolls_back_the_whole_delete_for_one_person()
+    {
+        let (_fixture, conn) = fresh_catalogue("rollback-one");
+        seed(&conn);
+        conn.execute_batch("DROP TABLE person;").expect("induce the failure");
+
+        let deleted = delete_keyword_paths_impl(&conn, &[people("James Wagner")]);
+
+        assert_eq!(deleted, 0, "H/rollback-one: the failed delete reports nothing deleted");
+        assert_eq!(count_with(&conn, "SELECT COUNT(*) FROM keyword WHERE path = ?1", &people("James Wagner")), 2, "H/rollback-one: the keyword delete was rolled back");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person_face_assignment"), 3, "H/rollback-one: no assignment was deleted");
+        assert!(conn.execute_batch("BEGIN TRANSACTION; ROLLBACK;").is_ok(), "H/rollback-one: the connection is not left inside a transaction");
+    }
+
+    #[test]
+    fn a_failed_person_delete_rolls_back_the_whole_delete_for_every_person()
+    {
+        let (_fixture, conn) = fresh_catalogue("rollback-all");
+        seed(&conn);
+        // The assignment delete SUCCEEDS first; the person delete then fails.
+        conn.execute_batch("DROP TABLE person;").expect("induce the failure");
+
+        let deleted = delete_keyword_paths_impl(&conn, &["People".to_string()]);
+
+        assert_eq!(deleted, 0, "H/rollback-all: the failed delete reports nothing deleted");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person_face_assignment"), 3, "H/rollback-all: the assignment delete that SUCCEEDED was rolled back");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM keyword WHERE path = 'People' OR starts_with(path, 'People' || chr(31))"), 6, "H/rollback-all: the keyword delete was rolled back");
+        assert!(conn.execute_batch("BEGIN TRANSACTION; ROLLBACK;").is_ok(), "H/rollback-all: the connection is not left inside a transaction");
+    }
+
+    // ------------------------------------------------------------------
+    // ⭐ Fix round 1 (REVIEW-1 F1; ruling 60) — a person is deleted only when
+    // the LAST People keyword naming it goes. The reviewer's scenario: a named
+    // search "James Wagner", then a later one typed "james wagner" — ONE person
+    // (reused by normalized name), TWO keywords (written with the typed name).
+    // ------------------------------------------------------------------
+
+    /// `seed`, plus a second spelling of James's keyword on image 5 and the
+    /// face assignment that later search wrote there.
+    fn seed_two_spellings(conn: &Connection) -> (i64, i64)
+    {
+        let (james, paige) = seed(conn);
+        assign(conn, 105, james, 5);
+        keyword(conn, 5, "People", KEYWORD_ORIGIN_FACE);
+        keyword(conn, 5, &people("james wagner"), KEYWORD_ORIGIN_FACE);
+        (james, paige)
+    }
+
+    #[test]
+    fn a_person_goes_only_with_the_last_people_keyword_that_names_it()
+    {
+        let (_fixture, conn) = fresh_catalogue("last-projection");
+        let (james, paige) = seed_two_spellings(&conn);
+
+        // Delete the lowercase duplicate: the other spelling still names James.
+        delete_keyword_paths_impl(&conn, &[people("james wagner")]);
+        assert_eq!(count_with(&conn, "SELECT COUNT(*) FROM keyword WHERE path = ?1", &people("james wagner")), 0, "H/F1: the duplicate keyword is gone");
+        assert_eq!(count_with(&conn, "SELECT COUNT(*) FROM keyword WHERE path = ?1", &people("James Wagner")), 2, "H/F1: the other spelling stays");
+        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM person WHERE id = {}", james)), 1, "H/F1: the person STAYS while another keyword names it");
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM person_face_assignment WHERE person_id = {}", james)),
+            3,
+            "H/F1: and keeps EVERY face assignment it gathered"
+        );
+
+        // Delete the last spelling: now the person goes.
+        delete_keyword_paths_impl(&conn, &[people("James Wagner")]);
+        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM person WHERE id = {}", james)), 0, "H/F1: the LAST keyword takes the person");
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM person_face_assignment WHERE person_id = {}", james)),
+            0,
+            "H/F1: and its assignments"
+        );
+
+        // A different person is untouched throughout.
+        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM person WHERE id = {}", paige)), 1, "H/F1: another person is unaffected");
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM person_face_assignment WHERE person_id = {}", paige)),
+            1,
+            "H/F1: another person's assignment is unaffected"
+        );
+    }
+
+    #[test]
+    fn deleting_every_spelling_in_one_call_takes_the_person()
+    {
+        let (_fixture, conn) = fresh_catalogue("both-spellings");
+        let (james, paige) = seed_two_spellings(&conn);
+
+        delete_keyword_paths_impl(&conn, &[people("james wagner"), people("James Wagner")]);
+
+        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM person WHERE id = {}", james)), 0, "H/F1-both: the person goes with its last keyword");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person_face_assignment"), 1, "H/F1-both: only Paige's assignment is left");
+        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM person WHERE id = {}", paige)), 1, "H/F1-both: another person is unaffected");
+    }
+
+    #[test]
+    fn a_failure_after_the_survivor_check_rolls_back_every_spelling()
+    {
+        let (_fixture, conn) = fresh_catalogue("rollback-spellings");
+        seed_two_spellings(&conn);
+        // The first path finds a survivor and keeps the person; the second
+        // finds none and fails on the (dropped) person table — a CATALOG error,
+        // so a COMMIT here would really persist (see the note above).
+        conn.execute_batch("DROP TABLE person;").expect("induce the failure");
+
+        let deleted = delete_keyword_paths_impl(&conn, &[people("james wagner"), people("James Wagner")]);
+
+        assert_eq!(deleted, 0, "H/F1-rollback: the failed delete reports nothing deleted");
+        assert_eq!(count_with(&conn, "SELECT COUNT(*) FROM keyword WHERE path = ?1", &people("james wagner")), 1, "H/F1-rollback: the FIRST path's keyword delete was rolled back too");
+        assert_eq!(count_with(&conn, "SELECT COUNT(*) FROM keyword WHERE path = ?1", &people("James Wagner")), 2, "H/F1-rollback: the second path's keyword delete was rolled back");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person_face_assignment"), 4, "H/F1-rollback: no assignment was deleted");
+        assert!(conn.execute_batch("BEGIN TRANSACTION; ROLLBACK;").is_ok(), "H/F1-rollback: the connection is not left inside a transaction");
     }
 }
 
@@ -43022,7 +44220,10 @@ mod swallowed_failure_tests
     /// lock below unsatisfiable by a `//` comment, a `/* … */` span, or a
     /// string literal that merely contains the locked text — the
     /// `Spikes/ApplePhotosEligibilityGate/` stripping discipline, in Rust.
-    fn blank_comments_and_string_bodies(source: &str) -> Vec<u8>
+    ///
+    /// `pub(super)` (W4-R) so `rust_source_location_tests`' source lock reuses
+    /// this hardened stripper instead of re-inventing one.
+    pub(super) fn blank_comments_and_string_bodies(source: &str) -> Vec<u8>
     {
         let bytes = source.as_bytes();
         let mut out = bytes.to_vec();
@@ -43219,7 +44420,9 @@ mod swallowed_failure_tests
     /// direction, but a future test helper written there with a legitimate
     /// `filter_map(|r| r.ok())` would have failed T9 spuriously. Every
     /// `#[cfg(test)]` item is now excised, module or not.
-    fn product_ranges(source: &str) -> Vec<(usize, usize)>
+    ///
+    /// `pub(super)` (W4-R) for `rust_source_location_tests`' source lock.
+    pub(super) fn product_ranges(source: &str) -> Vec<(usize, usize)>
     {
         let stripped = blank_comments_and_string_bodies(source);
         let mut ranges: Vec<(usize, usize)> = Vec::new();
