@@ -600,6 +600,24 @@ fileprivate struct FfiConverterString: FfiConverter {
     }
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterData: FfiConverterRustBuffer {
+    typealias SwiftType = Data
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Data {
+        let len: Int32 = try readInt(&buf)
+        return Data(try readBytes(&buf, count: Int(len)))
+    }
+
+    public static func write(_ value: Data, into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        writeBytes(&buf, value)
+    }
+}
+
 
 public struct AnalysisJob: Equatable, Hashable {
     public var id: Int64
@@ -1852,6 +1870,80 @@ public func FfiConverterTypeFaceEmbeddingVectorRecord_lift(_ buf: RustBuffer) th
 #endif
 public func FfiConverterTypeFaceEmbeddingVectorRecord_lower(_ value: FaceEmbeddingVectorRecord) -> RustBuffer {
     return FfiConverterTypeFaceEmbeddingVectorRecord.lower(value)
+}
+
+
+public struct FaceLeftWithOtherPersonRecord: Equatable, Hashable {
+    public var faceObservationId: Int64
+    public var imageId: Int64
+    public var seedFaceObservationId: Int64
+    public var faceIndex: UInt32
+    public var cosine: Double
+    public var ownerPersonId: Int64
+    public var ownerPersonName: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(faceObservationId: Int64, imageId: Int64, seedFaceObservationId: Int64, faceIndex: UInt32, cosine: Double, ownerPersonId: Int64, ownerPersonName: String) {
+        self.faceObservationId = faceObservationId
+        self.imageId = imageId
+        self.seedFaceObservationId = seedFaceObservationId
+        self.faceIndex = faceIndex
+        self.cosine = cosine
+        self.ownerPersonId = ownerPersonId
+        self.ownerPersonName = ownerPersonName
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension FaceLeftWithOtherPersonRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFaceLeftWithOtherPersonRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FaceLeftWithOtherPersonRecord {
+        return
+            try FaceLeftWithOtherPersonRecord(
+                faceObservationId: FfiConverterInt64.read(from: &buf), 
+                imageId: FfiConverterInt64.read(from: &buf), 
+                seedFaceObservationId: FfiConverterInt64.read(from: &buf), 
+                faceIndex: FfiConverterUInt32.read(from: &buf), 
+                cosine: FfiConverterDouble.read(from: &buf), 
+                ownerPersonId: FfiConverterInt64.read(from: &buf), 
+                ownerPersonName: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FaceLeftWithOtherPersonRecord, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.faceObservationId, into: &buf)
+        FfiConverterInt64.write(value.imageId, into: &buf)
+        FfiConverterInt64.write(value.seedFaceObservationId, into: &buf)
+        FfiConverterUInt32.write(value.faceIndex, into: &buf)
+        FfiConverterDouble.write(value.cosine, into: &buf)
+        FfiConverterInt64.write(value.ownerPersonId, into: &buf)
+        FfiConverterString.write(value.ownerPersonName, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFaceLeftWithOtherPersonRecord_lift(_ buf: RustBuffer) throws -> FaceLeftWithOtherPersonRecord {
+    return try FfiConverterTypeFaceLeftWithOtherPersonRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFaceLeftWithOtherPersonRecord_lower(_ value: FaceLeftWithOtherPersonRecord) -> RustBuffer {
+    return FfiConverterTypeFaceLeftWithOtherPersonRecord.lower(value)
 }
 
 
@@ -4106,10 +4198,13 @@ public struct PersonClusterAcceptResult: Equatable, Hashable {
     public var keywordPath: String
     public var status: String
     public var message: String
+    public var leftWithOtherPeopleFaceCount: UInt64
+    public var leftWithOtherPeopleFaces: [FaceLeftWithOtherPersonRecord]
+    public var explicitSeedCanonicalFaceObservationIds: [Int64]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(personId: Int64, personName: String, assignedFaceCount: UInt64, keywordImageCount: UInt64, keywordRowCount: UInt64, keywordPath: String, status: String, message: String) {
+    public init(personId: Int64, personName: String, assignedFaceCount: UInt64, keywordImageCount: UInt64, keywordRowCount: UInt64, keywordPath: String, status: String, message: String, leftWithOtherPeopleFaceCount: UInt64 = UInt64(0), leftWithOtherPeopleFaces: [FaceLeftWithOtherPersonRecord] = [], explicitSeedCanonicalFaceObservationIds: [Int64] = []) {
         self.personId = personId
         self.personName = personName
         self.assignedFaceCount = assignedFaceCount
@@ -4118,6 +4213,9 @@ public struct PersonClusterAcceptResult: Equatable, Hashable {
         self.keywordPath = keywordPath
         self.status = status
         self.message = message
+        self.leftWithOtherPeopleFaceCount = leftWithOtherPeopleFaceCount
+        self.leftWithOtherPeopleFaces = leftWithOtherPeopleFaces
+        self.explicitSeedCanonicalFaceObservationIds = explicitSeedCanonicalFaceObservationIds
     }
 
     
@@ -4143,7 +4241,10 @@ public struct FfiConverterTypePersonClusterAcceptResult: FfiConverterRustBuffer 
                 keywordRowCount: FfiConverterUInt64.read(from: &buf), 
                 keywordPath: FfiConverterString.read(from: &buf), 
                 status: FfiConverterString.read(from: &buf), 
-                message: FfiConverterString.read(from: &buf)
+                message: FfiConverterString.read(from: &buf), 
+                leftWithOtherPeopleFaceCount: FfiConverterUInt64.read(from: &buf), 
+                leftWithOtherPeopleFaces: FfiConverterSequenceTypeFaceLeftWithOtherPersonRecord.read(from: &buf), 
+                explicitSeedCanonicalFaceObservationIds: FfiConverterSequenceInt64.read(from: &buf)
         )
     }
 
@@ -4156,6 +4257,9 @@ public struct FfiConverterTypePersonClusterAcceptResult: FfiConverterRustBuffer 
         FfiConverterString.write(value.keywordPath, into: &buf)
         FfiConverterString.write(value.status, into: &buf)
         FfiConverterString.write(value.message, into: &buf)
+        FfiConverterUInt64.write(value.leftWithOtherPeopleFaceCount, into: &buf)
+        FfiConverterSequenceTypeFaceLeftWithOtherPersonRecord.write(value.leftWithOtherPeopleFaces, into: &buf)
+        FfiConverterSequenceInt64.write(value.explicitSeedCanonicalFaceObservationIds, into: &buf)
     }
 }
 
@@ -4706,11 +4810,11 @@ public func FfiConverterTypeSimilarPhotoCandidate_lower(_ value: SimilarPhotoCan
 public struct SimilarPhotoFeatureprint: Equatable, Hashable {
     public var imageId: Int64
     public var sourceStamp: String
-    public var featureprintBlob: [UInt8]
+    public var featureprintBlob: Data
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(imageId: Int64, sourceStamp: String, featureprintBlob: [UInt8]) {
+    public init(imageId: Int64, sourceStamp: String, featureprintBlob: Data) {
         self.imageId = imageId
         self.sourceStamp = sourceStamp
         self.featureprintBlob = featureprintBlob
@@ -4734,14 +4838,14 @@ public struct FfiConverterTypeSimilarPhotoFeatureprint: FfiConverterRustBuffer {
             try SimilarPhotoFeatureprint(
                 imageId: FfiConverterInt64.read(from: &buf), 
                 sourceStamp: FfiConverterString.read(from: &buf), 
-                featureprintBlob: FfiConverterSequenceUInt8.read(from: &buf)
+                featureprintBlob: FfiConverterData.read(from: &buf)
         )
     }
 
     public static func write(_ value: SimilarPhotoFeatureprint, into buf: inout [UInt8]) {
         FfiConverterInt64.write(value.imageId, into: &buf)
         FfiConverterString.write(value.sourceStamp, into: &buf)
-        FfiConverterSequenceUInt8.write(value.featureprintBlob, into: &buf)
+        FfiConverterData.write(value.featureprintBlob, into: &buf)
     }
 }
 
@@ -6004,31 +6108,6 @@ fileprivate struct FfiConverterOptionTypeVideoDetails: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterSequenceUInt8: FfiConverterRustBuffer {
-    typealias SwiftType = [UInt8]
-
-    public static func write(_ value: [UInt8], into buf: inout [UInt8]) {
-        let len = Int32(value.count)
-        writeInt(&buf, len)
-        for item in value {
-            FfiConverterUInt8.write(item, into: &buf)
-        }
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [UInt8] {
-        let len: Int32 = try readInt(&buf)
-        var seq = [UInt8]()
-        seq.reserveCapacity(Int(len))
-        for _ in 0 ..< len {
-            seq.append(try FfiConverterUInt8.read(from: &buf))
-        }
-        return seq
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterSequenceUInt64: FfiConverterRustBuffer {
     typealias SwiftType = [UInt64]
 
@@ -6346,6 +6425,31 @@ fileprivate struct FfiConverterSequenceTypeFaceEmbeddingVectorRecord: FfiConvert
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeFaceEmbeddingVectorRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFaceLeftWithOtherPersonRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [FaceLeftWithOtherPersonRecord]
+
+    public static func write(_ value: [FaceLeftWithOtherPersonRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFaceLeftWithOtherPersonRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FaceLeftWithOtherPersonRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FaceLeftWithOtherPersonRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFaceLeftWithOtherPersonRecord.read(from: &buf))
         }
         return seq
     }
@@ -7258,11 +7362,11 @@ public func assignFaceObservationsToPerson(faceObservationIds: [Int64], personNa
             
         )
 }
-public func assignFaceSearchMatchesToPerson(matches: [FaceSearchMatchRecord], personName: String, modelVersion: String, preprocessingVersion: String, threshold: Double)async  -> PersonClusterAcceptResult  {
+public func assignFaceSearchMatchesToPerson(matches: [FaceSearchMatchRecord], personName: String, modelVersion: String, preprocessingVersion: String, threshold: Double, explicitSeedFaceObservationIds: [Int64] = [])async  -> PersonClusterAcceptResult  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_photolibrariancore_fn_func_assign_face_search_matches_to_person(FfiConverterSequenceTypeFaceSearchMatchRecord.lower(matches),FfiConverterString.lower(personName),FfiConverterString.lower(modelVersion),FfiConverterString.lower(preprocessingVersion),FfiConverterDouble.lower(threshold)
+                uniffi_photolibrariancore_fn_func_assign_face_search_matches_to_person(FfiConverterSequenceTypeFaceSearchMatchRecord.lower(matches),FfiConverterString.lower(personName),FfiConverterString.lower(modelVersion),FfiConverterString.lower(preprocessingVersion),FfiConverterDouble.lower(threshold),FfiConverterSequenceInt64.lower(explicitSeedFaceObservationIds)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
@@ -9352,7 +9456,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_assign_face_observations_to_person() != 29864) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_photolibrariancore_checksum_func_assign_face_search_matches_to_person() != 42851) {
+    if (uniffi_photolibrariancore_checksum_func_assign_face_search_matches_to_person() != 3735) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_assign_keyword_for_ids() != 32359) {

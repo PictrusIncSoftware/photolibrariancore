@@ -1857,6 +1857,39 @@ pub struct PersonClusterAcceptResult {
     pub keyword_path: String,
     pub status: String,
     pub message: String,
+    /// ⭐ W4-20 / ruling 77 (b) — how many matched faces a named face search
+    /// LEFT with a different person instead of renaming them. Always 0 from
+    /// the two other person writers (they do not filter). Appended LAST with a
+    /// UDL default (the S65 wire-growth rule).
+    pub left_with_other_people_face_count: u64,
+    /// ⭐ W4-20 — exactly those faces, one record each, with the person who
+    /// keeps them. Swift builds the "already named as someone else" dialog from
+    /// this list and hands the same faces back for **Move**.
+    pub left_with_other_people_faces: Vec<FaceLeftWithOtherPersonRecord>,
+    /// ⭐ W4-20 fix round 1 (REVIEW-1 F2) — the explicit seeds this save used,
+    /// redirected to their CANONICAL face rows (the same ids the left-alone
+    /// faces carry), sorted. Swift settles these, so a face the user named
+    /// directly through a RAW-half pick cannot be bounced by a later dialog in
+    /// the same search. Empty from the other two writers. Appended LAST (S65).
+    pub explicit_seed_canonical_face_observation_ids: Vec<i64>,
+}
+
+/// ⭐ W4-20 / ruling 77 (b) — one matched face that a named face search did NOT
+/// rename, because it already belongs to a different person. The match fields
+/// are the search's own (`FaceSearchMatchRecord`), so **Move** can hand the face
+/// straight back to `assign_face_search_matches_to_person`; the owner fields are
+/// the person who keeps it, read from `person.display_name` (its stored
+/// spelling) at save time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FaceLeftWithOtherPersonRecord
+{
+    pub face_observation_id: i64,
+    pub image_id: i64,
+    pub seed_face_observation_id: i64,
+    pub face_index: u32,
+    pub cosine: f64,
+    pub owner_person_id: i64,
+    pub owner_person_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -2440,6 +2473,13 @@ struct MigrationProbe
     /// E3 — replace the migration's ROLLBACK text (only to make the ROLLBACK
     /// itself fail).
     rollback_sql_override: Option<&'static str>,
+    /// ⭐ W4-21 — at this point of the REAL → DOUBLE measurement migration, run
+    /// a statement the ENGINE fails with this class IN PLACE OF the real one,
+    /// inside the measurement transaction, on the real connection.
+    fail_measurement_step: Option<(MeasurementStep, InducedFailure)>,
+    /// ⭐ W4-21 — the SIGKILL rig's signal: on reaching this point the step
+    /// writes `<dir>/measurement-<point>`, then never returns if `block`.
+    measurement_rig: Option<(MeasurementRigPoint, std::path::PathBuf, bool)>,
 }
 
 #[cfg(test)]
@@ -2460,6 +2500,81 @@ fn forced_repair_sql(probe: MigrationProbeRef<'_>) -> Option<String>
 fn forced_repair_sql(_probe: MigrationProbeRef<'_>) -> Option<String>
 {
     None
+}
+
+/// ⭐ W4-21 — the statements of the REAL → DOUBLE measurement migration a test
+/// can fail (`MigrationProbe::fail_measurement_step`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MeasurementStep
+{
+    DropIndex,
+    Alter,
+    RecreateIndex,
+    Commit,
+}
+
+/// ⭐ W4-21 — the instants of the measurement migration the SIGKILL rig can
+/// stop at (`MigrationProbe::measurement_rig`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MeasurementRigPoint
+{
+    /// Every DROP / ALTER / CREATE INDEX is done; COMMIT has not been issued.
+    BeforeCommit,
+    /// COMMIT returned; the settings are not yet reset.
+    AfterCommit,
+    /// The step has returned to the open path; its closing CHECKPOINT has not run.
+    AfterStep,
+}
+
+/// The measurement statement to run: the real one, or (test builds, at the
+/// probed step) a statement the engine rejects with the probed class.
+///
+/// ⚠️ At `Commit` the substitute ENDS the transaction first (`ROLLBACK;`, then
+/// the failing statement), because a real COMMIT ends it whether it succeeds or
+/// fails. A substitute that left the transaction open would make the rest of the
+/// open fail by coincidence (the row migration's BEGIN), and a pin on "a failed
+/// COMMIT fails the open" would then pass for the wrong reason — W4-21's
+/// mutation M10 survived exactly that way until this was fixed.
+#[cfg(test)]
+fn measurement_step_sql(probe: MigrationProbeRef<'_>, step: MeasurementStep, real_sql: String) -> String
+{
+    match probe.and_then(|probe| probe.fail_measurement_step)
+    {
+        Some((target, failure)) if target == step && step == MeasurementStep::Commit =>
+        {
+            format!("ROLLBACK; {}", induced_failure_sql(failure))
+        }
+        Some((target, failure)) if target == step => induced_failure_sql(failure).to_string(),
+        _ => real_sql,
+    }
+}
+
+#[cfg(not(test))]
+fn measurement_step_sql(_probe: MigrationProbeRef<'_>, _step: MeasurementStep, real_sql: String) -> String
+{
+    real_sql
+}
+
+/// The SIGKILL rig's stopping point (test builds only; a no-op otherwise).
+#[cfg(test)]
+fn measurement_rig_point(probe: MigrationProbeRef<'_>, point: MeasurementRigPoint)
+{
+    if let Some((target, dir, block)) = probe.and_then(|probe| probe.measurement_rig.as_ref())
+    {
+        if *target == point
+        {
+            let _ = std::fs::write(dir.join(format!("measurement-{:?}", point)), b"1");
+            while *block
+            {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn measurement_rig_point(_probe: MigrationProbeRef<'_>, _point: MeasurementRigPoint)
+{
 }
 
 /// ⭐ E3 / ruling 15 — the row migration's steps, named for the log and the
@@ -2807,9 +2922,13 @@ fn open_and_migrate_catalogue_reporting(
             camera_make TEXT,
             camera_model TEXT,
             lens_model TEXT,
-            focal_length REAL,      -- Millimeters
-            aperture REAL,          -- F-stop value
-            shutter_speed REAL,     -- Seconds
+            -- ⭐ W4-21 (ruling 80): the six measurement columns are DOUBLE — they
+            -- were 32-bit REAL until W4-21. An existing catalogue is converted
+            -- once by `migrate_measurement_columns_to_double` (Rust, after this
+            -- batch); this CREATE body only shapes a NEW catalogue.
+            focal_length DOUBLE,    -- Millimeters
+            aperture DOUBLE,        -- F-stop value
+            shutter_speed DOUBLE,   -- Seconds
             iso INTEGER,            -- ISO speed rating
             capture_datetime TEXT,  -- ISO 8601 string
 
@@ -2819,10 +2938,10 @@ fn open_and_migrate_catalogue_reporting(
             color_space TEXT,
             bit_depth INTEGER,
 
-            -- GPS coordinates (from geotagged images)
-            gps_latitude REAL,
-            gps_longitude REAL,
-            gps_altitude REAL,
+            -- GPS coordinates (from geotagged images) — DOUBLE since W4-21
+            gps_latitude DOUBLE,
+            gps_longitude DOUBLE,
+            gps_altitude DOUBLE,
 
             -- IPTC/copyright metadata
             copyright TEXT,
@@ -3773,6 +3892,21 @@ fn open_and_migrate_catalogue_reporting(
         }
     }
 
+    // ⭐ W4-21 / ruling 80 — the six 32-bit REAL measurement columns become
+    // DOUBLE on an existing catalogue, ONCE. Same window as the S173 and S179
+    // steps above and for the same reasons (autocommit, before the row
+    // migration's BEGIN, never inside the schema batch). The why of its shape
+    // is on `migrate_measurement_columns_to_double`. An `Err` means a forced
+    // checkpoint failed AFTER DuckDB had applied the commit in memory, so this
+    // connection's catalog no longer matches the file: the open fails, exactly
+    // as a failed closing CHECKPOINT below already makes it fail.
+    if let Err(message) = migrate_measurement_columns_to_double(&conn, path, probe)
+    {
+        eprintln!("{}", message);
+        return None;
+    }
+    measurement_rig_point(probe, MeasurementRigPoint::AfterStep);
+
     // --- Backfill migration (DESIGN-Duplicate-Consolidation.md §8;
     // --- DESIGN-Filter-Aware-Pagination.md §4 added Step 3 in Session 19) ----
     //
@@ -3875,6 +4009,353 @@ fn open_and_migrate_catalogue_reporting(
     // --- End backfill migration --------------------------------------------
 
     Some((conn, outcome))
+}
+
+/// ⭐ W4-21 / ruling 80 — the `images` measurement columns that were 32-bit
+/// `REAL` (DuckDB reports `FLOAT`) until W4-21. Every one is `DOUBLE` in the
+/// CREATE body; an existing catalogue is converted by
+/// `migrate_measurement_columns_to_double`.
+const MEASUREMENT_DOUBLE_COLUMNS: [&str; 6] = [
+    "focal_length",
+    "aperture",
+    "shutter_speed",
+    "gps_latitude",
+    "gps_longitude",
+    "gps_altitude",
+];
+
+/// What `migrate_measurement_columns_to_double` did.
+///
+/// `wal_fallback_folded` = after COMMIT the WAL was NOT empty, i.e. DuckDB
+/// wrote the change to the WAL after all instead of checkpointing it straight
+/// into the file, and the defensive CHECKPOINT had to fold it. That is the
+/// window this step exists to close (engine fact 2 below). It is REPORTED
+/// rather than silently repaired because a silent repair hides exactly the
+/// defect it guards (W4-21 Phase 1, mutation M2): a test asserts it never fires.
+#[derive(Debug, PartialEq, Eq)]
+struct MeasurementMigrationOutcome
+{
+    converted: usize,
+    wal_fallback_folded: bool,
+    /// ⭐ W4-21 review L1 — the index that made the step refuse up front (a
+    /// UNIQUE index on `images`, or an index on a column being converted).
+    refused_by_index: Option<String>,
+}
+
+/// ⭐ W4-21 review L1 — does an index touch one of `columns`? Reads the index's
+/// `expressions` (DuckDB renders them as `[aperture]`, `[rating, focal_length]`,
+/// `['(lower(camera_model))']`), falling back to its SQL, split into identifier
+/// tokens and compared case-insensitively. A false positive only makes the
+/// step refuse, which is the safe direction.
+fn index_touches_any_column(expressions: Option<&str>, sql: &str, columns: &[String]) -> bool
+{
+    let text = expressions.unwrap_or(sql);
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|token| !token.is_empty())
+        .any(|token| columns.iter().any(|column| column.eq_ignore_ascii_case(token)))
+}
+
+/// ⭐ W4-21 / ruling 80 — convert every `MEASUREMENT_DOUBLE_COLUMNS` column
+/// that is still `FLOAT` to `DOUBLE`, once.
+///
+/// MARKER. `duckdb_columns().data_type`: a measurement column reading `FLOAT`
+/// is not converted yet. Every later launch pays one metadata probe and returns.
+///
+/// ⛔ THREE ENGINE FACTS (bundled DuckDB 1.5.5, measured W4-21 Phase 1 —
+/// `Docs/LatentDefectSweep-2026-09-18/slices/W4-21-double-columns/PLAN.md`):
+///   1. `ALTER TABLE images ALTER COLUMN … TYPE` is REFUSED while ANY index
+///      exists on `images` ("Dependency Error: Cannot alter entry "images"
+///      because there are entries that depend on it"), not only an index on the
+///      altered column. So every index on `images` is dropped and rebuilt from
+///      its own `duckdb_indexes().sql` — `idx_images_directory_path`, the S173
+///      marker, included — all inside ONE transaction, so no committed state
+///      ever lacks the marker.
+///      ⚠️ LIMITS (W4-21 review L1): an in-transaction DROP does NOT clear an
+///      index ON the column being altered ("Cannot change the type of this
+///      column: an index depends on it!"), and does not allow re-creating a
+///      UNIQUE index of the same name ("An index with the name … already
+///      exists!"). So the step REFUSES up front, logged, if either exists —
+///      neither does on `images` today, in any vintage. Index names are quoted
+///      in the DROP (a name like `"Idx Odd Quoted"` is otherwise a parser error).
+///   2. A committed `ALTER … TYPE` still in the WAL makes the catalogue
+///      UNOPENABLE: replay binds the cast with no default database ("INTERNAL
+///      Error: Failure while replaying WAL file … Calling
+///      DatabaseManager::GetDefaultDatabase with no default database set") — the
+///      S62 class. kill -9 before the closing CHECKPOINT wedged 89/188 runs at
+///      500k rows and 120/188 at 2k, one transaction or not.
+///   3. So the WAL is never allowed to hold it. CHECKPOINT first (the WAL is
+///      empty going in); then `checkpoint_threshold = '0b'` makes COMMIT decide
+///      to checkpoint, and `auto_checkpoint_skip_wal_threshold = 0` makes it skip
+///      the WAL write and checkpoint the transaction straight into the file
+///      (`DuckTransactionManager::CommitTransaction`). A kill at any instant
+///      leaves the whole old state or the whole new state, with an empty WAL
+///      (220 SIGKILLs at 2k and 500k rows, 0 wedges). Both settings are RESET.
+///
+/// VALUES. `USING CAST(CAST(col AS VARCHAR) AS DOUBLE)` (ruled): the float's
+/// decimal spelling read back as a double. Information-preserving — cast back
+/// to FLOAT it is the identical float (0 mismatches over 16.7M sampled bit
+/// patterns) — and for a photographic decimal it is what a fresh import stores
+/// (f/2.8 → 2.8, where plain widening gives 2.799999952316284, which "at least
+/// f/2.8" would then miss). Lost digits are NOT recovered; a re-import does that.
+///
+/// FAILURE. Anything before COMMIT → ROLLBACK, never COMMIT (E3); the settings
+/// are reset, the columns stay FLOAT, the open continues and the next open
+/// retries. A failed COMMIT returns `Err`: the forced checkpoint can fail after
+/// the commit was applied in memory, and nothing may then be written on top of
+/// a catalog that no longer matches the file — the caller fails the open.
+fn migrate_measurement_columns_to_double(
+    conn: &Connection,
+    path: &std::path::Path,
+    probe: MigrationProbeRef<'_>,
+) -> Result<MeasurementMigrationOutcome, String>
+{
+    let nothing = MeasurementMigrationOutcome { converted: 0, wal_fallback_folded: false, refused_by_index: None };
+
+    // The marker.
+    let floats: Vec<String> = {
+        let mut stmt = match conn.prepare(
+            "SELECT column_name FROM duckdb_columns() \
+             WHERE database_name = current_database() AND schema_name = 'main' \
+               AND table_name = 'images' AND data_type = 'FLOAT' \
+             ORDER BY column_index",
+        )
+        {
+            Ok(stmt) => stmt,
+            Err(e) =>
+            {
+                eprintln!("[migration] measurement-column type probe failed ({}); not converted this launch", e);
+                return Ok(nothing);
+            }
+        };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0))
+        {
+            Ok(rows) => rows,
+            Err(e) =>
+            {
+                eprintln!("[migration] measurement-column type probe failed ({}); not converted this launch", e);
+                return Ok(nothing);
+            }
+        };
+        collect_rows(rows, "migrate_measurement_columns_to_double.type_probe")
+            .into_iter()
+            .filter(|column| MEASUREMENT_DOUBLE_COLUMNS.contains(&column.as_str()))
+            .collect()
+    };
+    if floats.is_empty()
+    {
+        return Ok(nothing);
+    }
+
+    // Every index on images, with the SQL that recreates it (fact 1).
+    let indexes: Vec<(String, String, bool, Option<String>)> = {
+        let mut stmt = match conn.prepare(
+            "SELECT index_name, sql, is_unique, expressions FROM duckdb_indexes() \
+             WHERE database_name = current_database() AND schema_name = 'main' \
+               AND table_name = 'images' \
+             ORDER BY index_name",
+        )
+        {
+            Ok(stmt) => stmt,
+            Err(e) =>
+            {
+                eprintln!("[migration] measurement migration: index listing failed ({}); not converted this launch", e);
+                return Ok(nothing);
+            }
+        };
+        let rows = match stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        {
+            Ok(rows) => rows,
+            Err(e) =>
+            {
+                eprintln!("[migration] measurement migration: index listing failed ({}); not converted this launch", e);
+                return Ok(nothing);
+            }
+        };
+        let mut listed = Vec::new();
+        for (name, sql, is_unique, expressions) in collect_rows(rows, "migrate_measurement_columns_to_double.indexes")
+        {
+            match sql
+            {
+                Some(sql) if !sql.trim().is_empty() => listed.push((name, sql, is_unique, expressions)),
+                _ =>
+                {
+                    eprintln!(
+                        "[migration] measurement migration: index {} on images has no SQL to recreate it from; \
+                         not converted this launch",
+                        name
+                    );
+                    return Ok(nothing);
+                }
+            }
+        }
+        listed
+    };
+
+    // Fact 1's limits — refuse before anything is changed, with a clear line,
+    // rather than fail the transaction (and its checkpoint) on every launch.
+    for (name, sql, is_unique, expressions) in &indexes
+    {
+        let reason = if *is_unique
+        {
+            Some("it is UNIQUE, and DuckDB cannot re-create a UNIQUE index of the same name in the transaction that dropped it")
+        }
+        else if index_touches_any_column(expressions.as_deref(), sql, &floats)
+        {
+            Some("it is on a column being converted, and DuckDB refuses that type change even after an in-transaction DROP")
+        }
+        else
+        {
+            None
+        };
+        if let Some(reason) = reason
+        {
+            eprintln!(
+                "[migration] measurement columns NOT converted: index {} on images blocks it ({}). They stay 32-bit \
+                 until that index is removed; nothing was changed.",
+                name, reason
+            );
+            return Ok(MeasurementMigrationOutcome { refused_by_index: Some(name.clone()), ..nothing });
+        }
+    }
+
+    // Fact 3 — an empty WAL going in, then a COMMIT that never writes the WAL.
+    if let Err(e) = conn.execute_batch("CHECKPOINT;")
+    {
+        eprintln!("[migration] measurement migration: CHECKPOINT failed ({}); not converted this launch", e);
+        return Ok(nothing);
+    }
+    let reset_settings = |conn: &Connection|
+    {
+        for statement in ["RESET checkpoint_threshold;", "RESET auto_checkpoint_skip_wal_threshold;"]
+        {
+            if let Err(e) = conn.execute_batch(statement)
+            {
+                eprintln!(
+                    "[migration] measurement migration: {} failed ({}); every commit this session will checkpoint",
+                    statement, e
+                );
+            }
+        }
+    };
+    // Two statements, deliberately: execute_batch stops at the first error.
+    for statement in ["SET checkpoint_threshold = '0b';", "SET auto_checkpoint_skip_wal_threshold = 0;"]
+    {
+        if let Err(e) = conn.execute_batch(statement)
+        {
+            reset_settings(conn);
+            eprintln!("[migration] measurement migration: {} failed ({}); not converted this launch", statement, e);
+            return Ok(nothing);
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        reset_settings(conn);
+        eprintln!("[migration] measurement migration: BEGIN failed ({}); not converted this launch", e);
+        return Ok(nothing);
+    }
+    let body = || -> Result<(), String>
+    {
+        for (name, _, _, _) in &indexes
+        {
+            let sql = measurement_step_sql(
+                probe,
+                MeasurementStep::DropIndex,
+                format!("DROP INDEX \"{}\";", name.replace('"', "\"\"")),
+            );
+            conn.execute_batch(&sql).map_err(|e| format!("DROP INDEX {}: {}", name, e))?;
+        }
+        for column in &floats
+        {
+            let sql = measurement_step_sql(
+                probe,
+                MeasurementStep::Alter,
+                format!(
+                    "ALTER TABLE images ALTER COLUMN {c} SET DATA TYPE DOUBLE USING CAST(CAST({c} AS VARCHAR) AS DOUBLE);",
+                    c = column
+                ),
+            );
+            conn.execute_batch(&sql).map_err(|e| format!("ALTER {}: {}", column, e))?;
+        }
+        for (name, sql, _, _) in &indexes
+        {
+            // The S179-retired indexes are not rebuilt: that step drops them
+            // before this one, so this only matters if its drop failed.
+            if FOCUS_WRITEBACK_RETIRED_INDEXES.contains(&name.as_str())
+            {
+                continue;
+            }
+            let sql = measurement_step_sql(probe, MeasurementStep::RecreateIndex, sql.clone());
+            conn.execute_batch(&sql).map_err(|e| format!("recreating {}: {}", name, e))?;
+        }
+        Ok(())
+    };
+    if let Err(reason) = body()
+    {
+        // E3 — after an Err inside the transaction: ROLLBACK, never COMMIT.
+        let rolled_back = conn.execute_batch("ROLLBACK;");
+        reset_settings(conn);
+        eprintln!(
+            "[migration] measurement columns NOT converted ({}); {} — they stay 32-bit this launch and the next \
+             open retries",
+            reason,
+            match rolled_back
+            {
+                Ok(()) => "rolled back".to_string(),
+                Err(e) => format!("and the ROLLBACK failed too ({})", e),
+            }
+        );
+        return Ok(nothing);
+    }
+    measurement_rig_point(probe, MeasurementRigPoint::BeforeCommit);
+    let committed = conn.execute_batch(&measurement_step_sql(probe, MeasurementStep::Commit, "COMMIT;".to_string()));
+    measurement_rig_point(probe, MeasurementRigPoint::AfterCommit);
+    reset_settings(conn);
+    if let Err(e) = committed
+    {
+        return Err(format!(
+            "[migration] measurement-column COMMIT (a forced checkpoint) failed ({}); the catalogue open is \
+             abandoned so nothing is written on top of a catalog that may no longer match the file. The next \
+             launch reopens the file and retries.",
+            e
+        ));
+    }
+
+    // Defence in depth for fact 2: the WAL must not hold the ALTER. If DuckDB
+    // ever fell back to a WAL write, fold it into the file now — and say so.
+    let mut wal = path.as_os_str().to_owned();
+    wal.push(".wal");
+    let wal_bytes = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    let wal_fallback_folded = wal_bytes > 0;
+    if wal_fallback_folded
+    {
+        eprintln!(
+            "[migration] measurement migration: the WAL holds {} bytes after COMMIT (DuckDB did not skip the WAL \
+             write); checkpointing it now",
+            wal_bytes
+        );
+        if let Err(e) = conn.execute_batch("CHECKPOINT;")
+        {
+            return Err(format!(
+                "[migration] measurement migration: the defensive CHECKPOINT failed ({}); the catalogue open is \
+                 abandoned",
+                e
+            ));
+        }
+    }
+    eprintln!(
+        "[migration] {} measurement column(s) converted REAL -> DOUBLE; {} images index(es) rebuilt",
+        floats.len(),
+        indexes.iter().filter(|(name, _, _, _)| !FOCUS_WRITEBACK_RETIRED_INDEXES.contains(&name.as_str())).count()
+    );
+    Ok(MeasurementMigrationOutcome { converted: floats.len(), wal_fallback_folded, refused_by_index: None })
 }
 
 /// ⭐ E3 / ruling 15 — `BEGIN`, the row migration's body, then `COMMIT` on Ok
@@ -7274,12 +7755,21 @@ fn relative_date_cutoff(count: u32, unit: &str) -> Option<String>
 }
 
 /// One numeric-subject atom (S65 — ISO / aperture / shutter_speed /
-/// focal_length). `column` is fixed by the calling arm (never caller text);
-/// the numbers are formatted with Rust's shortest-round-trip f64 Display, so
-/// the SQL literal parses back to the exact stored double — equality on a
-/// dropdown-picked value is exact, not approximate. Non-finite numbers and
-/// unknown ops fall to the `(FALSE)` backstop via None. `between` requires
-/// both bounds; the other ops reuse the rating token vocabulary.
+/// focal_length, and every later numeric subject). `column` is fixed by the
+/// calling arm (never caller text). Non-finite numbers and unknown ops fall to
+/// the `(FALSE)` backstop via None. `between` requires both bounds; the other
+/// ops reuse the rating token vocabulary.
+///
+/// ⭐ W4-21 (ruling 80, decision 2) — the numbers are written in Rust's
+/// shortest-round-trip SCIENTIFIC form (`{:e}`: `2.8e0`, `5e-4`, `1.6e3`).
+/// DuckDB types that as DOUBLE and parses it correctly rounded, so a
+/// dropdown-picked stored double matches its own row bit-for-bit. ⛔ Not `{}`:
+/// a plain literal types as DECIMAL, and once it has 17 significant digits
+/// DuckDB's DECIMAL→DOUBLE/FLOAT conversion is not correctly rounded (the
+/// integer mantissa exceeds 2^53). Under `{}` "is exactly 1/50" (the dropdown
+/// hands back 0.019999999552965164 on REAL storage) matched NO photo, and so
+/// did 1/100 and 1/200 — 1,692 of 10,000 1/N speeds and 292 of 1,901
+/// Lightroom-APEX speeds, measured on the bundled 1.5.5.
 fn numeric_atom(column: &str, op: &str, num: f64, num_end: Option<f64>) -> Option<String> {
     if !num.is_finite() {
         return None;
@@ -7289,16 +7779,92 @@ fn numeric_atom(column: &str, op: &str, num: f64, num_end: Option<f64>) -> Optio
         if !end.is_finite() {
             return None;
         }
-        return Some(format!("({} BETWEEN {} AND {})", column, num, end));
+        return Some(format!("({} BETWEEN {:e} AND {:e})", column, num, end));
     }
     let sym = sql_compare_op(op)?;
-    Some(format!("({} {} {})", column, sym, num))
+    Some(format!("({} {} {:e})", column, sym, num))
+}
+
+/// ⭐ W4-21 review F1/F2 + the range follow-up (coordinator OK, both) — the
+/// exposure columns whose numeric predicates ("is exactly" AND at least / at
+/// most / between) compare at 32-bit precision (`float_precision_atom`), and
+/// whose dropdown lists one entry per 32-bit value (`distinct_numeric_values_sql`).
+/// GPS and every other numeric subject keep the 64-bit `numeric_atom`.
+const FLOAT_PRECISION_COLUMNS: [&str; 3] = ["aperture", "shutter_speed", "focal_length"];
+
+/// ⭐ W4-21 — every numeric predicate on aperture / shutter speed / focal length,
+/// compared at 32-bit (FLOAT) precision: `TRY_CAST(col AS FLOAT) <op> CAST(<v> AS
+/// FLOAT)` (`BETWEEN` likewise; the column side is a TRY_CAST, see below). A
+/// 64-bit comparison goes wrong three ways:
+///   F1 — a saved "is exactly" made on the REAL storage of before W4-21 holds
+///        the WIDENED float (f/2.8 → 2.799999952316284); the conversion stores
+///        2.8, so a 64-bit equality matched nothing (0/6 in the review's probe).
+///   F2 — a converted 1/60 is 0.016666668 and a later import stores
+///        0.016666666666666666; a 64-bit "is exactly 1/60" reached one half.
+///   Range — a typed "at most 1/60" (0.016666666666666666) left out every
+///        converted 1/60 photo (0.016666668): over 1/N for N ≤ 8,000, 4,011
+///        "at most" and 3,943 "at least" boundary misses.
+/// Every one of those pairs is the same 32-bit float, and no two real exposure
+/// settings differ by less than a float ulp (Richard: 64-bit is "almost
+/// completely overboard" for these). Each bound goes through Rust's `as f32` and
+/// is written `{:e}` (a DOUBLE literal, correctly rounded — the DECIMAL trap stays
+/// closed); SQL's DOUBLE→FLOAT cast then lands on that same float. A bound
+/// beyond the f32 range (no float to round to) falls back to the 64-bit atom.
+///
+/// ⭐ W4-21 review R2-1 — the COLUMN side is `TRY_CAST(col AS FLOAT)`, never
+/// `CAST`: a stored finite value beyond ±3.4e38 (corrupt metadata — Lightroom's
+/// unguarded `pow(2, -tv)`, Apple's `positiveExif`) makes `CAST` throw "out of
+/// range for the destination type FLOAT", and that one row would fail EVERY
+/// query on the column. REAL storage refused such a value at insert; DOUBLE
+/// stores it. Under `TRY_CAST` it reads NULL, so the row matches nothing and
+/// every other row still answers.
+fn float_precision_atom(column: &str, op: &str, num: f64, num_end: Option<f64>) -> Option<String>
+{
+    if !num.is_finite()
+    {
+        return None;
+    }
+    let float_literal = |value: f64| -> Option<String>
+    {
+        let float = value as f32;
+        if float.is_finite()
+        {
+            Some(format!("CAST({:e} AS FLOAT)", float as f64))
+        }
+        else
+        {
+            None
+        }
+    };
+    if op == "between"
+    {
+        let end = num_end?;
+        if !end.is_finite()
+        {
+            return None;
+        }
+        return match (float_literal(num), float_literal(end))
+        {
+            (Some(low), Some(high)) => Some(format!("(TRY_CAST({} AS FLOAT) BETWEEN {} AND {})", column, low, high)),
+            _ => numeric_atom(column, op, num, num_end),
+        };
+    }
+    let sym = sql_compare_op(op)?;
+    match float_literal(num)
+    {
+        Some(bound) => Some(format!("(TRY_CAST({} AS FLOAT) {} {})", column, sym, bound)),
+        None => numeric_atom(column, op, num, num_end),
+    }
 }
 
 /// The shared arm body for the four numeric kinds: op + num are required
 /// (num_end only for "between"); anything malformed matches nothing.
 fn numeric_predicate_sql(p: &QueryPredicate, column: &str) -> String {
     match (p.op.as_deref(), p.num) {
+        (Some(op), Some(num)) if FLOAT_PRECISION_COLUMNS.contains(&column) =>
+        {
+            float_precision_atom(column, op, num, p.num_end).unwrap_or_else(|| "(FALSE)".to_string())
+        }
         (Some(op), Some(num)) => {
             numeric_atom(column, op, num, p.num_end).unwrap_or_else(|| "(FALSE)".to_string())
         }
@@ -7977,8 +8543,9 @@ fn predicate_to_sql(p: &QueryPredicate) -> String {
         // four exposure columns, op ∈ eq/gte/lte/between (UI sends those; the
         // remaining rating tokens gt/lt also work — the LR import may use
         // them). The bound(s) ride `num`/`num_end`; a NULL column (no EXIF)
-        // correctly never matches. ISO is INTEGER, the rest REAL — DuckDB
-        // compares either against the f64 literal directly.
+        // correctly never matches. ISO is INTEGER, the rest DOUBLE (REAL until
+        // W4-21) — `numeric_atom` writes a DOUBLE literal (`{:e}`), which DuckDB
+        // compares exactly against either.
         "iso_num" => numeric_predicate_sql(p, "iso"),
         "aperture_num" => numeric_predicate_sql(p, "aperture"),
         "shutter_num" => numeric_predicate_sql(p, "shutter_speed"),
@@ -9633,10 +10200,13 @@ fn people_keyword_scope(path: &str) -> PeopleKeywordScope
 /// ⭐ Fix round 1 (REVIEW-1 F1; ruling 60, RULED Oct 9, 2026) — true when a
 /// People keyword that STILL EXISTS names the same person as `normalized_name`.
 ///
-/// The three person writers reuse a person by its NORMALIZED name but write the
-/// keyword with the TYPED name, so one person can carry several keywords
-/// (`People␟James Wagner` and `People␟james wagner`). The person goes only with
-/// the LAST of them: this reads the surviving keyword rows ON THE TABLE, inside
+/// The three person writers reuse a person by its NORMALIZED name. Before W4-20
+/// (ruling 77 (a)) they wrote the keyword with the TYPED name, so a catalogue
+/// written then can carry several keywords for one person (`People␟James
+/// Wagner` and `People␟james wagner`); since W4-20 every writer uses the
+/// person's STORED spelling (`stored_person_display_name`), so this rule now
+/// guards those older catalogues (and a hand-typed keyword spelling). The
+/// person goes only with the LAST of them: this reads the surviving keyword rows ON THE TABLE, inside
 /// the caller's transaction, after this path's own keyword DELETE — never a
 /// change count (S179). Every status counts (a hidden row is still a keyword
 /// the person stands behind), which errs toward keeping data.
@@ -10195,8 +10765,36 @@ pub async fn distinct_image_values(field: String) -> Vec<String> {
     }
 }
 
+/// The dropdown query of `distinct_numeric_values`, for one allow-listed
+/// column. A function so the W4-21 round-trip test runs the production text.
+///
+/// ⭐ W4-21 review F2 — for the three `FLOAT_PRECISION_COLUMNS` the list
+/// holds ONE entry per 32-bit value: a converted 1/60 (0.016666668) and a later
+/// import's 1/60 (0.016666666666666666) are the same float, so "1/60" appears
+/// once. The entry is that float's decimal text read back as a double (f/2.8 →
+/// 2.8), and `float_precision_atom` selects every photo sharing the float.
+/// ⭐ Review R2-1: `TRY_CAST`, and a value beyond the f32 range (it reads NULL)
+/// is left out, so one corrupt row cannot make the dropdown query fail.
+fn distinct_numeric_values_sql(column: &str) -> String
+{
+    if FLOAT_PRECISION_COLUMNS.contains(&column)
+    {
+        return format!(
+            "SELECT DISTINCT CAST(CAST(TRY_CAST({col} AS FLOAT) AS VARCHAR) AS DOUBLE) AS v FROM images \
+             WHERE TRY_CAST({col} AS FLOAT) IS NOT NULL ORDER BY v",
+            col = column
+        );
+    }
+    format!(
+        "SELECT DISTINCT CAST({col} AS DOUBLE) AS v FROM images WHERE {col} IS NOT NULL ORDER BY v",
+        col = column
+    )
+}
+
 /// `distinct_image_values`' numeric twin (S65) — the four exposure subjects'
-/// type-ahead source, returned as the exact stored doubles (Swift formats the
+/// type-ahead source, returned as the exact stored doubles — for aperture,
+/// shutter speed and focal length one entry per 32-bit value (W4-21 review F2;
+/// see `distinct_numeric_values_sql`) — (Swift formats the
 /// photographer notation — f/2.8, 1/2000, 70 mm — and hands the picked double
 /// straight back into the predicate, so "is exactly" equality never rides a
 /// string round-trip). ISO is an INTEGER column → CAST keeps one return type.
@@ -10231,10 +10829,7 @@ pub async fn distinct_numeric_values(field: String) -> Vec<f64> {
         }
     };
 
-    let sql = format!(
-        "SELECT DISTINCT CAST({col} AS DOUBLE) AS v FROM images WHERE {col} IS NOT NULL ORDER BY v",
-        col = column
-    );
+    let sql = distinct_numeric_values_sql(column);
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(e) => {
@@ -15774,6 +16369,9 @@ fn person_accept_error(status: &str, message: &str) -> PersonClusterAcceptResult
         keyword_path: String::new(),
         status: status.to_string(),
         message: message.to_string(),
+        left_with_other_people_face_count: 0,
+        left_with_other_people_faces: Vec::new(),
+        explicit_seed_canonical_face_observation_ids: Vec::new(),
     }
 }
 
@@ -15839,6 +16437,133 @@ fn get_or_create_person_impl(
         params![display_name, normalized_name],
         |row| row.get(0),
     )
+}
+
+/// ⭐ W4-20 / ruling 77 (a) — the person's STORED spelling, read back after
+/// `get_or_create_person_impl` inside the writer's own transaction.
+///
+/// A typed name is matched to a person by `normalized_name` (case-folded), so
+/// `zzw4rb` reuses the person `ZZW4Rb`. The three person writers used to build
+/// the `People<sep><Name>` keyword from the TYPED text, and a keyword path
+/// matches exactly — so one person grew a second label (`People › zzw4rb`).
+/// Every writer now builds the keyword, and reports `person_name`, from this.
+/// `LIMIT 1`: `id` is the primary key, so this is one row by construction.
+fn stored_person_display_name(conn: &Connection, person_id: i64) -> Result<String, duckdb::Error>
+{
+    conn.query_row(
+        "SELECT display_name FROM person WHERE id = ?1 LIMIT 1",
+        params![person_id],
+        |row| row.get(0),
+    )
+}
+
+/// ⭐ W4-20 / ruling 77 (b) — the person a typed name ALREADY names, if any,
+/// without creating one. A face that person already owns is "already that
+/// person's" and may be (re)assigned; a face any OTHER person owns is left
+/// alone. `None` = the name is new, so no matched face is already its own.
+fn existing_person_id_for_normalized_name(
+    conn: &Connection,
+    normalized_name: &str,
+) -> Result<Option<i64>, duckdb::Error>
+{
+    match conn.query_row(
+        "SELECT id FROM person WHERE normalized_name = ?1 LIMIT 1",
+        params![normalized_name],
+        |row| row.get::<_, i64>(0),
+    )
+    {
+        Ok(id) => Ok(Some(id)),
+        Err(duckdb::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// ⭐ W4-20 / ruling 77 (b) — the current person of each face, FAIL-CLOSED.
+///
+/// `person_assignments_for_face_observations_impl` logs and drops a row it
+/// cannot read, which is fine for a display. Here an unreadable row is a face
+/// whose owner is unknown, and treating it as unassigned would hand another
+/// person's face to the searched name — the exact defect this slice removes. So
+/// any failure, or any dropped row, is an `Err`, and the caller writes nothing.
+fn face_assignments_for_ids_checked(
+    conn: &Connection,
+    face_observation_ids: &[i64],
+) -> Result<Vec<PersonFaceAssignmentRecord>, String>
+{
+    if face_observation_ids.is_empty()
+    {
+        return Ok(Vec::new());
+    }
+    let id_list = face_observation_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT
+             a.face_observation_id,
+             a.person_id,
+             p.display_name,
+             a.image_id,
+             a.face_index
+         FROM person_face_assignment a
+         JOIN person p ON p.id = a.person_id
+         WHERE a.face_observation_id IN ({})
+         ORDER BY a.face_observation_id",
+        id_list
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("current face assignments: prepare {}", e))?;
+    let rows = stmt
+        .query_map([], |row|
+        {
+            let face_index = row.get::<_, i64>(4)?;
+            Ok(PersonFaceAssignmentRecord {
+                face_observation_id: row.get(0)?,
+                person_id: row.get(1)?,
+                person_name: row.get(2)?,
+                image_id: row.get(3)?,
+                face_index: face_index.clamp(0, u32::MAX as i64) as u32,
+            })
+        })
+        .map_err(|e| format!("current face assignments: query {}", e))?;
+    let (assignments, dropped) =
+        collect_rows_counted(rows, "assign_face_search_matches_to_person.current_assignments");
+    if dropped > 0
+    {
+        return Err(format!("current face assignments: {} row(s) could not be read", dropped));
+    }
+    Ok(assignments)
+}
+
+/// ⭐ W4-20 / ruling 77 (b) — what a named face search does with one matched
+/// face. Pure, so the rule is testable on its own.
+#[derive(Debug, Clone, PartialEq)]
+enum NamedSearchFaceDecision
+{
+    /// Unassigned, or already the searched person's: assign (or refresh) it.
+    Assign,
+    /// Owned by another person, but the user chose this face as the search's
+    /// seed — they are saying directly who it is. It takes the new name.
+    MoveExplicitSeed,
+    /// Owned by another person and not a chosen seed: it keeps its owner.
+    LeaveWithOwner,
+}
+
+fn named_search_face_decision(
+    current_owner_person_id: Option<i64>,
+    searched_person_id: Option<i64>,
+    is_explicit_seed: bool,
+) -> NamedSearchFaceDecision
+{
+    match current_owner_person_id
+    {
+        None => NamedSearchFaceDecision::Assign,
+        Some(owner) if Some(owner) == searched_person_id => NamedSearchFaceDecision::Assign,
+        Some(_) if is_explicit_seed => NamedSearchFaceDecision::MoveExplicitSeed,
+        Some(_) => NamedSearchFaceDecision::LeaveWithOwner,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -16080,6 +16805,93 @@ fn remove_obsolete_face_keyword_projections(
     }
 
     Ok(changed)
+}
+
+/// ⭐ W4-20 fix round 1 (REVIEW-1 F3; coordinator's call — ruling 60's rule, "a
+/// person disappears when nothing names it any more") — run inside a person
+/// writer's transaction, AFTER `remove_obsolete_face_keyword_projections`.
+///
+/// A save or a **Move** that takes a person's LAST face used to leave a `person`
+/// row with no face and no visible People keyword: it still fed the name
+/// suggestions (`person_summaries_impl` LEFT-JOINs), and Settings › Keywords
+/// (which hides an all-hidden keyword by default) offered nothing to delete it
+/// by. Each candidate — a PREVIOUS owner of a face this write moved, never the
+/// person written to — is deleted when it has
+/// * zero `person_face_assignment` rows, AND
+/// * zero ACTIVE (`status = 1`) People keyword rows naming it, in any spelling
+///   (`people_keyword_scope`, the normalization ruling 60's delete uses).
+///
+/// ⚠️ ACTIVE rows, where ruling 60's delete counts every status: the cleanup
+/// above SOFT-HIDES the old owner's face-only label (`status = 0`, origin
+/// cleared) rather than deleting it, so counting hidden rows would keep every
+/// such person and leave the ghost in place. Nothing is lost by the delete — the
+/// person holds no face (checked first), and its hidden keyword rows stay as
+/// keyword history. A label applied by hand, a collection or a color keeps its
+/// row ACTIVE (the cleanup only clears the face bit), so that person stays.
+///
+/// ⛔ Every read is checked and a dropped row is an `Err`; any `Err` is the
+/// caller's cue to ROLLBACK the whole write (S187). No change count is read
+/// (S179). Returns the ids it deleted.
+fn delete_people_named_by_nothing(
+    conn: &Connection,
+    candidate_person_ids: &std::collections::BTreeSet<i64>,
+) -> Result<Vec<i64>, String>
+{
+    let mut deleted = Vec::new();
+    for person_id in candidate_person_ids
+    {
+        let faces: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM person_face_assignment WHERE person_id = ?1",
+                params![person_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("faces of person {}: {}", person_id, e))?;
+        if faces > 0
+        {
+            continue;
+        }
+        let normalized_name = match conn.query_row(
+            "SELECT normalized_name FROM person WHERE id = ?1 LIMIT 1",
+            params![person_id],
+            |row| row.get::<_, String>(0),
+        )
+        {
+            Ok(name) => name,
+            Err(duckdb::Error::QueryReturnedNoRows) => continue,
+            Err(e) => return Err(format!("name of person {}: {}", person_id, e)),
+        };
+        if active_people_keyword_names(conn, &normalized_name)?
+        {
+            continue;
+        }
+        conn.execute("DELETE FROM person WHERE id = ?1", params![person_id])
+            .map_err(|e| format!("delete person {}: {}", person_id, e))?;
+        deleted.push(*person_id);
+    }
+    Ok(deleted)
+}
+
+/// True when an ACTIVE People keyword row names `normalized_name` (any spelling).
+/// The sibling of ruling 60's `surviving_people_keyword_names`, which counts
+/// every status — see `delete_people_named_by_nothing` for why this one does
+/// not. ⛔ Fails CLOSED: an unreadable row could be the name, so it is an `Err`.
+fn active_people_keyword_names(conn: &Connection, normalized_name: &str) -> Result<bool, String>
+{
+    let prefix = format!("{}{}", PEOPLE_KEYWORD_ROOT, KEYWORD_PATH_SEPARATOR);
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT path FROM keyword WHERE status = 1 AND starts_with(path, ?1)")
+        .map_err(|e| format!("active People keywords: prepare {}", e))?;
+    let rows = stmt
+        .query_map(params![prefix], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("active People keywords: query {}", e))?;
+    let (paths, dropped) = collect_rows_counted(rows, "person_writers.active_people_keywords");
+    if dropped > 0
+    {
+        return Err(format!("active People keywords: {} row(s) could not be read", dropped));
+    }
+    let wanted = PeopleKeywordScope::OnePerson(normalized_name.to_string());
+    Ok(paths.iter().any(|path| people_keyword_scope(path.trim()) == wanted))
 }
 
 fn person_face_observation_ids_impl(conn: &Connection, person_id: i64) -> Vec<i64> {
@@ -17714,8 +18526,6 @@ fn assign_face_observations_to_person_impl(
         return person_accept_error("invalid", "A non-empty person name is required.");
     };
     let normalized_name = normalized_person_name(&display_name);
-    let keyword_segments = vec!["People".to_string(), display_name.clone()];
-    let keyword_path = keyword_segments.join(KEYWORD_PATH_SEPARATOR);
     let faces = assignable_faces_for_observation_ids(conn, face_observation_ids);
     if faces.is_empty() {
         return person_accept_error(
@@ -17742,6 +18552,20 @@ fn assign_face_observations_to_person_impl(
             return person_accept_error("failed", "Could not create or reuse the person row.");
         }
     };
+    // ⭐ W4-20 / ruling 77 (a) — one person, one label: the keyword and the
+    // reported name use the person's STORED spelling, never the typed one.
+    let display_name = match stored_person_display_name(conn, person_id)
+    {
+        Ok(name) => name,
+        Err(e) =>
+        {
+            eprintln!("assign_face_observations_to_person: stored name {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return person_accept_error("failed", "Could not read the person's stored name.");
+        }
+    };
+    let keyword_segments = vec!["People".to_string(), display_name.clone()];
+    let keyword_path = keyword_segments.join(KEYWORD_PATH_SEPARATOR);
 
     let mut assigned_face_count = 0u64;
     let mut image_ids = std::collections::BTreeSet::new();
@@ -17817,6 +18641,20 @@ fn assign_face_observations_to_person_impl(
         return person_accept_error("failed", "Could not clean up the previous People keyword.");
     }
 
+    // ⭐ W4-20 fix round 1 (REVIEW-1 F3) — a previous owner this write left with
+    // no face and no active People keyword goes, in THIS transaction.
+    let unnamed_candidates = previous_assignments
+        .iter()
+        .map(|assignment| assignment.person_id)
+        .filter(|previous| *previous != person_id)
+        .collect::<std::collections::BTreeSet<i64>>();
+    if let Err(e) = delete_people_named_by_nothing(conn, &unnamed_candidates)
+    {
+        eprintln!("assign_face_observations_to_person: unnamed person {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return person_accept_error("failed", "Could not remove a person left with no faces.");
+    }
+
     if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("assign_face_observations_to_person: commit {}", e);
         return person_accept_error("failed", "Could not commit the person assignment.");
@@ -17831,6 +18669,9 @@ fn assign_face_observations_to_person_impl(
         keyword_path,
         status: "assigned".to_string(),
         message: "Face observations assigned to a named person.".to_string(),
+        left_with_other_people_face_count: 0,
+        left_with_other_people_faces: Vec::new(),
+        explicit_seed_canonical_face_observation_ids: Vec::new(),
     }
 }
 
@@ -17858,6 +18699,40 @@ pub async fn assign_face_observations_to_person(
     |panic| person_accept_error("failed", &ffi_panic_report("save this person", &panic)))
 }
 
+/// ⭐ W4-20 / ruling 77 (+ its amendment) — the named face search's ONE writer.
+///
+/// **(b) The search is unchanged.** `face_embedding_search_impl` still returns
+/// every face that resembles the seeds, whoever it belongs to. This writer only
+/// decides which of those matched faces a NAMED search renames
+/// (`named_search_face_decision`):
+/// * an unassigned face, or one the searched person already owns — assigned;
+/// * a face a DIFFERENT person owns — left with that person, and reported in
+///   `left_with_other_people_faces` so Swift can offer **Move** — unless
+/// * the user chose that face as the search's seed
+///   (`explicit_seed_face_observation_ids`: the clicked face, the picker's
+///   chosen face). They are saying directly who it is, so it takes the name.
+///
+/// Before this, the upsert below overwrote every matched face's owner and the
+/// old owner's keyword cleanup then removed their label — a named search could
+/// silently take any number of faces from any other named person.
+///
+/// **Move** is this same call with the left-alone faces handed back as both the
+/// matches AND the explicit seeds: they are reassigned, and the existing
+/// old-owner keyword cleanup runs on them exactly as it does for a moved seed.
+///
+/// **(a) One label per person.** The `People<sep><Name>` keyword and
+/// `person_name` use the person's STORED spelling (`stored_person_display_name`).
+///
+/// **Nothing is written when no face would be assigned.** The person row is not
+/// created then, so a name whose every match already belongs to someone else
+/// leaves no face-less person behind (it would carry no People keyword, so
+/// nothing in the app could delete it). The result is still `assigned`, with
+/// zero faces and the left-alone list; **Move** creates the person.
+///
+/// ⛔ Fails CLOSED: if the matched faces' current owners cannot be read, nothing
+/// is written — an unknown owner is never treated as "unassigned". After
+/// `BEGIN`, every `Err` is a ROLLBACK, never a COMMIT (S187). No change count is
+/// read as a decision (S179).
 fn assign_face_search_matches_to_person_impl(
     conn: &Connection,
     matches: &[FaceSearchMatchRecord],
@@ -17865,22 +18740,27 @@ fn assign_face_search_matches_to_person_impl(
     model_version: &str,
     preprocessing_version: &str,
     threshold: f64,
-) -> PersonClusterAcceptResult {
-    let Some(display_name) = clean_person_display_name(person_name) else {
+    explicit_seed_face_observation_ids: &[i64],
+) -> PersonClusterAcceptResult
+{
+    let Some(display_name) = clean_person_display_name(person_name) else
+    {
         return person_accept_error("invalid", "A non-empty person name is required.");
     };
     let normalized_name = normalized_person_name(&display_name);
-    let keyword_segments = vec!["People".to_string(), display_name.clone()];
-    let keyword_path = keyword_segments.join(KEYWORD_PATH_SEPARATOR);
 
     let mut best_match_by_face_id = std::collections::BTreeMap::<i64, FaceSearchMatchRecord>::new();
-    for search_match in matches {
-        if search_match.face_observation_id <= 0 || !search_match.cosine.is_finite() {
+    for search_match in matches
+    {
+        if search_match.face_observation_id <= 0 || !search_match.cosine.is_finite()
+        {
             continue;
         }
-        match best_match_by_face_id.get(&search_match.face_observation_id) {
+        match best_match_by_face_id.get(&search_match.face_observation_id)
+        {
             Some(existing) if existing.cosine >= search_match.cosine => {}
-            _ => {
+            _ =>
+            {
                 best_match_by_face_id
                     .insert(search_match.face_observation_id, search_match.clone());
             }
@@ -17889,16 +18769,132 @@ fn assign_face_search_matches_to_person_impl(
 
     let face_observation_ids = best_match_by_face_id.keys().copied().collect::<Vec<_>>();
     let faces = assignable_faces_for_observation_ids(conn, &face_observation_ids);
-    if faces.is_empty() {
+    if faces.is_empty()
+    {
         return person_accept_error(
             "empty_selection",
             "No persisted face observations were found for the search matches.",
         );
     }
-    let previous_assignments =
-        person_assignments_for_face_observations_impl(conn, &face_observation_ids);
 
-    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;") {
+    // The chosen seeds, redirected to their CANONICAL face rows exactly as the
+    // matched faces were (item 7c), so a clicked JPEG twin still names the face
+    // the match carries. A seed that cannot be resolved is simply not a seed —
+    // the strict direction: nothing extra moves.
+    let explicit_seed_ids = assignable_faces_for_observation_ids(conn, explicit_seed_face_observation_ids)
+        .into_iter()
+        .map(|face| face.face_observation_id)
+        .collect::<std::collections::HashSet<i64>>();
+    let mut explicit_seed_canonical_face_observation_ids = explicit_seed_ids.iter().copied().collect::<Vec<_>>();
+    explicit_seed_canonical_face_observation_ids.sort_unstable();
+
+    let canonical_face_ids = faces.iter().map(|face| face.face_observation_id).collect::<Vec<_>>();
+    let current_owners = match face_assignments_for_ids_checked(conn, &canonical_face_ids)
+    {
+        Ok(assignments) => assignments,
+        Err(e) =>
+        {
+            eprintln!("assign_face_search_matches_to_person: owners {}", e);
+            return person_accept_error(
+                "failed",
+                "Could not read who the matched faces already belong to, so nothing was saved.",
+            );
+        }
+    };
+    let owner_by_face_id = current_owners
+        .into_iter()
+        .map(|assignment| (assignment.face_observation_id, assignment))
+        .collect::<std::collections::HashMap<i64, PersonFaceAssignmentRecord>>();
+
+    let searched_person_id = match existing_person_id_for_normalized_name(conn, &normalized_name)
+    {
+        Ok(id) => id,
+        Err(e) =>
+        {
+            eprintln!("assign_face_search_matches_to_person: person lookup {}", e);
+            return person_accept_error("failed", "Could not look up the person, so nothing was saved.");
+        }
+    };
+
+    let mut faces_to_assign: Vec<(&PersonAssignableFace, &FaceSearchMatchRecord)> = Vec::new();
+    let mut moved_from_other_people: Vec<PersonFaceAssignmentRecord> = Vec::new();
+    let mut left_with_other_people: Vec<FaceLeftWithOtherPersonRecord> = Vec::new();
+    for face in &faces
+    {
+        let Some(search_match) = best_match_by_face_id.get(&face.face_observation_id) else
+        {
+            continue;
+        };
+        let owner = owner_by_face_id.get(&face.face_observation_id);
+        match named_search_face_decision(
+            owner.map(|assignment| assignment.person_id),
+            searched_person_id,
+            explicit_seed_ids.contains(&face.face_observation_id),
+        )
+        {
+            NamedSearchFaceDecision::Assign => faces_to_assign.push((face, search_match)),
+            NamedSearchFaceDecision::MoveExplicitSeed =>
+            {
+                faces_to_assign.push((face, search_match));
+                if let Some(owner) = owner
+                {
+                    moved_from_other_people.push(owner.clone());
+                }
+            }
+            NamedSearchFaceDecision::LeaveWithOwner =>
+            {
+                if let Some(owner) = owner
+                {
+                    left_with_other_people.push(FaceLeftWithOtherPersonRecord {
+                        face_observation_id: face.face_observation_id,
+                        image_id: face.image_id,
+                        seed_face_observation_id: search_match.seed_face_observation_id,
+                        face_index: face.face_index,
+                        cosine: search_match.cosine,
+                        owner_person_id: owner.person_id,
+                        owner_person_name: owner.person_name.clone(),
+                    });
+                }
+            }
+        }
+    }
+    let left_with_other_people_face_count = left_with_other_people.len() as u64;
+
+    if faces_to_assign.is_empty()
+    {
+        // Every match already belongs to someone else: write NOTHING (see the
+        // header). The name is reported in its stored spelling when the person
+        // already exists, else as typed and cleaned.
+        let (person_id, reported_name) = match searched_person_id
+        {
+            Some(id) => match stored_person_display_name(conn, id)
+            {
+                Ok(name) => (id, name),
+                Err(e) =>
+                {
+                    eprintln!("assign_face_search_matches_to_person: stored name {}", e);
+                    return person_accept_error("failed", "Could not read the person's stored name.");
+                }
+            },
+            None => (0, display_name.clone()),
+        };
+        return PersonClusterAcceptResult {
+            person_id,
+            keyword_path: ["People".to_string(), reported_name.clone()].join(KEYWORD_PATH_SEPARATOR),
+            person_name: reported_name,
+            assigned_face_count: 0,
+            keyword_image_count: 0,
+            keyword_row_count: 0,
+            status: "assigned".to_string(),
+            message: "No face was renamed: every matched face already belongs to someone else.".to_string(),
+            left_with_other_people_face_count,
+            left_with_other_people_faces: left_with_other_people,
+            explicit_seed_canonical_face_observation_ids,
+        };
+    }
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
         eprintln!("assign_face_search_matches_to_person: begin {}", e);
         return person_accept_error(
             "failed",
@@ -17906,14 +18902,42 @@ fn assign_face_search_matches_to_person_impl(
         );
     }
 
-    let person_id = match get_or_create_person_impl(conn, &display_name, &normalized_name) {
+    let person_id = match get_or_create_person_impl(conn, &display_name, &normalized_name)
+    {
         Ok(id) => id,
-        Err(e) => {
+        Err(e) =>
+        {
             eprintln!("assign_face_search_matches_to_person: person {}", e);
             let _ = conn.execute_batch("ROLLBACK;");
             return person_accept_error("failed", "Could not create or reuse the person row.");
         }
     };
+    // Every "already this person's" decision above was made against
+    // `searched_person_id`. The catalogue lock makes a different answer here
+    // impossible today; if it ever is not, the decisions are stale — write
+    // nothing rather than hand faces to the wrong person.
+    if searched_person_id.map_or(false, |id| id != person_id)
+    {
+        eprintln!(
+            "assign_face_search_matches_to_person: person changed while saving ({:?} -> {})",
+            searched_person_id, person_id
+        );
+        let _ = conn.execute_batch("ROLLBACK;");
+        return person_accept_error("failed", "The person changed while saving, so nothing was saved.");
+    }
+    // ⭐ (a) — one person, one label: the stored spelling, never the typed one.
+    let display_name = match stored_person_display_name(conn, person_id)
+    {
+        Ok(name) => name,
+        Err(e) =>
+        {
+            eprintln!("assign_face_search_matches_to_person: stored name {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return person_accept_error("failed", "Could not read the person's stored name.");
+        }
+    };
+    let keyword_segments = vec!["People".to_string(), display_name.clone()];
+    let keyword_path = keyword_segments.join(KEYWORD_PATH_SEPARATOR);
 
     let model_version = model_version.trim();
     let preprocessing_version = preprocessing_version.trim();
@@ -17921,10 +18945,8 @@ fn assign_face_search_matches_to_person_impl(
     let mut assigned_face_count = 0u64;
     let mut image_ids = std::collections::BTreeSet::new();
     let mut keyword_row_count = 0u64;
-    for face in &faces {
-        let Some(search_match) = best_match_by_face_id.get(&face.face_observation_id) else {
-            continue;
-        };
+    for (face, search_match) in &faces_to_assign
+    {
         match conn.execute(
             "INSERT INTO person_face_assignment (
                  face_observation_id, person_id, image_id, analyzed_image_id, face_index,
@@ -17957,12 +18979,15 @@ fn assign_face_search_matches_to_person_impl(
                 threshold,
                 search_match.cosine,
             ],
-        ) {
-            Ok(_) => {
+        )
+        {
+            Ok(_) =>
+            {
                 assigned_face_count += 1;
                 image_ids.insert(face.image_id);
             }
-            Err(e) => {
+            Err(e) =>
+            {
                 eprintln!(
                     "assign_face_search_matches_to_person: assign face_observation_id={} {}",
                     face.face_observation_id, e
@@ -17973,15 +18998,18 @@ fn assign_face_search_matches_to_person_impl(
         }
     }
 
-    for image_id in &image_ids {
+    for image_id in &image_ids
+    {
         match insert_or_merge_active_keyword_for_image(
             conn,
             *image_id,
             &keyword_segments,
             KEYWORD_ORIGIN_FACE,
-        ) {
+        )
+        {
             Ok(changed) => keyword_row_count += changed,
-            Err(e) => {
+            Err(e) =>
+            {
                 eprintln!(
                     "assign_face_search_matches_to_person: keyword image_id={} {}",
                     image_id, e
@@ -17992,14 +19020,32 @@ fn assign_face_search_matches_to_person_impl(
         }
     }
 
-    if let Err(e) = remove_obsolete_face_keyword_projections(conn, &previous_assignments, person_id)
+    // The old owner's label follows ONLY the faces that actually moved (an
+    // explicit seed, or a Move). A face left with its owner is not passed in:
+    // it never changed hands, and its owner's label must stay.
+    if let Err(e) = remove_obsolete_face_keyword_projections(conn, &moved_from_other_people, person_id)
     {
         eprintln!("assign_face_search_matches_to_person: cleanup {}", e);
         let _ = conn.execute_batch("ROLLBACK;");
         return person_accept_error("failed", "Could not clean up the previous People keyword.");
     }
 
-    if let Err(e) = conn.execute_batch("COMMIT;") {
+    // ⭐ W4-20 fix round 1 (REVIEW-1 F3) — a previous owner this write left with
+    // no face and no active People keyword goes, in THIS transaction.
+    let unnamed_candidates = moved_from_other_people
+        .iter()
+        .map(|assignment| assignment.person_id)
+        .filter(|previous| *previous != person_id)
+        .collect::<std::collections::BTreeSet<i64>>();
+    if let Err(e) = delete_people_named_by_nothing(conn, &unnamed_candidates)
+    {
+        eprintln!("assign_face_search_matches_to_person: unnamed person {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return person_accept_error("failed", "Could not remove a person left with no faces.");
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
         eprintln!("assign_face_search_matches_to_person: commit {}", e);
         return person_accept_error("failed", "Could not commit the face-search assignment.");
     }
@@ -18013,6 +19059,9 @@ fn assign_face_search_matches_to_person_impl(
         keyword_path,
         status: "assigned".to_string(),
         message: "Face-search matches assigned to a named person.".to_string(),
+        left_with_other_people_face_count,
+        left_with_other_people_faces: left_with_other_people,
+        explicit_seed_canonical_face_observation_ids,
     }
 }
 
@@ -18022,6 +19071,7 @@ pub async fn assign_face_search_matches_to_person(
     model_version: String,
     preprocessing_version: String,
     threshold: f64,
+    explicit_seed_face_observation_ids: Vec<i64>,
 ) -> PersonClusterAcceptResult {
     // ⭐ Slice F / R-07 — the panic boundary (`ffi_panic_boundary`): a panic in
     // the body below is reported through the existing `failed` status + `message` instead of
@@ -18045,6 +19095,7 @@ pub async fn assign_face_search_matches_to_person(
         &model_version,
         &preprocessing_version,
         threshold,
+        &explicit_seed_face_observation_ids,
     )
     },
     |panic| person_accept_error("failed", &ffi_panic_report("save the name", &panic)))
@@ -18065,8 +19116,6 @@ fn accept_face_cluster_as_person_impl(
         return person_accept_error("invalid", "A non-empty person name is required.");
     };
     let normalized_name = normalized_person_name(&display_name);
-    let keyword_segments = vec!["People".to_string(), display_name.clone()];
-    let keyword_path = keyword_segments.join(KEYWORD_PATH_SEPARATOR);
 
     let Some(run) = face_cluster_run_for_person_accept(conn, run_id) else {
         return person_accept_error(
@@ -18105,6 +19154,20 @@ fn accept_face_cluster_as_person_impl(
             return person_accept_error("failed", "Could not create or reuse the person row.");
         }
     };
+    // ⭐ W4-20 / ruling 77 (a) — one person, one label (see
+    // `stored_person_display_name`).
+    let display_name = match stored_person_display_name(conn, person_id)
+    {
+        Ok(name) => name,
+        Err(e) =>
+        {
+            eprintln!("accept_face_cluster_as_person: stored name {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return person_accept_error("failed", "Could not read the person's stored name.");
+        }
+    };
+    let keyword_segments = vec!["People".to_string(), display_name.clone()];
+    let keyword_path = keyword_segments.join(KEYWORD_PATH_SEPARATOR);
 
     let mut assigned_face_count = 0u64;
     let mut image_ids = std::collections::BTreeSet::new();
@@ -18187,6 +19250,20 @@ fn accept_face_cluster_as_person_impl(
         return person_accept_error("failed", "Could not clean up the previous People keyword.");
     }
 
+    // ⭐ W4-20 fix round 1 (REVIEW-1 F3) — a previous owner this write left with
+    // no face and no active People keyword goes, in THIS transaction.
+    let unnamed_candidates = previous_assignments
+        .iter()
+        .map(|assignment| assignment.person_id)
+        .filter(|previous| *previous != person_id)
+        .collect::<std::collections::BTreeSet<i64>>();
+    if let Err(e) = delete_people_named_by_nothing(conn, &unnamed_candidates)
+    {
+        eprintln!("accept_face_cluster_as_person: unnamed person {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return person_accept_error("failed", "Could not remove a person left with no faces.");
+    }
+
     if let Err(e) = conn.execute_batch("COMMIT;") {
         eprintln!("accept_face_cluster_as_person: commit {}", e);
         return person_accept_error("failed", "Could not commit the person assignment.");
@@ -18201,6 +19278,9 @@ fn accept_face_cluster_as_person_impl(
         keyword_path,
         status: "accepted".to_string(),
         message: "Face cluster accepted as a named person.".to_string(),
+        left_with_other_people_face_count: 0,
+        left_with_other_people_faces: Vec::new(),
+        explicit_seed_canonical_face_observation_ids: Vec::new(),
     }
 }
 
@@ -22508,6 +23588,7 @@ mod face_cluster_tests {
             "auraface-coreml-v1",
             "center-crop-v1",
             0.55,
+            &[],
         );
         assert_eq!(result.status, "assigned");
         assert_eq!(result.person_name, "Angry Girl");
@@ -26839,47 +27920,70 @@ mod keyword_tests {
             num_end: end,
         };
 
-        // The four columns, one mode each — shortest-round-trip literals
-        // (1600 prints bare, 2.8 prints "2.8", 0.0005 prints "0.0005").
+        // The four columns, one mode each — shortest-round-trip SCIENTIFIC
+        // literals (W4-21: `{:e}`, so DuckDB types them DOUBLE and parses them
+        // correctly rounded — 1600 is "1.6e3", 2.8 "2.8e0", 0.0005 "5e-4").
         assert_eq!(
             predicate_to_sql(&num("iso_num", "eq", 1600.0, None)),
-            "(iso = 1600)"
+            "(iso = 1.6e3)"
         );
         assert_eq!(
             predicate_to_sql(&num("aperture_num", "lte", 2.8, None)),
-            "(aperture <= 2.8)"
+            "(TRY_CAST(aperture AS FLOAT) <= CAST(2.799999952316284e0 AS FLOAT))"
+        );
+        // ⭐ W4-21 review F1/F2 + the range follow-up — every mode on aperture /
+        // shutter / focal compares at 32-bit precision; each literal is the
+        // f32's exact value. Every other numeric subject (iso, focus, face,
+        // duration, frame rate, GPS) keeps the 64-bit comparison.
+        assert_eq!(
+            predicate_to_sql(&num("aperture_num", "eq", 2.8, None)),
+            "(TRY_CAST(aperture AS FLOAT) = CAST(2.799999952316284e0 AS FLOAT))"
+        );
+        assert_eq!(
+            predicate_to_sql(&num("shutter_num", "eq", 1.0 / 60.0, None)),
+            "(TRY_CAST(shutter_speed AS FLOAT) = CAST(1.666666753590107e-2 AS FLOAT))"
+        );
+        assert_eq!(
+            predicate_to_sql(&num("focal_num", "eq", 50.0, None)),
+            "(TRY_CAST(focal_length AS FLOAT) = CAST(5e1 AS FLOAT))"
+        );
+        assert_eq!(predicate_to_sql(&num("aperture_num", "eq", f64::NAN, None)), "(FALSE)");
+        assert_eq!(
+            predicate_to_sql(&num("aperture_num", "eq", 1e300, None)),
+            "(aperture = 1e300)",
+            "a bound beyond the f32 range falls back to the 64-bit atom"
         );
         assert_eq!(
             predicate_to_sql(&num("shutter_num", "gte", 0.0005, None)),
-            "(shutter_speed >= 0.0005)"
+            "(TRY_CAST(shutter_speed AS FLOAT) >= CAST(5.000000237487257e-4 AS FLOAT))"
         );
         assert_eq!(
             predicate_to_sql(&num("focal_num", "between", 70.0, Some(200.0))),
-            "(focal_length BETWEEN 70 AND 200)"
+            "(TRY_CAST(focal_length AS FLOAT) BETWEEN CAST(7e1 AS FLOAT) AND CAST(2e2 AS FLOAT))"
         );
         assert_eq!(
             predicate_to_sql(&num("focus_num", "gte", 120.0, None)),
-            "(focus_score >= 120)"
+            "(focus_score >= 1.2e2)"
         );
         assert_eq!(
             predicate_to_sql(&num("face_quality_best_num", "gte", 0.7, None)),
-            "(face_quality_best >= 0.7)"
+            "(face_quality_best >= 7e-1)"
         );
         assert_eq!(
             predicate_to_sql(&num("face_quality_average_num", "lte", 0.5, None)),
-            "(face_quality_average <= 0.5)"
+            "(face_quality_average <= 5e-1)"
         );
         assert_eq!(
             predicate_to_sql(&num("face_quality_min_num", "between", 0.2, Some(0.9))),
-            "(face_quality_min BETWEEN 0.2 AND 0.9)"
+            "(face_quality_min BETWEEN 2e-1 AND 9e-1)"
         );
         assert_eq!(
             predicate_to_sql(&num("eyes_open_count_num", "gte", 2.0, None)),
-            "(face_eyes_open_count >= 2)"
+            "(face_eyes_open_count >= 2e0)"
         );
         assert_eq!(
             predicate_to_sql(&num("blink_risk_count_num", "lte", 0.0, None)),
-            "(face_blink_risk_count <= 0)"
+            "(face_blink_risk_count <= 0e0)"
         );
         assert!(predicate_to_sql(&num("focus_quality", "gte", 8.0, None))
             .contains("quantile_cont(score, 0.7)"));
@@ -28051,6 +29155,576 @@ mod person_keyword_delete_tests
 }
 
 #[cfg(test)]
+mod named_face_search_assignment_tests
+{
+    //! ⭐ W4-20 — ruling 77 (+ its amendment), pinned on REAL temp catalogues
+    //! (`open_and_migrate_catalogue`, the production schema). Every assertion
+    //! reads the TABLES, never a reported change count (S179).
+    //!
+    //! (b) a named face search renames only unassigned / same-person faces and
+    //!     the face(s) the user chose as the seed; a face another person owns is
+    //!     left alone and reported by person.
+    //! (a) a case-variant name reuses the person AND its stored label.
+    //! Move — the same writer, with the left-alone faces as matches and explicit
+    //!     seeds — reassigns them, and the old owners' labels follow the cleanup.
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture
+    {
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for Fixture
+    {
+        fn drop(&mut self)
+        {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn fresh_catalogue(tag: &str) -> (Fixture, Connection)
+    {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "plcore-w4-20-faces-{}-{}-{}",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        let conn = open_and_migrate_catalogue(&dir.join("catalogue.db")).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH.
+        fence_connection_against_extension_fetches(&conn);
+        (Fixture { dir }, conn)
+    }
+
+    const MODEL: &str = "auraface-coreml-v1";
+    const PREPROCESSING: &str = "expanded_square_v1";
+
+    /// A canonical face row: its own image is the analyzed image.
+    fn face(conn: &Connection, id: i64, image_id: i64)
+    {
+        pair_face(conn, id, image_id, image_id, 0);
+    }
+
+    /// Any face row, including a RAW+JPEG pair TWIN (`image_id` the JPEG,
+    /// `analyzed_image_id` the RAW the face was detected on).
+    fn pair_face(conn: &Connection, id: i64, image_id: i64, analyzed_image_id: i64, face_index: i64)
+    {
+        conn.execute(
+            "INSERT INTO face_observation
+                 (id, image_id, analyzed_image_id, face_index, algorithm_version, analysis_run_id,
+                  bounding_box_x, bounding_box_y, bounding_box_width, bounding_box_height)
+             VALUES (?1, ?2, ?3, ?4, 'v', 'run', 0.1, 0.1, 0.2, 0.2)",
+            params![id, image_id, analyzed_image_id, face_index],
+        )
+        .expect("insert face observation");
+    }
+
+    fn matched(face_observation_id: i64, image_id: i64, seed: i64, cosine: f64) -> FaceSearchMatchRecord
+    {
+        FaceSearchMatchRecord {
+            image_id,
+            face_observation_id,
+            seed_face_observation_id: seed,
+            face_index: 0,
+            cosine,
+        }
+    }
+
+    fn search(conn: &Connection, matches: &[FaceSearchMatchRecord], name: &str, explicit: &[i64]) -> PersonClusterAcceptResult
+    {
+        assign_face_search_matches_to_person_impl(conn, matches, name, MODEL, PREPROCESSING, 0.58, explicit)
+    }
+
+    /// The person who owns `face_id` now, read on the table (`None` = unassigned).
+    fn owner(conn: &Connection, face_id: i64) -> Option<String>
+    {
+        conn.query_row(
+            "SELECT p.display_name
+             FROM person_face_assignment a JOIN person p ON p.id = a.person_id
+             WHERE a.face_observation_id = ?1",
+            params![face_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    }
+
+    fn people(name: &str) -> String
+    {
+        ["People", name].join(KEYWORD_PATH_SEPARATOR)
+    }
+
+    /// True when `image_id` carries `path` as an ACTIVE keyword the face system
+    /// stands behind (status 1, face origin bit set).
+    fn has_face_label(conn: &Connection, image_id: i64, path: &str) -> bool
+    {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM keyword
+                 WHERE image_id = ?1 AND path = ?2 AND status = 1 AND (origin & ?3) <> 0",
+                params![image_id, path, KEYWORD_ORIGIN_FACE],
+                |row| row.get(0),
+            )
+            .expect("label count");
+        n > 0
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64
+    {
+        conn.query_row(sql, [], |row| row.get(0)).expect("count")
+    }
+
+    /// Judy (faces 3, 4, and 7 outside the search), Bob (face 5), Carol (face 1
+    /// — the face the user will click), and the searched person ZZW4R already
+    /// owning face 6. Written through the production manual writer, so each
+    /// person also carries its People label exactly as the app writes it. Face 2
+    /// is unassigned.
+    fn seed_people(conn: &Connection)
+    {
+        for (id, image) in [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7)]
+        {
+            face(conn, id, image);
+        }
+        assert_eq!(assign_face_observations_to_person_impl(conn, &[3, 4, 7], "Judy Wagner").status, "assigned");
+        assert_eq!(assign_face_observations_to_person_impl(conn, &[5], "Bob").status, "assigned");
+        assert_eq!(assign_face_observations_to_person_impl(conn, &[1], "Carol").status, "assigned");
+        assert_eq!(assign_face_observations_to_person_impl(conn, &[6], "ZZW4R").status, "assigned");
+    }
+
+    /// The search: every face 1–6 resembles the clicked face 1 (the search
+    /// returns them all, whoever owns them — ruling 77 leaves that unchanged).
+    fn all_matches() -> Vec<FaceSearchMatchRecord>
+    {
+        vec![
+            matched(1, 1, 1, 1.0),
+            matched(2, 2, 1, 0.81),
+            matched(3, 3, 1, 0.74),
+            matched(4, 4, 1, 0.71),
+            matched(5, 5, 1, 0.66),
+            matched(6, 6, 1, 0.90),
+        ]
+    }
+
+    #[test]
+    fn a_named_search_leaves_other_peoples_faces_alone_and_reports_them_by_person()
+    {
+        let (_fixture, conn) = fresh_catalogue("leave-alone");
+        seed_people(&conn);
+
+        let result = search(&conn, &all_matches(), "ZZW4R", &[1]);
+
+        assert_eq!(result.status, "assigned", "W4-20/b: the save ran");
+        assert_eq!(result.person_name, "ZZW4R");
+        assert_eq!(result.assigned_face_count, 3, "W4-20/b: the seed (1), the unassigned face (2) and ZZW4R's own (6)");
+        assert_eq!(result.left_with_other_people_face_count, 3, "W4-20/b: Judy's two faces and Bob's one were left alone");
+
+        // The report, by person (ids in face order; the dialog sorts by count).
+        let left = result
+            .left_with_other_people_faces
+            .iter()
+            .map(|face| (face.face_observation_id, face.owner_person_name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(left, vec![(3, "Judy Wagner"), (4, "Judy Wagner"), (5, "Bob")], "W4-20/b: each left-alone face names its owner");
+        let judy_id: i64 = conn
+            .query_row("SELECT id FROM person WHERE display_name = 'Judy Wagner'", [], |row| row.get(0))
+            .expect("judy");
+        assert!(
+            result.left_with_other_people_faces.iter().filter(|f| f.owner_person_name == "Judy Wagner").all(|f| f.owner_person_id == judy_id),
+            "W4-20/b: the owner id is the person's id"
+        );
+        let face_three = &result.left_with_other_people_faces[0];
+        assert_eq!((face_three.image_id, face_three.seed_face_observation_id), (3, 1), "W4-20/b: the search's own match fields ride along for Move");
+        assert!((face_three.cosine - 0.74).abs() < 1e-9);
+
+        // On the table: nobody else's face changed hands …
+        assert_eq!(owner(&conn, 3).as_deref(), Some("Judy Wagner"), "W4-20/b: Judy keeps face 3");
+        assert_eq!(owner(&conn, 4).as_deref(), Some("Judy Wagner"), "W4-20/b: Judy keeps face 4");
+        assert_eq!(owner(&conn, 5).as_deref(), Some("Bob"), "W4-20/b: Bob keeps face 5");
+        assert_eq!(owner(&conn, 7).as_deref(), Some("Judy Wagner"), "W4-20/b: a face outside the search is untouched");
+        // … the seed moved, and the unassigned and same-person faces are named.
+        assert_eq!(owner(&conn, 1).as_deref(), Some("ZZW4R"), "W4-20/b: the clicked seed takes the new name");
+        assert_eq!(owner(&conn, 2).as_deref(), Some("ZZW4R"), "W4-20/b: an unassigned face is named");
+        assert_eq!(owner(&conn, 6).as_deref(), Some("ZZW4R"), "W4-20/b: a face already ZZW4R's stays ZZW4R's");
+
+        // Labels: the left-alone owners keep theirs; ZZW4R's goes only where its
+        // faces are; Carol's follows her only face away.
+        for image in [3, 4, 7]
+        {
+            assert!(has_face_label(&conn, image, &people("Judy Wagner")), "W4-20/b: Judy keeps her label on image {}", image);
+            assert!(!has_face_label(&conn, image, &people("ZZW4R")), "W4-20/b: no ZZW4R label on Judy's image {}", image);
+        }
+        assert!(has_face_label(&conn, 5, &people("Bob")), "W4-20/b: Bob keeps his label");
+        assert!(!has_face_label(&conn, 5, &people("ZZW4R")), "W4-20/b: no ZZW4R label on Bob's image");
+        for image in [1, 2, 6]
+        {
+            assert!(has_face_label(&conn, image, &people("ZZW4R")), "W4-20/b: ZZW4R's label on image {}", image);
+        }
+        assert!(!has_face_label(&conn, 1, &people("Carol")), "W4-20/b: the moved seed's old owner loses her label (the existing cleanup)");
+        // F3 — face 1 was Carol's ONLY face and her label is now hidden: nothing
+        // names her any more, so the same transaction removed her.
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person WHERE normalized_name = 'carol'"), 0, "W4-20/F3: Carol, left with nothing, is gone");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person"), 3, "W4-20/F3: Judy, Bob and ZZW4R remain; nobody else was created or lost");
+        // F2 — the seed the writer used, as a canonical id.
+        assert_eq!(result.explicit_seed_canonical_face_observation_ids, vec![1], "W4-20/F2: the canonical explicit seed is reported");
+    }
+
+    #[test]
+    fn a_search_that_omits_explicit_seeds_moves_no_ones_face()
+    {
+        // The UDL default is an EMPTY seed list: a caller that forgets the
+        // argument gets the strict behaviour, never the old overwrite.
+        let (_fixture, conn) = fresh_catalogue("no-seeds");
+        seed_people(&conn);
+
+        let result = search(&conn, &all_matches(), "ZZW4R", &[]);
+
+        assert_eq!(result.assigned_face_count, 2, "W4-20/b: only the unassigned face and ZZW4R's own");
+        assert_eq!(result.left_with_other_people_face_count, 4, "W4-20/b: Carol's face is left too when it is not a chosen seed");
+        assert_eq!(owner(&conn, 1).as_deref(), Some("Carol"), "W4-20/b: no seed, no move");
+        assert!(has_face_label(&conn, 1, &people("Carol")), "W4-20/b: Carol keeps her label");
+    }
+
+    #[test]
+    fn move_reassigns_the_left_alone_faces_and_the_old_owners_labels_follow()
+    {
+        let (_fixture, conn) = fresh_catalogue("move");
+        seed_people(&conn);
+        let first = search(&conn, &all_matches(), "ZZW4R", &[1]);
+        assert_eq!(first.left_with_other_people_face_count, 3);
+
+        // Move — exactly what Swift does: the left-alone faces handed back as
+        // both the matches and the explicit seeds, under the stored name.
+        let move_matches = first
+            .left_with_other_people_faces
+            .iter()
+            .map(|face| FaceSearchMatchRecord {
+                image_id: face.image_id,
+                face_observation_id: face.face_observation_id,
+                seed_face_observation_id: face.seed_face_observation_id,
+                face_index: face.face_index,
+                cosine: face.cosine,
+            })
+            .collect::<Vec<_>>();
+        let move_ids = move_matches.iter().map(|m| m.face_observation_id).collect::<Vec<_>>();
+        let moved = search(&conn, &move_matches, &first.person_name, &move_ids);
+
+        assert_eq!(moved.status, "assigned");
+        assert_eq!(moved.person_id, first.person_id, "W4-20/move: the same person");
+        assert_eq!(moved.assigned_face_count, 3, "W4-20/move: exactly the three left-alone faces");
+        assert_eq!(moved.left_with_other_people_face_count, 0, "W4-20/move: nothing is left behind");
+        for face_id in [3, 4, 5]
+        {
+            assert_eq!(owner(&conn, face_id).as_deref(), Some("ZZW4R"), "W4-20/move: face {} now ZZW4R's", face_id);
+        }
+        assert_eq!(owner(&conn, 7).as_deref(), Some("Judy Wagner"), "W4-20/move: a face outside the Move keeps its owner");
+        let confidence: f64 = conn
+            .query_row("SELECT confidence_cosine FROM person_face_assignment WHERE face_observation_id = 3", [], |row| row.get(0))
+            .expect("confidence");
+        assert!((confidence - 0.74).abs() < 1e-9, "W4-20/move: the moved face keeps its search cosine");
+
+        // The old owners' labels follow the existing cleanup: gone where they
+        // have no face left, kept where they still do.
+        assert!(!has_face_label(&conn, 3, &people("Judy Wagner")), "W4-20/move: Judy's label leaves image 3");
+        assert!(!has_face_label(&conn, 4, &people("Judy Wagner")), "W4-20/move: Judy's label leaves image 4");
+        assert!(has_face_label(&conn, 7, &people("Judy Wagner")), "W4-20/move: Judy keeps her label where she still has a face");
+        assert!(!has_face_label(&conn, 5, &people("Bob")), "W4-20/move: Bob's label leaves image 5");
+        for image in [3, 4, 5]
+        {
+            assert!(has_face_label(&conn, image, &people("ZZW4R")), "W4-20/move: ZZW4R's label arrives on image {}", image);
+            assert!(has_face_label(&conn, image, "People"), "W4-20/move: the People root stays (a face is still named there)");
+        }
+
+        // F3 — Bob lost his only face to the Move and nothing names him: gone.
+        // Judy still owns face 7 (and its label): she stays.
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person WHERE normalized_name = 'bob'"), 0, "W4-20/F3: Bob, left with nothing, is gone");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person WHERE normalized_name = 'judy wagner'"), 1, "W4-20/F3: Judy keeps a face, so she stays");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person"), 2, "W4-20/F3: Judy and ZZW4R");
+        assert!(
+            !person_summaries_impl(&conn).iter().any(|person| person.person_name == "Bob"),
+            "W4-20/F3: Bob no longer appears where the name suggestions come from"
+        );
+    }
+
+    #[test]
+    fn a_case_variant_name_reuses_the_person_and_its_stored_label()
+    {
+        let (_fixture, conn) = fresh_catalogue("case-variant");
+        face(&conn, 21, 21);
+        face(&conn, 22, 22);
+        face(&conn, 23, 23);
+
+        let first = search(&conn, &[matched(21, 21, 21, 1.0)], "ZZW4Rb", &[21]);
+        assert_eq!(first.person_name, "ZZW4Rb");
+
+        let second = search(&conn, &[matched(22, 22, 22, 1.0)], "zzw4rb", &[22]);
+        assert_eq!(second.status, "assigned");
+        assert_eq!(second.person_id, first.person_id, "W4-20/a: the case variant reuses the person");
+        assert_eq!(second.person_name, "ZZW4Rb", "W4-20/a: the result names the STORED spelling");
+        assert_eq!(second.keyword_path, people("ZZW4Rb"), "W4-20/a: the keyword is the stored spelling");
+        assert!(has_face_label(&conn, 22, &people("ZZW4Rb")), "W4-20/a: image 22 carries the ONE label");
+
+        // The manual writer follows the same rule.
+        let manual = assign_face_observations_to_person_impl(&conn, &[23], "ZZW4RB");
+        assert_eq!(manual.person_name, "ZZW4Rb", "W4-20/a: every writer reports the stored spelling");
+        assert!(has_face_label(&conn, 23, &people("ZZW4Rb")));
+
+        let spellings = count(
+            &conn,
+            "SELECT COUNT(DISTINCT path) FROM keyword
+             WHERE starts_with(path, 'People' || chr(31)) AND lower(path) = lower('People' || chr(31) || 'zzw4rb')",
+        );
+        assert_eq!(spellings, 1, "W4-20/a: one person, ONE label — no second spelling anywhere");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person"), 1, "W4-20/a: one person row");
+    }
+
+    #[test]
+    fn an_explicit_seed_given_as_a_pair_twin_still_moves_its_canonical_face()
+    {
+        // The user clicked the JPEG half (twin 11); the stored embedding — and so
+        // the match — is the canonical RAW row (10). The seed is resolved through
+        // the same canonical redirect the matched faces take.
+        let (_fixture, conn) = fresh_catalogue("twin-seed");
+        pair_face(&conn, 10, 10, 10, 0);
+        pair_face(&conn, 11, 11, 10, 0);
+        assert_eq!(assign_face_observations_to_person_impl(&conn, &[10], "Carol").status, "assigned");
+
+        let result = search(&conn, &[matched(10, 10, 10, 1.0)], "Dana", &[11]);
+
+        assert_eq!(result.assigned_face_count, 1);
+        assert_eq!(result.left_with_other_people_face_count, 0);
+        assert_eq!(owner(&conn, 10).as_deref(), Some("Dana"), "W4-20/b: the clicked twin's canonical face takes the name");
+        assert_eq!(
+            result.explicit_seed_canonical_face_observation_ids,
+            vec![10],
+            "W4-20/F2: the twin seed 11 is reported as its CANONICAL face 10 — the id the left-alone list uses"
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person WHERE normalized_name = 'carol'"), 0, "W4-20/F3: Carol's only face moved: she is gone");
+    }
+
+    #[test]
+    fn when_every_match_belongs_to_someone_else_nothing_is_written()
+    {
+        let (_fixture, conn) = fresh_catalogue("nothing");
+        seed_people(&conn);
+        let people_before = count(&conn, "SELECT COUNT(*) FROM person");
+        let keywords_before = count(&conn, "SELECT COUNT(*) FROM keyword");
+
+        // A brand-new name whose only matches belong to Judy and Bob (no seed:
+        // a manual-region search has none).
+        let fresh = search(&conn, &[matched(3, 3, 0, 0.7), matched(5, 5, 0, 0.6)], "Nobody Yet", &[]);
+        assert_eq!(fresh.status, "assigned", "W4-20/b: not an error — the search simply renamed nothing");
+        assert_eq!(fresh.person_id, 0, "W4-20/b: no person was created");
+        assert_eq!(fresh.person_name, "Nobody Yet");
+        assert_eq!(fresh.assigned_face_count, 0);
+        assert_eq!(fresh.left_with_other_people_face_count, 2);
+        assert!(fresh.explicit_seed_canonical_face_observation_ids.is_empty(), "W4-20/F2: no seed was given, none reported");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person"), people_before, "W4-20/b: no face-less person is left behind");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM keyword"), keywords_before, "W4-20/b: no keyword row was written");
+
+        // An EXISTING person reports its stored spelling, still writing nothing.
+        let existing = search(&conn, &[matched(5, 5, 0, 0.6)], "zzw4r", &[]);
+        assert_eq!(existing.person_name, "ZZW4R", "W4-20/a: the stored spelling, even with nothing written");
+        assert!(existing.person_id > 0);
+        assert_eq!(existing.assigned_face_count, 0);
+        assert_eq!(owner(&conn, 5).as_deref(), Some("Bob"));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM keyword"), keywords_before);
+    }
+
+    #[test]
+    fn an_owner_that_cannot_be_read_fails_closed_and_writes_nothing()
+    {
+        // A face whose owner cannot be read must never be treated as
+        // unassigned — that is the defect itself. Judy's display_name is made
+        // unreadable (NULL), so the owner row for faces 3 and 4 fails to decode.
+        let (_fixture, conn) = fresh_catalogue("fail-closed");
+        seed_people(&conn);
+        conn.execute_batch(
+            "DROP INDEX idx_person_normalized_name;
+             ALTER TABLE person ALTER COLUMN display_name DROP NOT NULL;
+             UPDATE person SET display_name = NULL WHERE normalized_name = 'judy wagner';",
+        )
+        .expect("make Judy's name unreadable");
+        let assignments_before = count(&conn, "SELECT COUNT(*) FROM person_face_assignment WHERE assignment_source = 'manual_label'");
+
+        let result = search(&conn, &all_matches(), "ZZW4R", &[1]);
+
+        assert_eq!(result.status, "failed", "W4-20/b: an unreadable owner is a failure, never 'unassigned'");
+        assert!(
+            result.message.contains("already belong to"),
+            "W4-20/b: it failed at the OWNER read, not somewhere else: {}",
+            result.message
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM person_face_assignment WHERE face_observation_id = 3 AND assignment_source = 'manual_label'"),
+            1,
+            "W4-20/b: Judy's face 3 was not taken"
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM person_face_assignment WHERE assignment_source = 'manual_label'"),
+            assignments_before,
+            "W4-20/b: nothing at all was written — not even the seed or the unassigned face"
+        );
+        assert_eq!(owner(&conn, 2), None, "W4-20/b: the unassigned face stays unassigned");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM person_face_assignment WHERE assignment_source = 'face_search_match'"),
+            0,
+            "W4-20/b: the failed save wrote no face-search assignment"
+        );
+    }
+
+    #[test]
+    fn a_previous_owner_still_named_by_a_hand_applied_label_stays()
+    {
+        // F3's boundary: Bob loses his only face, but a People › Bob keyword the
+        // user applied by hand is still ACTIVE — something still names him.
+        let (_fixture, conn) = fresh_catalogue("hand-label");
+        seed_people(&conn);
+        insert_or_merge_active_keyword_for_image(&conn, 99, &["People".to_string(), "Bob".to_string()], KEYWORD_ORIGIN_USER)
+            .expect("hand-applied Bob label");
+
+        let result = search(&conn, &[matched(5, 5, 5, 1.0)], "ZZW4R", &[5]);
+
+        assert_eq!(result.status, "assigned");
+        assert_eq!(owner(&conn, 5).as_deref(), Some("ZZW4R"), "W4-20/F3: the chosen face moved");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person WHERE normalized_name = 'bob'"), 1, "W4-20/F3: a person an active label still names stays");
+    }
+
+    #[test]
+    fn a_previous_owner_who_still_has_faces_stays_even_with_no_active_label()
+    {
+        // F3's other boundary: the face test comes FIRST. Judy's People rows are
+        // all hidden (a user removed the keyword), and faces 3 AND 4 move, so she
+        // keeps EXACTLY ONE face (7) — the one-face boundary (round 2, N2: an
+        // off-by-one there deleted her and orphaned face 7's assignment).
+        let (_fixture, conn) = fresh_catalogue("faces-no-label");
+        seed_people(&conn);
+        conn.execute("UPDATE keyword SET status = 0 WHERE path = ?1", params![people("Judy Wagner")])
+            .expect("hide Judy's label");
+
+        let result = search(&conn, &[matched(3, 3, 3, 1.0), matched(4, 4, 4, 1.0)], "ZZW4R", &[3, 4]);
+
+        assert_eq!(result.status, "assigned");
+        assert_eq!(owner(&conn, 3).as_deref(), Some("ZZW4R"), "W4-20/F3: chosen face 3 moved");
+        assert_eq!(owner(&conn, 4).as_deref(), Some("ZZW4R"), "W4-20/F3: chosen face 4 moved");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM person_face_assignment a JOIN person p ON p.id = a.person_id WHERE p.normalized_name = 'judy wagner'"),
+            1,
+            "W4-20/F3: Judy is left with exactly one face"
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person WHERE normalized_name = 'judy wagner'"), 1, "W4-20/F3: a person who still owns ONE face stays");
+        assert_eq!(owner(&conn, 7).as_deref(), Some("Judy Wagner"), "W4-20/F3: her last face still resolves to her");
+    }
+
+    #[test]
+    fn the_manual_writer_also_removes_a_person_left_with_nothing()
+    {
+        // The rule lives in the shared helper, so every person writer follows it.
+        let (_fixture, conn) = fresh_catalogue("manual-unnamed");
+        face(&conn, 51, 51);
+        face(&conn, 52, 52);
+        assert_eq!(assign_face_observations_to_person_impl(&conn, &[51, 52], "Ada Lovelace").status, "assigned");
+
+        let grace = assign_face_observations_to_person_impl(&conn, &[51, 52], "Grace Hopper");
+
+        assert_eq!(grace.status, "assigned");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person WHERE normalized_name = 'ada lovelace'"), 0, "W4-20/F3: Ada, left with nothing, is gone");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person"), 1, "W4-20/F3: only Grace");
+    }
+
+    #[test]
+    fn the_cluster_writer_also_removes_a_person_left_with_nothing()
+    {
+        // Round 2, N3 — the third person writer (cluster accept; developer-only,
+        // no Swift caller) follows the same shared rule.
+        let (_fixture, conn) = fresh_catalogue("cluster-unnamed");
+        face(&conn, 61, 61);
+        face(&conn, 62, 62);
+        assert_eq!(assign_face_observations_to_person_impl(&conn, &[61, 62], "Ada Lovelace").status, "assigned");
+        let member = |face_observation_id: i64, member_rank: u32| FaceClusterMemberRecord {
+            run_id: "w4-20-run".to_string(),
+            cluster_id: 1,
+            face_observation_id,
+            image_id: face_observation_id,
+            analyzed_image_id: face_observation_id,
+            face_index: 0,
+            member_rank,
+            cluster_size: 2,
+            nearest_neighbor_face_observation_id: None,
+            nearest_neighbor_cosine: None,
+        };
+        let run = FaceClusterRunRecord {
+            run_id: "w4-20-run".to_string(),
+            face_algorithm_version: "v".to_string(),
+            model_version: MODEL.to_string(),
+            preprocessing_version: PREPROCESSING.to_string(),
+            threshold: 0.55,
+            cluster_count: 1,
+            member_count: 2,
+        };
+        assert_eq!(replace_face_cluster_run_impl(&conn, run, vec![member(61, 0), member(62, 1)]), 2);
+
+        let grace = accept_face_cluster_as_person_impl(&conn, "w4-20-run", 1, "Grace Hopper");
+
+        assert_eq!(grace.status, "accepted");
+        assert_eq!(owner(&conn, 61).as_deref(), Some("Grace Hopper"));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person WHERE normalized_name = 'ada lovelace'"), 0, "W4-20/F3: the cluster writer removes Ada, left with nothing");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person"), 1, "W4-20/F3: only Grace");
+    }
+
+    #[test]
+    fn a_person_that_cannot_be_removed_rolls_the_whole_save_back()
+    {
+        // The removal runs INSIDE the save's transaction: if it fails, nothing
+        // the save did may survive. The failure is induced with a foreign key
+        // that still references Carol.
+        //
+        // ⚠️ That is an EXECUTION error, which aborts the transaction on the
+        // bundled DuckDB 1.5.5 — so this pins the user-visible outcome (the save
+        // reports failure and nothing is written), not ROLLBACK-vs-COMMIT: the
+        // tables are also unchanged if the arm committed (S187). A CATALOG-error
+        // seam is not reachable here without breaking the earlier statements.
+        let (_fixture, conn) = fresh_catalogue("unnamed-rollback");
+        seed_people(&conn);
+        let carol: i64 = conn
+            .query_row("SELECT id FROM person WHERE normalized_name = 'carol'", [], |row| row.get(0))
+            .expect("carol");
+        conn.execute_batch("CREATE TABLE person_reference (person_id INTEGER REFERENCES person(id));")
+            .expect("reference table");
+        conn.execute("INSERT INTO person_reference VALUES (?1)", params![carol]).expect("reference Carol");
+
+        let result = search(&conn, &all_matches(), "ZZW4R", &[1]);
+
+        assert_eq!(result.status, "failed", "W4-20/F3: a removal that fails fails the save");
+        assert!(result.message.contains("no faces"), "W4-20/F3: it failed at the removal: {}", result.message);
+        assert_eq!(owner(&conn, 1).as_deref(), Some("Carol"), "W4-20/F3: the seed did not move");
+        assert_eq!(owner(&conn, 2), None, "W4-20/F3: the unassigned face was not named");
+        assert!(has_face_label(&conn, 1, &people("Carol")), "W4-20/F3: Carol's label was not cleaned");
+        assert!(!has_face_label(&conn, 2, &people("ZZW4R")), "W4-20/F3: no ZZW4R label was written");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person"), 4, "W4-20/F3: nobody was removed");
+        assert!(conn.execute_batch("BEGIN TRANSACTION; ROLLBACK;").is_ok(), "W4-20/F3: the connection is not left inside a transaction");
+    }
+
+    #[test]
+    fn the_decision_rule()
+    {
+        use NamedSearchFaceDecision::*;
+        assert_eq!(named_search_face_decision(None, None, false), Assign, "unassigned, new name");
+        assert_eq!(named_search_face_decision(None, Some(7), false), Assign, "unassigned, existing name");
+        assert_eq!(named_search_face_decision(Some(7), Some(7), false), Assign, "already this person's");
+        assert_eq!(named_search_face_decision(Some(7), Some(7), true), Assign, "already this person's, also a seed");
+        assert_eq!(named_search_face_decision(Some(3), Some(7), false), LeaveWithOwner, "another person's face");
+        assert_eq!(named_search_face_decision(Some(3), None, false), LeaveWithOwner, "another person's face, new name");
+        assert_eq!(named_search_face_decision(Some(3), Some(7), true), MoveExplicitSeed, "the chosen seed");
+        assert_eq!(named_search_face_decision(Some(3), None, true), MoveExplicitSeed, "the chosen seed, new name");
+    }
+}
+
+#[cfg(test)]
 mod saved_query_tests {
     use super::*;
     use duckdb::Connection;
@@ -29101,7 +30775,7 @@ mod query_builder_tests {
         let mut dur = qp("duration_num");
         dur.op = Some("gte".to_string());
         dur.num = Some(60.0);
-        assert_eq!(predicate_to_sql(&dur), "(duration_seconds >= 60)");
+        assert_eq!(predicate_to_sql(&dur), "(duration_seconds >= 6e1)");
 
         let mut between = qp("duration_num");
         between.op = Some("between".to_string());
@@ -29109,13 +30783,13 @@ mod query_builder_tests {
         between.num_end = Some(30.0);
         assert_eq!(
             predicate_to_sql(&between),
-            "(duration_seconds BETWEEN 10 AND 30)"
+            "(duration_seconds BETWEEN 1e1 AND 3e1)"
         );
 
         let mut fps = qp("framerate_num");
         fps.op = Some("eq".to_string());
         fps.num = Some(60.0);
-        assert_eq!(predicate_to_sql(&fps), "(frame_rate = 60)");
+        assert_eq!(predicate_to_sql(&fps), "(frame_rate = 6e1)");
 
         let mut codec = qp("codec_is");
         codec.value = Some("hevc".to_string());
@@ -40620,7 +42294,8 @@ mod schema_upgrade_fixture_tests
     /// distinct committed states, V1…V6; V7 is slice B's removal tombstone
     /// (S184, committed in 5bad24c), the first fixture named by its content
     /// hash (ruling 32); V8 is slice S24's `similar_photo_group_member.origin`
-    /// (2026-10-02): the identity control.
+    /// (2026-10-02), the last state with 32-bit REAL measurement columns; V9 is
+    /// W4-21's six DOUBLE measurement columns (2026-10-11): the identity control.
     ///
     /// ⚠️ NARROWED in fix round 1 (2026-09-25, reviewer finding K-F1). ⛔ The old
     /// wording, "the reachable window OPENS on 2026-07-03", does **not** follow
@@ -40639,7 +42314,7 @@ mod schema_upgrade_fixture_tests
     /// one column comment — which is why the fixture is named for 8193d5d and is
     /// byte-exact against 8193d5d's blob. 8193d5d is also the S111 commit at which
     /// such a catalogue first became BACKUP-able.
-    const VINTAGES: [Vintage; 10] = [
+    const VINTAGES: [Vintage; 11] = [
         Vintage
         {
             tag: "V1",
@@ -40726,11 +42401,13 @@ mod schema_upgrade_fixture_tests
         // ⭐ V8 — slice S24's durable hand-made stacks (2026-10-02): the
         // `origin INTEGER` column LAST in the `similar_photo_group_member`
         // CREATE body plus its bare `ALTER … ADD COLUMN IF NOT EXISTS origin
-        // INTEGER` (no default — S62). THE IDENTITY CONTROL. Named by the
-        // SHA-256 of its own bytes (ruling 32): `shasum -a 256` of the file
-        // begins bfb49cce6d91. Cut from the working tree; `source_commit` stays
-        // `None` until a commit carries it (it MAY then be filled in — never a
-        // rename).
+        // INTEGER` (no default — S62). The identity control until W4-21 (its
+        // flag and its identity assertion moved to V9), and the LAST state that
+        // stores the six measurement columns as 32-bit REAL — so its upgrade is
+        // the W4-21 REAL → DOUBLE conversion. Named by the SHA-256 of its own
+        // bytes (ruling 32): `shasum -a 256` of the file begins bfb49cce6d91.
+        // Cut from the working tree; `source_commit` stays `None` until someone
+        // fills it in (never a rename).
         Vintage
         {
             tag: "V8",
@@ -40738,6 +42415,25 @@ mod schema_upgrade_fixture_tests
             date: "2026-10-02",
             file: "sha256-bfb49cce6d91.sql",
             ddl: include_str!("schema_fixtures/sha256-bfb49cce6d91.sql"),
+            allowed: &[],
+            is_identity_control: false,
+        },
+        // ⭐ V9 — W4-21 / ruling 80 (2026-10-11): the six `images` measurement
+        // columns (focal_length, aperture, shutter_speed, gps_latitude,
+        // gps_longitude, gps_altitude) are DOUBLE in the CREATE body; every
+        // older vintage reaches DOUBLE through
+        // `migrate_measurement_columns_to_double`, which is why assertion (e)
+        // stays allow-list-free for V1…V8. THE IDENTITY CONTROL. Named by the
+        // SHA-256 of its own bytes (ruling 32): `shasum -a 256` of the file
+        // begins 24bf811ec9fc. Cut from the working tree; `source_commit` stays
+        // `None` until someone fills it in (never a rename).
+        Vintage
+        {
+            tag: "V9",
+            source_commit: None,
+            date: "2026-10-11",
+            file: "sha256-24bf811ec9fc.sql",
+            ddl: include_str!("schema_fixtures/sha256-24bf811ec9fc.sql"),
             allowed: &[],
             is_identity_control: true,
         },
@@ -40800,7 +42496,7 @@ mod schema_upgrade_fixture_tests
     /// `VINTAGES` row is added or removed without updating it. The detector for a
     /// moved schema batch is
     /// `the_identity_control_fixture_is_byte_identical_to_the_in_tree_schema_batch`.
-    const EXPECTED_VINTAGE_COUNT: usize = 10;
+    const EXPECTED_VINTAGE_COUNT: usize = 11;
 
     /// ⭐ RULING 32 (2026-09-27) — the ONLY fixtures that keep a COMMIT name,
     /// because their provenance is real: each reproduces byte-for-byte from its
@@ -41192,10 +42888,84 @@ mod schema_upgrade_fixture_tests
         let (fresh_path, fresh) = fresh_catalogue(&format!("fresh-for-{}", v.tag));
         assert_column_shapes(v, &fresh, &upgraded);
 
+        // --- (g) ⭐ W4-21 — the INDEX set, fresh vs upgraded. (e) sees columns
+        // only; W4-21's measurement migration drops and rebuilds every index on
+        // `images` on every vintage older than V9, so a lost or altered index
+        // would be invisible to (e). No allow-list: measured equal on all
+        // eleven vintages.
+        assert_index_shapes(v, &fresh, &upgraded);
+
         drop(upgraded);
         drop(fresh);
         cleanup(&old_path);
         cleanup(&fresh_path);
+    }
+
+    /// ⭐ W4-21 — every index in `main`: (table, index, unique, primary, SQL).
+    /// `duckdb_indexes().sql` is DuckDB's own re-rendering of the definition,
+    /// so an `IF NOT EXISTS` or whitespace difference between batches cannot
+    /// read as a divergence.
+    fn index_shapes(conn: &Connection, what: &str) -> Vec<(String, String, bool, bool, Option<String>)>
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT table_name, index_name, is_unique, is_primary, sql FROM duckdb_indexes() \
+                 WHERE schema_name = 'main' ORDER BY table_name, index_name",
+            )
+            .unwrap_or_else(|e| panic!("{}: preparing the index query failed: {}", what, e));
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .unwrap_or_else(|e| panic!("{}: the index query failed: {}", what, e));
+        let (shapes, dropped) = collect_rows_counted(rows, "schema_upgrade_fixture_tests.index_shapes");
+        assert_eq!(dropped, 0, "{}: the index query dropped {} row(s)", what, dropped);
+        shapes
+    }
+
+    /// ⭐ VACUITY GUARD for (g): the fresh catalogue carried 39 indexes when
+    /// W4-21 added this assertion.
+    const FRESH_INDEX_FLOOR: usize = 30;
+
+    /// Assertion (g) — the index set, fresh vs upgraded (W4-21).
+    fn assert_index_shapes(v: &Vintage, fresh: &Connection, upgraded: &Connection)
+    {
+        let fresh_shapes = index_shapes(fresh, "fresh");
+        let upgraded_shapes = index_shapes(upgraded, v.tag);
+        assert!(
+            fresh_shapes.len() >= FRESH_INDEX_FLOOR,
+            "VACUITY GUARD FAILED: the fresh reference catalogue listed only {} indexes (floor {}) — the \
+             index query is not reading the catalogue",
+            fresh_shapes.len(),
+            FRESH_INDEX_FLOOR
+        );
+        eprintln!(
+            "[K-1g] {} ({}): fresh = {} indexes, upgraded = {}",
+            v.tag,
+            v.file,
+            fresh_shapes.len(),
+            upgraded_shapes.len()
+        );
+        let only_fresh: Vec<_> = fresh_shapes.iter().filter(|s| !upgraded_shapes.contains(s)).collect();
+        let only_upgraded: Vec<_> = upgraded_shapes.iter().filter(|s| !fresh_shapes.contains(s)).collect();
+        assert!(
+            only_fresh.is_empty() && only_upgraded.is_empty(),
+            "⭐ ASSERTION (g) FAILED for {} ({}, {}): the INDEX set differs between a FRESH catalogue and one \
+             UPGRADED from this vintage.\n  only fresh:    {:?}\n  only upgraded: {:?}\nW4-21's \
+             measurement migration drops and rebuilds every index on images; a difference here is a lost, \
+             duplicated or altered index — a FINDING.",
+            v.tag,
+            v.file,
+            v.date,
+            only_fresh,
+            only_upgraded
+        );
     }
 
     /// Assertion (e), plus the two assertions ON the allow-list itself.
@@ -41360,7 +43130,7 @@ mod schema_upgrade_fixture_tests
             "exactly one vintage must be the identity control (the working tree's own \
              schema batch); without it a green sweep proves nothing about the comparison"
         );
-        for tag in ["V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "TIER3-4599235", "GENESIS"]
+        for tag in ["V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "TIER3-4599235", "GENESIS"]
         {
             let v = vintage(tag);
             assert!(
@@ -41482,17 +43252,27 @@ mod schema_upgrade_fixture_tests
         assert_vintage_upgrades(vintage("V7"));
     }
 
-    /// K-2 — THE IDENTITY CONTROL. V8 is the working tree's own schema batch, so
+    /// V8 — slice S24's state (2026-10-02), the last one with the six REAL
+    /// measurement columns. It was the identity control until W4-21's schema
+    /// change made V9 the working tree; its identity assertion moved to V9's
+    /// test with the flag (W4-21).
+    #[test]
+    fn v8_2026_10_02_upgrades_to_the_current_schema()
+    {
+        assert_vintage_upgrades(vintage("V8"));
+    }
+
+    /// K-2 — THE IDENTITY CONTROL. V9 is the working tree's own schema batch, so
     /// its upgrade must produce ZERO divergence. This is the assertion that
     /// proves a green K-1 means something rather than that the comparison is
     /// broken.
     #[test]
-    fn v8_the_identity_control_upgrades_to_a_byte_identical_schema()
+    fn v9_the_identity_control_upgrades_to_a_byte_identical_schema()
     {
-        let v = vintage("V8");
+        let v = vintage("V9");
         assert!(
             v.is_identity_control,
-            "V8 must be flagged as the identity control"
+            "V9 must be flagged as the identity control"
         );
         assert_vintage_upgrades(v);
     }
@@ -46213,6 +47993,7 @@ mod panic_boundary_tests
                 MODEL.to_string(),
                 PREPROCESSING.to_string(),
                 0.5,
+                Vec::new(),
             )));
         assert_eq!(r.status, "failed", "Swift reads anything but `assigned` as failure");
         assert!(says_injected(&r.message));
@@ -50588,5 +52369,1340 @@ mod cross_store_tests
             other => panic!("unknown PL_P_MEASURE {}", other),
         }
         drop(check);
+    }
+}
+
+// ===========================================================================
+// ⭐ W4-21 / ruling 80 — REAL → DOUBLE for the six `images` measurement
+// columns, and the numeric-literal round trip ("is exactly 1/50" matched no
+// photo on REAL storage).
+// ===========================================================================
+//
+// Every fixture is a REAL temp-FILE catalogue. A REAL-era catalogue is built
+// the way slice K builds its vintages — the V8 schema batch (the last one with
+// REAL columns) replayed on a raw, fenced connection — and then opened through
+// the production `open_and_migrate_catalogue`.
+#[cfg(test)]
+mod measurement_double_tests
+{
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// The last schema batch that stores the six columns as REAL.
+    const V8_REAL_BATCH: &str = include_str!("schema_fixtures/sha256-bfb49cce6d91.sql");
+    /// A batch that still CREATEs the 14 S179-retired indexes.
+    const V1_REAL_BATCH: &str = include_str!("schema_fixtures/8193d5d.sql");
+
+    /// One row's six values, in `MEASUREMENT_DOUBLE_COLUMNS` order.
+    type Row = [Option<f64>; 6];
+
+    const ROWS: [Row; 5] = [
+        [Some(50.0), Some(2.8), Some(1.0 / 250.0), Some(28.618055555555557), Some(-81.11236111111111), Some(12.3)],
+        [Some(23.5), Some(7.1), Some(1.0 / 60.0), Some(81.1124), Some(0.000123), Some(8848.86)],
+        [Some(4.25), Some(1.4), Some(1.0 / 50.0), None, None, None],
+        [None, None, None, Some(-33.8688), Some(151.2093), Some(-0.5)],
+        [Some(105.0), Some(5.6), Some(2.5), Some(0.0), Some(-0.0), Some(0.0)],
+    ];
+
+    fn fixture_dir(tag: &str) -> std::path::PathBuf
+    {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("plcore-w421-{}-{}-{}", std::process::id(), n, tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the fixture directory");
+        dir
+    }
+
+    fn wal_bytes(db: &std::path::Path) -> u64
+    {
+        let mut wal = db.as_os_str().to_owned();
+        wal.push(".wal");
+        std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0)
+    }
+
+    fn raw_open(db: &std::path::Path) -> Connection
+    {
+        let conn = Connection::open(db).expect("raw open");
+        fence_connection_against_extension_fetches(&conn);
+        conn
+    }
+
+    fn measurement_types(conn: &Connection) -> Vec<String>
+    {
+        MEASUREMENT_DOUBLE_COLUMNS
+            .iter()
+            .map(|column| {
+                conn.query_row(
+                    "SELECT data_type FROM duckdb_columns() WHERE table_name = 'images' AND column_name = ?1",
+                    params![column],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap_or_else(|e| panic!("data_type of {}: {}", column, e))
+            })
+            .collect()
+    }
+
+    fn images_indexes(conn: &Connection) -> Vec<String>
+    {
+        let mut stmt = conn
+            .prepare("SELECT index_name FROM duckdb_indexes() WHERE table_name = 'images' ORDER BY index_name")
+            .expect("prepare the index listing");
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0)).expect("list the indexes");
+        let (names, dropped) = collect_rows_counted(rows, "measurement_double_tests.images_indexes");
+        assert_eq!(dropped, 0);
+        names
+    }
+
+    fn setting(conn: &Connection, name: &str) -> String
+    {
+        conn.query_row(&format!("SELECT CAST(current_setting('{}') AS VARCHAR)", name), [], |row| {
+            row.get::<_, String>(0)
+        })
+        .unwrap_or_else(|e| panic!("current_setting('{}'): {}", name, e))
+    }
+
+    /// The engine's defaults for the two settings the conversion overrides.
+    fn default_settings() -> (String, String)
+    {
+        let conn = Connection::open_in_memory().expect("in-memory");
+        fence_connection_against_extension_fetches(&conn);
+        (setting(&conn, "checkpoint_threshold"), setting(&conn, "auto_checkpoint_skip_wal_threshold"))
+    }
+
+    /// Every row's six values cast back to FLOAT, as bits, in id order — what
+    /// "information-preserving" is measured against.
+    fn float_bits(conn: &Connection) -> Vec<[Option<u32>; 6]>
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT CAST(focal_length AS FLOAT), CAST(aperture AS FLOAT), CAST(shutter_speed AS FLOAT), \
+                 CAST(gps_latitude AS FLOAT), CAST(gps_longitude AS FLOAT), CAST(gps_altitude AS FLOAT) \
+                 FROM images ORDER BY id",
+            )
+            .expect("prepare the value read");
+        let rows = stmt
+            .query_map([], |row| {
+                let mut out = [None; 6];
+                for (i, slot) in out.iter_mut().enumerate()
+                {
+                    *slot = row.get::<_, Option<f32>>(i)?.map(f32::to_bits);
+                }
+                Ok(out)
+            })
+            .expect("read the values");
+        let (values, dropped) = collect_rows_counted(rows, "measurement_double_tests.float_bits");
+        assert_eq!(dropped, 0);
+        values
+    }
+
+    fn insert_rows(conn: &Connection, rows: &[Row])
+    {
+        for (i, r) in rows.iter().enumerate()
+        {
+            conn.execute(
+                "INSERT INTO images (file_path, file_size, file_name, directory_path, created_timestamp, \
+                 modified_timestamp, focal_length, aperture, shutter_speed, gps_latitude, gps_longitude, gps_altitude) \
+                 VALUES (?1, 1, ?2, '/w421', 1, 1, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![format!("/w421/{}.jpg", i), format!("{}.jpg", i), r[0], r[1], r[2], r[3], r[4], r[5]],
+            )
+            .expect("insert a row");
+        }
+    }
+
+    /// A REAL-era catalogue: `batch`, the S173 marker (the production open
+    /// builds it right after the batch), and `rows` written the way production
+    /// writes them — f64 binds into REAL columns. Returns the catalogue path.
+    fn real_catalogue(dir: &std::path::Path, batch: &str, rows: &[Row]) -> std::path::PathBuf
+    {
+        let db = dir.join("catalogue.db");
+        let conn = raw_open(&db);
+        conn.execute_batch(batch).expect("replay the REAL-era schema batch");
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_images_directory_path ON images(directory_path);")
+            .expect("the S173 marker");
+        insert_rows(&conn, rows);
+        conn.execute_batch("CHECKPOINT;").expect("checkpoint the fixture");
+        assert_eq!(measurement_types(&conn), vec!["FLOAT"; 6], "the fixture must start 32-bit");
+        db
+    }
+
+    #[test]
+    fn a_fresh_catalogue_stores_every_measurement_column_as_double()
+    {
+        let dir = fixture_dir("fresh");
+        let conn = open_and_migrate_catalogue(&dir.join("catalogue.db")).expect("fresh open");
+        assert_eq!(measurement_types(&conn), vec!["DOUBLE"; 6]);
+        let floats: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM duckdb_columns() c JOIN duckdb_tables() t ON c.table_oid = t.table_oid \
+                 WHERE t.schema_name = 'main' AND c.data_type = 'FLOAT'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count FLOAT columns");
+        assert_eq!(floats, 0, "no 32-bit REAL column may remain in a fresh catalogue (ruling 80)");
+    }
+
+    #[test]
+    fn a_real_catalogue_converts_on_open_keeping_every_value_every_index_and_the_marker()
+    {
+        let dir = fixture_dir("convert");
+        let db = real_catalogue(&dir, V8_REAL_BATCH, &ROWS);
+        let (bits_before, indexes_before) = {
+            let raw = raw_open(&db);
+            (float_bits(&raw), images_indexes(&raw))
+        };
+        assert_eq!(indexes_before.len(), 8, "the seven batch indexes plus the S173 marker");
+        assert!(indexes_before.iter().any(|name| name == "idx_images_directory_path"));
+
+        let conn = open_and_migrate_catalogue(&db).expect("the upgrade open");
+        assert_eq!(measurement_types(&conn), vec!["DOUBLE"; 6], "every measurement column is DOUBLE after the open");
+        assert_eq!(images_indexes(&conn), indexes_before, "the images index set — the S173 marker included — survives");
+        assert_eq!(float_bits(&conn), bits_before, "cast back to FLOAT, every value is the identical float");
+
+        // Ruled conversion: through the decimal text, so a photographic value
+        // reads back exactly as a fresh import stores it.
+        let read = |path: &str| -> (Option<f64>, Option<f64>, Option<f64>) {
+            conn.query_row(
+                "SELECT focal_length, aperture, shutter_speed FROM images WHERE file_path = ?1",
+                params![path],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read a converted row")
+        };
+        assert_eq!(read("/w421/0.jpg"), (Some(50.0), Some(2.8), Some(0.004)));
+        assert_eq!(read("/w421/1.jpg"), (Some(23.5), Some(7.1), Some(0.016666668)));
+        assert_eq!(read("/w421/2.jpg"), (Some(4.25), Some(1.4), Some(0.02)));
+        let at_least_7_1 = predicate_to_sql(&QueryPredicate
+        {
+            kind: "aperture_num".to_string(),
+            day: None,
+            day_end: None,
+            op: Some("gte".to_string()),
+            stars: None,
+            value: None,
+            num: Some(7.1),
+            num_end: None,
+        });
+        let matched: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM images WHERE {}", at_least_7_1), [], |row| row.get(0))
+            .expect("run the typed bound");
+        assert_eq!(matched, 1, "a converted f/7.1 still satisfies 'at least f/7.1'");
+        let nulls: i64 = conn
+            .query_row("SELECT COUNT(*) FROM images WHERE gps_latitude IS NULL", [], |row| row.get(0))
+            .expect("count NULLs");
+        assert_eq!(nulls, 1, "a NULL stays NULL");
+
+        assert_eq!(
+            migrate_measurement_columns_to_double(&conn, &db, None),
+            Ok(MeasurementMigrationOutcome { converted: 0, wal_fallback_folded: false, refused_by_index: None }),
+            "the marker reads 'done': a second pass does nothing"
+        );
+        drop(conn);
+        let again = open_and_migrate_catalogue(&db).expect("the second open");
+        assert_eq!(measurement_types(&again), vec!["DOUBLE"; 6]);
+        assert_eq!(images_indexes(&again), indexes_before);
+        assert_eq!(float_bits(&again), bits_before);
+    }
+
+    #[test]
+    fn the_retired_indexes_are_not_rebuilt_even_if_their_s179_drop_never_ran()
+    {
+        let dir = fixture_dir("retired");
+        let db = real_catalogue(&dir, V1_REAL_BATCH, &ROWS);
+        let raw = raw_open(&db);
+        let before = images_indexes(&raw);
+        assert!(
+            FOCUS_WRITEBACK_RETIRED_INDEXES.iter().all(|name| before.iter().any(|b| b == name)),
+            "the V1 fixture must carry the 14 retired indexes for this test to mean anything"
+        );
+        assert_eq!(
+            migrate_measurement_columns_to_double(&raw, &db, None),
+            Ok(MeasurementMigrationOutcome { converted: 6, wal_fallback_folded: false, refused_by_index: None })
+        );
+        let after = images_indexes(&raw);
+        let expected: Vec<String> =
+            before.iter().filter(|name| !FOCUS_WRITEBACK_RETIRED_INDEXES.contains(&name.as_str())).cloned().collect();
+        assert_eq!(after, expected, "every kept index rebuilt, no retired index brought back");
+        assert_eq!(measurement_types(&raw), vec!["DOUBLE"; 6]);
+    }
+
+    /// ⭐ The "safety checkpoint never fires" pin. `wal_fallback_folded` is the
+    /// defensive fold REPORTING itself; asserting the WAL alone would be
+    /// decoration, because the fold empties it (Phase 1 mutation M2).
+    #[test]
+    fn the_alter_never_reaches_the_wal_and_the_safety_checkpoint_never_fires()
+    {
+        let dir = fixture_dir("walfree");
+        let db = real_catalogue(&dir, V8_REAL_BATCH, &ROWS);
+        {
+            let raw = raw_open(&db);
+            raw.execute_batch("PRAGMA disable_checkpoint_on_shutdown;").expect("no shutdown checkpoint");
+            assert_eq!(
+                migrate_measurement_columns_to_double(&raw, &db, None),
+                Ok(MeasurementMigrationOutcome { converted: 6, wal_fallback_folded: false, refused_by_index: None }),
+                "COMMIT must checkpoint the conversion straight into the file — never through the WAL"
+            );
+            assert_eq!(wal_bytes(&db), 0, "the WAL must be empty after the conversion");
+            // Dropped WITHOUT a shutdown checkpoint: what a kill -9 leaves.
+        }
+        let reopened = Connection::open(&db).expect("the catalogue must reopen with nothing to replay");
+        fence_connection_against_extension_fetches(&reopened);
+        assert_eq!(measurement_types(&reopened), vec!["DOUBLE"; 6]);
+    }
+
+    /// The engine fact the recipe exists for (W4-21 fact 2). If a future DuckDB
+    /// replays `ALTER … TYPE` cleanly this goes RED — and only then may the
+    /// recipe be reconsidered.
+    #[test]
+    fn control_a_plain_alter_type_left_in_the_wal_wedges_the_catalogue()
+    {
+        let dir = fixture_dir("wedge");
+        let db = real_catalogue(&dir, V8_REAL_BATCH, &ROWS);
+        {
+            let raw = raw_open(&db);
+            raw.execute_batch("PRAGMA disable_checkpoint_on_shutdown; SET checkpoint_threshold = '1TB';")
+                .expect("keep the WAL");
+            for name in images_indexes(&raw)
+            {
+                raw.execute_batch(&format!("DROP INDEX {};", name)).expect("drop an index");
+            }
+            raw.execute_batch("ALTER TABLE images ALTER COLUMN aperture SET DATA TYPE DOUBLE;")
+                .expect("the bare ALTER");
+            assert!(wal_bytes(&db) > 0, "the control needs the ALTER in the WAL");
+        }
+        let message = Connection::open(&db).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            message.contains("GetDefaultDatabase"),
+            "expected the WAL-replay wedge on reopen, got: {:?}",
+            message
+        );
+    }
+
+    #[test]
+    fn a_failure_before_commit_rolls_everything_back_and_the_open_still_succeeds()
+    {
+        let defaults = default_settings();
+        for (step, class) in [
+            (MeasurementStep::DropIndex, InducedFailure::ExecutionClass),
+            (MeasurementStep::DropIndex, InducedFailure::CatalogClass),
+            (MeasurementStep::Alter, InducedFailure::ExecutionClass),
+            (MeasurementStep::Alter, InducedFailure::CatalogClass),
+            (MeasurementStep::RecreateIndex, InducedFailure::ExecutionClass),
+            // ⭐ The case that catches "COMMIT instead of ROLLBACK": a
+            // catalog-class error does not abort the transaction, so a COMMIT
+            // would publish the drops and ALTERs without the rebuilt indexes.
+            (MeasurementStep::RecreateIndex, InducedFailure::CatalogClass),
+        ]
+        {
+            let what = format!("{:?}/{:?}", step, class);
+            let dir = fixture_dir("prefail");
+            let db = real_catalogue(&dir, V8_REAL_BATCH, &ROWS);
+            let (bits_before, indexes_before) = {
+                let raw = raw_open(&db);
+                (float_bits(&raw), images_indexes(&raw))
+            };
+            let probe = MigrationProbe
+            {
+                fail_measurement_step: Some((step, class)),
+                ..Default::default()
+            };
+            let conn = open_and_migrate_catalogue_with_probe(&db, Some(&probe))
+                .unwrap_or_else(|| panic!("{}: a pre-commit failure must not fail the open", what));
+            assert_eq!(measurement_types(&conn), vec!["FLOAT"; 6], "{}: rolled back — still 32-bit", what);
+            assert_eq!(images_indexes(&conn), indexes_before, "{}: every index (and the marker) is back", what);
+            assert_eq!(float_bits(&conn), bits_before, "{}: no value moved", what);
+            assert_eq!(
+                (setting(&conn, "checkpoint_threshold"), setting(&conn, "auto_checkpoint_skip_wal_threshold")),
+                defaults,
+                "{}: both settings reset on the failure path",
+                what
+            );
+            drop(conn);
+            let again = open_and_migrate_catalogue(&db).unwrap_or_else(|| panic!("{}: the next open", what));
+            assert_eq!(measurement_types(&again), vec!["DOUBLE"; 6], "{}: the next open converts", what);
+            assert_eq!(images_indexes(&again), indexes_before, "{}", what);
+            assert_eq!(float_bits(&again), bits_before, "{}", what);
+        }
+    }
+
+    #[test]
+    fn a_failed_commit_fails_the_open_and_leaves_the_file_unconverted()
+    {
+        for class in [InducedFailure::ExecutionClass, InducedFailure::CatalogClass]
+        {
+            let dir = fixture_dir("commitfail");
+            let db = real_catalogue(&dir, V8_REAL_BATCH, &ROWS);
+            let (bits_before, indexes_before) = {
+                let raw = raw_open(&db);
+                (float_bits(&raw), images_indexes(&raw))
+            };
+            let probe = MigrationProbe
+            {
+                fail_measurement_step: Some((MeasurementStep::Commit, class)),
+                ..Default::default()
+            };
+            assert!(
+                open_and_migrate_catalogue_with_probe(&db, Some(&probe)).is_none(),
+                "{:?}: a failed measurement COMMIT must fail the open",
+                class
+            );
+            let raw = raw_open(&db);
+            assert_eq!(measurement_types(&raw), vec!["FLOAT"; 6], "{:?}: nothing was published", class);
+            assert_eq!(images_indexes(&raw), indexes_before, "{:?}", class);
+            assert_eq!(float_bits(&raw), bits_before, "{:?}", class);
+            drop(raw);
+            let again = open_and_migrate_catalogue(&db).unwrap_or_else(|| panic!("{:?}: the next open", class));
+            assert_eq!(measurement_types(&again), vec!["DOUBLE"; 6], "{:?}: the next open converts", class);
+        }
+    }
+
+    #[test]
+    fn both_checkpoint_settings_are_back_at_their_defaults_after_the_conversion()
+    {
+        let defaults = default_settings();
+        let dir = fixture_dir("settings");
+        let db = real_catalogue(&dir, V8_REAL_BATCH, &ROWS);
+        let conn = open_and_migrate_catalogue(&db).expect("the upgrade open");
+        assert_eq!(measurement_types(&conn), vec!["DOUBLE"; 6], "the conversion ran, so the SETs ran");
+        assert_eq!(
+            (setting(&conn, "checkpoint_threshold"), setting(&conn, "auto_checkpoint_skip_wal_threshold")),
+            defaults,
+            "a forced checkpoint-on-every-commit must not outlive the conversion"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The SIGKILL rig (the P18 pattern): a child process runs the production
+    // open on a REAL-era catalogue and is killed at fixed points of the
+    // conversion and at staggered instants across its COMMIT. After every
+    // kill the file must open RAW (no WAL-replay wedge), hold all-old or
+    // all-new, keep every index, and the next production open must converge.
+    // -----------------------------------------------------------------------
+    const RIG_CHILD_ENV: &str = "PL_W421_RIG_CHILD";
+    const RIG_ROWS: usize = 5_000;
+
+    fn rig_child(spec: &str) -> !
+    {
+        let mut parts = spec.split('|');
+        let dir = std::path::PathBuf::from(parts.next().unwrap_or_default());
+        let point = match parts.next()
+        {
+            Some("BeforeCommit") => MeasurementRigPoint::BeforeCommit,
+            Some("AfterCommit") => MeasurementRigPoint::AfterCommit,
+            _ => MeasurementRigPoint::AfterStep,
+        };
+        let block = parts.next() == Some("block");
+        let probe = MigrationProbe
+        {
+            measurement_rig: Some((point, dir.clone(), block)),
+            ..Default::default()
+        };
+        let opened = open_and_migrate_catalogue_with_probe(&dir.join("catalogue.db"), Some(&probe));
+        let _ = std::fs::write(dir.join(if opened.is_some() { "rig-opened" } else { "rig-open-failed" }), b"1");
+        // The parent SIGKILLs us. Backstop: never outlive a parent that died
+        // without doing so (a blocked rig point sleeps on inside the step, so
+        // `RigChild`'s Drop is the real guard; this covers the signal cases).
+        std::thread::sleep(std::time::Duration::from_secs(300));
+        std::process::exit(0);
+    }
+
+    /// Kills the rig child when dropped — also when an assertion in the parent
+    /// panics first, so a failing rig never leaves an orphan process behind.
+    struct RigChild(std::process::Child);
+
+    impl Drop for RigChild
+    {
+        fn drop(&mut self)
+        {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// file_stem / image_kind / file_extension are filled in, so the row
+    /// migration that follows every open has nothing to backfill — the rig
+    /// times the conversion, not 5,000 single-row UPDATEs.
+    fn seed_bulk(conn: &Connection, rows: usize)
+    {
+        conn.execute_batch(&format!(
+            "INSERT INTO images (file_path, file_size, file_name, file_extension, file_stem, image_kind, \
+                 directory_path, created_timestamp, modified_timestamp, camera_model, rating, focal_length, \
+                 aperture, shutter_speed, gps_latitude, gps_longitude, gps_altitude) \
+             SELECT '/w421/d' || (i % 97) || '/' || i || '.NEF', 1000 + i, i || '.NEF', 'nef', CAST(i AS VARCHAR), 'raw', \
+                 '/w421/d' || (i % 97), 1700000000 + i, 1700000000 + i, 'Z 8', i % 6, \
+                 CAST(([14.0, 24.0, 35.0, 50.0, 70.0, 85.0, 105.0, 200.0, 23.5, 4.25])[1 + i % 10] AS DOUBLE), \
+                 CAST(([1.4, 1.8, 2.8, 4.0, 5.6, 7.1, 8.0, 11.0, 16.0, 22.0])[1 + (i // 10) % 10] AS DOUBLE), \
+                 1.0 / (1 + i % 8000), \
+                 CASE WHEN i % 13 = 0 THEN NULL ELSE 28.0 + (i % 100003) / 100003.0 END, \
+                 CASE WHEN i % 13 = 0 THEN NULL ELSE -81.0 - (i % 77777) / 77777.0 END, \
+                 CASE WHEN i % 13 = 0 THEN NULL ELSE (i % 3001) / 10.0 END \
+             FROM range({}) t(i)",
+            rows
+        ))
+        .expect("seed the rig catalogue");
+    }
+
+    #[test]
+    fn sigkill_anywhere_in_the_conversion_never_wedges_the_catalogue()
+    {
+        if let Ok(spec) = std::env::var(RIG_CHILD_ENV)
+        {
+            rig_child(&spec);
+        }
+
+        let pristine_dir = fixture_dir("rig-pristine");
+        let pristine = pristine_dir.join("catalogue.db");
+        {
+            let raw = raw_open(&pristine);
+            raw.execute_batch(V8_REAL_BATCH).expect("the REAL-era batch");
+            raw.execute_batch("CREATE INDEX IF NOT EXISTS idx_images_directory_path ON images(directory_path);")
+                .expect("the S173 marker");
+            seed_bulk(&raw, RIG_ROWS);
+            raw.execute_batch("CHECKPOINT;").expect("checkpoint the pristine catalogue");
+        }
+        let (bits0, indexes0) = {
+            let raw = raw_open(&pristine);
+            (float_bits(&raw), images_indexes(&raw))
+        };
+        assert_eq!(bits0.len(), RIG_ROWS);
+
+        // How long the conversion takes on this build (debug DuckDB is -O0).
+        let step_ms = {
+            let dir = fixture_dir("rig-timing");
+            let db = dir.join("catalogue.db");
+            std::fs::copy(&pristine, &db).expect("copy for timing");
+            let raw = raw_open(&db);
+            let started = std::time::Instant::now();
+            migrate_measurement_columns_to_double(&raw, &db, None).expect("timed conversion");
+            (started.elapsed().as_millis() as u64).max(1)
+        };
+
+        let mut cases: Vec<(MeasurementRigPoint, bool, u64, Option<&str>)> = vec![
+            (MeasurementRigPoint::BeforeCommit, true, 0, Some("FLOAT")),
+            (MeasurementRigPoint::AfterCommit, true, 0, Some("DOUBLE")),
+            (MeasurementRigPoint::AfterStep, true, 0, Some("DOUBLE")),
+        ];
+        // Staggered across the COMMIT (the child commits the instant it has
+        // written the BeforeCommit signal): dense at the start, where the
+        // commit-time checkpoint runs, then out to the whole step.
+        for delay_us in [0u64, 500, 1_000, 2_000, 3_000, 5_000, 8_000, 12_000, 20_000, 35_000]
+        {
+            cases.push((MeasurementRigPoint::BeforeCommit, false, delay_us, None));
+        }
+        cases.push((MeasurementRigPoint::BeforeCommit, false, step_ms * 1_000, None));
+
+        let exe = std::env::current_exe().expect("the test binary");
+        let (mut landed_old, mut landed_new) = (0, 0);
+        for (iteration, (point, block, delay_ms, expected)) in cases.iter().enumerate()
+        {
+            let label = format!("rig {} ({:?}, block={}, +{} µs)", iteration, point, block, delay_ms);
+            let dir = fixture_dir(&format!("rig{}", iteration));
+            let db = dir.join("catalogue.db");
+            std::fs::copy(&pristine, &db).expect("copy the pristine catalogue");
+            let mut child = RigChild(std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "measurement_double_tests::sigkill_anywhere_in_the_conversion_never_wedges_the_catalogue",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(RIG_CHILD_ENV, format!("{}|{:?}|{}", dir.display(), point, if *block { "block" } else { "signal" }))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn the rig child"));
+            let signal = dir.join(format!("measurement-{:?}", point));
+            let started = std::time::Instant::now();
+            while !signal.exists()
+            {
+                assert!(started.elapsed() < std::time::Duration::from_secs(120), "{}: the child never got there", label);
+                if let Ok(Some(status)) = child.0.try_wait()
+                {
+                    panic!("{}: the child exited early: {}", label, status);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            std::thread::sleep(std::time::Duration::from_micros(*delay_ms));
+            child.0.kill().expect("SIGKILL the child");
+            let _ = child.0.wait();
+
+            // ⭐ THE WEDGE CHECK: a RAW open, nothing in front of it.
+            let raw = Connection::open(&db).unwrap_or_else(|e| {
+                panic!("⭐ {}: the catalogue does not reopen after SIGKILL — the WAL-replay wedge: {}", label, e)
+            });
+            fence_connection_against_extension_fetches(&raw);
+            let types = measurement_types(&raw);
+            let state = if types.iter().all(|t| t == "FLOAT")
+            {
+                "FLOAT"
+            }
+            else if types.iter().all(|t| t == "DOUBLE")
+            {
+                "DOUBLE"
+            }
+            else
+            {
+                panic!("{}: a TORN conversion: {:?}", label, types)
+            };
+            assert_eq!(images_indexes(&raw), indexes0, "{}: the index set after the kill", label);
+            if let Some(expected) = expected
+            {
+                assert_eq!(state, *expected, "{}: the state at this fixed point", label);
+            }
+            if state == "FLOAT"
+            {
+                landed_old += 1;
+            }
+            else
+            {
+                landed_new += 1;
+            }
+            drop(raw);
+
+            let conn = open_and_migrate_catalogue(&db).unwrap_or_else(|| panic!("{}: the next open failed", label));
+            assert_eq!(measurement_types(&conn), vec!["DOUBLE"; 6], "{}: converged", label);
+            assert_eq!(float_bits(&conn), bits0, "{}: every value preserved", label);
+            assert_eq!(images_indexes(&conn), indexes0, "{}: every index", label);
+        }
+        eprintln!(
+            "[W4-21 rig] {} rows, conversion ≈ {} ms; kills landed old={} new={}",
+            RIG_ROWS, step_ms, landed_old, landed_new
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The dropdown round trip (ruling 80 decision 2). The dropdown hands back
+    // `SELECT DISTINCT CAST(col AS DOUBLE)`; "is exactly" sends that double to
+    // `numeric_atom`. Every value must find its own row — on a catalogue still
+    // REAL (unconverted), a fresh DOUBLE catalogue, and a converted one.
+    // -----------------------------------------------------------------------
+
+    /// The value families W4-21 measured, plus the speeds the defect was found
+    /// with (1/50, 1/100, 1/200 matched nothing on REAL storage).
+    fn families() -> [(&'static str, Option<&'static str>, Vec<f64>); 6]
+    {
+        let mut shutter: Vec<f64> = (1..=1000).map(|n| 1.0 / n as f64).collect();
+        shutter.extend((-500..=1400).step_by(10).map(|tv| 2f64.powf(-(tv as f64) / 100.0))); // Lightroom APEX
+        shutter.extend([2.5, 30.0, 1.0 / 1250.0, 1.0 / 1600.0, 1.0 / 3200.0, 1.0 / 8000.0]);
+        let mut aperture: Vec<f64> = (10..=640).map(|n| n as f64 / 10.0).collect();
+        aperture.extend((0..=2000).step_by(10).map(|k| 2f64.powf(k as f64 / 200.0))); // Lightroom APEX 2^(AV/2)
+        let mut focal: Vec<f64> = (10..=8000).step_by(13).map(|n| n as f64 / 10.0).collect();
+        focal.extend((100..=3000).step_by(7).map(|n| n as f64 / 100.0));
+        let mut gps: Vec<f64> =
+            vec![28.618055555555557, -81.11236111111111, 81.1124, 12.3456789, 0.000123, 8848.86, -33.8688, 151.2093];
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..400
+        {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            gps.push((seed % 360_000_000) as f64 / 1e6 - 180.0);
+        }
+        [
+            ("shutter_speed", Some("shutter_num"), shutter),
+            ("aperture", Some("aperture_num"), aperture),
+            ("focal_length", Some("focal_num"), focal),
+            ("gps_latitude", None, gps.clone()),
+            ("gps_longitude", None, gps.iter().rev().cloned().collect()),
+            ("gps_altitude", None, gps.iter().map(|v| v.abs() * 10.0).collect()),
+        ]
+    }
+
+    /// Writes the families into `images` as f64 binds (exactly as production
+    /// writes them), one family per column, row i taking each family's i-th
+    /// value cyclically.
+    fn seed_families(conn: &Connection)
+    {
+        let families = families();
+        let rows = families.iter().map(|(_, _, values)| values.len()).max().unwrap_or(0);
+        conn.execute_batch(
+            "CREATE TEMP TABLE w421_values (i INTEGER, fl DOUBLE, ap DOUBLE, sh DOUBLE, la DOUBLE, lo DOUBLE, al DOUBLE);",
+        )
+        .expect("staging table");
+        {
+            let mut appender = conn.appender("w421_values").expect("appender");
+            let pick = |name: &str, i: usize| -> f64 {
+                let values = &families.iter().find(|(column, _, _)| *column == name).expect("family").2;
+                values[i % values.len()]
+            };
+            for i in 0..rows
+            {
+                appender
+                    .append_row(params![
+                        i as i64,
+                        pick("focal_length", i),
+                        pick("aperture", i),
+                        pick("shutter_speed", i),
+                        pick("gps_latitude", i),
+                        pick("gps_longitude", i),
+                        pick("gps_altitude", i)
+                    ])
+                    .expect("append");
+            }
+        }
+        conn.execute_batch(
+            "INSERT INTO images (file_path, file_size, file_name, directory_path, created_timestamp, \
+                 modified_timestamp, focal_length, aperture, shutter_speed, gps_latitude, gps_longitude, gps_altitude) \
+             SELECT '/w421/f/' || i || '.jpg', 1, i || '.jpg', '/w421/f', 1, 1, fl, ap, sh, la, lo, al FROM w421_values; \
+             DROP TABLE w421_values;",
+        )
+        .expect("write the families");
+    }
+
+    /// For every dropdown value of every family column: does the production
+    /// atom find at least one row? Returns the misses (column, value).
+    fn dropdown_misses(conn: &Connection) -> Vec<(String, f64)>
+    {
+        let mut misses = Vec::new();
+        for (column, kind, _) in families().iter()
+        {
+            let mut stmt = conn.prepare(&distinct_numeric_values_sql(column)).expect("the dropdown query");
+            let rows = stmt.query_map([], |row| row.get::<_, f64>(0)).expect("run the dropdown query");
+            let (values, dropped) = collect_rows_counted(rows, "measurement_double_tests.dropdown");
+            assert_eq!(dropped, 0);
+            assert!(values.len() > 100, "{}: the dropdown returned only {} values", column, values.len());
+            let atoms: Vec<String> = values
+                .iter()
+                .map(|v| match kind
+                {
+                    Some(kind) => predicate_to_sql(&QueryPredicate
+                    {
+                        kind: kind.to_string(),
+                        day: None,
+                        day_end: None,
+                        op: Some("eq".to_string()),
+                        stars: None,
+                        value: None,
+                        num: Some(*v),
+                        num_end: None,
+                    }),
+                    None => numeric_atom(column, "eq", *v, None).expect("a finite value"),
+                })
+                .collect();
+            // 200 atoms per scan: COUNT(*) FILTER (WHERE <the production atom>).
+            // ⭐ W4-21 review F2 — the entries must also PARTITION the column:
+            // their counts sum to the column's non-NULL rows, so no photo is
+            // unreachable from the dropdown and none is reached twice.
+            let mut reached = 0i64;
+            for (chunk_values, chunk_atoms) in values.chunks(200).zip(atoms.chunks(200))
+            {
+                let select = chunk_atoms
+                    .iter()
+                    .map(|atom| format!("COUNT(*) FILTER (WHERE {})", atom))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let counts: Vec<i64> = conn
+                    .query_row(&format!("SELECT {} FROM images", select), [], |row| {
+                        (0..chunk_atoms.len()).map(|i| row.get::<_, i64>(i)).collect()
+                    })
+                    .expect("count the matches");
+                for (v, n) in chunk_values.iter().zip(counts)
+                {
+                    reached += n;
+                    if n == 0
+                    {
+                        misses.push((column.to_string(), *v));
+                    }
+                }
+            }
+            let rows = count_where(conn, &format!("{} IS NOT NULL", column));
+            assert_eq!(
+                reached, rows,
+                "{}: the dropdown's entries reach {} rows in total, the column has {} — the entries do not \
+                 partition the column",
+                column, reached, rows
+            );
+        }
+        misses
+    }
+
+    fn count_where(conn: &Connection, predicate: &str) -> i64
+    {
+        conn.query_row(&format!("SELECT COUNT(*) FROM images WHERE {}", predicate), [], |row| row.get(0))
+            .unwrap_or_else(|e| panic!("{}: {}", predicate, e))
+    }
+
+    fn eq_atom(kind: &str, v: f64) -> String
+    {
+        predicate_to_sql(&QueryPredicate
+        {
+            kind: kind.to_string(),
+            day: None,
+            day_end: None,
+            op: Some("eq".to_string()),
+            stars: None,
+            value: None,
+            num: Some(v),
+            num_end: None,
+        })
+    }
+
+    #[test]
+    fn dropdown_values_round_trip_on_real_double_and_converted_storage()
+    {
+        // (1) REAL — a catalogue whose conversion has not run (never opened by
+        //     this build). The dropdown hands back the widened float.
+        let real_dir = fixture_dir("dropdown-real");
+        let real_db = real_catalogue(&real_dir, V8_REAL_BATCH, &[]);
+        let real = raw_open(&real_db);
+        seed_families(&real);
+        assert_eq!(measurement_types(&real), vec!["FLOAT"; 6]);
+        let misses = dropdown_misses(&real);
+        assert!(misses.is_empty(), "REAL storage: {} dropdown values found no row: {:?}", misses.len(), &misses[..misses.len().min(10)]);
+
+        // The defect, by mechanism: the dropdown's 17-digit doubles written the
+        // OLD way (`{}`, typed DECIMAL) miss their REAL rows; the new atom hits.
+        for n in [50.0, 100.0, 200.0]
+        {
+            let widened = ((1.0 / n) as f32) as f64;
+            assert_eq!(
+                count_where(&real, &format!("(shutter_speed = {})", widened)),
+                0,
+                "CONTROL: the pre-W4-21 spelling of 1/{} ({}) must still miss — if DuckDB's DECIMAL conversion \
+                 is ever fixed this flips, and the {{:e}} spelling is then merely belt-and-braces",
+                n,
+                widened
+            );
+            assert!(count_where(&real, &eq_atom("shutter_num", widened)) > 0, "1/{} is exactly — REAL", n);
+        }
+        // ⭐ W4-21 range follow-up — round 0 recorded a REAL-only trade-off
+        // here: a TYPED "at least f/2.8" compared in DOUBLE and missed the
+        // widened float (2.799999952316284 < 2.8). The 32-bit range comparison
+        // removes it: the typed bound and the stored float are the same float.
+        let typed_at_least_2_8 = predicate_to_sql(&QueryPredicate
+        {
+            kind: "aperture_num".to_string(),
+            day: None,
+            day_end: None,
+            op: Some("gte".to_string()),
+            stars: None,
+            value: None,
+            num: Some(2.8),
+            num_end: None,
+        });
+        let real_f_2_8 = "aperture = CAST(2.8 AS FLOAT)";
+        assert!(count_where(&real, real_f_2_8) > 0, "the REAL fixture must hold f/2.8 rows");
+        assert!(
+            count_where(&real, &format!("{} AND {}", typed_at_least_2_8, real_f_2_8)) > 0,
+            "a typed 'at least f/2.8' must include f/2.8 photos even on storage that is still REAL"
+        );
+        drop(real);
+
+        // (2) DOUBLE — a fresh catalogue written by this build.
+        let fresh_dir = fixture_dir("dropdown-double");
+        let fresh = open_and_migrate_catalogue(&fresh_dir.join("catalogue.db")).expect("fresh open");
+        seed_families(&fresh);
+        let misses = dropdown_misses(&fresh);
+        assert!(misses.is_empty(), "DOUBLE storage: {} dropdown values found no row: {:?}", misses.len(), &misses[..misses.len().min(10)]);
+        assert!(count_where(&fresh, &format!("{} AND aperture = 2.8e0", typed_at_least_2_8)) > 0, "typed f/2.8 bound — DOUBLE");
+        for n in [50.0, 100.0, 200.0]
+        {
+            assert!(count_where(&fresh, &eq_atom("shutter_num", 1.0 / n)) > 0, "1/{} is exactly — DOUBLE", n);
+        }
+        drop(fresh);
+
+        // (3) CONVERTED — the REAL catalogue of (1), opened by this build.
+        let converted = open_and_migrate_catalogue(&real_db).expect("the converting open");
+        assert_eq!(measurement_types(&converted), vec!["DOUBLE"; 6]);
+        let misses = dropdown_misses(&converted);
+        assert!(misses.is_empty(), "converted storage: {} dropdown values found no row: {:?}", misses.len(), &misses[..misses.len().min(10)]);
+        assert!(count_where(&converted, &format!("{} AND aperture = 2.8e0", typed_at_least_2_8)) > 0, "typed f/2.8 bound — converted");
+        for n in [50.0, 100.0, 200.0]
+        {
+            assert!(count_where(&converted, &eq_atom("shutter_num", 1.0 / n)) > 0, "1/{} is exactly — converted", n);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ⭐ W4-21 review round 1 — F1 / F2 (32-bit "is exactly"), L1 (index
+    // shapes the recipe cannot handle), L2 (a deterministic crash inside the
+    // commit-time checkpoint).
+    // -----------------------------------------------------------------------
+
+    /// F1 — "is exactly" queries SAVED before W4-21 hold the widened float the
+    /// old dropdown handed back (f/2.8 → 2.799999952316284). After the
+    /// conversion they must select exactly the photos they selected before.
+    #[test]
+    fn a_saved_is_exactly_query_made_on_real_storage_still_matches_after_the_conversion()
+    {
+        let dir = fixture_dir("saved-eq");
+        let db = real_catalogue(&dir, V8_REAL_BATCH, &[]);
+        let raw = raw_open(&db);
+        seed_families(&raw);
+
+        // The PRE-W4-21 dropdown text, verbatim: on REAL storage it returns
+        // the widened float.
+        let old_dropdown = |column: &str| -> Vec<f64> {
+            let mut stmt = raw
+                .prepare(&format!(
+                    "SELECT DISTINCT CAST({c} AS DOUBLE) AS v FROM images WHERE {c} IS NOT NULL ORDER BY v",
+                    c = column
+                ))
+                .expect("the old dropdown query");
+            let rows = stmt.query_map([], |row| row.get::<_, f64>(0)).expect("run it");
+            collect_rows_counted(rows, "measurement_double_tests.old_dropdown").0
+        };
+        let nominal: [(&str, &str, f64); 13] = [
+            ("shutter_num", "shutter_speed", 1.0 / 60.0),
+            ("shutter_num", "shutter_speed", 1.0 / 30.0),
+            ("shutter_num", "shutter_speed", 1.0 / 3.0),
+            ("shutter_num", "shutter_speed", 1.0 / 50.0),
+            ("shutter_num", "shutter_speed", 1.0 / 100.0),
+            ("shutter_num", "shutter_speed", 1.0 / 200.0),
+            ("aperture_num", "aperture", 2.8),
+            ("aperture_num", "aperture", 7.1),
+            ("aperture_num", "aperture", 1.4),
+            ("aperture_num", "aperture", 2.8284271247461903), // Lightroom APEX f/2.8
+            ("focal_num", "focal_length", 20.5),
+            ("focal_num", "focal_length", 7.5),
+            ("focal_num", "focal_length", 1.7),
+        ];
+        let mut saved: Vec<(String, i64, i64)> = Vec::new(); // (what, query id, photos before)
+        for (kind, column, value) in nominal
+        {
+            let widened = (value as f32) as f64;
+            assert!(
+                old_dropdown(column).contains(&widened),
+                "{} {}: the widened float {} must be a real pick from the old dropdown",
+                column,
+                value,
+                widened
+            );
+            let predicate = QueryPredicate
+            {
+                kind: kind.to_string(),
+                day: None,
+                day_end: None,
+                op: Some("eq".to_string()),
+                stars: None,
+                value: None,
+                num: Some(widened),
+                num_end: None,
+            };
+            let before = count_where(&raw, &format!("{} = CAST({:e} AS FLOAT)", column, widened));
+            assert!(before > 0, "{} {}: the fixture must hold photos at this value", column, value);
+            let info = save_query_impl(&raw, &format!("{} is exactly {}", column, value), &[predicate], &[])
+                .expect("save the query through the production path");
+            saved.push((format!("{} {}", column, value), info.id, before));
+        }
+        drop(raw);
+
+        let conn = open_and_migrate_catalogue(&db).expect("the converting open");
+        assert_eq!(measurement_types(&conn), vec!["DOUBLE"; 6]);
+        for (what, id, before) in saved
+        {
+            let payload = load_saved_query_impl(&conn, id).expect("load the saved query");
+            let after = count_where(&conn, &predicate_to_sql(&payload.predicates[0]));
+            assert_eq!(after, before, "{}: the saved 'is exactly' query must select the same photos after the conversion", what);
+        }
+    }
+
+    /// F2 — converted rows plus photos imported AFTER the conversion: one
+    /// dropdown entry per value, and that entry reaches both halves.
+    #[test]
+    fn a_mixed_catalogue_shows_one_dropdown_entry_per_value_and_it_returns_both_halves()
+    {
+        // ⭐ Review P1: each column carries at least one value whose converted
+        // and fresh doubles DIFFER (1/60, Lightroom-APEX f/2.8, 20/3 mm), so
+        // "one entry per setting" is proven for all three, focal_length included.
+        let speeds = [1.0 / 60.0, 1.0 / 30.0, 1.0 / 3.0, 1.0 / 50.0, 1.0 / 100.0, 1.0 / 200.0, 1.0 / 6.0];
+        let apertures = [2.8, 2.8284271247461903, 7.1, 1.4, 5.6, 22.0, 3.5];
+        let focals = [23.5, 4.25, 2.7, 50.0, 105.0, 6.86, 20.0 / 3.0];
+        let rows: Vec<Row> = (0..7)
+            .map(|i| [Some(focals[i]), Some(apertures[i]), Some(speeds[i]), None, None, None])
+            .collect();
+        let dir = fixture_dir("mixed");
+        let db = real_catalogue(&dir, V8_REAL_BATCH, &rows);
+        let conn = open_and_migrate_catalogue(&db).expect("the converting open");
+        assert_eq!(measurement_types(&conn), vec!["DOUBLE"; 6]);
+        // The same six settings, imported after the conversion (exact doubles).
+        for (i, r) in rows.iter().enumerate()
+        {
+            conn.execute(
+                "INSERT INTO images (file_path, file_size, file_name, directory_path, created_timestamp, \
+                 modified_timestamp, focal_length, aperture, shutter_speed) \
+                 VALUES (?1, 1, ?2, '/w421/new', 1, 1, ?3, ?4, ?5)",
+                params![format!("/w421/new/{}.jpg", i), format!("{}.jpg", i), r[0], r[1], r[2]],
+            )
+            .expect("a fresh import");
+        }
+        for (kind, column, values) in [
+            ("shutter_num", "shutter_speed", &speeds[..]),
+            ("aperture_num", "aperture", &apertures[..]),
+            ("focal_num", "focal_length", &focals[..]),
+        ]
+        {
+            let mut stmt = conn.prepare(&distinct_numeric_values_sql(column)).expect("the dropdown query");
+            let entries: Vec<f64> =
+                collect_rows_counted(stmt.query_map([], |row| row.get::<_, f64>(0)).expect("run it"), "mixed").0;
+            assert_eq!(
+                entries.len(),
+                values.len(),
+                "{}: {} dropdown entries for {} settings — a converted value and a fresh one must collapse",
+                column,
+                entries.len(),
+                values.len()
+            );
+            for entry in &entries
+            {
+                let matched = count_where(&conn, &eq_atom(kind, *entry));
+                assert_eq!(matched, 2, "{} = {}: the one entry must return the converted photo AND the fresh one", column, entry);
+            }
+        }
+        // 1/50, 1/100 and 1/200 — the speeds the defect was found with — still match.
+        for n in [50.0, 100.0, 200.0]
+        {
+            assert_eq!(count_where(&conn, &eq_atom("shutter_num", 1.0 / n)), 2, "1/{} is exactly", n);
+        }
+    }
+
+    /// L1 — an index on a column being converted cannot be dropped and
+    /// converted in one transaction on 1.5.5: the step refuses up front.
+    #[test]
+    fn an_index_on_a_converted_column_makes_the_step_refuse_up_front_and_the_open_still_succeeds()
+    {
+        let dir = fixture_dir("refuse-on-column");
+        let db = real_catalogue(&dir, V8_REAL_BATCH, &ROWS);
+        {
+            let raw = raw_open(&db);
+            raw.execute_batch("CREATE INDEX idx_on_aperture ON images(aperture);").expect("the blocking index");
+            raw.execute_batch("CHECKPOINT;").expect("checkpoint");
+            assert_eq!(
+                migrate_measurement_columns_to_double(&raw, &db, None),
+                Ok(MeasurementMigrationOutcome
+                {
+                    converted: 0,
+                    wal_fallback_folded: false,
+                    refused_by_index: Some("idx_on_aperture".to_string()),
+                })
+            );
+            assert_eq!(measurement_types(&raw), vec!["FLOAT"; 6]);
+        }
+        let conn = open_and_migrate_catalogue(&db).expect("a refused conversion must not fail the open");
+        assert_eq!(measurement_types(&conn), vec!["FLOAT"; 6], "still 32-bit — honestly");
+        assert!(images_indexes(&conn).iter().any(|name| name == "idx_on_aperture"));
+    }
+
+    /// L1 — a UNIQUE index on `images` cannot be re-created in the transaction
+    /// that dropped it on 1.5.5: the step refuses up front.
+    #[test]
+    fn a_unique_index_on_images_makes_the_step_refuse_up_front()
+    {
+        let dir = fixture_dir("refuse-unique");
+        let db = real_catalogue(&dir, V8_REAL_BATCH, &ROWS);
+        let raw = raw_open(&db);
+        raw.execute_batch("CREATE UNIQUE INDEX idx_unique_name ON images(file_name);").expect("the blocking index");
+        assert_eq!(
+            migrate_measurement_columns_to_double(&raw, &db, None),
+            Ok(MeasurementMigrationOutcome
+            {
+                converted: 0,
+                wal_fallback_folded: false,
+                refused_by_index: Some("idx_unique_name".to_string()),
+            })
+        );
+        assert_eq!(measurement_types(&raw), vec!["FLOAT"; 6]);
+    }
+
+    /// L1 — an index whose name needs quoting is dropped (quoted) and rebuilt
+    /// under the same name; an expression index on an unconverted column too.
+    #[test]
+    fn index_names_that_need_quoting_and_expression_indexes_survive_the_conversion()
+    {
+        let dir = fixture_dir("quoted");
+        let db = real_catalogue(&dir, V8_REAL_BATCH, &ROWS);
+        let raw = raw_open(&db);
+        raw.execute_batch(
+            "CREATE INDEX \"Idx Odd Quoted\" ON images(camera_make); \
+             CREATE INDEX \"has\"\"quote\" ON images(lens_model); \
+             CREATE INDEX idx_expr ON images(lower(camera_model));",
+        )
+        .expect("the unusual indexes");
+        let before = images_indexes(&raw);
+        assert_eq!(
+            migrate_measurement_columns_to_double(&raw, &db, None),
+            Ok(MeasurementMigrationOutcome { converted: 6, wal_fallback_folded: false, refused_by_index: None })
+        );
+        assert_eq!(images_indexes(&raw), before, "every index rebuilt under its own name");
+        assert_eq!(measurement_types(&raw), vec!["DOUBLE"; 6]);
+    }
+
+    /// L2 — a DETERMINISTIC crash inside the commit-time checkpoint, via the
+    /// engine's own abort switch. `before_header`: the new state never reaches
+    /// the file — COMMIT fails, the WAL is empty, a RAW reopen shows the old
+    /// state. `before_truncate`: the header was written — the new state, WAL
+    /// empty. Goes RED if the commit ever writes the WAL instead of
+    /// checkpointing (review mutation MF: no `checkpoint_threshold` SET).
+    #[test]
+    fn a_crash_inside_the_commit_checkpoint_leaves_one_whole_state_and_an_empty_wal()
+    {
+        for (knob, expected) in [("before_header", "FLOAT"), ("before_truncate", "DOUBLE")]
+        {
+            let dir = fixture_dir(knob);
+            let db = real_catalogue(&dir, V8_REAL_BATCH, &ROWS);
+            let bits_before = float_bits(&raw_open(&db));
+            {
+                let raw = raw_open(&db);
+                raw.execute_batch("PRAGMA disable_checkpoint_on_shutdown;").expect("no shutdown checkpoint");
+                raw.execute_batch(&format!("SET debug_checkpoint_abort = '{}';", knob)).expect("arm the abort");
+                assert!(
+                    migrate_measurement_columns_to_double(&raw, &db, None).is_err(),
+                    "{}: the aborted checkpoint must surface as a failed COMMIT",
+                    knob
+                );
+                assert_eq!(wal_bytes(&db), 0, "{}: the WAL must never have held the conversion", knob);
+            }
+            let reopened = Connection::open(&db)
+                .unwrap_or_else(|e| panic!("{}: the catalogue must reopen RAW — no WAL-replay wedge: {}", knob, e));
+            fence_connection_against_extension_fetches(&reopened);
+            assert_eq!(measurement_types(&reopened), vec![expected; 6], "{}: one whole state", knob);
+            assert_eq!(float_bits(&reopened), bits_before, "{}: every value intact", knob);
+            drop(reopened);
+            let conn = open_and_migrate_catalogue(&db).unwrap_or_else(|| panic!("{}: the next open", knob));
+            assert_eq!(measurement_types(&conn), vec!["DOUBLE"; 6], "{}: the next open converges", knob);
+        }
+    }
+
+
+    /// ⭐ W4-21 range follow-up (coordinator OK) — a TYPED photographer bound
+    /// at exactly a stored shutter speed: "at most 1/N" and "at least 1/N" must
+    /// both include the photo shot at 1/N, for every N up to 8,000, on CONVERTED
+    /// storage (the float's decimal text, 0.016666668 for 1/60), FRESH storage
+    /// (the exact double) and storage still REAL. Under the 64-bit comparison
+    /// the converted catalogue missed 4,011 "at most" and 3,943 "at least".
+    /// Strictness twin: each bound must EXCLUDE the neighbouring speed, so the
+    /// comparison cannot pass by being trivially true. ⭐ Review P2: a
+    /// behavioural "between" row — "between 1/(n+1) and 1/n" for every n below
+    /// 2,000, both ends exact stored speeds.
+    #[test]
+    fn range_bounds_at_every_1_over_n_up_to_8000_have_no_boundary_miss()
+    {
+        const N: i64 = 8_000;
+        const BETWEEN_N: i64 = 2_000;
+        let speed = |n: i64| 1.0 / n as f64;
+        // file_size carries n, so a chunk of bounds scans only its own rows.
+        let insert = |conn: &Connection| {
+            conn.execute_batch("CREATE TEMP TABLE w421_speeds (n BIGINT, s DOUBLE);").expect("staging");
+            {
+                let mut appender = conn.appender("w421_speeds").expect("appender");
+                for n in 1..=N
+                {
+                    appender.append_row(params![n, speed(n)]).expect("append");
+                }
+            }
+            conn.execute_batch(
+                "INSERT INTO images (file_path, file_size, file_name, file_extension, file_stem, image_kind, \
+                     directory_path, created_timestamp, modified_timestamp, shutter_speed) \
+                 SELECT '/w421/n/' || n || '.jpg', n, n || '.jpg', 'jpg', CAST(n AS VARCHAR), 'jpeg', '/w421/n', 1, 1, s \
+                 FROM w421_speeds; DROP TABLE w421_speeds;",
+            )
+            .expect("write the speeds");
+        };
+        let typed = |op: &str, n: i64| {
+            predicate_to_sql(&QueryPredicate
+            {
+                kind: "shutter_num".to_string(),
+                day: None,
+                day_end: None,
+                op: Some(op.to_string()),
+                stars: None,
+                value: None,
+                num: Some(speed(n)),
+                num_end: None,
+            })
+        };
+        // ⭐ Review P2 — "between 1/(n+1) and 1/n": BOTH ends are exact stored
+        // speeds, so the photo at 1/n (the upper end) and at 1/(n+1) (the lower
+        // end) must match, and 1/(n-1) and 1/(n+2) must not.
+        let typed_between = |n: i64| {
+            predicate_to_sql(&QueryPredicate
+            {
+                kind: "shutter_num".to_string(),
+                day: None,
+                day_end: None,
+                op: Some("between".to_string()),
+                stars: None,
+                value: None,
+                num: Some(speed(n + 1)),
+                num_end: Some(speed(n)),
+            })
+        };
+        // Returns (boundary misses, strictness failures) for one storage. Each
+        // query routes every row to the production atom built for ITS OWN n
+        // (`CASE file_size WHEN n THEN <atom for 1/n> …`), 1,000 bounds a query.
+        let check = |conn: &Connection, what: &str, with_between: bool| -> (Vec<String>, Vec<String>) {
+            let (mut misses, mut loose) = (Vec::new(), Vec::new());
+            let ns: Vec<i64> = (1..=N).collect();
+            let rows_where = |condition: String| -> Vec<i64> {
+                let mut stmt = conn
+                    .prepare(&format!("SELECT file_size FROM images WHERE {} ORDER BY file_size", condition))
+                    .expect("prepare the boundary query");
+                let rows = stmt.query_map([], |row| row.get::<_, i64>(0)).expect("run the boundary query");
+                collect_rows_counted(rows, "measurement_double_tests.range_bounds").0
+            };
+            for chunk in ns.chunks(1_000)
+            {
+                for (op, label) in [("lte", "at most"), ("gte", "at least")]
+                {
+                    // Boundary: row n under the bound for 1/n must match.
+                    let routed = chunk
+                        .iter()
+                        .map(|n| format!("WHEN {} THEN {}", n, typed(op, *n)))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    for n in rows_where(format!(
+                        "file_size BETWEEN {} AND {} AND NOT (CASE file_size {} ELSE TRUE END)",
+                        chunk[0],
+                        chunk[chunk.len() - 1],
+                        routed
+                    ))
+                    {
+                        misses.push(format!("{}: {} 1/{}", what, label, n));
+                    }
+                    // Strictness: "at most 1/n" must exclude 1/(n-1) (slower);
+                    // "at least 1/n" must exclude 1/(n+1) (faster).
+                    let step = if op == "lte" { -1 } else { 1 };
+                    let neighbours = chunk
+                        .iter()
+                        .filter(|n| (1..=N).contains(&(**n + step)))
+                        .map(|n| format!("WHEN {} THEN {}", n + step, typed(op, *n)))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    for m in rows_where(format!("(CASE file_size {} ELSE FALSE END)", neighbours))
+                    {
+                        loose.push(format!("{}: {} 1/{} included 1/{}", what, label, m - step, m));
+                    }
+                }
+                // "between 1/(n+1) and 1/n" — the two ends, then the two outsiders.
+                // Over n < BETWEEN_N on converted and fresh storage (the still-REAL
+                // pass checks the single-bound modes only): a two-ended atom
+                // costs twice as much to plan, and the full sweep would double
+                // this test's run time for no new mechanism.
+                let between_ns: Vec<i64> = chunk.iter().copied().filter(|n| *n < N && *n < BETWEEN_N).collect();
+                if !with_between || between_ns.is_empty()
+                {
+                    continue;
+                }
+                for (offset, end) in [(0i64, "upper"), (1i64, "lower")]
+                {
+                    let routed = between_ns
+                        .iter()
+                        .map(|n| format!("WHEN {} THEN {}", n + offset, typed_between(*n)))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    for m in rows_where(format!(
+                        "file_size BETWEEN {} AND {} AND NOT (CASE file_size {} ELSE TRUE END)",
+                        between_ns[0] + offset,
+                        between_ns[between_ns.len() - 1] + offset,
+                        routed
+                    ))
+                    {
+                        misses.push(format!("{}: between 1/{} and 1/{} missed its {} end", what, m - offset + 1, m - offset, end));
+                    }
+                }
+                for offset in [-1i64, 2i64]
+                {
+                    let routed = between_ns
+                        .iter()
+                        .filter(|n| (1..=N).contains(&(**n + offset)))
+                        .map(|n| format!("WHEN {} THEN {}", n + offset, typed_between(*n)))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    for m in rows_where(format!("(CASE file_size {} ELSE FALSE END)", routed))
+                    {
+                        loose.push(format!("{}: between 1/{} and 1/{} included 1/{}", what, m - offset + 1, m - offset, m));
+                    }
+                }
+            }
+            (misses, loose)
+        };
+
+        // CONVERTED — a REAL catalogue opened by this build.
+        let converted_dir = fixture_dir("range-converted");
+        let converted_db = real_catalogue(&converted_dir, V8_REAL_BATCH, &[]);
+        {
+            let raw = raw_open(&converted_db);
+            insert(&raw);
+            raw.execute_batch("CHECKPOINT;").expect("checkpoint");
+            // ⭐ storage still REAL (a conversion that has not run yet).
+            let (misses, loose) = check(&raw, "REAL", false);
+            assert!(misses.is_empty(), "{} boundary misses, e.g. {:?}", misses.len(), &misses[..misses.len().min(8)]);
+            assert!(loose.is_empty(), "{} loose bounds, e.g. {:?}", loose.len(), &loose[..loose.len().min(8)]);
+        }
+        let converted = open_and_migrate_catalogue(&converted_db).expect("the converting open");
+        assert_eq!(measurement_types(&converted), vec!["DOUBLE"; 6]);
+        let (misses, loose) = check(&converted, "converted", true);
+        assert!(misses.is_empty(), "{} boundary misses, e.g. {:?}", misses.len(), &misses[..misses.len().min(8)]);
+        assert!(loose.is_empty(), "{} loose bounds, e.g. {:?}", loose.len(), &loose[..loose.len().min(8)]);
+
+        // FRESH — photos imported by this build (exact doubles).
+        let fresh_dir = fixture_dir("range-fresh");
+        let fresh = open_and_migrate_catalogue(&fresh_dir.join("catalogue.db")).expect("fresh open");
+        insert(&fresh);
+        let (misses, loose) = check(&fresh, "fresh", true);
+        assert!(misses.is_empty(), "{} boundary misses, e.g. {:?}", misses.len(), &misses[..misses.len().min(8)]);
+        assert!(loose.is_empty(), "{} loose bounds, e.g. {:?}", loose.len(), &loose[..loose.len().min(8)]);
+    }
+
+
+    /// ⭐ Review R2-1 — a stored value beyond the f32 range (1e39, 1e60 in each
+    /// of the three columns: corrupt metadata DOUBLE storage now accepts) must
+    /// never make a query on that column fail. Every mode and the dropdown
+    /// answer; the out-of-range rows match nothing; the ordinary rows still match.
+    #[test]
+    fn a_stored_value_beyond_the_f32_range_never_breaks_a_query_or_the_dropdown()
+    {
+        let dir = fixture_dir("overflow");
+        let conn = open_and_migrate_catalogue(&dir.join("catalogue.db")).expect("fresh open");
+        let rows: [Row; 3] = [
+            [Some(50.0), Some(2.8), Some(1.0 / 60.0), None, None, None],
+            [Some(1e39), Some(1e39), Some(1e39), None, None, None],
+            [Some(1e60), Some(1e60), Some(1e60), None, None, None],
+        ];
+        insert_rows(&conn, &rows);
+        for (kind, column, ordinary) in [
+            ("focal_num", "focal_length", 50.0),
+            ("aperture_num", "aperture", 2.8),
+            ("shutter_num", "shutter_speed", 1.0 / 60.0),
+        ]
+        {
+            let atom = |op: &str, num: f64, num_end: Option<f64>| {
+                predicate_to_sql(&QueryPredicate
+                {
+                    kind: kind.to_string(),
+                    day: None,
+                    day_end: None,
+                    op: Some(op.to_string()),
+                    stars: None,
+                    value: None,
+                    num: Some(num),
+                    num_end,
+                })
+            };
+            let answer = |predicate: String| -> i64 {
+                conn.query_row(&format!("SELECT COUNT(*) FROM images WHERE {}", predicate), [], |row| row.get(0))
+                    .unwrap_or_else(|e| panic!("{}: a query on a column holding 1e39 must not fail: {} — {}", column, predicate, e))
+            };
+            // Each mode answers; only the ordinary row can match.
+            assert_eq!(answer(atom("eq", ordinary, None)), 1, "{} is exactly", column);
+            assert_eq!(answer(atom("gte", ordinary, None)), 1, "{} at least (the 1e39/1e60 rows match nothing)", column);
+            assert_eq!(answer(atom("lte", ordinary, None)), 1, "{} at most", column);
+            assert_eq!(answer(atom("gt", ordinary / 2.0, None)), 1, "{} more than", column);
+            assert_eq!(answer(atom("lt", ordinary * 2.0, None)), 1, "{} less than", column);
+            assert_eq!(answer(atom("between", ordinary / 2.0, Some(ordinary * 2.0))), 1, "{} between", column);
+            assert_eq!(answer(atom("gte", 0.0, None)), 1, "{} at least 0: still only the ordinary row", column);
+            // The dropdown answers too, and lists only the representable value.
+            let mut stmt = conn.prepare(&distinct_numeric_values_sql(column)).expect("the dropdown query");
+            let entries: Vec<f64> = collect_rows_counted(
+                stmt.query_map([], |row| row.get::<_, f64>(0))
+                    .unwrap_or_else(|e| panic!("{}: the dropdown must not fail on a column holding 1e39: {}", column, e)),
+                "overflow.dropdown",
+            )
+            .0;
+            assert_eq!(entries.len(), 1, "{}: the dropdown lists the one representable value", column);
+            assert_eq!(answer(atom("eq", entries[0], None)), 1, "{}: and that entry selects its photo", column);
+        }
     }
 }

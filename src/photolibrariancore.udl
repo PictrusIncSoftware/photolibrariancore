@@ -558,13 +558,22 @@ namespace photolibrariancore {
     [Async]
     PersonClusterAcceptResult assign_face_observations_to_person(sequence<i64> face_observation_ids, string person_name);
 
+    // ⭐ W4-20 / ruling 77 — a NAMED face search renames only matched faces that
+    // are unassigned or already this person's; a face another person owns keeps
+    // its owner and is reported in the result's left_with_other_people_faces.
+    // The exception is explicit_seed_face_observation_ids — the face(s) the user
+    // chose as the search's seed — which take the new name. Move is this same
+    // call with the left-alone faces passed as both matches and explicit seeds.
+    // Appended LAST with a default, so a call that omits it never moves a face
+    // that belongs to someone else (the strict direction).
     [Async]
     PersonClusterAcceptResult assign_face_search_matches_to_person(
         sequence<FaceSearchMatchRecord> matches,
         string person_name,
         string model_version,
         string preprocessing_version,
-        f64 threshold
+        f64 threshold,
+        optional sequence<i64> explicit_seed_face_observation_ids = []
     );
 
     // Similar-photo grouping (S94): Swift computes Vision feature-print groups
@@ -1215,7 +1224,13 @@ dictionary SimilarPhotoCandidate {
 dictionary SimilarPhotoFeatureprint {
     i64 image_id;
     string source_stamp;
-    sequence<u8> featureprint_blob;
+    // W4-17 (ruling 73): `bytes`, not `sequence<u8>`. Both reach Rust as the
+    // same `Vec<u8>` with a byte-identical wire format, so no Rust code or
+    // stored blob changes. In Swift `sequence<u8>` lifted each ~9.4 KB
+    // archived featureprint one byte at a time (~1.56 s per 1,000-record page
+    // in a Debug build, on the main actor); `bytes` lifts it as `Data` with a
+    // bulk copy and no per-byte loop. Pinned by Spikes/FeatureprintBytesGate/.
+    bytes featureprint_blob;
 };
 
 dictionary SimilarPhotoGroupMember {
@@ -1516,6 +1531,16 @@ dictionary PersonClusterAcceptResult {
     string keyword_path;
     string status;
     string message;
+    // ⭐ W4-20 / ruling 77 (b) — the matched faces a named face search LEFT with
+    // a different person (always empty from the other two person writers).
+    // person_name is now the person's STORED spelling (ruling 77 (a)). Appended
+    // LAST with defaults (S65).
+    u64 left_with_other_people_face_count = 0;
+    sequence<FaceLeftWithOtherPersonRecord> left_with_other_people_faces = [];
+    // ⭐ W4-20 fix round 1 (REVIEW-1 F2) — the explicit seeds the named search
+    // used, as CANONICAL face ids (the ids left_with_other_people_faces carry),
+    // so Swift can settle a face named through a RAW-half pick. Appended LAST.
+    sequence<i64> explicit_seed_canonical_face_observation_ids = [];
 };
 
 dictionary PersonSummaryRecord {
@@ -2065,4 +2090,19 @@ dictionary FaceEmbeddingSearchResult {
     boolean ok;
     string? error_message;
     sequence<FaceSearchMatchRecord> matches;
+};
+
+// ⭐ W4-20 / ruling 77 (b) — one matched face a named face search did NOT
+// rename, because it already belongs to another person. face_observation_id /
+// image_id / face_index are the canonical face row; seed_face_observation_id and
+// cosine are the search's own; owner_* is the person who keeps the face, in that
+// person's stored spelling. Swift hands these straight back for Move.
+dictionary FaceLeftWithOtherPersonRecord {
+    i64 face_observation_id;
+    i64 image_id;
+    i64 seed_face_observation_id;
+    u32 face_index;
+    f64 cosine;
+    i64 owner_person_id;
+    string owner_person_name;
 };
