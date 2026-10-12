@@ -18699,6 +18699,337 @@ pub async fn assign_face_observations_to_person(
     |panic| person_accept_error("failed", &ffi_panic_report("save this person", &panic)))
 }
 
+// ===========================================================================
+// ⭐ S194-86d (ruling 86, reshaped Oct 12; the design approved as ruling 99) —
+// the named face-search save's SET-BASED write phase.
+//
+// The save used to issue one statement per matched face (the assignment
+// upsert), two to four per image (the People mirror) and up to six per moved
+// face's previous owner (the cleanup). Through the `@MainActor` binding
+// (R-171, ruling 79) that was about 78 s of main-thread work for the retyped
+// "Judy Wagner" save on a copy of the live catalogue (S194-86b). These helpers
+// write the SAME rows with a handful of set statements; the per-face writer is
+// kept as `assign_face_search_matches_to_person_per_row_reference` (cfg(test))
+// and `face_search_save_set_tests` proves the two equal row for row (keyword ids
+// too, up to one DuckDB row group of inserts — see the mirror's doc below).
+//
+// Every helper runs INSIDE the save's transaction. ⛔ No change count is read
+// (S179): every number the save reports is planned in memory or READ before the
+// write it describes. ⛔ Any `Err` is the caller's cue to ROLLBACK, never to
+// COMMIT (S187). Staged values are BOUND parameters, never formatted text. The
+// staging tables are connection-scoped TEMP tables created inside the
+// transaction, so a ROLLBACK removes them; after COMMIT the caller drops them
+// (`drop_face_search_save_tables`). No index is added (the L1215 doctrine).
+// ===========================================================================
+
+/// Faces staged per bound multi-row `VALUES` statement (5 parameters each).
+const FACE_SEARCH_SAVE_BATCH_CHUNK: usize = 1000;
+
+/// Previous owners of moved faces staged per statement (3 parameters each).
+const FACE_SEARCH_SAVE_MOVED_CHUNK: usize = 300;
+
+/// Every TEMP table one save may create; `drop_face_search_save_tables` drops
+/// them all, so a table a failed drop left behind goes at the next save too.
+const FACE_SEARCH_SAVE_TEMP_TABLES: [&str; 3] = [
+    "pl_face_search_save_batch",
+    "pl_face_search_save_moved",
+    "pl_face_search_save_clear",
+];
+
+/// ONE statement upserts every staged face exactly as the per-face statement
+/// did: the same columns, the same literals (`'face_search_match'`, the two
+/// NULL cluster columns), the same `CURRENT_TIMESTAMP` / `now()` stamps and the
+/// same ON CONFLICT SET list. The batch holds one row per CANONICAL face id
+/// (`assignable_faces_for_observation_ids` de-duplicates), so the one command
+/// never touches a key twice. `?1` person id · `?2` model version · `?3`
+/// preprocessing version · `?4` threshold (NULL when not finite).
+const FACE_SEARCH_SAVE_UPSERT_SQL: &str = "INSERT INTO person_face_assignment (
+         face_observation_id, person_id, image_id, analyzed_image_id, face_index,
+         assignment_source, face_cluster_run_id, face_cluster_id,
+         model_version, preprocessing_version, threshold, confidence_cosine,
+         created_at, updated_at
+     )
+     SELECT b.face_observation_id, CAST(?1 AS BIGINT), b.image_id, b.analyzed_image_id, b.face_index,
+            'face_search_match', NULL, NULL, CAST(?2 AS VARCHAR), CAST(?3 AS VARCHAR), CAST(?4 AS DOUBLE),
+            b.cosine, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+     FROM pl_face_search_save_batch b
+     ORDER BY b.face_observation_id
+     ON CONFLICT (face_observation_id) DO UPDATE SET
+         person_id = excluded.person_id,
+         image_id = excluded.image_id,
+         analyzed_image_id = excluded.analyzed_image_id,
+         face_index = excluded.face_index,
+         assignment_source = excluded.assignment_source,
+         face_cluster_run_id = excluded.face_cluster_run_id,
+         face_cluster_id = excluded.face_cluster_id,
+         model_version = excluded.model_version,
+         preprocessing_version = excluded.preprocessing_version,
+         threshold = excluded.threshold,
+         confidence_cosine = excluded.confidence_cosine,
+         updated_at = now()";
+
+/// Stage the faces to assign in `pl_face_search_save_batch`, created INSIDE the
+/// save's transaction. Bound multi-row VALUES, so a cosine keeps its exact bits.
+fn stage_face_search_batch(
+    conn: &Connection,
+    faces_to_assign: &[(&PersonAssignableFace, &FaceSearchMatchRecord)],
+) -> Result<(), duckdb::Error>
+{
+    conn.execute_batch(
+        "CREATE OR REPLACE TEMP TABLE pl_face_search_save_batch (
+             face_observation_id BIGINT NOT NULL,
+             image_id BIGINT NOT NULL,
+             analyzed_image_id BIGINT NOT NULL,
+             face_index BIGINT NOT NULL,
+             cosine DOUBLE NOT NULL
+         );",
+    )?;
+    for chunk in faces_to_assign.chunks(FACE_SEARCH_SAVE_BATCH_CHUNK)
+    {
+        let placeholders = vec!["(?, ?, ?, ?, ?)"; chunk.len()].join(", ");
+        let mut values: Vec<Value> = Vec::with_capacity(chunk.len() * 5);
+        for (face, search_match) in chunk
+        {
+            values.push(Value::BigInt(face.face_observation_id));
+            values.push(Value::BigInt(face.image_id));
+            values.push(Value::BigInt(face.analyzed_image_id));
+            values.push(Value::BigInt(face.face_index as i64));
+            values.push(Value::Double(search_match.cosine));
+        }
+        conn.execute(
+            &format!("INSERT INTO pl_face_search_save_batch VALUES {}", placeholders),
+            params_from_iter(values.iter()),
+        )?;
+    }
+    Ok(())
+}
+
+/// The People mirror for every staged image at once — the rule of
+/// `insert_or_merge_active_keyword_for_image`, applied per (image, ancestor
+/// row) of `segments`:
+/// * an ACTIVE row exists → OR `origin` into every active row that lacks it,
+///   counted ONCE when any of them lacked it;
+/// * no active row → insert one active row, counted once, `is_video` read from
+///   the image through the S124 `LIMIT 1` scalar subquery (FALSE when the image
+///   row is absent).
+///
+/// The count is READ before any write (never a change count — S179). Inserts follow
+/// the per-image order, so ids match it up to one DuckDB row group (122,880 inserted
+/// rows per save); past that the sort runs in parallel: ids permute, rows identical.
+fn mirror_active_keyword_for_staged_images(
+    conn: &Connection,
+    segments: &[String],
+    origin: i32,
+) -> Result<u64, String>
+{
+    let rows = keyword_materialized_rows(segments);
+    if rows.is_empty()
+    {
+        return Ok(0);
+    }
+
+    // (image, depth, label, path) for every staged image × every ancestor row.
+    let wanted_values = (0..rows.len())
+        .map(|depth| format!("({}, CAST(? AS VARCHAR), CAST(? AS VARCHAR))", depth))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let wanted = format!(
+        "(SELECT b.image_id, w.depth, w.label, w.path
+          FROM (SELECT DISTINCT image_id FROM pl_face_search_save_batch) b
+          CROSS JOIN (VALUES {}) AS w(depth, label, path))",
+        wanted_values
+    );
+    let mut wanted_params: Vec<Value> = Vec::with_capacity(rows.len() * 2);
+    for (label, path) in &rows
+    {
+        wanted_params.push(Value::Text(label.clone()));
+        wanted_params.push(Value::Text(path.clone()));
+    }
+
+    // 1) What the per-image writer would report, read before any write.
+    let count_sql = format!(
+        "SELECT
+             COALESCE(SUM(CASE WHEN NOT has_active THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN has_active_lacking THEN 1 ELSE 0 END), 0)
+         FROM (
+             SELECT
+                 EXISTS (SELECT 1 FROM keyword k
+                         WHERE k.image_id = wanted.image_id AND k.path = wanted.path AND k.status = 1) AS has_active,
+                 EXISTS (SELECT 1 FROM keyword k
+                         WHERE k.image_id = wanted.image_id AND k.path = wanted.path AND k.status = 1
+                           AND (k.origin & {origin}) = 0) AS has_active_lacking
+             FROM {wanted} wanted
+         ) flags",
+        origin = origin,
+        wanted = wanted
+    );
+    let (to_insert, to_merge): (i64, i64) = conn
+        .query_row(&count_sql, params_from_iter(wanted_params.iter()), |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| format!("keyword plan read: {}", e))?;
+
+    // 2) Missing ACTIVE rows in (image, depth) order; no product read keys on keyword.id.
+    let insert_sql = format!(
+        "INSERT INTO keyword (image_id, label, path, status, origin, created_at, is_video)
+         SELECT wanted.image_id, wanted.label, wanted.path, 1, {origin}, CURRENT_TIMESTAMP,
+                COALESCE((SELECT is_video FROM images WHERE id = wanted.image_id LIMIT 1), FALSE)
+         FROM {wanted} wanted
+         WHERE NOT EXISTS (SELECT 1 FROM keyword k
+                           WHERE k.image_id = wanted.image_id AND k.path = wanted.path AND k.status = 1)
+         ORDER BY wanted.image_id, wanted.depth",
+        origin = origin,
+        wanted = wanted
+    );
+    conn.execute(&insert_sql, params_from_iter(wanted_params.iter()))
+        .map_err(|e| format!("keyword INSERT: {}", e))?;
+
+    // 3) OR the bit into the existing ACTIVE rows that lack it. The rows
+    //    inserted just above already carry it, so they never match.
+    let path_placeholders = vec!["?"; rows.len()].join(", ");
+    let merge_sql = format!(
+        "UPDATE keyword SET origin = (origin | {origin})
+         WHERE status = 1
+           AND (origin & {origin}) = 0
+           AND path IN ({paths})
+           AND image_id IN (SELECT image_id FROM pl_face_search_save_batch)",
+        origin = origin,
+        paths = path_placeholders
+    );
+    let path_params = rows.iter().map(|(_, path)| Value::Text(path.clone())).collect::<Vec<_>>();
+    conn.execute(&merge_sql, params_from_iter(path_params.iter()))
+        .map_err(|e| format!("keyword origin merge: {}", e))?;
+
+    Ok((to_insert.max(0) + to_merge.max(0)) as u64)
+}
+
+/// `remove_obsolete_face_keyword_projections` as set statements, with its rule
+/// unchanged: for each (image, previous owner) of a face that MOVED, when that
+/// owner has no face left on that image, clear the face bit from
+/// `People<sep><Name>` there and hide the row when nothing else keeps it
+/// active; and when the image then holds no face assignment at all, do the same
+/// to the `People` root. The UPDATE pairs carry exactly
+/// `clear_face_keyword_origin_for_path`'s predicates. Runs after the upsert, so
+/// "left" is read on the table as this transaction leaves it.
+fn remove_obsolete_face_keyword_projections_set(
+    conn: &Connection,
+    previous_assignments: &[PersonFaceAssignmentRecord],
+    new_person_id: i64,
+) -> Result<(), duckdb::Error>
+{
+    let mut previous_people = std::collections::BTreeSet::new();
+    for assignment in previous_assignments
+    {
+        if assignment.person_id != new_person_id
+        {
+            previous_people.insert((
+                assignment.image_id,
+                assignment.person_id,
+                ["People", assignment.person_name.as_str()].join(KEYWORD_PATH_SEPARATOR),
+            ));
+        }
+    }
+    if previous_people.is_empty()
+    {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "CREATE OR REPLACE TEMP TABLE pl_face_search_save_moved (
+             image_id BIGINT NOT NULL,
+             person_id BIGINT NOT NULL,
+             path VARCHAR NOT NULL
+         );",
+    )?;
+    let previous_people = previous_people.into_iter().collect::<Vec<_>>();
+    for chunk in previous_people.chunks(FACE_SEARCH_SAVE_MOVED_CHUNK)
+    {
+        let placeholders = vec!["(?, ?, ?)"; chunk.len()].join(", ");
+        let mut values: Vec<Value> = Vec::with_capacity(chunk.len() * 3);
+        for (image_id, person_id, path) in chunk
+        {
+            values.push(Value::BigInt(*image_id));
+            values.push(Value::BigInt(*person_id));
+            values.push(Value::Text(path.clone()));
+        }
+        conn.execute(
+            &format!("INSERT INTO pl_face_search_save_moved VALUES {}", placeholders),
+            params_from_iter(values.iter()),
+        )?;
+    }
+
+    // The (image, path) pairs whose previous owner has no face left there.
+    conn.execute_batch(
+        "CREATE OR REPLACE TEMP TABLE pl_face_search_save_clear AS
+         SELECT DISTINCT m.image_id, m.path
+         FROM pl_face_search_save_moved m
+         WHERE NOT EXISTS (SELECT 1 FROM person_face_assignment a
+                           WHERE a.image_id = m.image_id AND a.person_id = m.person_id);",
+    )?;
+
+    let clear_face_mask = !KEYWORD_ORIGIN_FACE;
+    // `People<sep><Name>` on those images: clear the bit, then hide what nothing keeps.
+    conn.execute(
+        "UPDATE keyword SET origin = (origin & ?1)
+         WHERE status = 1
+           AND (origin & ?2) <> 0
+           AND EXISTS (SELECT 1 FROM pl_face_search_save_clear c
+                       WHERE c.image_id = keyword.image_id AND c.path = keyword.path)",
+        params![clear_face_mask, KEYWORD_ORIGIN_FACE],
+    )?;
+    conn.execute(
+        "UPDATE keyword
+         SET status = 0, hidden_at = CURRENT_TIMESTAMP
+         WHERE status = 1
+           AND origin = 0
+           AND COALESCE(collection, FALSE) = FALSE
+           AND COALESCE(color, FALSE) = FALSE
+           AND EXISTS (SELECT 1 FROM pl_face_search_save_clear c
+                       WHERE c.image_id = keyword.image_id AND c.path = keyword.path)",
+        [],
+    )?;
+    // The `People` root, on those images that now hold no face assignment.
+    conn.execute(
+        "UPDATE keyword SET origin = (origin & ?1)
+         WHERE status = 1
+           AND (origin & ?2) <> 0
+           AND path = 'People'
+           AND image_id IN (SELECT c.image_id FROM pl_face_search_save_clear c
+                            WHERE NOT EXISTS (SELECT 1 FROM person_face_assignment a
+                                              WHERE a.image_id = c.image_id))",
+        params![clear_face_mask, KEYWORD_ORIGIN_FACE],
+    )?;
+    conn.execute(
+        "UPDATE keyword
+         SET status = 0, hidden_at = CURRENT_TIMESTAMP
+         WHERE status = 1
+           AND origin = 0
+           AND COALESCE(collection, FALSE) = FALSE
+           AND COALESCE(color, FALSE) = FALSE
+           AND path = 'People'
+           AND image_id IN (SELECT c.image_id FROM pl_face_search_save_clear c
+                            WHERE NOT EXISTS (SELECT 1 FROM person_face_assignment a
+                                              WHERE a.image_id = c.image_id))",
+        [],
+    )?;
+    Ok(())
+}
+
+/// After COMMIT (autocommit): drop every staging table this connection holds.
+/// A failed drop is logged and left for the next save, whose
+/// `CREATE OR REPLACE` and drop cover it — a TEMP table is never in the
+/// catalogue file, so a backup or another connection never sees one. The name
+/// is qualified with the `temp` catalogue, so this can only ever drop a TEMP
+/// table.
+fn drop_face_search_save_tables(conn: &Connection)
+{
+    for table in FACE_SEARCH_SAVE_TEMP_TABLES
+    {
+        if let Err(e) = conn.execute_batch(&format!("DROP TABLE IF EXISTS temp.{};", table))
+        {
+            eprintln!("assign_face_search_matches_to_person: drop {} {}", table, e);
+        }
+    }
+}
+
 /// ⭐ W4-20 / ruling 77 (+ its amendment) — the named face search's ONE writer.
 ///
 /// **(b) The search is unchanged.** `face_embedding_search_impl` still returns
@@ -18733,7 +19064,316 @@ pub async fn assign_face_observations_to_person(
 /// is written — an unknown owner is never treated as "unassigned". After
 /// `BEGIN`, every `Err` is a ROLLBACK, never a COMMIT (S187). No change count is
 /// read as a decision (S179).
+///
+/// **S194-86d (ruling 86 → 99):** the writes after `BEGIN` are SET-BASED
+/// (`stage_face_search_batch`, `FACE_SEARCH_SAVE_UPSERT_SQL`,
+/// `mirror_active_keyword_for_staged_images`,
+/// `remove_obsolete_face_keyword_projections_set`) and write exactly the rows
+/// the per-face writer did — `face_search_save_set_tests` compares them against
+/// `assign_face_search_matches_to_person_per_row_reference`.
 fn assign_face_search_matches_to_person_impl(
+    conn: &Connection,
+    matches: &[FaceSearchMatchRecord],
+    person_name: &str,
+    model_version: &str,
+    preprocessing_version: &str,
+    threshold: f64,
+    explicit_seed_face_observation_ids: &[i64],
+) -> PersonClusterAcceptResult
+{
+    let Some(display_name) = clean_person_display_name(person_name) else
+    {
+        return person_accept_error("invalid", "A non-empty person name is required.");
+    };
+    let normalized_name = normalized_person_name(&display_name);
+
+    let mut best_match_by_face_id = std::collections::BTreeMap::<i64, FaceSearchMatchRecord>::new();
+    for search_match in matches
+    {
+        if search_match.face_observation_id <= 0 || !search_match.cosine.is_finite()
+        {
+            continue;
+        }
+        match best_match_by_face_id.get(&search_match.face_observation_id)
+        {
+            Some(existing) if existing.cosine >= search_match.cosine => {}
+            _ =>
+            {
+                best_match_by_face_id
+                    .insert(search_match.face_observation_id, search_match.clone());
+            }
+        }
+    }
+
+    let face_observation_ids = best_match_by_face_id.keys().copied().collect::<Vec<_>>();
+    let faces = assignable_faces_for_observation_ids(conn, &face_observation_ids);
+    if faces.is_empty()
+    {
+        return person_accept_error(
+            "empty_selection",
+            "No persisted face observations were found for the search matches.",
+        );
+    }
+
+    // The chosen seeds, redirected to their CANONICAL face rows exactly as the
+    // matched faces were (item 7c), so a clicked JPEG twin still names the face
+    // the match carries. A seed that cannot be resolved is simply not a seed —
+    // the strict direction: nothing extra moves.
+    let explicit_seed_ids = assignable_faces_for_observation_ids(conn, explicit_seed_face_observation_ids)
+        .into_iter()
+        .map(|face| face.face_observation_id)
+        .collect::<std::collections::HashSet<i64>>();
+    let mut explicit_seed_canonical_face_observation_ids = explicit_seed_ids.iter().copied().collect::<Vec<_>>();
+    explicit_seed_canonical_face_observation_ids.sort_unstable();
+
+    let canonical_face_ids = faces.iter().map(|face| face.face_observation_id).collect::<Vec<_>>();
+    let current_owners = match face_assignments_for_ids_checked(conn, &canonical_face_ids)
+    {
+        Ok(assignments) => assignments,
+        Err(e) =>
+        {
+            eprintln!("assign_face_search_matches_to_person: owners {}", e);
+            return person_accept_error(
+                "failed",
+                "Could not read who the matched faces already belong to, so nothing was saved.",
+            );
+        }
+    };
+    let owner_by_face_id = current_owners
+        .into_iter()
+        .map(|assignment| (assignment.face_observation_id, assignment))
+        .collect::<std::collections::HashMap<i64, PersonFaceAssignmentRecord>>();
+
+    let searched_person_id = match existing_person_id_for_normalized_name(conn, &normalized_name)
+    {
+        Ok(id) => id,
+        Err(e) =>
+        {
+            eprintln!("assign_face_search_matches_to_person: person lookup {}", e);
+            return person_accept_error("failed", "Could not look up the person, so nothing was saved.");
+        }
+    };
+
+    let mut faces_to_assign: Vec<(&PersonAssignableFace, &FaceSearchMatchRecord)> = Vec::new();
+    let mut moved_from_other_people: Vec<PersonFaceAssignmentRecord> = Vec::new();
+    let mut left_with_other_people: Vec<FaceLeftWithOtherPersonRecord> = Vec::new();
+    for face in &faces
+    {
+        let Some(search_match) = best_match_by_face_id.get(&face.face_observation_id) else
+        {
+            continue;
+        };
+        let owner = owner_by_face_id.get(&face.face_observation_id);
+        match named_search_face_decision(
+            owner.map(|assignment| assignment.person_id),
+            searched_person_id,
+            explicit_seed_ids.contains(&face.face_observation_id),
+        )
+        {
+            NamedSearchFaceDecision::Assign => faces_to_assign.push((face, search_match)),
+            NamedSearchFaceDecision::MoveExplicitSeed =>
+            {
+                faces_to_assign.push((face, search_match));
+                if let Some(owner) = owner
+                {
+                    moved_from_other_people.push(owner.clone());
+                }
+            }
+            NamedSearchFaceDecision::LeaveWithOwner =>
+            {
+                if let Some(owner) = owner
+                {
+                    left_with_other_people.push(FaceLeftWithOtherPersonRecord {
+                        face_observation_id: face.face_observation_id,
+                        image_id: face.image_id,
+                        seed_face_observation_id: search_match.seed_face_observation_id,
+                        face_index: face.face_index,
+                        cosine: search_match.cosine,
+                        owner_person_id: owner.person_id,
+                        owner_person_name: owner.person_name.clone(),
+                    });
+                }
+            }
+        }
+    }
+    let left_with_other_people_face_count = left_with_other_people.len() as u64;
+
+    if faces_to_assign.is_empty()
+    {
+        // Every match already belongs to someone else: write NOTHING (see the
+        // header). The name is reported in its stored spelling when the person
+        // already exists, else as typed and cleaned.
+        let (person_id, reported_name) = match searched_person_id
+        {
+            Some(id) => match stored_person_display_name(conn, id)
+            {
+                Ok(name) => (id, name),
+                Err(e) =>
+                {
+                    eprintln!("assign_face_search_matches_to_person: stored name {}", e);
+                    return person_accept_error("failed", "Could not read the person's stored name.");
+                }
+            },
+            None => (0, display_name.clone()),
+        };
+        return PersonClusterAcceptResult {
+            person_id,
+            keyword_path: ["People".to_string(), reported_name.clone()].join(KEYWORD_PATH_SEPARATOR),
+            person_name: reported_name,
+            assigned_face_count: 0,
+            keyword_image_count: 0,
+            keyword_row_count: 0,
+            status: "assigned".to_string(),
+            message: "No face was renamed: every matched face already belongs to someone else.".to_string(),
+            left_with_other_people_face_count,
+            left_with_other_people_faces: left_with_other_people,
+            explicit_seed_canonical_face_observation_ids,
+        };
+    }
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("assign_face_search_matches_to_person: begin {}", e);
+        return person_accept_error(
+            "failed",
+            "Could not start the face-search assignment transaction.",
+        );
+    }
+
+    let person_id = match get_or_create_person_impl(conn, &display_name, &normalized_name)
+    {
+        Ok(id) => id,
+        Err(e) =>
+        {
+            eprintln!("assign_face_search_matches_to_person: person {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return person_accept_error("failed", "Could not create or reuse the person row.");
+        }
+    };
+    // Every "already this person's" decision above was made against
+    // `searched_person_id`. The catalogue lock makes a different answer here
+    // impossible today; if it ever is not, the decisions are stale — write
+    // nothing rather than hand faces to the wrong person.
+    if searched_person_id.map_or(false, |id| id != person_id)
+    {
+        eprintln!(
+            "assign_face_search_matches_to_person: person changed while saving ({:?} -> {})",
+            searched_person_id, person_id
+        );
+        let _ = conn.execute_batch("ROLLBACK;");
+        return person_accept_error("failed", "The person changed while saving, so nothing was saved.");
+    }
+    // ⭐ (a) — one person, one label: the stored spelling, never the typed one.
+    let display_name = match stored_person_display_name(conn, person_id)
+    {
+        Ok(name) => name,
+        Err(e) =>
+        {
+            eprintln!("assign_face_search_matches_to_person: stored name {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return person_accept_error("failed", "Could not read the person's stored name.");
+        }
+    };
+    let keyword_segments = vec!["People".to_string(), display_name.clone()];
+    let keyword_path = keyword_segments.join(KEYWORD_PATH_SEPARATOR);
+
+    let model_version = model_version.trim();
+    let preprocessing_version = preprocessing_version.trim();
+    let threshold = threshold.is_finite().then_some(threshold);
+
+    // ⭐ S194-86d (ruling 86 → 99) — the SET-BASED write phase. Everything
+    // above is unchanged; from here the per-face writer's rows are written by
+    // a handful of set statements (see `stage_face_search_batch` and its
+    // siblings). ⛔ No change count is read; after BEGIN every `Err` is a
+    // ROLLBACK, never a COMMIT.
+    let image_ids = faces_to_assign
+        .iter()
+        .map(|(face, _)| face.image_id)
+        .collect::<std::collections::BTreeSet<i64>>();
+
+    if let Err(e) = stage_face_search_batch(conn, &faces_to_assign)
+    {
+        eprintln!("assign_face_search_matches_to_person: stage {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return person_accept_error("failed", "Could not persist all face-search assignments.");
+    }
+    if let Err(e) = conn.execute(
+        FACE_SEARCH_SAVE_UPSERT_SQL,
+        params![person_id, model_version, preprocessing_version, threshold],
+    )
+    {
+        eprintln!("assign_face_search_matches_to_person: assign {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return person_accept_error("failed", "Could not persist all face-search assignments.");
+    }
+    // One statement wrote the whole batch or failed whole, so the per-face
+    // writer's count of successful upserts is exactly the batch size.
+    let assigned_face_count = faces_to_assign.len() as u64;
+
+    let keyword_row_count = match mirror_active_keyword_for_staged_images(conn, &keyword_segments, KEYWORD_ORIGIN_FACE)
+    {
+        Ok(rows) => rows,
+        Err(e) =>
+        {
+            eprintln!("assign_face_search_matches_to_person: keyword {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return person_accept_error("failed", "Could not mirror the People keyword.");
+        }
+    };
+
+    // The old owner's label follows ONLY the faces that actually moved (an
+    // explicit seed, or a Move). A face left with its owner is not passed in:
+    // it never changed hands, and its owner's label must stay.
+    if let Err(e) = remove_obsolete_face_keyword_projections_set(conn, &moved_from_other_people, person_id)
+    {
+        eprintln!("assign_face_search_matches_to_person: cleanup {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return person_accept_error("failed", "Could not clean up the previous People keyword.");
+    }
+
+    // ⭐ W4-20 fix round 1 (REVIEW-1 F3) — a previous owner this write left with
+    // no face and no active People keyword goes, in THIS transaction.
+    let unnamed_candidates = moved_from_other_people
+        .iter()
+        .map(|assignment| assignment.person_id)
+        .filter(|previous| *previous != person_id)
+        .collect::<std::collections::BTreeSet<i64>>();
+    if let Err(e) = delete_people_named_by_nothing(conn, &unnamed_candidates)
+    {
+        eprintln!("assign_face_search_matches_to_person: unnamed person {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return person_accept_error("failed", "Could not remove a person left with no faces.");
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("assign_face_search_matches_to_person: commit {}", e);
+        return person_accept_error("failed", "Could not commit the face-search assignment.");
+    }
+    // Autocommit now: the staging tables go with the save.
+    drop_face_search_save_tables(conn);
+
+    PersonClusterAcceptResult {
+        person_id,
+        person_name: display_name,
+        assigned_face_count,
+        keyword_image_count: image_ids.len() as u64,
+        keyword_row_count,
+        keyword_path,
+        status: "assigned".to_string(),
+        message: "Face-search matches assigned to a named person.".to_string(),
+        left_with_other_people_face_count,
+        left_with_other_people_faces: left_with_other_people,
+        explicit_seed_canonical_face_observation_ids,
+    }
+}
+
+/// ⭐ S194-86d — the named face-search save exactly as it shipped before the
+/// set-based rewrite (one statement per face, per image and per moved owner),
+/// kept ONLY as the reference `face_search_save_set_tests` compares the
+/// production writer against, row for row. Not reachable from any product path.
+#[cfg(test)]
+fn assign_face_search_matches_to_person_per_row_reference(
     conn: &Connection,
     matches: &[FaceSearchMatchRecord],
     person_name: &str,
@@ -20527,6 +21167,11 @@ pub async fn replace_similar_photo_groups_for_ids(
     create_stack_writer_impl(conn, &ids, members, &algorithm_version)
 }
 
+/// ⭐ S194-86d — members per multi-row upsert in the grouping pass's unit
+/// writer (8 bound parameters each). A unit averages about 62 members, so one
+/// statement nearly always carries the whole unit.
+const SIMILAR_UNIT_WRITE_VALUES_CHUNK: usize = 500;
+
 fn upsert_similar_photo_groups_for_ids_impl(
     conn: &Connection,
     ids: &[i64],
@@ -20544,6 +21189,151 @@ fn upsert_similar_photo_groups_for_ids_impl(
 /// row — reachable when a Create Stack commits after the pass loaded its
 /// candidates), and every row it writes is `SIMILAR_STACK_ORIGIN_AUTO`.
 fn upsert_similar_photo_groups_for_ids_impl_with_probe(
+    conn: &Connection,
+    ids: &[i64],
+    members: Vec<SimilarPhotoGroupMember>,
+    algorithm_version: &str,
+    probe: SimilarStackProbeRef<'_>,
+) -> u64
+{
+    let algorithm_version = algorithm_version.trim();
+    if ids.is_empty() || algorithm_version.is_empty()
+    {
+        return 0;
+    }
+    let Some(filter) = id_in_list(ids) else
+    {
+        return 0;
+    };
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("upsert_similar_photo_groups_for_ids: begin {}", e);
+        return 0;
+    }
+
+    if !similar_automatic_write_may_proceed(conn, ids, &members, "upsert_similar_photo_groups_for_ids", probe)
+    {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return 0;
+    }
+
+    let delete_sql = format!(
+        "DELETE FROM similar_photo_group_member
+         WHERE algorithm_version = ?1 AND image_id IN (SELECT id FROM images WHERE {})
+           AND {}",
+        filter,
+        similar_row_is_not_hand_made_sql()
+    );
+    if let Err(e) = conn.execute(&delete_sql, params![algorithm_version])
+    {
+        eprintln!("upsert_similar_photo_groups_for_ids: delete {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return 0;
+    }
+
+    // ⭐ S194-86d (ruling 86 → 99) — the members are written by ONE multi-row
+    // upsert per `SIMILAR_UNIT_WRITE_VALUES_CHUNK` members instead of one
+    // statement per member (81–92 ms → 7–14 ms per unit, S194-86b). Everything
+    // above — the trims, BEGIN, Guard 3's census, Guard 2's anchor DELETE — is
+    // unchanged; every row is still `SIMILAR_STACK_ORIGIN_AUTO`. The
+    // per-member writer is kept, verbatim, as
+    // `upsert_similar_photo_groups_for_ids_per_row_reference` (`#[cfg(test)]`),
+    // and `similar_unit_set_write_tests` proves the two equal row for row.
+    let mut valid: Vec<&SimilarPhotoGroupMember> = Vec::with_capacity(members.len());
+    for member in &members
+    {
+        if !similar_photo_member_is_valid(member)
+        {
+            eprintln!(
+                "upsert_similar_photo_groups_for_ids: skipped invalid member image_id={}",
+                member.image_id
+            );
+            continue;
+        }
+        valid.push(member);
+    }
+    // The per-member writer upserted the members one after another, so for an
+    // image id named twice the LAST valid occurrence won. One statement may
+    // not touch a key twice, so keep exactly that occurrence.
+    let mut last_position = std::collections::HashMap::<i64, usize>::with_capacity(valid.len());
+    for (position, member) in valid.iter().enumerate()
+    {
+        last_position.insert(member.image_id, position);
+    }
+    let rows = valid
+        .iter()
+        .enumerate()
+        .filter(|(position, member)| last_position.get(&member.image_id) == Some(position))
+        .map(|(_, member)| *member)
+        .collect::<Vec<_>>();
+
+    for chunk in rows.chunks(SIMILAR_UNIT_WRITE_VALUES_CHUNK)
+    {
+        let placeholders = vec!["(?, ?, ?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ");
+        let mut values: Vec<Value> = Vec::with_capacity(chunk.len() * 8);
+        for member in chunk
+        {
+            values.push(Value::BigInt(member.image_id));
+            values.push(Value::BigInt(member.group_id));
+            values.push(Value::BigInt(member.representative_id));
+            values.push(Value::BigInt(member.member_rank as i64));
+            values.push(match member.distance_to_representative
+            {
+                Some(distance) => Value::Double(distance),
+                None => Value::Null,
+            });
+            values.push(Value::Text(algorithm_version.to_string()));
+            values.push(Value::Double(member.threshold));
+            values.push(Value::Int(SIMILAR_STACK_ORIGIN_AUTO));
+        }
+        let sql = format!(
+            "INSERT INTO similar_photo_group_member (
+                 image_id, group_id, representative_id, member_rank,
+                 distance_to_representative, algorithm_version, threshold, origin
+             )
+             VALUES {}
+             ON CONFLICT (image_id)
+             DO UPDATE SET
+                 group_id = excluded.group_id,
+                 representative_id = excluded.representative_id,
+                 member_rank = excluded.member_rank,
+                 distance_to_representative = excluded.distance_to_representative,
+                 algorithm_version = excluded.algorithm_version,
+                 threshold = excluded.threshold,
+                 origin = excluded.origin,
+                 created_at = now()",
+            placeholders
+        );
+        if let Err(e) = conn.execute(&sql, params_from_iter(values.iter()))
+        {
+            eprintln!(
+                "upsert_similar_photo_groups_for_ids: insert {} member(s) failed: {}",
+                chunk.len(),
+                e
+            );
+            let _ = conn.execute_batch("ROLLBACK;");
+            return 0;
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("upsert_similar_photo_groups_for_ids: commit {}", e);
+        return 0;
+    }
+
+    // ⛔ Never a statement's change count (S179): the per-member writer counted
+    // one per valid member, a repeated image included, so that is the count.
+    valid.len() as u64
+}
+
+/// ⭐ S194-86d — the per-member unit writer exactly as it shipped before the
+/// set-based rewrite (S24 Guards included), kept ONLY as the reference
+/// `similar_unit_set_write_tests` compares the production writer against, row
+/// for row. Not reachable from any product path.
+#[cfg(test)]
+fn upsert_similar_photo_groups_for_ids_per_row_reference(
     conn: &Connection,
     ids: &[i64],
     members: Vec<SimilarPhotoGroupMember>,
@@ -53704,5 +54494,1857 @@ mod measurement_double_tests
             assert_eq!(entries.len(), 1, "{}: the dropdown lists the one representable value", column);
             assert_eq!(answer(atom("eq", entries[0], None)), 1, "{}: and that entry selects its photo", column);
         }
+    }
+}
+
+// ===========================================================================
+// ⭐ S194-86d (ruling 86 → 99) — the set-based face-search save and the
+// set-based similar-photo unit write, pinned against the per-row writers they
+// replaced (`assign_face_search_matches_to_person_per_row_reference`,
+// `upsert_similar_photo_groups_for_ids_per_row_reference`). Each comparison
+// runs both writers on two IDENTICALLY built real temp catalogues
+// (`open_and_migrate_catalogue`, the production schema) and diffs every
+// affected table row for row, ids included (keyword ids follow the per-image
+// order only up to one DuckDB row group — 122,880 inserted rows in one save;
+// past that DuckDB sorts in parallel and the ids are a permutation of the
+// reference's with identical rows, and no product read keys on keyword.id;
+// every fixture here stays far below it). Timestamps the run wrote are
+// compared as "written by this run" (both writers stamp CURRENT_TIMESTAMP /
+// now(), one value per transaction); timestamps already present compare as
+// "already there". ⛔ No assertion reads a reported change count (S179).
+// ===========================================================================
+
+#[cfg(test)]
+mod set_write_equivalence_support
+{
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// When set (a directory), every fixture is created under it and KEPT —
+    /// the scale harnesses' evidence. Otherwise fixtures live under the system
+    /// temp directory and are removed when the `Fixture` drops, as every other
+    /// test module's are.
+    pub(super) const KEEP_FIXTURES_ENV: &str = "PL_SET_WRITE_FIXTURE_DIR";
+
+    pub(super) struct Fixture
+    {
+        pub(super) dir: PathBuf,
+        keep: bool,
+    }
+
+    impl Drop for Fixture
+    {
+        fn drop(&mut self)
+        {
+            if !self.keep
+            {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+    }
+
+    /// A NEW, never-used directory (an existing name is skipped, never reused).
+    pub(super) fn fixture_dir(tag: &str) -> Fixture
+    {
+        let (root, keep) = match std::env::var(KEEP_FIXTURES_ENV)
+        {
+            Ok(root) if !root.trim().is_empty() => (PathBuf::from(root), true),
+            _ => (std::env::temp_dir(), false),
+        };
+        loop
+        {
+            let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let dir = root.join(format!("plcore-s194-set-write-{}-{}-{}", std::process::id(), n, tag));
+            if dir.exists()
+            {
+                continue;
+            }
+            std::fs::create_dir_all(&dir).expect("fixture directory");
+            return Fixture { dir, keep };
+        }
+    }
+
+    pub(super) fn open_fenced(path: &Path) -> Connection
+    {
+        let conn = open_and_migrate_catalogue(path).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH.
+        fence_connection_against_extension_fetches(&conn);
+        conn
+    }
+
+    pub(super) fn copy_catalogue(base: &Path, dir: &Path, name: &str) -> PathBuf
+    {
+        let target = dir.join(name);
+        std::fs::copy(base, &target).expect("copy catalogue");
+        target
+    }
+
+    pub(super) fn count(conn: &Connection, sql: &str) -> i64
+    {
+        conn.query_row(sql, [], |row| row.get(0)).unwrap_or_else(|e| panic!("{}: {}", sql, e))
+    }
+
+    pub(super) fn rows_as_strings(conn: &Connection, sql: &str, columns: usize) -> Vec<Vec<Option<String>>>
+    {
+        let mut stmt = conn.prepare(sql).unwrap_or_else(|e| panic!("prepare {}: {}", sql, e));
+        let rows = stmt
+            .query_map([], |row|
+            {
+                let mut out = Vec::with_capacity(columns);
+                for index in 0..columns
+                {
+                    out.push(row.get::<_, Option<String>>(index)?);
+                }
+                Ok(out)
+            })
+            .unwrap_or_else(|e| panic!("query {}: {}", sql, e));
+        rows.map(|row| row.expect("row")).collect()
+    }
+
+    /// Every timestamp the catalogue holds BEFORE the run, from `sql`'s one column.
+    pub(super) fn timestamps(conn: &Connection, sql: &str) -> BTreeSet<String>
+    {
+        rows_as_strings(conn, sql, 1).into_iter().filter_map(|row| row.into_iter().next().flatten()).collect()
+    }
+
+    /// Table name → its rows rendered one line each; `run_timestamps` = the
+    /// distinct timestamps the run wrote (one per write transaction).
+    pub(super) struct Dump
+    {
+        pub(super) tables: BTreeMap<&'static str, Vec<String>>,
+        pub(super) run_timestamps: BTreeSet<String>,
+    }
+
+    /// Render `sql`'s rows; a value in a `timestamp_columns` column is "PRE"
+    /// when it was already in the catalogue (`pre`) and "RUN" when the run
+    /// wrote it.
+    pub(super) fn render_table(
+        conn: &Connection,
+        sql: &str,
+        columns: usize,
+        timestamp_columns: &[usize],
+        pre: &BTreeSet<String>,
+        run_timestamps: &mut BTreeSet<String>,
+    ) -> Vec<String>
+    {
+        rows_as_strings(conn, sql, columns)
+            .into_iter()
+            .map(|row|
+            {
+                row.into_iter()
+                    .enumerate()
+                    .map(|(index, value)| match value
+                    {
+                        None => "∅".to_string(),
+                        Some(text) if timestamp_columns.contains(&index) =>
+                        {
+                            if pre.contains(&text)
+                            {
+                                "PRE".to_string()
+                            }
+                            else
+                            {
+                                run_timestamps.insert(text);
+                                "RUN".to_string()
+                            }
+                        }
+                        Some(text) => text,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect()
+    }
+
+    /// The number of differing lines across every table (0 = identical); the
+    /// first few differences of each table are printed.
+    pub(super) fn diff_dumps(label: &str, left: &Dump, right: &Dump) -> usize
+    {
+        let mut total = 0usize;
+        for (name, left_lines) in &left.tables
+        {
+            let empty = Vec::new();
+            let right_lines = right.tables.get(name).unwrap_or(&empty);
+            let mut differing = 0usize;
+            for index in 0..left_lines.len().max(right_lines.len())
+            {
+                let a = left_lines.get(index);
+                let b = right_lines.get(index);
+                if a != b
+                {
+                    if differing < 5
+                    {
+                        println!("  DIFF {} {} #{}:\n    reference: {:?}\n    set-based: {:?}", label, name, index, a, b);
+                    }
+                    differing += 1;
+                }
+            }
+            total += differing;
+        }
+        if left.run_timestamps.len() != right.run_timestamps.len()
+        {
+            println!(
+                "  DIFF {} write transactions: reference {} · set-based {}",
+                label,
+                left.run_timestamps.len(),
+                right.run_timestamps.len()
+            );
+            total += 1;
+        }
+        total
+    }
+
+    /// TEMP tables named `prefix…` this connection can see.
+    pub(super) fn temp_tables_named(conn: &Connection, prefix: &str) -> i64
+    {
+        conn.query_row(
+            "SELECT COUNT(*) FROM duckdb_tables() WHERE starts_with(table_name, ?1)",
+            params![prefix],
+            |row| row.get(0),
+        )
+        .expect("temp table census")
+    }
+
+    /// True when the connection is in autocommit (a fresh BEGIN succeeds).
+    pub(super) fn not_in_a_transaction(conn: &Connection) -> bool
+    {
+        conn.execute_batch("BEGIN TRANSACTION; ROLLBACK;").is_ok()
+    }
+}
+
+#[cfg(test)]
+mod face_search_save_set_tests
+{
+    //! ⭐ S194-86d — the named face-search save, set-based, against the
+    //! per-face reference on every W4-20 writer fixture (the ten
+    //! `named_face_search_assignment_tests` scenarios) plus the keyword and
+    //! old-owner edge states, then targeted pins for each rule the set
+    //! statements re-express. `scale_drive_fixture_and_live_replay` is the
+    //! `#[ignore]` `--release` timing harness.
+    use super::*;
+    use super::set_write_equivalence_support::*;
+    use std::collections::BTreeSet;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    const MODEL: &str = "auraface-coreml-v1";
+    const PREPROCESSING: &str = "expanded_square_v1";
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Writer
+    {
+        PerRowReference,
+        SetBased,
+    }
+
+    fn write(conn: &Connection, writer: Writer, matches: &[FaceSearchMatchRecord], name: &str, seeds: &[i64]) -> PersonClusterAcceptResult
+    {
+        match writer
+        {
+            Writer::PerRowReference => assign_face_search_matches_to_person_per_row_reference(
+                conn, matches, name, MODEL, PREPROCESSING, 0.58, seeds,
+            ),
+            Writer::SetBased => assign_face_search_matches_to_person_impl(
+                conn, matches, name, MODEL, PREPROCESSING, 0.58, seeds,
+            ),
+        }
+    }
+
+    fn matched(face_observation_id: i64, image_id: i64, seed: i64, cosine: f64) -> FaceSearchMatchRecord
+    {
+        FaceSearchMatchRecord { image_id, face_observation_id, seed_face_observation_id: seed, face_index: 0, cosine }
+    }
+
+    fn face(conn: &Connection, id: i64, image_id: i64)
+    {
+        pair_face(conn, id, image_id, image_id, 0);
+    }
+
+    fn pair_face(conn: &Connection, id: i64, image_id: i64, analyzed_image_id: i64, face_index: i64)
+    {
+        conn.execute(
+            "INSERT INTO face_observation
+                 (id, image_id, analyzed_image_id, face_index, algorithm_version, analysis_run_id,
+                  bounding_box_x, bounding_box_y, bounding_box_width, bounding_box_height)
+             VALUES (?1, ?2, ?3, ?4, 'v', 'run', 0.1, 0.1, 0.2, 0.2)",
+            params![id, image_id, analyzed_image_id, face_index],
+        )
+        .expect("insert face observation");
+    }
+
+    fn image_row(conn: &Connection, id: i64, is_video: bool)
+    {
+        conn.execute(
+            "INSERT INTO images (id, file_path, file_size, file_name, created_timestamp, modified_timestamp, is_video)
+             VALUES (?1, '/s194d/img_' || CAST(?1 AS VARCHAR), 1, 'img', 0, 0, ?2)",
+            params![id, is_video],
+        )
+        .expect("image row");
+    }
+
+    fn kw_row(conn: &Connection, image_id: i64, label: &str, path: &str, status: i32, origin: i32, collection: bool)
+    {
+        conn.execute(
+            "INSERT INTO keyword (image_id, label, path, status, origin, created_at, hidden_at, collection, color, is_video)
+             VALUES (?1, ?2, ?3, ?4, ?5, TIMESTAMP '2026-09-01 00:00:00',
+                     CASE WHEN ?4 = 0 THEN TIMESTAMP '2026-09-02 00:00:00' END, ?6, FALSE, FALSE)",
+            params![image_id, label, path, status, origin, collection],
+        )
+        .expect("keyword row");
+    }
+
+    fn people(name: &str) -> String
+    {
+        ["People", name].join(KEYWORD_PATH_SEPARATOR)
+    }
+
+    /// The W4-20 fixture: Judy (faces 3, 4 and 7 outside the search), Bob (5),
+    /// Carol (1, the clicked face) and ZZW4R (6), written through the
+    /// production manual writer; face 2 is unassigned.
+    fn seed_people(conn: &Connection)
+    {
+        for (id, image) in [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7)]
+        {
+            face(conn, id, image);
+        }
+        assert_eq!(assign_face_observations_to_person_impl(conn, &[3, 4, 7], "Judy Wagner").status, "assigned");
+        assert_eq!(assign_face_observations_to_person_impl(conn, &[5], "Bob").status, "assigned");
+        assert_eq!(assign_face_observations_to_person_impl(conn, &[1], "Carol").status, "assigned");
+        assert_eq!(assign_face_observations_to_person_impl(conn, &[6], "ZZW4R").status, "assigned");
+    }
+
+    fn all_matches() -> Vec<FaceSearchMatchRecord>
+    {
+        vec![
+            matched(1, 1, 1, 1.0),
+            matched(2, 2, 1, 0.81),
+            matched(3, 3, 1, 0.74),
+            matched(4, 4, 1, 0.71),
+            matched(5, 5, 1, 0.66),
+            matched(6, 6, 1, 0.90),
+        ]
+    }
+
+    /// Images 31–38 in every keyword state the People mirror distinguishes:
+    /// 31 a user People row AND a user leaf (both merge) · 32 a HIDDEN People
+    /// row only (a fresh active row is inserted beside it) · 33 two ACTIVE
+    /// People rows, one face, one user (the one lacking the bit merges; counted
+    /// once) · 34 an active origin-0 collection leaf (merges to face) · 35 both
+    /// rows already face (nothing written, nothing counted) · 36 a VIDEO image ·
+    /// 37 NO images row (the `is_video` subquery is NULL → FALSE) · 38 two faces
+    /// on one image (one keyword pair).
+    fn keyword_edge_states(conn: &Connection)
+    {
+        for image in 31..=38
+        {
+            if image != 37
+            {
+                image_row(conn, image, image == 36);
+            }
+            face(conn, image, image);
+        }
+        pair_face(conn, 138, 38, 38, 1);
+        kw_row(conn, 31, "People", "People", 1, 1, false);
+        kw_row(conn, 31, "Kim", &people("Kim"), 1, 1, false);
+        kw_row(conn, 32, "People", "People", 0, 4, false);
+        kw_row(conn, 33, "People", "People", 1, 4, false);
+        kw_row(conn, 33, "People", "People", 1, 1, false);
+        kw_row(conn, 34, "Kim", &people("Kim"), 1, 0, true);
+        kw_row(conn, 35, "People", "People", 1, 4, false);
+        kw_row(conn, 35, "Kim", &people("Kim"), 1, 6, false);
+    }
+
+    fn keyword_edge_matches() -> Vec<FaceSearchMatchRecord>
+    {
+        (31..=38).map(|id| matched(id, id, 31, 0.8)).chain([matched(138, 38, 31, 0.7)]).collect()
+    }
+
+    /// Lee owns faces 41 and 42 (both image 41): only 41 moves, so Lee keeps
+    /// image 41's label. Mo owns 43, whose stored row points at image 44 (a
+    /// divergent image id): Mo's label AND the People root on 44 are cleaned,
+    /// and Mo is deleted. Nia owns 45 with a user+face label and 46 with a
+    /// collection label: both stay active.
+    fn old_owner_edges(conn: &Connection)
+    {
+        for (id, image) in [(41, 41), (43, 43), (45, 45), (46, 46)]
+        {
+            face(conn, id, image);
+        }
+        pair_face(conn, 42, 41, 41, 1);
+        assert_eq!(assign_face_observations_to_person_impl(conn, &[41, 42], "Lee").status, "assigned");
+        assert_eq!(assign_face_observations_to_person_impl(conn, &[43], "Mo").status, "assigned");
+        assert_eq!(assign_face_observations_to_person_impl(conn, &[45, 46], "Nia").status, "assigned");
+        conn.execute("UPDATE person_face_assignment SET image_id = 44 WHERE face_observation_id = 43", [])
+            .expect("divergent stored image");
+        conn.execute("UPDATE keyword SET image_id = 44 WHERE image_id = 43", []).expect("the label follows it");
+        conn.execute("UPDATE keyword SET origin = 5 WHERE image_id = 45 AND path = ?1", params![people("Nia")])
+            .expect("user+face label");
+        conn.execute("UPDATE keyword SET collection = TRUE WHERE image_id = 46 AND path = ?1", params![people("Nia")])
+            .expect("collection label");
+    }
+
+    fn old_owner_matches() -> Vec<FaceSearchMatchRecord>
+    {
+        [41, 43, 45, 46].iter().map(|&id| matched(id, id, 41, 0.9)).collect()
+    }
+
+    type Setup = fn(&Connection);
+    type Calls = fn(&Connection, Writer) -> Vec<PersonClusterAcceptResult>;
+
+    fn move_left_alone(conn: &Connection, writer: Writer, first: &PersonClusterAcceptResult) -> PersonClusterAcceptResult
+    {
+        let move_matches = first
+            .left_with_other_people_faces
+            .iter()
+            .map(|face| FaceSearchMatchRecord {
+                image_id: face.image_id,
+                face_observation_id: face.face_observation_id,
+                seed_face_observation_id: face.seed_face_observation_id,
+                face_index: face.face_index,
+                cosine: face.cosine,
+            })
+            .collect::<Vec<_>>();
+        let move_ids = move_matches.iter().map(|m| m.face_observation_id).collect::<Vec<_>>();
+        write(conn, writer, &move_matches, &first.person_name, &move_ids)
+    }
+
+    /// The ten W4-20 writer fixtures (the `named_face_search_assignment_tests`
+    /// scenarios, same setups and calls) plus the keyword and old-owner edge
+    /// states and the invalid / empty inputs.
+    fn sc(tag: &'static str, setup: Setup, calls: Calls) -> (&'static str, Setup, Calls)
+    {
+        (tag, setup, calls)
+    }
+
+    fn scenarios() -> Vec<(&'static str, Setup, Calls)>
+    {
+        vec![
+            sc("leave-alone", seed_people, |c, w| vec![write(c, w, &all_matches(), "ZZW4R", &[1])]),
+            sc("no-seeds", seed_people, |c, w| vec![write(c, w, &all_matches(), "ZZW4R", &[])]),
+            sc("move", seed_people, |c, w|
+            {
+                let first = write(c, w, &all_matches(), "ZZW4R", &[1]);
+                let moved = move_left_alone(c, w, &first);
+                vec![first, moved]
+            }),
+            sc("case-variant", |c|
+            {
+                face(c, 21, 21);
+                face(c, 22, 22);
+                face(c, 23, 23);
+            }, |c, w|
+            {
+                let first = write(c, w, &[matched(21, 21, 21, 1.0)], "ZZW4Rb", &[21]);
+                let second = write(c, w, &[matched(22, 22, 22, 1.0)], "zzw4rb", &[22]);
+                let manual = assign_face_observations_to_person_impl(c, &[23], "ZZW4RB");
+                vec![first, second, manual]
+            }),
+            sc("twin-seed", |c|
+            {
+                pair_face(c, 10, 10, 10, 0);
+                pair_face(c, 11, 11, 10, 0);
+                assert_eq!(assign_face_observations_to_person_impl(c, &[10], "Carol").status, "assigned");
+            }, |c, w| vec![write(c, w, &[matched(10, 10, 10, 1.0)], "Dana", &[11])]),
+            sc("nothing-written", seed_people, |c, w|
+            {
+                let fresh = write(c, w, &[matched(3, 3, 0, 0.7), matched(5, 5, 0, 0.6)], "Nobody Yet", &[]);
+                let existing = write(c, w, &[matched(5, 5, 0, 0.6)], "zzw4r", &[]);
+                vec![fresh, existing]
+            }),
+            sc("fail-closed", |c|
+            {
+                seed_people(c);
+                c.execute_batch(
+                    "DROP INDEX idx_person_normalized_name;
+                     ALTER TABLE person ALTER COLUMN display_name DROP NOT NULL;
+                     UPDATE person SET display_name = NULL WHERE normalized_name = 'judy wagner';",
+                )
+                .expect("make Judy's name unreadable");
+            }, |c, w| vec![write(c, w, &all_matches(), "ZZW4R", &[1])]),
+            sc("hand-label", |c|
+            {
+                seed_people(c);
+                insert_or_merge_active_keyword_for_image(c, 99, &["People".to_string(), "Bob".to_string()], KEYWORD_ORIGIN_USER)
+                    .expect("hand-applied Bob label");
+            }, |c, w| vec![write(c, w, &[matched(5, 5, 5, 1.0)], "ZZW4R", &[5])]),
+            sc("faces-no-label", |c|
+            {
+                seed_people(c);
+                c.execute("UPDATE keyword SET status = 0 WHERE path = ?1", params![people("Judy Wagner")])
+                    .expect("hide Judy's label");
+            }, |c, w| vec![write(c, w, &[matched(3, 3, 3, 1.0), matched(4, 4, 4, 1.0)], "ZZW4R", &[3, 4])]),
+            sc("unnamed-rollback", |c|
+            {
+                seed_people(c);
+                let carol: i64 = c
+                    .query_row("SELECT id FROM person WHERE normalized_name = 'carol'", [], |row| row.get(0))
+                    .expect("carol");
+                c.execute_batch("CREATE TABLE person_reference (person_id INTEGER REFERENCES person(id));")
+                    .expect("reference table");
+                c.execute("INSERT INTO person_reference VALUES (?1)", params![carol]).expect("reference Carol");
+            }, |c, w| vec![write(c, w, &all_matches(), "ZZW4R", &[1])]),
+            sc("keyword-edge-states", keyword_edge_states, |c, w| vec![write(c, w, &keyword_edge_matches(), "Kim", &[31])]),
+            sc("old-owner-edges", old_owner_edges, |c, w| vec![write(c, w, &old_owner_matches(), "Pat", &[41, 43, 45, 46])]),
+            sc("invalid-and-empty", |c| face(c, 51, 51), |c, w|
+            {
+                vec![
+                    write(c, w, &[matched(51, 51, 51, 1.0)], "   ", &[]),
+                    write(c, w, &[matched(51, 51, 51, 1.0)], &format!("A{}B", KEYWORD_PATH_SEPARATOR), &[]),
+                    write(c, w, &[], "Quinn", &[]),
+                    write(c, w, &[matched(0, 51, 51, 1.0), matched(51, 51, 51, f64::NAN)], "Quinn", &[]),
+                    write(c, w, &[matched(51, 51, 51, 1.0)], "  Quinn   Q ", &[]),
+                ]
+            }),
+        ]
+    }
+
+    const PERSON_DUMP: &str = "SELECT CAST(id AS VARCHAR), display_name, normalized_name,
+            CAST(created_at AS VARCHAR), CAST(updated_at AS VARCHAR)
+        FROM person ORDER BY id";
+    const ASSIGNMENT_DUMP: &str = "SELECT CAST(face_observation_id AS VARCHAR), CAST(person_id AS VARCHAR),
+            CAST(image_id AS VARCHAR), CAST(analyzed_image_id AS VARCHAR), CAST(face_index AS VARCHAR),
+            assignment_source, face_cluster_run_id, CAST(face_cluster_id AS VARCHAR), model_version,
+            preprocessing_version, CAST(threshold AS VARCHAR), CAST(confidence_cosine AS VARCHAR),
+            CAST(created_at AS VARCHAR), CAST(updated_at AS VARCHAR)
+        FROM person_face_assignment ORDER BY face_observation_id";
+    const KEYWORD_DUMP: &str = "SELECT CAST(id AS VARCHAR), CAST(image_id AS VARCHAR), label,
+            replace(path, chr(31), ' › '), CAST(status AS VARCHAR), CAST(origin AS VARCHAR),
+            CAST(created_at AS VARCHAR), CAST(hidden_at AS VARCHAR), CAST(collection AS VARCHAR),
+            CAST(color AS VARCHAR), CAST(is_video AS VARCHAR)
+        FROM keyword ORDER BY id";
+    const PRE_RUN_TIMESTAMPS: &str = "SELECT DISTINCT ts FROM (
+             SELECT CAST(created_at AS VARCHAR) ts FROM person UNION ALL
+             SELECT CAST(updated_at AS VARCHAR) FROM person UNION ALL
+             SELECT CAST(created_at AS VARCHAR) FROM person_face_assignment UNION ALL
+             SELECT CAST(updated_at AS VARCHAR) FROM person_face_assignment UNION ALL
+             SELECT CAST(created_at AS VARCHAR) FROM keyword UNION ALL
+             SELECT CAST(hidden_at AS VARCHAR) FROM keyword
+         ) WHERE ts IS NOT NULL";
+
+    /// Full-row fingerprints of the two tables a face save must never touch.
+    fn untouched_fingerprint(conn: &Connection) -> Vec<String>
+    {
+        [
+            "SELECT CAST(COUNT(*) AS VARCHAR) || ' ' || COALESCE(md5(string_agg(CAST(t AS VARCHAR), chr(10) ORDER BY t.id)), '') FROM images t",
+            "SELECT CAST(COUNT(*) AS VARCHAR) || ' ' || COALESCE(md5(string_agg(CAST(t AS VARCHAR), chr(10) ORDER BY t.id)), '') FROM face_observation t",
+        ]
+        .iter()
+        .map(|sql| rows_as_strings(conn, sql, 1).into_iter().next().and_then(|row| row.into_iter().next().flatten()).unwrap_or_default())
+        .collect()
+    }
+
+    struct Before
+    {
+        timestamps: BTreeSet<String>,
+        untouched: Vec<String>,
+    }
+
+    fn before(conn: &Connection) -> Before
+    {
+        Before { timestamps: timestamps(conn, PRE_RUN_TIMESTAMPS), untouched: untouched_fingerprint(conn) }
+    }
+
+    /// person, person_face_assignment and keyword (ids included — every fixture
+    /// inserts far fewer than the 122,880-row bound on keyword-id order), the keyword
+    /// table's content without ids, and the run's own invariants: images and
+    /// face_observation untouched, no staging table left, not in a transaction.
+    fn dump(conn: &Connection, before: &Before) -> Dump
+    {
+        let mut run_timestamps = BTreeSet::new();
+        let mut tables = std::collections::BTreeMap::new();
+        tables.insert("person", render_table(conn, PERSON_DUMP, 5, &[3, 4], &before.timestamps, &mut run_timestamps));
+        tables.insert(
+            "person_face_assignment",
+            render_table(conn, ASSIGNMENT_DUMP, 14, &[12, 13], &before.timestamps, &mut run_timestamps),
+        );
+        tables.insert("keyword", render_table(conn, KEYWORD_DUMP, 11, &[6, 7], &before.timestamps, &mut run_timestamps));
+        let mut content = tables["keyword"]
+            .iter()
+            .map(|line| line.splitn(2, '|').nth(1).unwrap_or("").to_string())
+            .collect::<Vec<_>>();
+        content.sort();
+        tables.insert("keyword_content_without_id", content);
+        tables.insert(
+            "invariants",
+            vec![
+                format!("images+face_observation untouched: {}", untouched_fingerprint(conn) == before.untouched),
+                format!("staging tables left: {}", temp_tables_named(conn, "pl_face_search_save")),
+                format!("not in a transaction: {}", not_in_a_transaction(conn)),
+            ],
+        );
+        Dump { tables, run_timestamps }
+    }
+
+    fn assert_invariants(tag: &str, writer: Writer, dump: &Dump)
+    {
+        assert_eq!(
+            dump.tables["invariants"],
+            vec![
+                "images+face_observation untouched: true".to_string(),
+                "staging tables left: 0".to_string(),
+                "not in a transaction: true".to_string(),
+            ],
+            "{} {:?}: a face save touches only person, person_face_assignment and keyword, \
+             leaves no staging table, and never leaves the connection inside a transaction",
+            tag,
+            writer
+        );
+    }
+
+    /// One scenario, both writers, two identically built catalogues.
+    fn run_scenario(tag: &str, setup: Setup, calls: Calls) -> (usize, bool)
+    {
+        let mut dumps = Vec::new();
+        let mut results = Vec::new();
+        let mut fixtures = Vec::new();
+        for writer in [Writer::PerRowReference, Writer::SetBased]
+        {
+            let fixture = fixture_dir(&format!("face-{}-{:?}", tag, writer));
+            let conn = open_fenced(&fixture.dir.join("catalogue.db"));
+            setup(&conn);
+            let before = before(&conn);
+            let run = calls(&conn, writer);
+            results.push(run.iter().map(|result| format!("{:?}", result)).collect::<Vec<_>>());
+            let dump = dump(&conn, &before);
+            assert_invariants(tag, writer, &dump);
+            dumps.push(dump);
+            fixtures.push(fixture);
+        }
+        let differing = diff_dumps(tag, &dumps[0], &dumps[1]);
+        let results_equal = results[0] == results[1];
+        if !results_equal
+        {
+            println!("  RESULT DIFF {}:\n    reference: {:#?}\n    set-based: {:#?}", tag, results[0], results[1]);
+        }
+        println!("SCENARIO {:<20} differing rows={} results equal={}", tag, differing, results_equal);
+        (differing, results_equal)
+    }
+
+    #[test]
+    fn set_save_matches_the_per_row_reference_on_every_w4_20_fixture()
+    {
+        let mut failures = Vec::new();
+        for (tag, setup, calls) in scenarios()
+        {
+            let (differing, results_equal) = run_scenario(tag, setup, calls);
+            if differing != 0 || !results_equal
+            {
+                failures.push(tag);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "S194-86d: the set-based save must write exactly the per-face writer's rows \
+             (person, person_face_assignment, keyword — ids included, below the \
+             122,880-row keyword-id bound) and return the \
+             same result; it did not on: {:?}",
+            failures
+        );
+    }
+
+    /// (origin, status) of every row on `image_id` at `path`, sorted.
+    fn keyword_states(conn: &Connection, image_id: i64, path: &str) -> Vec<(i32, i32)>
+    {
+        let mut stmt = conn
+            .prepare("SELECT origin, status FROM keyword WHERE image_id = ?1 AND path = ?2 ORDER BY origin, status")
+            .expect("prepare keyword states");
+        let rows = stmt
+            .query_map(params![image_id, path], |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i32>(1)?)))
+            .expect("keyword states");
+        rows.map(|row| row.expect("keyword state")).collect()
+    }
+
+    #[test]
+    fn people_mirror_merges_the_face_bit_and_counts_each_image_path_once()
+    {
+        let fixture = fixture_dir("mirror-merge");
+        let conn = open_fenced(&fixture.dir.join("catalogue.db"));
+        keyword_edge_states(&conn);
+
+        let result = write(&conn, Writer::SetBased, &keyword_edge_matches(), "Kim", &[31]);
+
+        assert_eq!(result.status, "assigned");
+        assert_eq!(result.assigned_face_count, 9, "nine faces on eight images");
+        assert_eq!(result.keyword_image_count, 8);
+        // 31: two merges · 32: two inserts · 33: one merge (two rows, counted
+        // once) + one insert · 34: one insert + one merge · 35: nothing ·
+        // 36, 37, 38: two inserts each.
+        assert_eq!(
+            result.keyword_row_count, 14,
+            "each (image, path) counts once — an insert or a merge — read before the writes"
+        );
+        let root = "People";
+        let kim = people("Kim");
+        assert_eq!(keyword_states(&conn, 31, root), vec![(5, 1)], "a user People row gains the face bit");
+        assert_eq!(keyword_states(&conn, 31, &kim), vec![(5, 1)], "a hand-applied leaf gains the face bit");
+        assert_eq!(
+            keyword_states(&conn, 32, root),
+            vec![(4, 0), (4, 1)],
+            "a HIDDEN row is not active: a fresh active face row is inserted and the hidden one stays hidden"
+        );
+        assert_eq!(keyword_states(&conn, 32, &kim), vec![(4, 1)]);
+        assert_eq!(
+            keyword_states(&conn, 33, root),
+            vec![(4, 1), (5, 1)],
+            "of two active rows only the one lacking the bit merges; no third row"
+        );
+        assert_eq!(keyword_states(&conn, 34, root), vec![(4, 1)]);
+        assert_eq!(keyword_states(&conn, 34, &kim), vec![(4, 1)], "an origin-0 collection leaf merges to face");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM keyword WHERE image_id = 34 AND collection = TRUE"),
+            1,
+            "the merge keeps the collection switch"
+        );
+        assert_eq!(keyword_states(&conn, 35, root), vec![(4, 1)], "already face: untouched");
+        assert_eq!(keyword_states(&conn, 35, &kim), vec![(6, 1)], "already face: untouched");
+        for image in [36, 37, 38]
+        {
+            assert_eq!(keyword_states(&conn, image, root), vec![(4, 1)], "image {}: one People row", image);
+            assert_eq!(keyword_states(&conn, image, &kim), vec![(4, 1)], "image {}: one leaf, two faces or not", image);
+        }
+    }
+
+    #[test]
+    fn people_mirror_carries_is_video_from_the_image()
+    {
+        let fixture = fixture_dir("mirror-video");
+        let conn = open_fenced(&fixture.dir.join("catalogue.db"));
+        keyword_edge_states(&conn);
+
+        let result = write(&conn, Writer::SetBased, &keyword_edge_matches(), "Kim", &[31]);
+        assert_eq!(result.status, "assigned");
+
+        let is_video = |image_id: i64| -> Vec<bool>
+        {
+            let mut stmt = conn
+                .prepare("SELECT is_video FROM keyword WHERE image_id = ?1 AND status = 1 AND (origin & 4) <> 0 ORDER BY id")
+                .expect("prepare is_video");
+            let rows = stmt.query_map(params![image_id], |row| row.get::<_, bool>(0)).expect("is_video");
+            rows.map(|row| row.expect("is_video row")).collect()
+        };
+        assert_eq!(is_video(36), vec![true, true], "rows inserted for a VIDEO image carry is_video = TRUE");
+        assert_eq!(is_video(37), vec![false, false], "an image with no images row reads FALSE, never NULL");
+        assert_eq!(is_video(32), vec![false, false], "a still's inserted rows carry FALSE");
+    }
+
+    #[test]
+    fn keyword_ids_follow_the_old_per_image_order()
+    {
+        // Sixty images whose matches arrive in a scrambled order, some already
+        // holding an active People root, so the inserts interleave roots and
+        // leaves. The per-image writer inserted image by image (ascending),
+        // root before leaf — `keyword_id_seq` must hand out the same ids, which
+        // holds up to one DuckDB row group (122,880 inserted keyword rows in one
+        // save); past that the INSERT's sort runs in parallel and the ids come out
+        // as a permutation (row contents identical; no product read keys on
+        // keyword.id). This fixture inserts 100 rows.
+        let setup = |conn: &Connection|
+        {
+            for image in 101..=160
+            {
+                image_row(conn, image, false);
+                face(conn, image, image);
+                if image % 3 == 0
+                {
+                    kw_row(conn, image, "People", "People", 1, 1, false);
+                }
+            }
+        };
+        let matches = (101..=160)
+            .map(|offset| (offset * 37) % 60 + 101)
+            .map(|image| matched(image, image, 101, 0.6 + (image % 7) as f64 / 100.0))
+            .collect::<Vec<_>>();
+
+        let mut inserted = Vec::new();
+        let mut fixtures = Vec::new();
+        for writer in [Writer::PerRowReference, Writer::SetBased]
+        {
+            let fixture = fixture_dir(&format!("keyword-order-{:?}", writer));
+            let conn = open_fenced(&fixture.dir.join("catalogue.db"));
+            setup(&conn);
+            let first_new_id = count(&conn, "SELECT COALESCE(MAX(id), 0) + 1 FROM keyword");
+            let result = write(&conn, writer, &matches, "Ola", &[]);
+            assert_eq!(result.status, "assigned");
+            let rows = rows_as_strings(
+                &conn,
+                &format!(
+                    "SELECT CAST(id AS VARCHAR), CAST(image_id AS VARCHAR), replace(path, chr(31), ' › ')
+                     FROM keyword WHERE id >= {} ORDER BY id",
+                    first_new_id
+                ),
+                3,
+            );
+            inserted.push(rows.into_iter().map(|row| row.into_iter().map(|v| v.unwrap_or_default()).collect::<Vec<_>>()).collect::<Vec<_>>());
+            fixtures.push(fixture);
+        }
+        assert_eq!(inserted[0], inserted[1], "every inserted keyword row gets the per-image writer's id");
+
+        // And the order itself, read on the table: by image, root before leaf.
+        let order = inserted[1]
+            .iter()
+            .map(|row| (row[1].parse::<i64>().expect("image id"), if row[2] == "People" { 0 } else { 1 }))
+            .collect::<Vec<_>>();
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(order, sorted, "keyword ids ascend by (image id, ancestor depth)");
+        assert_eq!(order.len(), 60 + 40, "60 leaves, and roots on the 40 images without one");
+    }
+
+    #[test]
+    fn old_owner_cleanup_follows_each_moved_face()
+    {
+        let fixture = fixture_dir("old-owner");
+        let conn = open_fenced(&fixture.dir.join("catalogue.db"));
+        old_owner_edges(&conn);
+
+        let result = write(&conn, Writer::SetBased, &old_owner_matches(), "Pat", &[41, 43, 45, 46]);
+        assert_eq!(result.status, "assigned");
+        assert_eq!(result.assigned_face_count, 4, "every chosen seed moves");
+
+        let root = "People";
+        // Lee keeps face 42 on image 41: Lee's label and the root stay.
+        assert_eq!(keyword_states(&conn, 41, &people("Lee")), vec![(4, 1)], "an owner with a face left keeps the label");
+        assert_eq!(keyword_states(&conn, 41, root), vec![(4, 1)]);
+        // Mo had one face, stored on image 44: label and root cleared and hidden.
+        assert_eq!(keyword_states(&conn, 44, &people("Mo")), vec![(0, 0)], "the emptied label is cleared AND hidden");
+        assert_eq!(
+            keyword_states(&conn, 44, root),
+            vec![(0, 0)],
+            "the People root on an image with no face left is cleared and hidden"
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person WHERE normalized_name = 'mo'"), 0, "Mo, named by nothing, is gone");
+        // Nia: the user half of a user+face label keeps it active; a collection keeps its row active.
+        assert_eq!(keyword_states(&conn, 45, &people("Nia")), vec![(1, 1)], "only the face bit is cleared");
+        assert_eq!(keyword_states(&conn, 45, root), vec![(4, 1)], "image 45 holds Pat's face: the root stays");
+        assert_eq!(keyword_states(&conn, 46, &people("Nia")), vec![(0, 1)], "a collection keeps an origin-0 row active");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM person WHERE normalized_name = 'nia'"), 1, "an active label keeps Nia");
+        // Pat is labelled where the faces now are.
+        for image in [41, 43, 45, 46]
+        {
+            assert_eq!(keyword_states(&conn, image, &people("Pat")), vec![(4, 1)], "image {}", image);
+        }
+    }
+
+    #[test]
+    fn staging_tables_never_outlive_the_save()
+    {
+        let fixture = fixture_dir("staging");
+        let conn = open_fenced(&fixture.dir.join("catalogue.db"));
+        seed_people(&conn);
+        face(&conn, 8, 8);
+
+        // A table an earlier save's failed drop left behind (the documented
+        // fallback): the next save replaces and drops it.
+        conn.execute_batch(
+            "CREATE TEMP TABLE pl_face_search_save_batch (leftover INTEGER);
+             CREATE TEMP TABLE pl_face_search_save_clear (leftover INTEGER);",
+        )
+        .expect("leftover staging tables");
+        assert_eq!(temp_tables_named(&conn, "pl_face_search_save"), 2);
+
+        // A save with a Move: all three staging tables are created …
+        let saved = write(&conn, Writer::SetBased, &all_matches(), "ZZW4R", &[1]);
+        assert_eq!(saved.status, "assigned");
+        assert!(saved.assigned_face_count > 0);
+        // … and none survives it.
+        assert_eq!(temp_tables_named(&conn, "pl_face_search_save"), 0, "a successful save drops every staging table");
+        assert!(not_in_a_transaction(&conn));
+
+        // A save that writes nothing creates none.
+        let nothing = write(&conn, Writer::SetBased, &[matched(3, 3, 3, 0.7)], "Nobody Yet", &[]);
+        assert_eq!((nothing.status.as_str(), nothing.assigned_face_count), ("assigned", 0));
+        assert_eq!(temp_tables_named(&conn, "pl_face_search_save"), 0);
+
+        // A save that fails after staging rolls the tables back with it.
+        conn.execute_batch("CREATE TABLE person_reference (person_id INTEGER REFERENCES person(id));")
+            .expect("reference table");
+        let judy: i64 = count(&conn, "SELECT id FROM person WHERE normalized_name = 'judy wagner'");
+        conn.execute("INSERT INTO person_reference VALUES (?1)", params![judy]).expect("reference Judy");
+        let failed = write(
+            &conn,
+            Writer::SetBased,
+            &[matched(3, 3, 3, 0.7), matched(4, 4, 3, 0.7), matched(7, 7, 3, 0.7), matched(8, 8, 3, 0.7)],
+            "Ruth",
+            &[3, 4, 7],
+        );
+        assert_eq!(failed.status, "failed", "deleting Judy (left with no face) is refused, so the save fails");
+        assert_eq!(temp_tables_named(&conn, "pl_face_search_save"), 0, "a ROLLBACK takes the staging tables with it");
+        assert!(not_in_a_transaction(&conn));
+    }
+
+    #[test]
+    fn a_failed_upsert_rolls_back_whole()
+    {
+        // Two refusals, each a real `Err` from the real upsert statement, made
+        // AFTER the person row and the staging table were written in the same
+        // transaction:
+        // * "constraint" — a test-only UNIQUE index on
+        //   person_face_assignment(image_id) and two faces of one image: an
+        //   EXECUTION-class error, which aborts the transaction;
+        // * "binder" — the table rebuilt without its primary key, so the
+        //   ON CONFLICT target names no unique constraint: a BINDER-class error,
+        //   which does NOT abort it. Only this case can tell a ROLLBACK from a
+        //   COMMIT: on 1.5.5 a COMMIT of an ABORTED transaction silently
+        //   discards it (S187, E3), so the first case alone would pass a COMMIT.
+        let constraint = |conn: &Connection|
+        {
+            seed_people(conn);
+            pair_face(conn, 8, 2, 2, 1);
+            conn.execute_batch("CREATE UNIQUE INDEX s194d_one_face_per_image ON person_face_assignment(image_id);")
+                .expect("test-only unique index");
+        };
+        let binder = |conn: &Connection|
+        {
+            seed_people(conn);
+            pair_face(conn, 8, 2, 2, 1);
+            conn.execute_batch(
+                "CREATE TABLE s194d_assignment_copy AS SELECT * FROM person_face_assignment;
+                 DROP TABLE person_face_assignment;
+                 ALTER TABLE s194d_assignment_copy RENAME TO person_face_assignment;",
+            )
+            .expect("test-only rebuild without the primary key");
+        };
+        let matches = vec![matched(2, 2, 2, 0.9), matched(8, 2, 2, 0.8)];
+
+        for (case, setup) in [("constraint", &constraint as &dyn Fn(&Connection)), ("binder", &binder)]
+        {
+            let mut signatures = Vec::new();
+            let mut fixtures = Vec::new();
+            for writer in [Writer::PerRowReference, Writer::SetBased]
+            {
+                let fixture = fixture_dir(&format!("failed-upsert-{}-{:?}", case, writer));
+                let conn = open_fenced(&fixture.dir.join("catalogue.db"));
+                setup(&conn);
+                let before = before(&conn);
+                let tables_before = dump(&conn, &before);
+
+                let result = write(&conn, writer, &matches, "Nora", &[]);
+
+                assert_eq!(result.status, "failed", "{} {:?}: the engine refused the upsert", case, writer);
+                assert_eq!(result.message, "Could not persist all face-search assignments.", "{} {:?}", case, writer);
+                assert_eq!(
+                    count(&conn, "SELECT COUNT(*) FROM person WHERE normalized_name = 'nora'"),
+                    0,
+                    "{} {:?}: the person row written before the upsert went with the ROLLBACK",
+                    case,
+                    writer
+                );
+                let tables_after = dump(&conn, &before);
+                assert_eq!(
+                    diff_dumps(&format!("failed-upsert {} {:?} before vs after", case, writer), &tables_before, &tables_after),
+                    0,
+                    "{} {:?}: nothing the save wrote survives — person, assignments and keywords exactly as before",
+                    case,
+                    writer
+                );
+                assert_invariants(case, writer, &tables_after);
+                signatures.push(format!("{:?}", result));
+                fixtures.push(fixture);
+            }
+            assert_eq!(signatures[0], signatures[1], "{}: both writers report the same failure", case);
+        }
+    }
+
+    /// Two owners and 1,050 faces, built in bulk: Alder owns faces 1–170 (images
+    /// 1–170) and keeps a second face on images 1–25; Birch owns faces 171–320
+    /// (images 171–320) and keeps a second face on images 316–320; Birch's faces
+    /// 311–315 are STORED on images 2311–2315 (a divergent image id, so the
+    /// People-root pair has work to do). Faces 321–1050 are unassigned. Each
+    /// owner carries its People + People<sep><Name> labels where its faces are.
+    /// Sized just past both staging chunks (1,050 > 1,000 faces; 320 > 300 moved
+    /// (image, owner) pairs) to keep the debug-profile suite fast.
+    fn chunk_boundary_fixture(conn: &Connection)
+    {
+        let ts = "TIMESTAMP '2026-09-01 00:00:00'";
+        conn.execute_batch(&format!(
+            "INSERT INTO images (id, file_path, file_size, file_name, created_timestamp, modified_timestamp, is_video)
+             SELECT i, '/s194d/chunk_' || CAST(i AS VARCHAR), 1, 'c', 0, 0, (i % 97 = 0) FROM range(1, 1051) t(i);
+             INSERT INTO face_observation (id, image_id, analyzed_image_id, face_index, algorithm_version, analysis_run_id,
+                                           bounding_box_x, bounding_box_y, bounding_box_width, bounding_box_height)
+             SELECT i, i, i, 0, 'v', 'run', 0.1, 0.1, 0.2, 0.2 FROM range(1, 1051) t(i)
+             UNION ALL SELECT 2000 + i, i, i, 1, 'v', 'run', 0.5, 0.1, 0.2, 0.2 FROM range(1, 26) t(i)
+             UNION ALL SELECT 2000 + i, i, i, 1, 'v', 'run', 0.5, 0.1, 0.2, 0.2 FROM range(316, 321) t(i);
+             INSERT INTO person (display_name, normalized_name, created_at, updated_at) VALUES
+                 ('Alder', 'alder', {ts}, {ts}),
+                 ('Birch', 'birch', {ts}, {ts});
+             INSERT INTO person_face_assignment (face_observation_id, person_id, image_id, analyzed_image_id, face_index,
+                                                 assignment_source, model_version, preprocessing_version, threshold,
+                                                 confidence_cosine, created_at, updated_at)
+             SELECT f.id, p.id, f.image_id, f.analyzed_image_id, f.face_index, 'face_search_match',
+                    'auraface-coreml-v1', 'expanded_square_v1', 0.58, 0.7, {ts}, {ts}
+             FROM face_observation f
+             JOIN person p ON p.normalized_name =
+                 CASE
+                     WHEN f.id <= 170 OR f.id BETWEEN 2001 AND 2025 THEN 'alder'
+                     WHEN f.id <= 320 OR f.id BETWEEN 2316 AND 2320 THEN 'birch'
+                 END
+             ORDER BY f.id;
+             UPDATE person_face_assignment SET image_id = image_id + 2000 WHERE face_observation_id BETWEEN 311 AND 315;
+             INSERT INTO keyword (image_id, label, path, status, origin, created_at, hidden_at, collection, color, is_video)
+             SELECT image_id, 'People', 'People', 1, 4, {ts}, NULL, FALSE, FALSE, FALSE
+             FROM (SELECT DISTINCT image_id FROM person_face_assignment) ORDER BY image_id;
+             INSERT INTO keyword (image_id, label, path, status, origin, created_at, hidden_at, collection, color, is_video)
+             SELECT a.image_id, p.display_name, 'People' || chr(31) || p.display_name, 1, 4, {ts}, NULL, FALSE, FALSE, FALSE
+             FROM (SELECT DISTINCT image_id, person_id FROM person_face_assignment) a
+             JOIN person p ON p.id = a.person_id
+             ORDER BY a.image_id, p.display_name;",
+            ts = ts
+        ))
+        .expect("chunk-boundary fixture");
+    }
+
+    /// Active rows at `path` on images in `low..=high`.
+    fn active_label_count(conn: &Connection, path: &str, low: i64, high: i64) -> i64
+    {
+        conn.query_row(
+            "SELECT COUNT(*) FROM keyword WHERE path = ?1 AND status = 1 AND image_id BETWEEN ?2 AND ?3",
+            params![path, low, high],
+            |row| row.get(0),
+        )
+        .expect("active label count")
+    }
+
+    /// ⭐ S194-86d fix round 1 (REVIEW-1 F1) — a save that crosses BOTH staging
+    /// chunk boundaries: 1,050 faces staged (`FACE_SEARCH_SAVE_BATCH_CHUNK` =
+    /// 1,000, so two statements) and 320 explicit-seed moves from two owners
+    /// (`FACE_SEARCH_SAVE_MOVED_CHUNK` = 300, so two statements; images 301–310,
+    /// 316–320 and the divergent 2311–2315 sort into the SECOND). Row for row
+    /// against the per-face reference, and the outcome read on the table for
+    /// both writers.
+    #[test]
+    fn a_save_crossing_both_staging_chunk_boundaries_matches_the_reference()
+    {
+        assert!(1050 > FACE_SEARCH_SAVE_BATCH_CHUNK, "the save must need a second staging statement");
+        assert!(320 > FACE_SEARCH_SAVE_MOVED_CHUNK, "the moves must need a second staging statement");
+        let (differing, results_equal) = run_scenario("chunk-boundaries", chunk_boundary_fixture, |c, w|
+        {
+            let matches = (1..=1050)
+                .map(|id| matched(id, id, 1, 0.5 + ((id * 7919) % 450) as f64 / 1000.0))
+                .collect::<Vec<_>>();
+            let seeds = (1..=320).collect::<Vec<i64>>();
+            let result = write(c, w, &matches, "Cedar", &seeds);
+            assert_eq!(
+                (result.status.as_str(), result.assigned_face_count, result.left_with_other_people_face_count),
+                ("assigned", 1050, 0),
+                "{:?}: every face is saved, every chosen seed moves",
+                w
+            );
+            assert_eq!(
+                count(c, "SELECT COUNT(*) FROM person_face_assignment a JOIN person p ON p.id = a.person_id WHERE p.normalized_name = 'cedar'"),
+                1050,
+                "{:?}: faces past the first staging statement are written too",
+                w
+            );
+            assert_eq!(active_label_count(c, &people("Cedar"), 1001, 1050), 50, "{:?}: the second chunk's images are labelled", w);
+            assert_eq!(active_label_count(c, &people("Alder"), 26, 170), 0, "{:?}: Alder's emptied labels (first moved chunk) go", w);
+            assert_eq!(active_label_count(c, &people("Alder"), 1, 25), 25, "{:?}: Alder keeps the images it still has a face on", w);
+            assert_eq!(active_label_count(c, &people("Birch"), 301, 310), 0, "{:?}: Birch's emptied labels in the SECOND moved chunk go", w);
+            assert_eq!(active_label_count(c, &people("Birch"), 2311, 2315), 0, "{:?}: the divergent images' labels go", w);
+            assert_eq!(active_label_count(c, "People", 2311, 2315), 0, "{:?}: the People root on a now-faceless image goes", w);
+            assert_eq!(active_label_count(c, &people("Birch"), 316, 320), 5, "{:?}: Birch keeps the images it still has a face on", w);
+            assert_eq!(
+                count(c, "SELECT COUNT(*) FROM person WHERE normalized_name IN ('alder', 'birch')"),
+                2,
+                "{:?}: both owners keep a face, so both stay",
+                w
+            );
+            vec![result]
+        });
+        assert!(
+            differing == 0 && results_equal,
+            "S194-86d: across both staging chunk boundaries the set-based save must write \
+             exactly the per-face writer's rows (differing rows {}, results equal {})",
+            differing,
+            results_equal
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `#[ignore]` scale harness (S194-86b's, against the production writer):
+    //   PL_SET_WRITE_FIXTURE_DIR=<dir> cargo test --release --lib \
+    //     face_search_save_set_tests::scale_drive_fixture_and_live_replay -- --ignored --nocapture
+    // Optional PL_S194_LIVE_COPY=<a COPY of catalogue.db> adds the live replay
+    // (the save of every face Judy Wagner and Agriculture hold plus
+    // PL_S194_UNASSIGNED unassigned faces, default 9000, with Agriculture's
+    // first face as the seed). Every write lands on a copy.
+    // -----------------------------------------------------------------------
+
+    const FIXTURE_TS: &str = "TIMESTAMP '2026-09-29 20:40:49'";
+
+    /// 104k images, ~388k keyword rows, 77.6k faces (25.5k RAW/JPEG twins),
+    /// seven people — the S192 drive's shape.
+    fn build_drive_fixture(conn: &Connection)
+    {
+        let sql = format!(
+            "
+            INSERT INTO images (id, file_path, file_size, file_name, created_timestamp, modified_timestamp, is_video)
+            SELECT i, '/fixture/img_' || CAST(i AS VARCHAR) || '.NEF', 1000 + i, 'img_' || CAST(i AS VARCHAR) || '.NEF', 0, 0,
+                   (i % 997 = 0)
+            FROM range(1, 104001) t(i);
+
+            INSERT INTO keyword (image_id, label, path, status, origin, created_at, hidden_at, collection, color, is_video)
+            SELECT s.i, s.lbl, s.pth,
+                   CASE WHEN s.i % 331 = 0 THEN 0 ELSE 1 END,
+                   CASE WHEN starts_with(s.pth, 'Topic') AND s.i % 5 = 0 THEN 2 ELSE 1 END,
+                   TIMESTAMP '2026-09-01 00:00:00',
+                   CASE WHEN s.i % 331 = 0 THEN TIMESTAMP '2026-09-02 00:00:00' END,
+                   FALSE, FALSE, COALESCE(img.is_video, FALSE)
+            FROM (
+                SELECT i, 'Places' AS lbl, 'Places' AS pth, 0 AS d FROM range(1, 96001) t(i)
+                UNION ALL SELECT i, 'City ' || CAST(i % 350 AS VARCHAR), 'Places' || chr(31) || 'City ' || CAST(i % 350 AS VARCHAR), 1 FROM range(1, 96001) t(i)
+                UNION ALL SELECT i, 'Topic ' || CAST(i % 360 AS VARCHAR), 'Topic ' || CAST(i % 360 AS VARCHAR), 2 FROM range(1, 96001) t(i)
+                UNION ALL SELECT i, 'Year ' || CAST(2000 + i % 10 AS VARCHAR), 'Year ' || CAST(2000 + i % 10 AS VARCHAR), 3 FROM range(1, 96001) t(i)
+            ) s JOIN images img ON img.id = s.i
+            ORDER BY s.i, s.d;
+
+            INSERT INTO face_observation (id, image_id, analyzed_image_id, face_index, algorithm_version, analysis_run_id,
+                                          bounding_box_x, bounding_box_y, bounding_box_width, bounding_box_height, created_at)
+            SELECT i, i, i, 0, 'v', 'run', 0.1, 0.1, 0.2, 0.2, TIMESTAMP '2026-09-01 00:00:00' FROM range(1, 40001) t(i)
+            UNION ALL
+            SELECT 100000 + i, i, i, 1, 'v', 'run', 0.5, 0.1, 0.2, 0.2, TIMESTAMP '2026-09-01 00:00:00' FROM range(1, 12101) t(i)
+            UNION ALL
+            SELECT 200000 + i, 60000 + i, i, 0, 'v', 'run', 0.1, 0.1, 0.2, 0.2, TIMESTAMP '2026-09-01 00:00:00' FROM range(1, 25501) t(i);
+
+            INSERT INTO person (display_name, normalized_name, created_at, updated_at) VALUES
+                ('Judy Wagner', 'judy wagner', {ts}, {ts}),
+                ('Agriculture', 'agriculture', {ts}, {ts}),
+                ('Bob', 'bob', {ts}, {ts}),
+                ('Carol', 'carol', {ts}, {ts}),
+                ('Dana', 'dana', {ts}, {ts}),
+                ('Eve', 'eve', {ts}, {ts}),
+                ('Frank', 'frank', {ts}, {ts});
+
+            INSERT INTO person_face_assignment (face_observation_id, person_id, image_id, analyzed_image_id, face_index,
+                                                assignment_source, model_version, preprocessing_version, threshold,
+                                                confidence_cosine, created_at, updated_at)
+            SELECT f.id, p.id, f.image_id, f.analyzed_image_id, f.face_index, 'face_search_match',
+                   'auraface-coreml-v1', 'expanded_square_v1', 0.58, 0.7, {ts}, {ts}
+            FROM face_observation f
+            JOIN person p ON p.normalized_name =
+                CASE
+                    WHEN f.id BETWEEN 1 AND 1490 THEN 'judy wagner'
+                    WHEN f.id BETWEEN 30001 AND 30136 THEN 'agriculture'
+                    WHEN f.id BETWEEN 2001 AND 2300 THEN 'bob'
+                    WHEN f.id = 2401 THEN 'carol'
+                    WHEN f.id IN (2501, 102501) THEN 'dana'
+                    WHEN f.id BETWEEN 2601 AND 2603 THEN 'eve'
+                    WHEN f.id = 2701 THEN 'frank'
+                END;
+            UPDATE person_face_assignment SET image_id = 2702 WHERE face_observation_id = 2701;
+
+            INSERT INTO keyword (image_id, label, path, status, origin, created_at, hidden_at, collection, color, is_video)
+            SELECT image_id, 'People', 'People', 1, 4, {ts}, NULL, FALSE, FALSE, is_video FROM (
+                SELECT DISTINCT a.image_id, COALESCE(i.is_video, FALSE) AS is_video
+                FROM person_face_assignment a JOIN images i ON i.id = a.image_id) ORDER BY image_id;
+            INSERT INTO keyword (image_id, label, path, status, origin, created_at, hidden_at, collection, color, is_video)
+            SELECT image_id, display_name, 'People' || chr(31) || display_name, 1, 4, {ts}, NULL, FALSE, FALSE, is_video FROM (
+                SELECT DISTINCT a.image_id, p.display_name, COALESCE(i.is_video, FALSE) AS is_video
+                FROM person_face_assignment a JOIN person p ON p.id = a.person_id JOIN images i ON i.id = a.image_id)
+            ORDER BY image_id, display_name;
+            UPDATE keyword SET origin = 5 WHERE image_id = 2601 AND path = 'People' || chr(31) || 'Eve';
+            UPDATE keyword SET collection = TRUE WHERE image_id = 2602 AND path = 'People' || chr(31) || 'Eve';
+
+            INSERT INTO keyword (image_id, label, path, status, origin, created_at, hidden_at, collection, color, is_video)
+            SELECT i, 'People', 'People', 1, 1, {ts}, NULL, FALSE, FALSE, FALSE FROM range(3001, 3061) t(i)
+            UNION ALL SELECT i, 'Judy Wagner', 'People' || chr(31) || 'Judy Wagner', 1, 1, {ts}, NULL, FALSE, FALSE, FALSE FROM range(3051, 3061) t(i)
+            UNION ALL SELECT i, 'People', 'People', 0, 4, {ts}, {ts}, FALSE, FALSE, FALSE FROM range(3061, 3071) t(i)
+            UNION ALL SELECT i, 'People', 'People', 1, 4, {ts}, NULL, FALSE, FALSE, FALSE FROM range(3071, 3081) t(i)
+            UNION ALL SELECT i, 'People', 'People', 1, 1, {ts}, NULL, FALSE, FALSE, FALSE FROM range(3071, 3081) t(i)
+            UNION ALL SELECT i, 'People', 'People', 1, 4, {ts}, NULL, FALSE, FALSE, FALSE FROM range(3081, 3091) t(i)
+            UNION ALL SELECT i, 'Judy Wagner', 'People' || chr(31) || 'Judy Wagner', 1, 0, {ts}, NULL, TRUE, FALSE, FALSE FROM range(3091, 3096) t(i)
+            UNION ALL SELECT i, 'Judy Wagner', 'People' || chr(31) || 'Judy Wagner', 0, 0, {ts}, {ts}, FALSE, FALSE, FALSE FROM range(3096, 3101) t(i);
+            CHECKPOINT;
+            ",
+            ts = FIXTURE_TS
+        );
+        conn.execute_batch(&sql).expect("build the drive fixture");
+    }
+
+    fn drive_cosine(id: i64) -> f64
+    {
+        0.5 + ((id * 7919) % 450) as f64 / 1000.0 + (id % 7) as f64 * 1e-7
+    }
+
+    /// The retyped "Judy Wagner" search, shaped like the S192 drive.
+    fn drive_matches() -> (Vec<FaceSearchMatchRecord>, Vec<i64>)
+    {
+        let mut matches = Vec::new();
+        for id in 1..=1490
+        {
+            matches.push(matched(id, id, 1, drive_cosine(id)));
+        }
+        for id in 3001..=11766
+        {
+            matches.push(matched(id, id, 1, drive_cosine(id)));
+        }
+        for image in 3001..=3200
+        {
+            matches.push(matched(100_000 + image, image, 1, drive_cosine(image + 1)));
+        }
+        for image in 12001..=12020
+        {
+            matches.push(matched(200_000 + image, 60_000 + image, 1, drive_cosine(image)));
+        }
+        for id in 2001..=2300
+        {
+            matches.push(matched(id, id, 1, drive_cosine(id)));
+        }
+        matches.push(matched(2401, 2401, 1, 0.71));
+        matches.push(matched(2501, 2501, 1, 0.72));
+        for id in 2601..=2603
+        {
+            matches.push(matched(id, id, 1, 0.73));
+        }
+        matches.push(matched(2701, 2701, 1, 0.74));
+        matches.push(matched(3002, 3002, 1, 0.95));
+        matches.push(matched(3003, 3003, 1, f64::NAN));
+        matches.push(matched(0, 1, 1, 0.9));
+        matches.push(matched(-5, 1, 1, 0.9));
+        matches.push(matched(999_999, 1, 1, 0.9));
+        let seeds = vec![2401, 2501, 2601, 2602, 2603, 2701, 200_000 + 2150, 200_000 + 3010];
+        (matches, seeds)
+    }
+
+    type ScaleCalls<'a> = &'a dyn Fn(&Connection, Writer, &mut Vec<Duration>) -> Vec<PersonClusterAcceptResult>;
+
+    /// One writer on its own copy of `base`: the results, the dump, the wall times.
+    fn run_on_copy(base: &Path, dir: &Path, tag: &str, writer: Writer, calls: ScaleCalls<'_>) -> (Vec<String>, Dump, Vec<Duration>)
+    {
+        let path = copy_catalogue(base, dir, &format!("{}-{:?}.db", tag, writer));
+        let conn = open_fenced(&path);
+        let before = before(&conn);
+        let mut wall = Vec::new();
+        let results = calls(&conn, writer, &mut wall);
+        let dump = dump(&conn, &before);
+        assert_invariants(tag, writer, &dump);
+        (results.iter().map(|result| format!("{:?}", result)).collect(), dump, wall)
+    }
+
+    fn compare(tag: &str, reference: &(Vec<String>, Dump, Vec<Duration>), set_based: &(Vec<String>, Dump, Vec<Duration>)) -> bool
+    {
+        let differing = diff_dumps(tag, &reference.1, &set_based.1);
+        let results_equal = reference.0 == set_based.0;
+        println!(
+            "COMPARE {:<28} differing rows={} results equal={} · wall reference={:?} set-based={:?}",
+            tag,
+            differing,
+            results_equal,
+            reference.2.iter().map(|d| format!("{:.3}s", d.as_secs_f64())).collect::<Vec<_>>(),
+            set_based.2.iter().map(|d| format!("{:.3}s", d.as_secs_f64())).collect::<Vec<_>>()
+        );
+        differing == 0 && results_equal
+    }
+
+    #[test]
+    #[ignore]
+    fn scale_drive_fixture_and_live_replay()
+    {
+        let fixture = fixture_dir("face-scale");
+        let base = fixture.dir.join("base.db");
+        {
+            let conn = open_fenced(&base);
+            let started = Instant::now();
+            build_drive_fixture(&conn);
+            println!(
+                "drive fixture built in {:.1} s: images={} keyword rows={} faces={} twin faces={} assignments={}",
+                started.elapsed().as_secs_f64(),
+                count(&conn, "SELECT COUNT(*) FROM images"),
+                count(&conn, "SELECT COUNT(*) FROM keyword"),
+                count(&conn, "SELECT COUNT(*) FROM face_observation"),
+                count(&conn, "SELECT COUNT(*) FROM face_observation WHERE image_id <> analyzed_image_id"),
+                count(&conn, "SELECT COUNT(*) FROM person_face_assignment")
+            );
+        }
+        let (matches, seeds) = drive_matches();
+        let mut all_equal = true;
+
+        let retyped_judy_then_move = |conn: &Connection, writer: Writer, wall: &mut Vec<Duration>| -> Vec<PersonClusterAcceptResult>
+        {
+            let started = Instant::now();
+            let first = write(conn, writer, &matches, "judy  wagner", &seeds);
+            wall.push(started.elapsed());
+            let started = Instant::now();
+            let moved = move_left_alone(conn, writer, &first);
+            wall.push(started.elapsed());
+            vec![first, moved]
+        };
+        let new_name = |conn: &Connection, writer: Writer, wall: &mut Vec<Duration>| -> Vec<PersonClusterAcceptResult>
+        {
+            let started = Instant::now();
+            let result = write(conn, writer, &matches, "Zed Nobody", &seeds);
+            wall.push(started.elapsed());
+            vec![result]
+        };
+        for (tag, calls) in [
+            ("drive-retyped-judy+move", &retyped_judy_then_move as ScaleCalls<'_>),
+            ("drive-new-name", &new_name),
+        ]
+        {
+            let reference = run_on_copy(&base, &fixture.dir, tag, Writer::PerRowReference, calls);
+            let set_based = run_on_copy(&base, &fixture.dir, tag, Writer::SetBased, calls);
+            all_equal &= compare(tag, &reference, &set_based);
+        }
+
+        if let Ok(source) = std::env::var("PL_S194_LIVE_COPY")
+        {
+            let source = std::path::PathBuf::from(source);
+            let live_base = copy_catalogue(&source, &fixture.dir, "live-base.db");
+            let source_wal = std::path::PathBuf::from(format!("{}.wal", source.display()));
+            if source_wal.exists()
+            {
+                std::fs::copy(&source_wal, fixture.dir.join("live-base.db.wal")).expect("copy the WAL");
+            }
+            let unassigned: i64 = std::env::var("PL_S194_UNASSIGNED").ok().and_then(|v| v.parse().ok()).unwrap_or(9000);
+            let (live_matches, live_seeds) = {
+                let conn = open_fenced(&live_base);
+                conn.execute_batch("CHECKPOINT;").expect("checkpoint the live copy");
+                println!(
+                    "live copy: images={} keyword rows={} faces={} assignments={}",
+                    count(&conn, "SELECT COUNT(*) FROM images"),
+                    count(&conn, "SELECT COUNT(*) FROM keyword"),
+                    count(&conn, "SELECT COUNT(*) FROM face_observation"),
+                    count(&conn, "SELECT COUNT(*) FROM person_face_assignment")
+                );
+                let mut live_matches = Vec::new();
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT a.face_observation_id, a.image_id, COALESCE(a.confidence_cosine, 0.6)
+                         FROM person_face_assignment a JOIN person p ON p.id = a.person_id
+                         WHERE p.normalized_name IN ('judy wagner', 'agriculture')
+                         ORDER BY a.face_observation_id",
+                    )
+                    .expect("prepare owned faces");
+                for row in stmt
+                    .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, f64>(2)?)))
+                    .expect("owned faces")
+                {
+                    let (id, image, cosine) = row.expect("owned face");
+                    live_matches.push(matched(id, image, 1, cosine));
+                }
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT f.id, f.image_id FROM face_observation f
+                         WHERE f.image_id = f.analyzed_image_id
+                           AND NOT EXISTS (SELECT 1 FROM person_face_assignment a WHERE a.face_observation_id = f.id)
+                         ORDER BY f.id LIMIT {}",
+                        unassigned
+                    ))
+                    .expect("prepare unassigned faces");
+                for row in stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))).expect("unassigned faces")
+                {
+                    let (id, image) = row.expect("unassigned face");
+                    live_matches.push(matched(id, image, 1, drive_cosine(id)));
+                }
+                let seed = count(
+                    &conn,
+                    "SELECT COALESCE(MIN(a.face_observation_id), 0) FROM person_face_assignment a
+                     JOIN person p ON p.id = a.person_id WHERE p.normalized_name = 'agriculture'",
+                );
+                (live_matches, vec![seed])
+            };
+            println!("live replay: {} matches", live_matches.len());
+            let live = |conn: &Connection, writer: Writer, wall: &mut Vec<Duration>| -> Vec<PersonClusterAcceptResult>
+            {
+                let started = Instant::now();
+                let result = write(conn, writer, &live_matches, "Judy Wagner", &live_seeds);
+                wall.push(started.elapsed());
+                vec![result]
+            };
+            let reference = run_on_copy(&live_base, &fixture.dir, "live", Writer::PerRowReference, &live);
+            let set_based = run_on_copy(&live_base, &fixture.dir, "live", Writer::SetBased, &live);
+            all_equal &= compare("live-retyped-judy", &reference, &set_based);
+        }
+        assert!(all_equal, "the set-based save and the per-face reference disagree at scale");
+    }
+}
+
+#[cfg(test)]
+mod similar_unit_set_write_tests
+{
+    //! ⭐ S194-86d — the grouping pass's per-unit member write, set-based,
+    //! against the per-member reference: the same rows in
+    //! `similar_photo_group_member` and the same returned count (the count of
+    //! VALID members, a repeated image included — never a statement's change
+    //! count). `scale_unit_pass` is the `#[ignore]` `--release` timing harness.
+    use super::*;
+    use super::set_write_equivalence_support::*;
+    use std::collections::BTreeSet;
+    use std::time::{Duration, Instant};
+
+    const V: &str = "similar-featureprint-v4";
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Writer
+    {
+        PerRowReference,
+        SetBased,
+    }
+
+    fn write(conn: &Connection, writer: Writer, ids: &[i64], members: Vec<SimilarPhotoGroupMember>) -> u64
+    {
+        match writer
+        {
+            Writer::PerRowReference => upsert_similar_photo_groups_for_ids_per_row_reference(conn, ids, members, V, None),
+            Writer::SetBased => upsert_similar_photo_groups_for_ids_impl(conn, ids, members, V),
+        }
+    }
+
+    fn member(image_id: i64, group_id: i64, rank: u32, distance: Option<f64>, threshold: f64) -> SimilarPhotoGroupMember
+    {
+        SimilarPhotoGroupMember
+        {
+            image_id,
+            group_id,
+            representative_id: group_id,
+            member_rank: rank,
+            distance_to_representative: distance,
+            threshold,
+        }
+    }
+
+    const MEMBER_DUMP: &str = "SELECT CAST(image_id AS VARCHAR), CAST(group_id AS VARCHAR), CAST(representative_id AS VARCHAR),
+            CAST(member_rank AS VARCHAR), CAST(distance_to_representative AS VARCHAR), algorithm_version,
+            CAST(threshold AS VARCHAR), CAST(created_at AS VARCHAR), CAST(origin AS VARCHAR)
+        FROM similar_photo_group_member ORDER BY image_id";
+    const CHECKPOINT_DUMP: &str = "SELECT algorithm_version, unit_key, CAST(start_image_id AS VARCHAR),
+            CAST(end_image_id AS VARCHAR), CAST(anchor_count AS VARCHAR), CAST(member_count AS VARCHAR),
+            CAST(created_at AS VARCHAR)
+        FROM similar_photo_unit_checkpoint ORDER BY algorithm_version, unit_key";
+    const PRE_RUN_TIMESTAMPS: &str = "SELECT DISTINCT CAST(created_at AS VARCHAR) FROM similar_photo_group_member WHERE created_at IS NOT NULL
+         UNION SELECT DISTINCT CAST(created_at AS VARCHAR) FROM similar_photo_unit_checkpoint WHERE created_at IS NOT NULL";
+
+    fn dump(conn: &Connection, pre: &BTreeSet<String>, returns: &[u64]) -> Dump
+    {
+        let mut run_timestamps = BTreeSet::new();
+        let mut tables = std::collections::BTreeMap::new();
+        tables.insert("similar_photo_group_member", render_table(conn, MEMBER_DUMP, 9, &[7], pre, &mut run_timestamps));
+        tables.insert("similar_photo_unit_checkpoint", render_table(conn, CHECKPOINT_DUMP, 7, &[6], pre, &mut run_timestamps));
+        tables.insert("returned_counts", returns.iter().map(|count| count.to_string()).collect());
+        tables.insert("not_in_a_transaction", vec![not_in_a_transaction(conn).to_string()]);
+        Dump { tables, run_timestamps }
+    }
+
+    /// 2,400 plain images; three HAND-MADE rows (900–902, group 900); a few
+    /// automatic rows (5–6, 42–43 with a legacy NULL origin, 75 in group 70)
+    /// and one stale v3 row (76).
+    fn edge_fixture(conn: &Connection)
+    {
+        conn.execute_batch(
+            "INSERT INTO images (id, file_path, file_size, file_name, created_timestamp, modified_timestamp, is_video)
+             SELECT i, '/e/' || CAST(i AS VARCHAR), 1, 'e', 0, 0, FALSE FROM range(1, 2401) t(i);
+             INSERT INTO similar_photo_group_member (image_id, group_id, representative_id, member_rank,
+                 distance_to_representative, algorithm_version, threshold, created_at, origin) VALUES
+                 (900, 900, 900, 0, 0.0, 'similar-featureprint-v4', 0.0, TIMESTAMP '2026-09-01 00:00:00', 1),
+                 (901, 900, 900, 1, 0.0, 'similar-featureprint-v4', 0.0, TIMESTAMP '2026-09-01 00:00:00', 1),
+                 (902, 900, 900, 2, 0.0, 'similar-featureprint-v4', 0.0, TIMESTAMP '2026-09-01 00:00:00', 1),
+                 (5, 5, 5, 0, 0.0, 'similar-featureprint-v4', 8.5, TIMESTAMP '2026-09-01 00:00:00', 2),
+                 (6, 5, 5, 1, 1.0, 'similar-featureprint-v4', 8.5, TIMESTAMP '2026-09-01 00:00:00', 2),
+                 (42, 42, 42, 0, 0.0, 'similar-featureprint-v4', 8.5, TIMESTAMP '2026-09-01 00:00:00', 2),
+                 (43, 42, 42, 1, 1.0, 'similar-featureprint-v4', 8.5, TIMESTAMP '2026-09-01 00:00:00', NULL),
+                 (75, 70, 70, 3, 2.0, 'similar-featureprint-v4', 8.5, TIMESTAMP '2026-09-01 00:00:00', 2),
+                 (76, 76, 76, 0, 0.0, 'similar-featureprint-v3', 7.0, TIMESTAMP '2026-08-01 00:00:00', 2);",
+        )
+        .expect("edge fixture");
+    }
+
+    /// 1,301 members over anchors 1000–2300, in groups of three.
+    fn over_one_chunk() -> (Vec<i64>, Vec<SimilarPhotoGroupMember>)
+    {
+        let ids = (1000..=2300).collect::<Vec<_>>();
+        let members = ids
+            .iter()
+            .map(|&id| member(id, 1000 + (id - 1000) / 3 * 3, ((id - 1000) % 3) as u32, Some(((id % 9) as f64) / 2.0), 8.5))
+            .collect();
+        (ids, members)
+    }
+
+    /// Every unit shape, in one sequence on one catalogue per writer.
+    fn edge_calls() -> Vec<(Vec<i64>, Vec<SimilarPhotoGroupMember>)>
+    {
+        vec![
+            // a repeated image (3 twice — the second wins) beside plain members
+            ((1..=10).collect(), vec![member(1, 1, 0, Some(0.0), 8.5), member(3, 1, 1, Some(2.0), 8.5), member(3, 1, 2, Some(4.5), 7.25), member(4, 1, 3, None, 8.5)]),
+            // invalid members are skipped; the valid ones land
+            ((11..=20).collect(), vec![member(-1, 11, 0, None, 8.5), member(12, 0, 0, None, 8.5), member(13, 13, 0, Some(f64::NAN), 8.5), member(14, 14, 0, Some(-1.0), 8.5), member(15, 15, 0, None, f64::INFINITY), member(16, 16, 0, Some(0.0), 8.5), member(17, 16, 1, Some(1.5), 8.5)]),
+            // Guard 3: a member names a hand-made photo → refused whole
+            ((21..=30).collect(), vec![member(21, 21, 0, Some(0.0), 8.5), member(901, 21, 1, Some(1.0), 8.5)]),
+            // Guard 3: a group id names a hand-made group → refused whole
+            ((31..=40).collect(), vec![member(31, 900, 0, Some(0.0), 8.5), member(32, 900, 1, Some(1.0), 8.5)]),
+            // no members: the anchors' automatic rows go, nothing is written
+            ((41..=50).collect(), vec![]),
+            // a member outside the anchors overwrites an existing automatic row
+            ((51..=60).collect(), vec![member(55, 55, 0, Some(0.0), 8.5), member(75, 55, 1, Some(3.0), 8.5)]),
+            // a hand-made row among the anchors (not a member) survives the DELETE
+            ((895..=905).collect(), vec![member(895, 895, 0, Some(0.0), 8.5), member(896, 895, 1, Some(1.0), 8.5)]),
+            // a stale v3 row is overwritten by the v4 member
+            ((76..=80).collect(), vec![member(76, 76, 0, Some(0.0), 8.5), member(77, 76, 1, Some(0.5), 8.5)]),
+            over_one_chunk(),
+        ]
+    }
+
+    #[test]
+    fn unit_write_matches_the_per_member_reference()
+    {
+        let mut dumps = Vec::new();
+        let mut fixtures = Vec::new();
+        for writer in [Writer::PerRowReference, Writer::SetBased]
+        {
+            let fixture = fixture_dir(&format!("similar-edges-{:?}", writer));
+            let conn = open_fenced(&fixture.dir.join("catalogue.db"));
+            edge_fixture(&conn);
+            let pre = timestamps(&conn, PRE_RUN_TIMESTAMPS);
+            let returns = edge_calls()
+                .into_iter()
+                .map(|(anchors, members)| write(&conn, writer, &anchors, members))
+                .collect::<Vec<_>>();
+            println!("  {:?} returned {:?}", writer, returns);
+            dumps.push(dump(&conn, &pre, &returns));
+            fixtures.push(fixture);
+        }
+        assert_eq!(dumps[1].tables["not_in_a_transaction"], vec!["true".to_string()]);
+        assert_eq!(
+            diff_dumps("similar-edges", &dumps[0], &dumps[1]),
+            0,
+            "S194-86d: the set-based unit write must leave exactly the per-member writer's rows \
+             and return the same counts"
+        );
+    }
+
+    fn member_row(conn: &Connection, image_id: i64) -> Option<(i64, i64, Option<f64>, f64, i32)>
+    {
+        conn.query_row(
+            "SELECT group_id, member_rank, distance_to_representative, threshold, origin
+             FROM similar_photo_group_member WHERE image_id = ?1",
+            params![image_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .ok()
+    }
+
+    #[test]
+    fn a_repeated_image_keeps_its_last_occurrence()
+    {
+        let fixture = fixture_dir("similar-repeat");
+        let conn = open_fenced(&fixture.dir.join("catalogue.db"));
+        edge_fixture(&conn);
+        let members = vec![
+            member(1, 1, 0, Some(0.0), 8.5),
+            member(3, 1, 1, Some(2.0), 8.5),
+            member(4, 1, 3, None, 8.5),
+            member(3, 1, 2, Some(4.5), 7.25),
+        ];
+        let written = write(&conn, Writer::SetBased, &(1..=10).collect::<Vec<_>>(), members);
+
+        assert_eq!(written, 4, "the per-member writer counted every valid member, the repeat included");
+        assert_eq!(
+            member_row(&conn, 3),
+            Some((1, 2, Some(4.5), 7.25, SIMILAR_STACK_ORIGIN_AUTO)),
+            "the LAST occurrence of a repeated image wins, as it did member by member"
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM similar_photo_group_member WHERE image_id BETWEEN 1 AND 10"), 3);
+    }
+
+    #[test]
+    fn invalid_members_are_skipped_and_not_counted()
+    {
+        let fixture = fixture_dir("similar-invalid");
+        let conn = open_fenced(&fixture.dir.join("catalogue.db"));
+        edge_fixture(&conn);
+        let members = vec![
+            member(-1, 11, 0, None, 8.5),
+            member(12, 0, 0, None, 8.5),
+            member(13, 13, 0, Some(f64::NAN), 8.5),
+            member(14, 14, 0, Some(-1.0), 8.5),
+            member(15, 15, 0, None, f64::INFINITY),
+            member(16, 16, 0, Some(0.0), 8.5),
+            member(17, 16, 1, Some(1.5), 8.5),
+        ];
+        let written = write(&conn, Writer::SetBased, &(11..=20).collect::<Vec<_>>(), members);
+
+        assert_eq!(written, 2, "only the two valid members are counted");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM similar_photo_group_member WHERE image_id = -1 OR image_id BETWEEN 11 AND 20"),
+            2,
+            "an invalid member writes no row"
+        );
+        assert!(member_row(&conn, 16).is_some() && member_row(&conn, 17).is_some());
+        assert!(member_row(&conn, 13).is_none() && member_row(&conn, 14).is_none() && member_row(&conn, 15).is_none());
+    }
+
+    #[test]
+    fn a_unit_over_one_chunk_is_written_whole()
+    {
+        let fixture = fixture_dir("similar-chunks");
+        let conn = open_fenced(&fixture.dir.join("catalogue.db"));
+        edge_fixture(&conn);
+        let (ids, members) = over_one_chunk();
+        assert!(members.len() > 2 * SIMILAR_UNIT_WRITE_VALUES_CHUNK, "the unit spans three statements");
+
+        let written = write(&conn, Writer::SetBased, &ids, members.clone());
+
+        assert_eq!(written, members.len() as u64);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM similar_photo_group_member WHERE image_id BETWEEN 1000 AND 2300"),
+            members.len() as i64,
+            "every chunk is written, not only the first"
+        );
+        for probe in [1000i64, 1499, 1500, 1999, 2000, 2300]
+        {
+            let expected = members.iter().find(|m| m.image_id == probe).expect("a member");
+            assert_eq!(
+                member_row(&conn, probe),
+                Some((
+                    expected.group_id,
+                    expected.member_rank as i64,
+                    expected.distance_to_representative,
+                    expected.threshold,
+                    SIMILAR_STACK_ORIGIN_AUTO
+                )),
+                "member {} carries its own values, whichever statement wrote it",
+                probe
+            );
+        }
+        assert!(not_in_a_transaction(&conn));
+    }
+
+    // -----------------------------------------------------------------------
+    // `#[ignore]` scale harness (S194-86b's 543-unit pass):
+    //   PL_SET_WRITE_FIXTURE_DIR=<dir> cargo test --release --lib \
+    //     similar_unit_set_write_tests::scale_unit_pass -- --ignored --nocapture
+    // 103k stills, ≈32k grouped, units of 190 anchors (PL_S194_ANCHORS), the
+    // checkpoint marked after every unit as `drainReadyResults` does; both an
+    // empty table and a pre-populated one (500 stale v3 rows, 90 hand-made).
+    // -----------------------------------------------------------------------
+
+    const SIMILAR_IMAGES: i64 = 103_000;
+
+    fn similar_plan(image_count: i64) -> Vec<Vec<i64>>
+    {
+        let sizes = [2i64, 3, 2, 4, 2, 5, 3, 2, 6, 2, 3, 8, 2, 4, 3];
+        let gaps = [5i64, 7, 6, 9, 8, 6, 10, 7];
+        let mut groups = Vec::new();
+        let mut next = 1i64;
+        let mut index = 0usize;
+        while next <= image_count
+        {
+            next += gaps[index % gaps.len()];
+            let size = sizes[index % sizes.len()];
+            if next + size - 1 > image_count
+            {
+                break;
+            }
+            groups.push((next..next + size).collect::<Vec<_>>());
+            next += size;
+            index += 1;
+        }
+        groups
+    }
+
+    fn group_members(group: &[i64]) -> Vec<SimilarPhotoGroupMember>
+    {
+        let representative = group.iter().copied().min().unwrap_or(0);
+        group
+            .iter()
+            .enumerate()
+            .map(|(rank, &image_id)| SimilarPhotoGroupMember {
+                image_id,
+                group_id: representative,
+                representative_id: representative,
+                member_rank: rank as u32,
+                distance_to_representative: if image_id == representative
+                {
+                    Some(0.0)
+                }
+                else if image_id % 7 == 0
+                {
+                    None
+                }
+                else
+                {
+                    Some(((image_id * 31) % 85) as f64 / 10.0)
+                },
+                threshold: 8.5,
+            })
+            .collect()
+    }
+
+    struct Unit
+    {
+        key: String,
+        anchors: Vec<i64>,
+        members: Vec<SimilarPhotoGroupMember>,
+    }
+
+    fn units(image_count: i64, anchors_per_unit: i64) -> Vec<Unit>
+    {
+        let groups = similar_plan(image_count);
+        let mut group_of = std::collections::HashMap::<i64, usize>::new();
+        for (index, group) in groups.iter().enumerate()
+        {
+            for &image in group
+            {
+                group_of.insert(image, index);
+            }
+        }
+        let mut units = Vec::new();
+        let mut start = 1i64;
+        while start <= image_count
+        {
+            let end = (start + anchors_per_unit - 1).min(image_count);
+            let anchors = (start..=end).collect::<Vec<_>>();
+            let mut touched = anchors.iter().filter_map(|id| group_of.get(id).copied()).collect::<Vec<_>>();
+            touched.sort_unstable();
+            touched.dedup();
+            let members = touched.iter().flat_map(|&index| group_members(&groups[index])).collect();
+            units.push(Unit { key: format!("unit-{:06}", units.len()), anchors, members });
+            start = end + 1;
+        }
+        units
+    }
+
+    fn build_scale_fixture(conn: &Connection, prepopulated: bool)
+    {
+        conn.execute_batch(
+            "INSERT INTO images (id, file_path, file_size, file_name, created_timestamp, modified_timestamp, is_video)
+             SELECT i, '/fixture/s_' || CAST(i AS VARCHAR) || '.NEF', 1000 + i, 's_' || CAST(i AS VARCHAR) || '.NEF', 0, 0, FALSE
+             FROM range(1, 103091) t(i);
+             INSERT INTO similar_photo_group_member (image_id, group_id, representative_id, member_rank,
+                                                     distance_to_representative, algorithm_version, threshold, created_at, origin)
+             SELECT 103000 + i, 103000 + ((i - 1) // 3) * 3 + 1, 103000 + ((i - 1) // 3) * 3 + 1, (i - 1) % 3, 0.0,
+                    'similar-featureprint-v4', 0.0, TIMESTAMP '2026-09-01 00:00:00', 1
+             FROM range(1, 91) t(i);",
+        )
+        .expect("scale fixture base");
+        let groups = similar_plan(SIMILAR_IMAGES);
+        let mut rows: Vec<SimilarPhotoGroupMember> = Vec::new();
+        if prepopulated
+        {
+            for group in &groups
+            {
+                rows.extend(group_members(group));
+            }
+        }
+        let stale = groups.iter().flatten().copied().filter(|id| id % 60 == 0).take(500).collect::<BTreeSet<i64>>();
+        let mut values_sql = Vec::new();
+        for member in &rows
+        {
+            if stale.contains(&member.image_id)
+            {
+                continue;
+            }
+            values_sql.push(format!(
+                "({}, {}, {}, {}, {}, 'similar-featureprint-v4', 8.5, TIMESTAMP '2026-09-01 00:00:00', 2)",
+                member.image_id,
+                member.group_id,
+                member.representative_id,
+                member.member_rank,
+                member.distance_to_representative.map(|d| format!("{:e}", d)).unwrap_or_else(|| "NULL".to_string())
+            ));
+        }
+        for id in &stale
+        {
+            values_sql.push(format!(
+                "({}, {}, {}, 0, NULL, 'similar-featureprint-v3', 7.0, TIMESTAMP '2026-08-01 00:00:00', 2)",
+                id, id, id
+            ));
+        }
+        for chunk in values_sql.chunks(5000)
+        {
+            conn.execute_batch(&format!(
+                "INSERT INTO similar_photo_group_member (image_id, group_id, representative_id, member_rank,
+                     distance_to_representative, algorithm_version, threshold, created_at, origin) VALUES {};",
+                chunk.join(", ")
+            ))
+            .expect("scale fixture rows");
+        }
+        conn.execute_batch("CHECKPOINT;").expect("checkpoint");
+    }
+
+    /// The pass as `drainReadyResults` runs it: per unit the member write, then
+    /// the checkpoint with `member_count = written` (unconditionally — R-120).
+    fn pass(conn: &Connection, writer: Writer, units: &[Unit]) -> (Vec<u64>, Duration, Duration)
+    {
+        let mut returns = Vec::with_capacity(units.len());
+        let mut upsert_time = Duration::ZERO;
+        let mut checkpoint_time = Duration::ZERO;
+        for unit in units
+        {
+            let started = Instant::now();
+            let written = write(conn, writer, &unit.anchors, unit.members.clone());
+            upsert_time += started.elapsed();
+            let started = Instant::now();
+            let _ = mark_similar_photo_unit_checkpoint_impl(
+                conn,
+                V,
+                SimilarPhotoUnitCheckpoint {
+                    unit_key: unit.key.clone(),
+                    start_image_id: unit.anchors.first().copied().unwrap_or(0),
+                    end_image_id: unit.anchors.last().copied().unwrap_or(0),
+                    anchor_count: unit.anchors.len() as i64,
+                    member_count: written as i64,
+                },
+            );
+            checkpoint_time += started.elapsed();
+            returns.push(written);
+        }
+        (returns, upsert_time, checkpoint_time)
+    }
+
+    #[test]
+    #[ignore]
+    fn scale_unit_pass()
+    {
+        let anchors_per_unit: i64 = std::env::var("PL_S194_ANCHORS").ok().and_then(|v| v.parse().ok()).unwrap_or(190);
+        let units = units(SIMILAR_IMAGES, anchors_per_unit);
+        let member_total: usize = units.iter().map(|unit| unit.members.len()).sum();
+        println!(
+            "similar plan: {} stills, {} units of {} anchors, {} member rows (mean {:.1}/unit)",
+            SIMILAR_IMAGES,
+            units.len(),
+            anchors_per_unit,
+            member_total,
+            member_total as f64 / units.len().max(1) as f64
+        );
+        let fixture = fixture_dir("similar-scale");
+        let mut all_equal = true;
+        for prepopulated in [false, true]
+        {
+            let tag = if prepopulated { "prepopulated" } else { "empty" };
+            let base = fixture.dir.join(format!("{}-base.db", tag));
+            {
+                let conn = open_fenced(&base);
+                build_scale_fixture(&conn, prepopulated);
+            }
+            let mut dumps = Vec::new();
+            for writer in [Writer::PerRowReference, Writer::SetBased]
+            {
+                let path = copy_catalogue(&base, &fixture.dir, &format!("{}-{:?}.db", tag, writer));
+                let conn = open_fenced(&path);
+                let pre = timestamps(&conn, PRE_RUN_TIMESTAMPS);
+                let started = Instant::now();
+                let (returns, upsert_time, checkpoint_time) = pass(&conn, writer, &units);
+                let wall = started.elapsed();
+                println!(
+                    "  {} {:?}: pass {:.2} s · member writes {:.2} s ({:.1} ms/unit) · checkpoints {:.2} s ({:.2} ms/unit) · Σreturned {}",
+                    tag,
+                    writer,
+                    wall.as_secs_f64(),
+                    upsert_time.as_secs_f64(),
+                    upsert_time.as_secs_f64() * 1000.0 / units.len().max(1) as f64,
+                    checkpoint_time.as_secs_f64(),
+                    checkpoint_time.as_secs_f64() * 1000.0 / units.len().max(1) as f64,
+                    returns.iter().sum::<u64>()
+                );
+                dumps.push(dump(&conn, &pre, &returns));
+            }
+            let differing = diff_dumps(&format!("similar-scale-{}", tag), &dumps[0], &dumps[1]);
+            println!("COMPARE similar-scale-{} differing rows={}", tag, differing);
+            all_equal &= differing == 0;
+        }
+        assert!(all_equal, "the set-based unit write and the per-member reference disagree at scale");
     }
 }
