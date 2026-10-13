@@ -3712,6 +3712,28 @@ fn open_and_migrate_catalogue_reporting(
         Err(e) => eprintln!("Failed to query schema: {}", e),
     }
 
+    // --- ⭐ S195 — ruling 101: the `unreadable_file` memory ------------------
+    //
+    // Created HERE, on every open, in the autocommit window right after the
+    // schema batch — so a brand-new catalogue is born with it and an existing
+    // catalogue gains it on its next launch. `CREATE TABLE IF NOT EXISTS`: no
+    // `ALTER`, no `DEFAULT` (the S62 WAL rule cannot arise).
+    //
+    // ⚠️ LOG-AND-CONTINUE, deliberately outside the batch: the table is
+    // optional bookkeeping, and a failure here must never cost the user the
+    // library (inside the batch, a failing statement aborts the batch and this
+    // function returns `None`). Without the table every ruling-101 lookup
+    // answers "nothing remembered", which is exactly the behaviour before the
+    // ruling. See `UNREADABLE_FILE_TABLE_DDL`.
+    if let Err(e) = conn.execute_batch(UNREADABLE_FILE_TABLE_DDL)
+    {
+        eprintln!(
+            "open_and_migrate_catalogue: could not create unreadable_file ({}); Folder Sync will \
+             keep offering files it could not read, exactly as before ruling 101",
+            e
+        );
+    }
+
     // --- ⭐ S173 — directory_path repair + index: ONE TIME, SELF-HEALING -----
     //
     // WHAT THIS IS. S173 makes the per-directory FFIs pivot on the STORED
@@ -5037,6 +5059,16 @@ fn ingest_metadata_impl(
         }
     }
 
+    // ⭐ S195 — ruling 101's FORGET (fix round 1, M3 + L3): every record here
+    // READ, so none of them is an unreadable file any more. Once per call,
+    // after the inserts (autocommit, so nothing is open); one read of the small
+    // memory and a DELETE only for paths it actually holds. See
+    // `forget_unreadable_after_write`.
+    forget_unreadable_after_write(
+        conn,
+        metadata.iter().map(|record| record.file_path.as_str()),
+        "ingest_metadata");
+
     // Return count of successfully inserted records
     // Note: This excludes skipped duplicates (which contribute 0)
     inserted_count
@@ -5618,6 +5650,9 @@ fn upsert_editor_saved_image_database(
             let _ = conn.execute_batch("ROLLBACK;");
             return Err(format!("editor saved image insert COMMIT failed: {}", e));
         }
+        // ⭐ S195 — ruling 101's FORGET (fix round 1, L3), after the COMMIT
+        // and outside its transaction (S187 / E3): the saved path has a row now.
+        forget_unreadable_after_write(conn, [metadata.file_path.as_str()], "upsert_editor_saved_image");
         return Ok(EditorSavedImageDatabaseOutcome
         {
             status: EditorSavedImageCatalogueStatus::Inserted,
@@ -5669,6 +5704,8 @@ fn upsert_editor_saved_image_database(
         let _ = conn.execute_batch("ROLLBACK;");
         return Err(format!("editor saved image refresh COMMIT failed: {}", e));
     }
+    // ⭐ S195 — ruling 101's FORGET (fix round 1, L3): the refreshed path read.
+    forget_unreadable_after_write(conn, [metadata.file_path.as_str()], "upsert_editor_saved_image");
 
     Ok(EditorSavedImageDatabaseOutcome
     {
@@ -15728,12 +15765,24 @@ pub async fn face_embedding_search(
         preprocessing_version,
         threshold,
         limit,
+        Vec::new(),
     )
     .await
     .matches
 }
 
 /// Slice 7 / R-08 — the same search, carrying the store's reachability.
+///
+/// ⭐ S195-104 (ruling 104, item 4) — `prior_matches` lets Swift run ONE search
+/// as several short calls (a few reference faces each), so the search can show
+/// a determinate bar and stop between calls. Each call merges its own matches
+/// into `prior_matches` — the previous call's answer, handed back unchanged —
+/// under the strict total order of `face_search_match_outranks`, so running
+/// the reference faces in any number of calls, in any order, answers exactly
+/// what ONE call with all of them answers (`face_search_chunk_tests` pins it on
+/// a real store). Empty (the UDL default) is today's single search. A chunked
+/// caller passes `limit: 0` on every call; a `limit` cuts only the call's own
+/// answer.
 pub async fn face_embedding_search_checked(
     seed_face_observation_ids: Vec<i64>,
     candidate_image_ids: Vec<i64>,
@@ -15741,6 +15790,7 @@ pub async fn face_embedding_search_checked(
     preprocessing_version: String,
     threshold: f64,
     limit: u32,
+    prior_matches: Vec<FaceSearchMatchRecord>,
 ) -> FaceEmbeddingSearchResult {
     // ⭐ Slice F — L2 + L3: the runtime is acquired fallibly and the synchronous
     // spawn sits inside the panic boundary. A panic inside the spawned search —
@@ -15763,6 +15813,7 @@ pub async fn face_embedding_search_checked(
                     preprocessing_version,
                     threshold,
                     limit,
+                    prior_matches,
                 ))
             })
             .map_err(|message| format!("face_embedding_search: {}", message))
@@ -15894,6 +15945,135 @@ fn face_observation_pairs_for_ids(
     }
 }
 
+/// ⭐ S195-104 (ruling 104, item 4) — the ONE order a face search uses to keep
+/// the best match per image: the higher cosine wins; on an equal cosine the
+/// lower `face_observation_id` (the candidate face) wins; on the same face, the
+/// lower `seed_face_observation_id` wins.
+///
+/// It is a STRICT TOTAL order over finite cosines, which is what lets a search
+/// split into several calls (`prior_matches`) answer exactly what one call
+/// answers: the per-image best of a union is the best of the per-part bests
+/// only when "best" does not depend on the order things were looked at.
+///
+/// It is the order the single search always had. The old loop replaced a
+/// match on a higher cosine, or an equal cosine with a lower candidate face;
+/// on the same face it kept the FIRST seed it saw, and it saw seeds in
+/// ascending `face_observation_id` (`stored_face_embeddings` sorts them) — so
+/// the lowest seed id. Naming that third rule is the only change, and it gives
+/// the same answer. ⚠️ A NaN cosine is never a match (`face_search_best_by_image`
+/// skips it), so this order never sees one.
+fn face_search_match_outranks(candidate: &FaceSearchMatchRecord, existing: &FaceSearchMatchRecord) -> bool
+{
+    candidate.cosine > existing.cosine
+        || (candidate.cosine == existing.cosine
+            && (candidate.face_observation_id < existing.face_observation_id
+                || (candidate.face_observation_id == existing.face_observation_id
+                    && candidate.seed_face_observation_id < existing.seed_face_observation_id)))
+}
+
+/// Keep `candidate` for its image when it outranks what is held there.
+fn face_search_keep_best(
+    best_by_image: &mut std::collections::HashMap<i64, FaceSearchMatchRecord>,
+    candidate: FaceSearchMatchRecord,
+)
+{
+    match best_by_image.get(&candidate.image_id)
+    {
+        Some(existing) if !face_search_match_outranks(&candidate, existing) => {}
+        _ =>
+        {
+            best_by_image.insert(candidate.image_id, candidate);
+        }
+    }
+}
+
+/// ⭐ S195-104 — the search's arithmetic, pure: the best match per image for
+/// `seeds` against `records`, starting from `prior_matches` (an earlier call's
+/// answer). Pure so the chunked-equals-single proof can run it directly too.
+///
+/// A prior match is held to the same rules as a new one — inside the candidate
+/// scope and at or above the threshold — so it cannot carry anything a single
+/// call would not have produced; for a caller that hands back the previous
+/// call's answer unchanged both filters keep everything.
+fn face_search_best_by_image(
+    records: &[StoredFaceEmbedding],
+    seeds: &[&StoredFaceEmbedding],
+    candidate_ids: Option<&std::collections::HashSet<i64>>,
+    threshold: f64,
+    prior_matches: Vec<FaceSearchMatchRecord>,
+) -> std::collections::HashMap<i64, FaceSearchMatchRecord>
+{
+    let in_scope = |image_id: i64| candidate_ids.map_or(true, |ids| ids.contains(&image_id));
+
+    let mut best_by_image = std::collections::HashMap::<i64, FaceSearchMatchRecord>::new();
+    for prior in prior_matches
+    {
+        // `!(x >= threshold)` — a NaN is never at or above the threshold.
+        if !in_scope(prior.image_id) || !(prior.cosine >= threshold)
+        {
+            continue;
+        }
+        face_search_keep_best(&mut best_by_image, prior);
+    }
+
+    for candidate in records.iter()
+    {
+        if !in_scope(candidate.image_id)
+        {
+            continue;
+        }
+
+        for seed in seeds.iter()
+        {
+            let cosine = cosine_f32(&seed.vector, &candidate.vector);
+            // ⭐ S195-104 — `!(cosine >= threshold)` rather than
+            // `cosine < threshold`: a NaN (a vector holding a NaN or an
+            // infinity) is not a match. The old test let one through, and a
+            // NaN then replaced whatever came before it, so the answer
+            // depended on the order the loop visited things.
+            if !(cosine >= threshold)
+            {
+                continue;
+            }
+
+            face_search_keep_best(
+                &mut best_by_image,
+                FaceSearchMatchRecord {
+                    image_id: candidate.image_id,
+                    face_observation_id: candidate.face_observation_id,
+                    seed_face_observation_id: seed.face_observation_id,
+                    face_index: candidate.face_index,
+                    cosine,
+                },
+            );
+        }
+    }
+    best_by_image
+}
+
+/// The search's answer: highest cosine first, then image id, then face id —
+/// unique per image, so this order is total — cut to `limit` when it is set.
+fn face_search_ordered_matches(
+    best_by_image: std::collections::HashMap<i64, FaceSearchMatchRecord>,
+    limit: u32,
+) -> Vec<FaceSearchMatchRecord>
+{
+    let mut matches = best_by_image.into_values().collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        right
+            .cosine
+            .partial_cmp(&left.cosine)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(left.image_id.cmp(&right.image_id))
+            .then(left.face_observation_id.cmp(&right.face_observation_id))
+    });
+
+    if limit > 0 {
+        matches.truncate(limit as usize);
+    }
+    matches
+}
+
 async fn face_embedding_search_impl(
     seed_face_observation_ids: Vec<i64>,
     candidate_image_ids: Vec<i64>,
@@ -15901,35 +16081,8 @@ async fn face_embedding_search_impl(
     preprocessing_version: String,
     threshold: f64,
     limit: u32,
+    prior_matches: Vec<FaceSearchMatchRecord>,
 ) -> Result<Vec<FaceSearchMatchRecord>, String> {
-    if seed_face_observation_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Slice 7 / R-08: a store that could not be read propagates as an Err, so
-    // the caller can say "this search has no answer" instead of "0 photos".
-    let records = stored_face_embeddings(&model_version, &preprocessing_version).await?;
-    if records.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let seed_ids = seed_face_observation_ids
-        .into_iter()
-        .collect::<std::collections::HashSet<_>>();
-    // Item 7c: seeds resolve by direct id OR by physical-face pair, so a
-    // twin seed id still reaches its canonical vector.
-    let seed_pairs = face_observation_pairs_for_ids(&seed_ids);
-    let seeds = records
-        .iter()
-        .filter(|record| {
-            seed_ids.contains(&record.face_observation_id)
-                || seed_pairs.contains(&(record.analyzed_image_id, record.face_index))
-        })
-        .collect::<Vec<_>>();
-    if seeds.is_empty() {
-        return Ok(Vec::new());
-    }
-
     let candidate_ids = if candidate_image_ids.is_empty() {
         None
     } else {
@@ -15945,54 +16098,47 @@ async fn face_embedding_search_impl(
         0.0
     };
 
-    let mut best_by_image = std::collections::HashMap::<i64, FaceSearchMatchRecord>::new();
-    for candidate in records.iter() {
-        if let Some(candidate_ids) = &candidate_ids {
-            if !candidate_ids.contains(&candidate.image_id) {
-                continue;
-            }
-        }
-
-        for seed in seeds.iter() {
-            let cosine = cosine_f32(&seed.vector, &candidate.vector);
-            if cosine < threshold {
-                continue;
-            }
-
-            let match_record = FaceSearchMatchRecord {
-                image_id: candidate.image_id,
-                face_observation_id: candidate.face_observation_id,
-                seed_face_observation_id: seed.face_observation_id,
-                face_index: candidate.face_index,
-                cosine,
-            };
-
-            match best_by_image.get(&candidate.image_id) {
-                Some(existing)
-                    if existing.cosine > cosine
-                        || (existing.cosine == cosine
-                            && existing.face_observation_id <= candidate.face_observation_id) => {}
-                _ => {
-                    best_by_image.insert(candidate.image_id, match_record);
-                }
-            }
-        }
+    // ⭐ S195-104 — a call that brings no reference face of its own (or none
+    // that resolves to a stored vector) answers the PRIOR matches, filtered and
+    // ordered exactly as a full answer is. With no prior matches that is the
+    // empty answer it always was.
+    if seed_face_observation_ids.is_empty() {
+        return Ok(face_search_ordered_matches(
+            face_search_best_by_image(&[], &[], candidate_ids.as_ref(), threshold, prior_matches),
+            limit,
+        ));
     }
 
-    let mut matches = best_by_image.into_values().collect::<Vec<_>>();
-    matches.sort_by(|left, right| {
-        right
-            .cosine
-            .partial_cmp(&left.cosine)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(left.image_id.cmp(&right.image_id))
-            .then(left.face_observation_id.cmp(&right.face_observation_id))
-    });
+    // Slice 7 / R-08: a store that could not be read propagates as an Err, so
+    // the caller can say "this search has no answer" instead of "0 photos".
+    let records = stored_face_embeddings(&model_version, &preprocessing_version).await?;
 
-    if limit > 0 {
-        matches.truncate(limit as usize);
-    }
-    Ok(matches)
+    let seed_ids = seed_face_observation_ids
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    // Item 7c: seeds resolve by direct id OR by physical-face pair, so a
+    // twin seed id still reaches its canonical vector.
+    let seed_pairs = if records.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        face_observation_pairs_for_ids(&seed_ids)
+    };
+    let seeds = records
+        .iter()
+        .filter(|record| {
+            seed_ids.contains(&record.face_observation_id)
+                || seed_pairs.contains(&(record.analyzed_image_id, record.face_index))
+        })
+        .collect::<Vec<_>>();
+
+    let best_by_image = face_search_best_by_image(
+        &records,
+        &seeds,
+        candidate_ids.as_ref(),
+        threshold,
+        prior_matches,
+    );
+    Ok(face_search_ordered_matches(best_by_image, limit))
 }
 
 async fn face_embedding_search_vector_impl(
@@ -16934,6 +17080,245 @@ pub async fn person_face_observation_ids(person_id: i64) -> Vec<i64> {
     };
 
     person_face_observation_ids_impl(conn, person_id)
+}
+
+// ===========================================================================
+// ⭐ S195-104 — ruling 104 (Richard, Oct 13, 2026: "I say go for this."): a
+// named face search seeds from the faces the user CHOSE first.
+//
+// A named search used to seed from every face the person had gathered
+// (`person_face_observation_ids`), so each save widened the next search (R-161)
+// and a person with 17,500 faces made one search compare 17,500 × 57,000
+// vectors — about 15 minutes. Now:
+// * The face the user picks (the picker's face — the search is run FROM it)
+//   is written `chosen_seed`; `manual_label` rows count as chosen too.
+//   Resemblance matches stay `face_search_match`; a cluster accept stays
+//   `cluster_accept`.
+// * A later save never turns a chosen face back into a match for the SAME
+//   person (`FACE_ASSIGNMENT_SOURCE_NEVER_DOWNGRADE_SQL`); a later explicit choice
+//   turns a match into a chosen face; a face that changes person takes the
+//   new writer's source.
+// * The seeds are the person's chosen faces first, then the person's best
+//   other assigned faces, best capture quality first within each group, at
+//   most `limit` (500 at the caller). Fix round 1 (Richard, Oct 13, 2026)
+//   replaced round 1's chosen-ONLY seeds with this top-up: one chosen face plus
+//   a ~50 cap kept only ~30% of the old reach, while the best 500 kept 55% at
+//   ~1/44 of the time (Judy: 10,423 of 18,911 images, 12.3 s against 545 s,
+//   every new match inside the old set). A person with NO chosen face (every
+//   catalogue built before this slice) seeds from its best `limit` faces.
+// Faces already assigned by earlier searches stay assigned — only the
+// seeding changes.
+// ===========================================================================
+
+/// `person_face_assignment.assignment_source` for a face the user chose: the
+/// face a named search was run FROM.
+const FACE_ASSIGNMENT_SOURCE_CHOSEN_SEED: &str = "chosen_seed";
+
+/// `person_face_assignment.assignment_source` for a face a named search found
+/// by resemblance.
+const FACE_ASSIGNMENT_SOURCE_FACE_SEARCH_MATCH: &str = "face_search_match";
+
+/// The sources that count as "the user chose this face", as an SQL list: the
+/// seed query reads it, and it is the list inside
+/// `FACE_ASSIGNMENT_SOURCE_NEVER_DOWNGRADE_SQL` (a test holds the two equal).
+const FACE_ASSIGNMENT_CHOSEN_SOURCES_SQL: &str = "('chosen_seed', 'manual_label')";
+
+/// ⭐ The never-downgrade rule, as the `assignment_source` item of every
+/// person writer's `ON CONFLICT (face_observation_id) DO UPDATE SET` list:
+/// a face that is ALREADY chosen for the person this write names keeps its
+/// chosen source; anything else takes the writer's source. So a later search
+/// that merely matches a chosen face cannot demote it, a later explicit choice
+/// promotes a match (the existing row is not chosen, so the new source wins),
+/// and a face that changes person never carries "chosen" across.
+///
+/// ⚠️ It is written OUT, verbatim, as the FIRST item of each writer's SET list
+/// — not spliced in — because `engine_contract_residue_tests` scans every
+/// product SQL text passed to `execute(` and can only scan a plain string
+/// literal. `the_person_writers_carry_the_never_downgrade_item_verbatim`
+/// holds all four copies to this text (so it is compiled for tests only — the
+/// writers carry the copies). First, because it reads the EXISTING row's
+/// `person_id`, and nothing earlier in the list has assigned it yet.
+#[cfg(test)]
+const FACE_ASSIGNMENT_SOURCE_NEVER_DOWNGRADE_SQL: &str = "assignment_source = CASE WHEN person_face_assignment.person_id = excluded.person_id AND person_face_assignment.assignment_source IN ('chosen_seed', 'manual_label') THEN person_face_assignment.assignment_source ELSE excluded.assignment_source END";
+
+/// The manual writer's upsert (`assign_face_observations_to_person_impl`,
+/// `manual_label`), its SET list opening with the never-downgrade item.
+const PERSON_MANUAL_LABEL_UPSERT_SQL: &str = "INSERT INTO person_face_assignment (
+                 face_observation_id, person_id, image_id, analyzed_image_id, face_index,
+                 assignment_source, face_cluster_run_id, face_cluster_id,
+                 model_version, preprocessing_version, threshold, confidence_cosine,
+                 created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, 'manual_label', NULL, NULL, NULL, NULL, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+             ON CONFLICT (face_observation_id) DO UPDATE SET
+                 assignment_source = CASE WHEN person_face_assignment.person_id = excluded.person_id AND person_face_assignment.assignment_source IN ('chosen_seed', 'manual_label') THEN person_face_assignment.assignment_source ELSE excluded.assignment_source END,
+                 person_id = excluded.person_id,
+                 image_id = excluded.image_id,
+                 analyzed_image_id = excluded.analyzed_image_id,
+                 face_index = excluded.face_index,
+                 face_cluster_run_id = excluded.face_cluster_run_id,
+                 face_cluster_id = excluded.face_cluster_id,
+                 model_version = excluded.model_version,
+                 preprocessing_version = excluded.preprocessing_version,
+                 threshold = excluded.threshold,
+                 confidence_cosine = excluded.confidence_cosine,
+                 updated_at = now()";
+
+/// The cluster writer's upsert (`accept_face_cluster_as_person_impl`,
+/// `cluster_accept`), its SET list opening with the never-downgrade item.
+const PERSON_CLUSTER_ACCEPT_UPSERT_SQL: &str = "INSERT INTO person_face_assignment (
+                 face_observation_id, person_id, image_id, analyzed_image_id, face_index,
+                 assignment_source, face_cluster_run_id, face_cluster_id,
+                 model_version, preprocessing_version, threshold, confidence_cosine,
+                 created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, 'cluster_accept', ?6, ?7, ?8, ?9, ?10, ?11, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+             ON CONFLICT (face_observation_id) DO UPDATE SET
+                 assignment_source = CASE WHEN person_face_assignment.person_id = excluded.person_id AND person_face_assignment.assignment_source IN ('chosen_seed', 'manual_label') THEN person_face_assignment.assignment_source ELSE excluded.assignment_source END,
+                 person_id = excluded.person_id,
+                 image_id = excluded.image_id,
+                 analyzed_image_id = excluded.analyzed_image_id,
+                 face_index = excluded.face_index,
+                 face_cluster_run_id = excluded.face_cluster_run_id,
+                 face_cluster_id = excluded.face_cluster_id,
+                 model_version = excluded.model_version,
+                 preprocessing_version = excluded.preprocessing_version,
+                 threshold = excluded.threshold,
+                 confidence_cosine = excluded.confidence_cosine,
+                 updated_at = now()";
+
+/// The per-face reference writer's upsert (`#[cfg(test)]`; `?10` the face's
+/// source), its SET list opening with the never-downgrade item, so
+/// `face_search_save_set_tests` still compares like with like.
+#[cfg(test)]
+const FACE_SEARCH_SAVE_PER_ROW_REFERENCE_UPSERT_SQL: &str = "INSERT INTO person_face_assignment (
+                 face_observation_id, person_id, image_id, analyzed_image_id, face_index,
+                 assignment_source, face_cluster_run_id, face_cluster_id,
+                 model_version, preprocessing_version, threshold, confidence_cosine,
+                 created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?10, NULL, NULL, ?6, ?7, ?8, ?9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+             ON CONFLICT (face_observation_id) DO UPDATE SET
+                 assignment_source = CASE WHEN person_face_assignment.person_id = excluded.person_id AND person_face_assignment.assignment_source IN ('chosen_seed', 'manual_label') THEN person_face_assignment.assignment_source ELSE excluded.assignment_source END,
+                 person_id = excluded.person_id,
+                 image_id = excluded.image_id,
+                 analyzed_image_id = excluded.analyzed_image_id,
+                 face_index = excluded.face_index,
+                 face_cluster_run_id = excluded.face_cluster_run_id,
+                 face_cluster_id = excluded.face_cluster_id,
+                 model_version = excluded.model_version,
+                 preprocessing_version = excluded.preprocessing_version,
+                 threshold = excluded.threshold,
+                 confidence_cosine = excluded.confidence_cosine,
+                 updated_at = now()";
+
+/// ⭐ S195-104 — the source a named face search writes for one face it
+/// assigns: `chosen_seed` when the user picked this face for the search
+/// (`is_explicit_seed`) AND the search was run FROM it — its own match is
+/// self-seeded, `seed_face_observation_id == face_observation_id` — else
+/// `face_search_match`.
+///
+/// Why the second test. **Move** hands the writer the faces left with other
+/// people as explicit seeds too (that is what lets them change hands), but
+/// those faces were FOUND by the search, never searched from: each carries the
+/// seed that found it (`FaceLeftWithOtherPersonRecord.seed_face_observation_id`),
+/// so a Move never makes a face "chosen" — a resemblance match confirmed in
+/// bulk is not a face the user picked. A drawn-region search has no face to
+/// pick (its seed id is 0) and passes no explicit seed.
+fn face_search_assignment_source(is_explicit_seed: bool, search_match: &FaceSearchMatchRecord) -> &'static str
+{
+    if is_explicit_seed && search_match.seed_face_observation_id == search_match.face_observation_id
+    {
+        FACE_ASSIGNMENT_SOURCE_CHOSEN_SEED
+    }
+    else
+    {
+        FACE_ASSIGNMENT_SOURCE_FACE_SEARCH_MATCH
+    }
+}
+
+/// ⭐ S195-104 — a person's face-search seeds, in ONE query: the person's
+/// CHOSEN faces first (`chosen_seed`, `manual_label`), then the person's other
+/// assigned faces; within each group best capture quality first, ties by face
+/// id; at most `limit` in all (`0` = no cap). So the chosen faces always lead
+/// and the rest of the cap is filled with the person's best other faces — a
+/// person with one chosen face still searches from up to `limit` faces, and a
+/// person with none (every catalogue built before this slice) seeds from its
+/// best `limit` assigned faces. A person who has faces never gets zero seeds.
+///
+/// Fix round 1 (Richard, Oct 13, 2026): the cap is 500 at the caller and the
+/// round-1 chosen-ONLY collapse is gone — one chosen face plus a weak ~50-face
+/// cap lost ~70% of the old reach (Judy: best 50 → 5,699 images of the old
+/// 18,911; best 500 → 10,423, every new match inside the old set).
+///
+/// A seed needs its `face_observation` row (it carries the quality, and a face
+/// without one has no stored vector to search from). A quality that is NULL,
+/// NaN or infinite sorts LAST within its group — DuckDB sorts NaN above every
+/// number, which would otherwise put it first.
+fn person_search_seed_face_observation_ids_impl(
+    conn: &Connection,
+    person_id: i64,
+    limit: u32,
+) -> Result<Vec<i64>, String>
+{
+    if person_id <= 0
+    {
+        return Ok(Vec::new());
+    }
+
+    let limit_clause = if limit > 0 { format!(" LIMIT {}", limit) } else { String::new() };
+    let sql = format!(
+        "SELECT a.face_observation_id
+         FROM person_face_assignment a
+         JOIN face_observation f ON f.id = a.face_observation_id
+         WHERE a.person_id = ?1
+         ORDER BY CASE WHEN a.assignment_source IN {} THEN 0 ELSE 1 END ASC,
+                  CASE WHEN isfinite(f.face_capture_quality) THEN f.face_capture_quality END DESC NULLS LAST,
+                  a.face_observation_id ASC{}",
+        FACE_ASSIGNMENT_CHOSEN_SOURCES_SQL,
+        limit_clause
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("face-search seeds: prepare {}", e))?;
+    let rows = stmt
+        .query_map(params![person_id], |row| row.get::<_, i64>(0))
+        .map_err(|e| format!("face-search seeds: query {}", e))?;
+    let (ids, dropped) = collect_rows_counted(rows, "person_search_seed_face_observation_ids");
+    if dropped > 0
+    {
+        return Err(format!("face-search seeds: {} row(s) could not be read", dropped));
+    }
+    Ok(ids)
+}
+
+pub async fn person_search_seed_face_observation_ids(person_id: i64, limit: u32) -> Vec<i64>
+{
+    let catalogue = lock_catalogue();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    // A read that fails answers EMPTY — the caller then searches from the
+    // face the user picked alone, which is never zero seeds — and the failure
+    // is logged and counted in the dropped-row census (no failure channel on
+    // a bare list: ruling 23).
+    match person_search_seed_face_observation_ids_impl(conn, person_id, limit)
+    {
+        Ok(ids) => ids,
+        Err(message) =>
+        {
+            eprintln!("person_search_seed_face_observation_ids: {}", message);
+            record_dropped_rows("person_search_seed_face_observation_ids.query_failed", 1);
+            Vec::new()
+        }
+    }
 }
 
 fn assignable_faces_for_observation_ids(
@@ -18571,27 +18956,11 @@ fn assign_face_observations_to_person_impl(
     let mut image_ids = std::collections::BTreeSet::new();
     let mut keyword_row_count = 0u64;
     for face in &faces {
+        // ⭐ S195-104 — `manual_label` is itself a chosen source; the
+        // never-downgrade item keeps a `chosen_seed` row's own spelling of
+        // "chosen" when the person does not change.
         match conn.execute(
-            "INSERT INTO person_face_assignment (
-                 face_observation_id, person_id, image_id, analyzed_image_id, face_index,
-                 assignment_source, face_cluster_run_id, face_cluster_id,
-                 model_version, preprocessing_version, threshold, confidence_cosine,
-                 created_at, updated_at
-             )
-             VALUES (?1, ?2, ?3, ?4, ?5, 'manual_label', NULL, NULL, NULL, NULL, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-             ON CONFLICT (face_observation_id) DO UPDATE SET
-                 person_id = excluded.person_id,
-                 image_id = excluded.image_id,
-                 analyzed_image_id = excluded.analyzed_image_id,
-                 face_index = excluded.face_index,
-                 assignment_source = excluded.assignment_source,
-                 face_cluster_run_id = excluded.face_cluster_run_id,
-                 face_cluster_id = excluded.face_cluster_id,
-                 model_version = excluded.model_version,
-                 preprocessing_version = excluded.preprocessing_version,
-                 threshold = excluded.threshold,
-                 confidence_cosine = excluded.confidence_cosine,
-                 updated_at = now()",
+            PERSON_MANUAL_LABEL_UPSERT_SQL,
             params![
                 face.face_observation_id,
                 person_id,
@@ -18722,7 +19091,8 @@ pub async fn assign_face_observations_to_person(
 // (`drop_face_search_save_tables`). No index is added (the L1215 doctrine).
 // ===========================================================================
 
-/// Faces staged per bound multi-row `VALUES` statement (5 parameters each).
+/// Faces staged per bound multi-row `VALUES` statement (6 parameters each —
+/// S195-104 added the face's `assignment_source`).
 const FACE_SEARCH_SAVE_BATCH_CHUNK: usize = 1000;
 
 /// Previous owners of moved faces staged per statement (3 parameters each).
@@ -18737,12 +19107,17 @@ const FACE_SEARCH_SAVE_TEMP_TABLES: [&str; 3] = [
 ];
 
 /// ONE statement upserts every staged face exactly as the per-face statement
-/// did: the same columns, the same literals (`'face_search_match'`, the two
-/// NULL cluster columns), the same `CURRENT_TIMESTAMP` / `now()` stamps and the
-/// same ON CONFLICT SET list. The batch holds one row per CANONICAL face id
+/// did: the same columns, the same literals (the two NULL cluster columns),
+/// the same `CURRENT_TIMESTAMP` / `now()` stamps and the same ON CONFLICT SET
+/// list. The batch holds one row per CANONICAL face id
 /// (`assignable_faces_for_observation_ids` de-duplicates), so the one command
 /// never touches a key twice. `?1` person id · `?2` model version · `?3`
 /// preprocessing version · `?4` threshold (NULL when not finite).
+///
+/// ⭐ S195-104 — each staged face carries its own `assignment_source`
+/// (`face_search_assignment_source`: `chosen_seed` or `face_search_match`), and
+/// the SET list opens with the never-downgrade rule
+/// (`FACE_ASSIGNMENT_SOURCE_NEVER_DOWNGRADE_SQL`, written out verbatim).
 const FACE_SEARCH_SAVE_UPSERT_SQL: &str = "INSERT INTO person_face_assignment (
          face_observation_id, person_id, image_id, analyzed_image_id, face_index,
          assignment_source, face_cluster_run_id, face_cluster_id,
@@ -18750,16 +19125,16 @@ const FACE_SEARCH_SAVE_UPSERT_SQL: &str = "INSERT INTO person_face_assignment (
          created_at, updated_at
      )
      SELECT b.face_observation_id, CAST(?1 AS BIGINT), b.image_id, b.analyzed_image_id, b.face_index,
-            'face_search_match', NULL, NULL, CAST(?2 AS VARCHAR), CAST(?3 AS VARCHAR), CAST(?4 AS DOUBLE),
+            b.assignment_source, NULL, NULL, CAST(?2 AS VARCHAR), CAST(?3 AS VARCHAR), CAST(?4 AS DOUBLE),
             b.cosine, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
      FROM pl_face_search_save_batch b
      ORDER BY b.face_observation_id
      ON CONFLICT (face_observation_id) DO UPDATE SET
+         assignment_source = CASE WHEN person_face_assignment.person_id = excluded.person_id AND person_face_assignment.assignment_source IN ('chosen_seed', 'manual_label') THEN person_face_assignment.assignment_source ELSE excluded.assignment_source END,
          person_id = excluded.person_id,
          image_id = excluded.image_id,
          analyzed_image_id = excluded.analyzed_image_id,
          face_index = excluded.face_index,
-         assignment_source = excluded.assignment_source,
          face_cluster_run_id = excluded.face_cluster_run_id,
          face_cluster_id = excluded.face_cluster_id,
          model_version = excluded.model_version,
@@ -18770,9 +19145,10 @@ const FACE_SEARCH_SAVE_UPSERT_SQL: &str = "INSERT INTO person_face_assignment (
 
 /// Stage the faces to assign in `pl_face_search_save_batch`, created INSIDE the
 /// save's transaction. Bound multi-row VALUES, so a cosine keeps its exact bits.
+/// ⭐ S195-104 — the third element is the face's `assignment_source`.
 fn stage_face_search_batch(
     conn: &Connection,
-    faces_to_assign: &[(&PersonAssignableFace, &FaceSearchMatchRecord)],
+    faces_to_assign: &[(&PersonAssignableFace, &FaceSearchMatchRecord, &'static str)],
 ) -> Result<(), duckdb::Error>
 {
     conn.execute_batch(
@@ -18781,20 +19157,22 @@ fn stage_face_search_batch(
              image_id BIGINT NOT NULL,
              analyzed_image_id BIGINT NOT NULL,
              face_index BIGINT NOT NULL,
-             cosine DOUBLE NOT NULL
+             cosine DOUBLE NOT NULL,
+             assignment_source VARCHAR NOT NULL
          );",
     )?;
     for chunk in faces_to_assign.chunks(FACE_SEARCH_SAVE_BATCH_CHUNK)
     {
-        let placeholders = vec!["(?, ?, ?, ?, ?)"; chunk.len()].join(", ");
-        let mut values: Vec<Value> = Vec::with_capacity(chunk.len() * 5);
-        for (face, search_match) in chunk
+        let placeholders = vec!["(?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ");
+        let mut values: Vec<Value> = Vec::with_capacity(chunk.len() * 6);
+        for (face, search_match, source) in chunk
         {
             values.push(Value::BigInt(face.face_observation_id));
             values.push(Value::BigInt(face.image_id));
             values.push(Value::BigInt(face.analyzed_image_id));
             values.push(Value::BigInt(face.face_index as i64));
             values.push(Value::Double(search_match.cosine));
+            values.push(Value::Text(source.to_string()));
         }
         conn.execute(
             &format!("INSERT INTO pl_face_search_save_batch VALUES {}", placeholders),
@@ -19054,6 +19432,14 @@ fn drop_face_search_save_tables(conn: &Connection)
 /// **(a) One label per person.** The `People<sep><Name>` keyword and
 /// `person_name` use the person's STORED spelling (`stored_person_display_name`).
 ///
+/// **⭐ S195-104 (ruling 104) — the chosen face.** The face the search was run
+/// FROM and that the user picked is written `chosen_seed`; every other face it
+/// assigns is `face_search_match` (`face_search_assignment_source`). A face
+/// already chosen for this person stays chosen (`FACE_SEARCH_SAVE_UPSERT_SQL`'s
+/// never-downgrade item). Named searches seed from the chosen faces first, then
+/// the person's best other faces up to the cap
+/// (`person_search_seed_face_observation_ids`).
+///
 /// **Nothing is written when no face would be assigned.** The person row is not
 /// created then, so a name whose every match already belongs to someone else
 /// leaves no face-less person behind (it would carry no People keyword, so
@@ -19154,7 +19540,10 @@ fn assign_face_search_matches_to_person_impl(
         }
     };
 
-    let mut faces_to_assign: Vec<(&PersonAssignableFace, &FaceSearchMatchRecord)> = Vec::new();
+    // ⭐ S195-104 — each face to assign carries the source it is written with
+    // (`face_search_assignment_source`: `chosen_seed` for the face the search
+    // was run from and the user picked, else `face_search_match`).
+    let mut faces_to_assign: Vec<(&PersonAssignableFace, &FaceSearchMatchRecord, &'static str)> = Vec::new();
     let mut moved_from_other_people: Vec<PersonFaceAssignmentRecord> = Vec::new();
     let mut left_with_other_people: Vec<FaceLeftWithOtherPersonRecord> = Vec::new();
     for face in &faces
@@ -19164,16 +19553,18 @@ fn assign_face_search_matches_to_person_impl(
             continue;
         };
         let owner = owner_by_face_id.get(&face.face_observation_id);
+        let is_explicit_seed = explicit_seed_ids.contains(&face.face_observation_id);
+        let source = face_search_assignment_source(is_explicit_seed, search_match);
         match named_search_face_decision(
             owner.map(|assignment| assignment.person_id),
             searched_person_id,
-            explicit_seed_ids.contains(&face.face_observation_id),
+            is_explicit_seed,
         )
         {
-            NamedSearchFaceDecision::Assign => faces_to_assign.push((face, search_match)),
+            NamedSearchFaceDecision::Assign => faces_to_assign.push((face, search_match, source)),
             NamedSearchFaceDecision::MoveExplicitSeed =>
             {
-                faces_to_assign.push((face, search_match));
+                faces_to_assign.push((face, search_match, source));
                 if let Some(owner) = owner
                 {
                     moved_from_other_people.push(owner.clone());
@@ -19288,7 +19679,7 @@ fn assign_face_search_matches_to_person_impl(
     // ROLLBACK, never a COMMIT.
     let image_ids = faces_to_assign
         .iter()
-        .map(|(face, _)| face.image_id)
+        .map(|(face, _, _)| face.image_id)
         .collect::<std::collections::BTreeSet<i64>>();
 
     if let Err(e) = stage_face_search_batch(conn, &faces_to_assign)
@@ -19456,7 +19847,10 @@ fn assign_face_search_matches_to_person_per_row_reference(
         }
     };
 
-    let mut faces_to_assign: Vec<(&PersonAssignableFace, &FaceSearchMatchRecord)> = Vec::new();
+    // ⭐ S195-104 — each face to assign carries the source it is written with
+    // (`face_search_assignment_source`: `chosen_seed` for the face the search
+    // was run from and the user picked, else `face_search_match`).
+    let mut faces_to_assign: Vec<(&PersonAssignableFace, &FaceSearchMatchRecord, &'static str)> = Vec::new();
     let mut moved_from_other_people: Vec<PersonFaceAssignmentRecord> = Vec::new();
     let mut left_with_other_people: Vec<FaceLeftWithOtherPersonRecord> = Vec::new();
     for face in &faces
@@ -19466,16 +19860,18 @@ fn assign_face_search_matches_to_person_per_row_reference(
             continue;
         };
         let owner = owner_by_face_id.get(&face.face_observation_id);
+        let is_explicit_seed = explicit_seed_ids.contains(&face.face_observation_id);
+        let source = face_search_assignment_source(is_explicit_seed, search_match);
         match named_search_face_decision(
             owner.map(|assignment| assignment.person_id),
             searched_person_id,
-            explicit_seed_ids.contains(&face.face_observation_id),
+            is_explicit_seed,
         )
         {
-            NamedSearchFaceDecision::Assign => faces_to_assign.push((face, search_match)),
+            NamedSearchFaceDecision::Assign => faces_to_assign.push((face, search_match, source)),
             NamedSearchFaceDecision::MoveExplicitSeed =>
             {
-                faces_to_assign.push((face, search_match));
+                faces_to_assign.push((face, search_match, source));
                 if let Some(owner) = owner
                 {
                     moved_from_other_people.push(owner.clone());
@@ -19585,29 +19981,13 @@ fn assign_face_search_matches_to_person_per_row_reference(
     let mut assigned_face_count = 0u64;
     let mut image_ids = std::collections::BTreeSet::new();
     let mut keyword_row_count = 0u64;
-    for (face, search_match) in &faces_to_assign
+    // ⭐ S195-104 — the reference carries the same per-face source and the same
+    // never-downgrade item as the production upsert, written per row, so
+    // `face_search_save_set_tests` still compares like with like.
+    for (face, search_match, source) in &faces_to_assign
     {
         match conn.execute(
-            "INSERT INTO person_face_assignment (
-                 face_observation_id, person_id, image_id, analyzed_image_id, face_index,
-                 assignment_source, face_cluster_run_id, face_cluster_id,
-                 model_version, preprocessing_version, threshold, confidence_cosine,
-                 created_at, updated_at
-             )
-             VALUES (?1, ?2, ?3, ?4, ?5, 'face_search_match', NULL, NULL, ?6, ?7, ?8, ?9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-             ON CONFLICT (face_observation_id) DO UPDATE SET
-                 person_id = excluded.person_id,
-                 image_id = excluded.image_id,
-                 analyzed_image_id = excluded.analyzed_image_id,
-                 face_index = excluded.face_index,
-                 assignment_source = excluded.assignment_source,
-                 face_cluster_run_id = excluded.face_cluster_run_id,
-                 face_cluster_id = excluded.face_cluster_id,
-                 model_version = excluded.model_version,
-                 preprocessing_version = excluded.preprocessing_version,
-                 threshold = excluded.threshold,
-                 confidence_cosine = excluded.confidence_cosine,
-                 updated_at = now()",
+            FACE_SEARCH_SAVE_PER_ROW_REFERENCE_UPSERT_SQL,
             params![
                 face.face_observation_id,
                 person_id,
@@ -19618,6 +19998,7 @@ fn assign_face_search_matches_to_person_per_row_reference(
                 preprocessing_version,
                 threshold,
                 search_match.cosine,
+                *source,
             ],
         )
         {
@@ -19814,27 +20195,11 @@ fn accept_face_cluster_as_person_impl(
     let mut keyword_row_count = 0u64;
 
     for member in &members {
+        // ⭐ S195-104 — a cluster accept is NOT a per-face choice (it names a
+        // whole resemblance cluster), so it writes `cluster_accept` and never
+        // demotes a face already chosen for the same person.
         match conn.execute(
-            "INSERT INTO person_face_assignment (
-                 face_observation_id, person_id, image_id, analyzed_image_id, face_index,
-                 assignment_source, face_cluster_run_id, face_cluster_id,
-                 model_version, preprocessing_version, threshold, confidence_cosine,
-                 created_at, updated_at
-             )
-             VALUES (?1, ?2, ?3, ?4, ?5, 'cluster_accept', ?6, ?7, ?8, ?9, ?10, ?11, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-             ON CONFLICT (face_observation_id) DO UPDATE SET
-                 person_id = excluded.person_id,
-                 image_id = excluded.image_id,
-                 analyzed_image_id = excluded.analyzed_image_id,
-                 face_index = excluded.face_index,
-                 assignment_source = excluded.assignment_source,
-                 face_cluster_run_id = excluded.face_cluster_run_id,
-                 face_cluster_id = excluded.face_cluster_id,
-                 model_version = excluded.model_version,
-                 preprocessing_version = excluded.preprocessing_version,
-                 threshold = excluded.threshold,
-                 confidence_cosine = excluded.confidence_cosine,
-                 updated_at = now()",
+            PERSON_CLUSTER_ACCEPT_UPSERT_SQL,
             params![
                 member.face_observation_id,
                 person_id,
@@ -22527,6 +22892,16 @@ fn merge_records_into(conn: &Connection, records: &[ImageMetadata]) -> MergeChun
             failure_message: Some(message),
         };
     }
+
+    // ⭐ S195 — ruling 101's FORGET (fix round 1, L3): every path this chunk
+    // merged now has a catalogue row, so none of them is an unreadable file
+    // any more — whichever importer (Lightroom, Apple Photos, Copy-and-Import)
+    // brought it. AFTER the COMMIT, in a transaction of its own: a forget that
+    // fails must never un-merge the chunk (the S187 / E3 rule).
+    forget_unreadable_after_write(
+        conn,
+        records.iter().map(|record| record.file_path.as_str()),
+        "merge_records_into");
     out
 }
 
@@ -30365,6 +30740,11 @@ mod named_face_search_assignment_tests
             0,
             "W4-20/b: the failed save wrote no face-search assignment"
         );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM person_face_assignment WHERE assignment_source = 'chosen_seed'"),
+            0,
+            "S195-104: nor the chosen seed"
+        );
     }
 
     #[test]
@@ -30511,6 +30891,1280 @@ mod named_face_search_assignment_tests
         assert_eq!(named_search_face_decision(Some(3), None, false), LeaveWithOwner, "another person's face, new name");
         assert_eq!(named_search_face_decision(Some(3), Some(7), true), MoveExplicitSeed, "the chosen seed");
         assert_eq!(named_search_face_decision(Some(3), None, true), MoveExplicitSeed, "the chosen seed, new name");
+    }
+}
+
+// ===========================================================================
+// ⭐ S195-104 — ruling 104 (Richard, Oct 13, 2026: "I say go for this."):
+// a named face search seeds from the faces the user CHOSE first. Fix round 1
+// (same day, "Okay, sounds perfect"): then the person's best other faces fill
+// the cap, which is 500 — the round-1 chosen-only collapse is gone.
+//
+// Pinned here: the chosen-seed write · never-downgrade · the legacy fallback ·
+// chosen-first-then-fill, the cap and its order · chunked-equals-single (in memory, against the
+// pre-slice loop, AND through the real FFI on a real `vectors.lancedb`). Every
+// catalogue is REAL (`open_and_migrate_catalogue`); every assertion reads the
+// tables (S179). The env-gated recall measurement at the end runs only with
+// `PLDIAG_FACE_SEED_DB` set — on a COPY of a catalogue, never the live one.
+// ===========================================================================
+#[cfg(test)]
+mod face_search_seed_tests
+{
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture
+    {
+        dir: std::path::PathBuf,
+        catalogue: std::path::PathBuf,
+    }
+
+    impl Drop for Fixture
+    {
+        fn drop(&mut self)
+        {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn fresh_catalogue(tag: &str) -> (Fixture, Connection)
+    {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "plcore-s195-104-{}-{}-{}",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        let catalogue = dir.join("catalogue.db");
+        let conn = open_and_migrate_catalogue(&catalogue).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH.
+        fence_connection_against_extension_fetches(&conn);
+        (Fixture { dir, catalogue }, conn)
+    }
+
+    const MODEL: &str = "s195-104-model";
+    const PREPROCESSING: &str = "s195-104-prep";
+
+    /// A canonical face row (its own image is the analyzed image) with a
+    /// capture quality.
+    fn face(conn: &Connection, id: i64, quality: Option<f64>)
+    {
+        conn.execute(
+            "INSERT INTO face_observation
+                 (id, image_id, analyzed_image_id, face_index, algorithm_version, analysis_run_id,
+                  bounding_box_x, bounding_box_y, bounding_box_width, bounding_box_height,
+                  face_capture_quality)
+             VALUES (?1, ?1, ?1, 0, 'v', 'run', 0.1, 0.1, 0.2, 0.2, ?2)",
+            params![id, quality],
+        )
+        .expect("insert face observation");
+    }
+
+    /// One search match: face `face_observation_id` (on its own image),
+    /// found by `seed`.
+    fn matched(face_observation_id: i64, seed: i64, cosine: f64) -> FaceSearchMatchRecord
+    {
+        FaceSearchMatchRecord
+        {
+            image_id: face_observation_id,
+            face_observation_id,
+            seed_face_observation_id: seed,
+            face_index: 0,
+            cosine,
+        }
+    }
+
+    fn save(conn: &Connection, matches: &[FaceSearchMatchRecord], name: &str, explicit: &[i64]) -> PersonClusterAcceptResult
+    {
+        let result = assign_face_search_matches_to_person_impl(conn, matches, name, MODEL, PREPROCESSING, 0.58, explicit);
+        assert_eq!(result.status, "assigned", "the save ran: {}", result.message);
+        result
+    }
+
+    /// Move, exactly as Swift builds it: the left-alone faces as both the
+    /// matches (each carrying the seed that FOUND it) and the explicit seeds.
+    fn move_left_alone(conn: &Connection, first: &PersonClusterAcceptResult, name: &str) -> PersonClusterAcceptResult
+    {
+        let move_matches = first
+            .left_with_other_people_faces
+            .iter()
+            .map(|face| FaceSearchMatchRecord
+            {
+                image_id: face.image_id,
+                face_observation_id: face.face_observation_id,
+                seed_face_observation_id: face.seed_face_observation_id,
+                face_index: face.face_index,
+                cosine: face.cosine,
+            })
+            .collect::<Vec<_>>();
+        let move_ids = move_matches.iter().map(|m| m.face_observation_id).collect::<Vec<_>>();
+        save(conn, &move_matches, name, &move_ids)
+    }
+
+    /// (owner, source) of `face_id`, read on the table.
+    fn assignment(conn: &Connection, face_id: i64) -> Option<(String, String)>
+    {
+        conn.query_row(
+            "SELECT p.display_name, a.assignment_source
+             FROM person_face_assignment a JOIN person p ON p.id = a.person_id
+             WHERE a.face_observation_id = ?1",
+            params![face_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .ok()
+    }
+
+    fn source(conn: &Connection, face_id: i64) -> String
+    {
+        assignment(conn, face_id)
+            .map(|(_, source)| source)
+            .unwrap_or_else(|| "unassigned".to_string())
+    }
+
+    fn owned(name: &str, source: &str) -> Option<(String, String)>
+    {
+        Some((name.to_string(), source.to_string()))
+    }
+
+    fn person_id(conn: &Connection, name: &str) -> i64
+    {
+        conn.query_row(
+            "SELECT id FROM person WHERE normalized_name = ?1",
+            params![normalized_person_name(name)],
+            |row| row.get(0),
+        )
+        .expect("person id")
+    }
+
+    fn seeds(conn: &Connection, name: &str, limit: u32) -> Vec<i64>
+    {
+        person_search_seed_face_observation_ids_impl(conn, person_id(conn, name), limit).expect("the seed query")
+    }
+
+    /// The ruled order, computed independently: finite quality first, highest
+    /// first; NULL / NaN / ±∞ last; ties by face id ascending.
+    fn ruled_order(faces: &[(i64, Option<f64>)], limit: usize) -> Vec<i64>
+    {
+        let mut sorted = faces.to_vec();
+        sorted.sort_by(|left, right|
+        {
+            let key = |quality: Option<f64>| quality.filter(|value| value.is_finite());
+            match (key(left.1), key(right.1))
+            {
+                (Some(a), Some(b)) => b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+            .then(left.0.cmp(&right.0))
+        });
+        sorted.into_iter().map(|(id, _)| id).take(if limit == 0 { usize::MAX } else { limit }).collect()
+    }
+
+    fn cluster(conn: &Connection, ids: &[i64])
+    {
+        let members = ids
+            .iter()
+            .enumerate()
+            .map(|(rank, &id)| FaceClusterMemberRecord
+            {
+                run_id: "s195-104-run".to_string(),
+                cluster_id: 1,
+                face_observation_id: id,
+                image_id: id,
+                analyzed_image_id: id,
+                face_index: 0,
+                member_rank: rank as u32,
+                cluster_size: ids.len() as u32,
+                nearest_neighbor_face_observation_id: None,
+                nearest_neighbor_cosine: None,
+            })
+            .collect::<Vec<_>>();
+        let run = FaceClusterRunRecord
+        {
+            run_id: "s195-104-run".to_string(),
+            face_algorithm_version: "v".to_string(),
+            model_version: MODEL.to_string(),
+            preprocessing_version: PREPROCESSING.to_string(),
+            threshold: 0.55,
+            cluster_count: 1,
+            member_count: ids.len() as u32,
+        };
+        assert_eq!(replace_face_cluster_run_impl(conn, run, members), ids.len() as u64);
+    }
+
+    // ------------------------------------------------------------------
+    // The chosen-seed write
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_face_the_search_ran_from_is_written_chosen_and_its_matches_are_not()
+    {
+        let (_fixture, conn) = fresh_catalogue("chosen-write");
+        for id in 1..=4
+        {
+            face(&conn, id, Some(0.5));
+        }
+
+        // The user picked face 1, and the search ran FROM it (its own match is
+        // self-seeded). Face 4 is self-seeded too — a reference face the person
+        // already had — but the user did not pick it.
+        save(
+            &conn,
+            &[matched(1, 1, 1.0), matched(2, 1, 0.8), matched(3, 1, 0.7), matched(4, 4, 1.0)],
+            "Judy",
+            &[1],
+        );
+
+        assert_eq!(source(&conn, 1), "chosen_seed", "ruling 104: the picked face is chosen");
+        assert_eq!(source(&conn, 2), "face_search_match", "a resemblance match is not chosen");
+        assert_eq!(source(&conn, 3), "face_search_match");
+        assert_eq!(source(&conn, 4), "face_search_match", "a reference face the user did not pick is not chosen");
+    }
+
+    #[test]
+    fn move_never_makes_a_face_chosen()
+    {
+        let (_fixture, conn) = fresh_catalogue("move-not-chosen");
+        for id in 1..=3
+        {
+            face(&conn, id, Some(0.5));
+        }
+        assert_eq!(assign_face_observations_to_person_impl(&conn, &[2, 3], "Bob").status, "assigned");
+
+        let first = save(&conn, &[matched(1, 1, 1.0), matched(2, 1, 0.8), matched(3, 1, 0.7)], "Judy", &[1]);
+        assert_eq!(first.left_with_other_people_face_count, 2, "Bob's two faces are left with him");
+        assert_eq!(source(&conn, 1), "chosen_seed");
+
+        move_left_alone(&conn, &first, "Judy");
+
+        assert_eq!(assignment(&conn, 2), owned("Judy", "face_search_match"), "a moved face is Judy's — as a MATCH");
+        assert_eq!(assignment(&conn, 3), owned("Judy", "face_search_match"));
+        assert_eq!(source(&conn, 1), "chosen_seed", "and the picked face stays chosen");
+    }
+
+    #[test]
+    fn the_person_writers_carry_the_never_downgrade_item_verbatim()
+    {
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let rule = flat(FACE_ASSIGNMENT_SOURCE_NEVER_DOWNGRADE_SQL);
+        assert!(
+            rule.contains(&format!("IN {} THEN", FACE_ASSIGNMENT_CHOSEN_SOURCES_SQL)),
+            "the rule's chosen list IS the seed query's chosen list"
+        );
+        for (writer, sql) in [
+            ("the named face-search save", FACE_SEARCH_SAVE_UPSERT_SQL),
+            ("the per-face reference", FACE_SEARCH_SAVE_PER_ROW_REFERENCE_UPSERT_SQL),
+            ("the manual writer", PERSON_MANUAL_LABEL_UPSERT_SQL),
+            ("the cluster writer", PERSON_CLUSTER_ACCEPT_UPSERT_SQL),
+        ]
+        {
+            let sql = flat(sql);
+            let set_list = sql.split("ON CONFLICT (face_observation_id) DO UPDATE SET ").nth(1).unwrap_or("");
+            assert!(
+                set_list.starts_with(&format!("{},", rule)),
+                "S195-104: {}'s SET list must OPEN with the never-downgrade item, verbatim",
+                writer
+            );
+            assert_eq!(
+                sql.matches("assignment_source =").count(),
+                1,
+                "S195-104: {} sets assignment_source exactly once (no `= excluded.assignment_source` left behind)",
+                writer
+            );
+        }
+    }
+
+    #[test]
+    fn the_source_rule_is_explicit_and_self_seeded()
+    {
+        assert_eq!(face_search_assignment_source(true, &matched(7, 7, 1.0)), "chosen_seed", "the picked face");
+        assert_eq!(face_search_assignment_source(true, &matched(7, 3, 0.9)), "face_search_match", "a Move");
+        assert_eq!(face_search_assignment_source(false, &matched(7, 7, 1.0)), "face_search_match", "a reference face nobody picked");
+        assert_eq!(face_search_assignment_source(false, &matched(7, 3, 0.9)), "face_search_match", "a match");
+        assert_eq!(face_search_assignment_source(true, &matched(7, 0, 0.9)), "face_search_match", "a drawn-region seed id is 0");
+    }
+
+    // ------------------------------------------------------------------
+    // Never downgrade
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_later_search_never_downgrades_a_chosen_face_and_an_explicit_choice_upgrades_a_match()
+    {
+        let (_fixture, conn) = fresh_catalogue("never-downgrade");
+        for id in 1..=4
+        {
+            face(&conn, id, Some(0.5));
+        }
+
+        save(&conn, &[matched(1, 1, 1.0), matched(2, 1, 0.8)], "Judy", &[1]);
+        assert_eq!(source(&conn, 1), "chosen_seed");
+        assert_eq!(source(&conn, 2), "face_search_match");
+
+        // A later search, run from face 3, matches face 1 again: face 1 is
+        // re-saved for Judy as a MATCH, and must stay chosen.
+        save(&conn, &[matched(3, 3, 1.0), matched(1, 3, 0.9), matched(2, 3, 0.85)], "Judy", &[3]);
+        assert_eq!(source(&conn, 1), "chosen_seed", "ruling 104: a chosen face is never downgraded");
+        assert_eq!(source(&conn, 3), "chosen_seed");
+        assert_eq!(source(&conn, 2), "face_search_match");
+
+        // A later EXPLICIT choice of face 2 (a case variant of the name) upgrades it.
+        save(&conn, &[matched(2, 2, 1.0), matched(1, 2, 0.9)], "judy", &[2]);
+        assert_eq!(assignment(&conn, 2), owned("Judy", "chosen_seed"), "a later explicit choice turns a match into a chosen face");
+        assert_eq!(source(&conn, 1), "chosen_seed");
+    }
+
+    #[test]
+    fn manual_labels_and_cluster_accepts_keep_a_chosen_face_chosen()
+    {
+        let (_fixture, conn) = fresh_catalogue("manual-cluster");
+        for id in 61..=63
+        {
+            face(&conn, id, Some(0.5));
+        }
+        assert_eq!(assign_face_observations_to_person_impl(&conn, &[61], "Grace").status, "assigned");
+        assert_eq!(source(&conn, 61), "manual_label");
+
+        // A search for Grace that matches 61 without it being picked.
+        save(&conn, &[matched(62, 62, 1.0), matched(61, 62, 0.9)], "Grace", &[62]);
+        assert_eq!(source(&conn, 61), "manual_label", "a manual label counts as chosen, and stays");
+        assert_eq!(source(&conn, 62), "chosen_seed");
+
+        // A cluster accept for the SAME person keeps both chosen faces chosen.
+        cluster(&conn, &[61, 62, 63]);
+        let accepted = accept_face_cluster_as_person_impl(&conn, "s195-104-run", 1, "Grace");
+        assert_eq!(accepted.status, "accepted", "{}", accepted.message);
+        assert_eq!(source(&conn, 61), "manual_label", "a cluster accept is not a per-face choice and demotes nothing");
+        assert_eq!(source(&conn, 62), "chosen_seed");
+        assert_eq!(source(&conn, 63), "cluster_accept");
+
+        // The manual writer on a `chosen_seed` face of the same person keeps it chosen.
+        assert_eq!(assign_face_observations_to_person_impl(&conn, &[62], "Grace").status, "assigned");
+        assert_eq!(source(&conn, 62), "chosen_seed");
+    }
+
+    #[test]
+    fn a_face_that_changes_person_takes_the_new_writers_source()
+    {
+        let (_fixture, conn) = fresh_catalogue("changes-person");
+        for id in 1..=3
+        {
+            face(&conn, id, Some(0.5));
+        }
+        save(&conn, &[matched(1, 1, 1.0)], "Carol", &[1]);
+        save(&conn, &[matched(2, 2, 1.0)], "Carol", &[2]);
+        assert_eq!(source(&conn, 1), "chosen_seed");
+        assert_eq!(source(&conn, 2), "chosen_seed");
+
+        // The user picks Carol's chosen face 1 and names it Dana: Dana's chosen face now.
+        save(&conn, &[matched(1, 1, 1.0)], "Dana", &[1]);
+        assert_eq!(assignment(&conn, 1), owned("Dana", "chosen_seed"));
+
+        // Dana's search, run from face 3, finds Carol's chosen face 2: it stays
+        // Carol's. Move hands it to Dana as a MATCH — "chosen" is never carried
+        // across to a different person.
+        let first = save(&conn, &[matched(3, 3, 1.0), matched(2, 3, 0.9)], "Dana", &[3]);
+        assert_eq!(assignment(&conn, 2), owned("Carol", "chosen_seed"), "left with Carol");
+        move_left_alone(&conn, &first, "Dana");
+        assert_eq!(assignment(&conn, 2), owned("Dana", "face_search_match"), "a face that changes person takes the new source");
+
+        // The manual writer moving Dana's chosen face 3 to Eve writes Eve's label.
+        assert_eq!(assign_face_observations_to_person_impl(&conn, &[3], "Eve").status, "assigned");
+        assert_eq!(assignment(&conn, 3), owned("Eve", "manual_label"));
+    }
+
+    // ------------------------------------------------------------------
+    // The seeds: chosen first, then the best other faces, quality first
+    // within each group, capped (fix round 1: 500, no chosen-only collapse)
+    // ------------------------------------------------------------------
+
+    /// The ruled seed order, computed independently: every chosen face in
+    /// `ruled_order`, then every other face in `ruled_order`, at most `limit`.
+    fn ruled_seed_order(chosen: &[(i64, Option<f64>)], others: &[(i64, Option<f64>)], limit: usize) -> Vec<i64>
+    {
+        ruled_order(chosen, 0)
+            .into_iter()
+            .chain(ruled_order(others, 0))
+            .take(if limit == 0 { usize::MAX } else { limit })
+            .collect()
+    }
+
+    #[test]
+    fn seeds_are_the_chosen_faces_first_then_the_best_other_faces_capped_at_the_limit()
+    {
+        let (_fixture, conn) = fresh_catalogue("seed-cap");
+        // 60 chosen faces with many tied qualities, one NULL, one NaN and two
+        // infinities (which must all sort LAST within the chosen group); 10
+        // MATCH faces of a HIGHER quality than any chosen one — they must
+        // still come AFTER every chosen face — plus three weaker matches, one
+        // of them with no quality (last of all).
+        let mut chosen = Vec::new();
+        for id in 101..=160_i64
+        {
+            let quality = match id
+            {
+                157 => None,
+                158 => Some(f64::NAN),
+                159 => Some(f64::INFINITY),
+                160 => Some(f64::NEG_INFINITY),
+                _ => Some(((id % 7) as f64) / 10.0),
+            };
+            face(&conn, id, quality);
+            chosen.push((id, quality));
+        }
+        let mut others = Vec::new();
+        for id in 201..=210_i64
+        {
+            face(&conn, id, Some(0.99));
+            others.push((id, Some(0.99)));
+        }
+        for (id, quality) in [(211_i64, Some(0.05)), (212, None), (213, Some(0.05))]
+        {
+            face(&conn, id, quality);
+            others.push((id, quality));
+        }
+        // Half the chosen faces as `manual_label`, half as `chosen_seed`.
+        let manual = (101..=130).collect::<Vec<i64>>();
+        assert_eq!(assign_face_observations_to_person_impl(&conn, &manual, "Judy").status, "assigned");
+        for id in 131..=160
+        {
+            save(&conn, &[matched(id, id, 1.0)], "Judy", &[id]);
+        }
+        let matches = (201..=213).map(|id| matched(id, 101, 0.8)).collect::<Vec<_>>();
+        save(&conn, &matches, "Judy", &[]);
+        assert_eq!(source(&conn, 205), "face_search_match");
+
+        assert_eq!(seeds(&conn, "Judy", 50), ruled_seed_order(&chosen, &others, 50), "chosen first: 50 of the 60 chosen faces, no match yet");
+        assert!(seeds(&conn, "Judy", 50).iter().all(|id| (101..=160).contains(id)), "a better-quality match never displaces a chosen face");
+        assert_eq!(seeds(&conn, "Judy", 65), ruled_seed_order(&chosen, &others, 65), "the cap is filled with the best other faces after every chosen face");
+        assert_eq!(seeds(&conn, "Judy", 65).len(), 65);
+        assert_eq!(seeds(&conn, "Judy", 500), ruled_seed_order(&chosen, &others, 0), "a 500 cap above the person's 73 faces takes them all");
+        assert_eq!(seeds(&conn, "Judy", 0), ruled_seed_order(&chosen, &others, 0), "limit 0 = every face, same order");
+        assert_eq!(seeds(&conn, "Judy", 3), ruled_seed_order(&chosen, &others, 3));
+        let all = seeds(&conn, "Judy", 0);
+        assert_eq!(&all[56..60], &[157, 158, 159, 160], "NULL, NaN and ±∞ qualities sort LAST within the chosen group, by id");
+        assert_eq!(&all[60..70], &(201..=210).collect::<Vec<i64>>()[..], "then the best other faces, ties by id");
+        assert_eq!(&all[70..], &[211, 213, 212], "weaker others, then the one with no quality last");
+    }
+
+    #[test]
+    fn a_500_cap_holds_exactly_and_keeps_the_chosen_faces_in_front()
+    {
+        // Fix round 1's cap, on more faces than it allows: 3 chosen faces of
+        // the LOWEST quality and 517 others — the 500 seeds are the 3 chosen
+        // faces then the best 497 others.
+        let (_fixture, conn) = fresh_catalogue("seed-500");
+        let mut chosen = Vec::new();
+        for id in 1001..=1003_i64
+        {
+            face(&conn, id, Some(0.01));
+            chosen.push((id, Some(0.01)));
+        }
+        let mut others = Vec::new();
+        for id in 2001..=2517_i64
+        {
+            let quality = Some(((id * 53) % 997) as f64 / 1000.0 + 0.02);
+            face(&conn, id, quality);
+            others.push((id, quality));
+        }
+        save(&conn, &(2001..=2517).map(|id| matched(id, 0, 0.8)).collect::<Vec<_>>(), "Judy", &[]);
+        assert_eq!(assign_face_observations_to_person_impl(&conn, &[1001, 1002, 1003], "Judy").status, "assigned");
+
+        let capped = seeds(&conn, "Judy", 500);
+        assert_eq!(capped.len(), 500, "the cap holds exactly");
+        assert_eq!(&capped[..3], &[1001, 1002, 1003], "the chosen faces lead, however weak their quality");
+        assert_eq!(capped, ruled_seed_order(&chosen, &others, 500));
+        assert_eq!(seeds(&conn, "Judy", 0).len(), 520, "limit 0 = every face");
+    }
+
+    #[test]
+    fn a_person_with_no_chosen_face_seeds_from_its_best_assigned_faces()
+    {
+        let (_fixture, conn) = fresh_catalogue("legacy-fallback");
+        // Every catalogue built before ruling 104: the person's faces are all
+        // resemblance matches.
+        let mut legacy = Vec::new();
+        for id in 301..=370_i64
+        {
+            let quality = if id == 333 { None } else { Some(((id * 37) % 101) as f64 / 100.0) };
+            face(&conn, id, quality);
+            legacy.push((id, quality));
+        }
+        let matches = (301..=370).map(|id| matched(id, 0, 0.8)).collect::<Vec<_>>();
+        save(&conn, &matches, "Judy", &[]);
+        assert_eq!(source(&conn, 301), "face_search_match");
+
+        assert_eq!(seeds(&conn, "Judy", 50), ruled_order(&legacy, 50), "the legacy fallback: the best 50 assigned faces");
+        assert_eq!(seeds(&conn, "Judy", 500), ruled_order(&legacy, 0), "under the 500 cap: all 70, best first");
+        assert_eq!(seeds(&conn, "Judy", 0), ruled_order(&legacy, 0));
+
+        // A small person: every face, never zero.
+        for id in 401..=403
+        {
+            face(&conn, id, Some(0.2));
+        }
+        save(&conn, &[matched(401, 0, 0.8), matched(402, 0, 0.8), matched(403, 0, 0.8)], "Bob", &[]);
+        assert_eq!(seeds(&conn, "Bob", 50), vec![401, 402, 403], "a person who has faces never gets zero seeds");
+
+        // A person known only through a cluster accept: its faces are the fallback.
+        for id in 501..=502
+        {
+            face(&conn, id, Some(0.3));
+        }
+        cluster(&conn, &[501, 502]);
+        assert_eq!(accept_face_cluster_as_person_impl(&conn, "s195-104-run", 1, "Cleo").status, "accepted");
+        assert_eq!(seeds(&conn, "Cleo", 50), vec![501, 502]);
+    }
+
+    #[test]
+    fn one_chosen_face_leads_and_the_best_other_faces_fill_the_cap()
+    {
+        // Fix round 1 (Richard, Oct 13, 2026) REVERSES round 1's chosen-only
+        // collapse: one chosen face no longer shrinks the search to one seed.
+        // The chosen faces lead (however weak), then the person's best other
+        // faces fill the cap.
+        let (_fixture, conn) = fresh_catalogue("one-chosen");
+        for id in 601..=640
+        {
+            face(&conn, id, Some(0.9));
+        }
+        for id in 650..=652
+        {
+            face(&conn, id, Some(0.95));
+        }
+        face(&conn, 653, Some(f64::NAN));
+        face(&conn, 654, None);
+        face(&conn, 641, Some(0.1));
+        face(&conn, 642, Some(0.05));
+        let others = (601..=640).chain(650..=654).map(|id| matched(id, 0, 0.8)).collect::<Vec<_>>();
+        save(&conn, &others, "Judy", &[]);
+        save(&conn, &[matched(641, 641, 1.0)], "Judy", &[641]);
+        assert_eq!(assign_face_observations_to_person_impl(&conn, &[642], "Judy").status, "assigned");
+        assert_eq!(source(&conn, 641), "chosen_seed");
+        assert_eq!(source(&conn, 642), "manual_label");
+
+        let mut expected = vec![641, 642, 650, 651, 652];
+        expected.extend(601..=640);
+        expected.extend([653, 654]);
+        assert_eq!(seeds(&conn, "Judy", 0), expected, "chosen (best first), then the best others, invalid quality last");
+        assert_eq!(seeds(&conn, "Judy", 500), expected, "the 500 cap takes every face here");
+        assert_eq!(seeds(&conn, "Judy", 5), vec![641, 642, 650, 651, 652], "a small cap still fills past the chosen faces");
+        assert_eq!(seeds(&conn, "Judy", 1), vec![641]);
+    }
+
+    #[test]
+    fn the_seed_query_answers_nothing_for_nobody()
+    {
+        let (_fixture, conn) = fresh_catalogue("seed-nobody");
+        face(&conn, 701, Some(0.5));
+        save(&conn, &[matched(701, 701, 1.0)], "Judy", &[701]);
+        assert_eq!(person_search_seed_face_observation_ids_impl(&conn, 0, 50), Ok(Vec::new()));
+        assert_eq!(person_search_seed_face_observation_ids_impl(&conn, -1, 50), Ok(Vec::new()));
+        assert_eq!(person_search_seed_face_observation_ids_impl(&conn, 999_999, 50), Ok(Vec::new()));
+        // A face whose observation row is gone is no seed (it has no vector).
+        conn.execute("DELETE FROM face_observation WHERE id = 701", []).expect("orphan the assignment");
+        assert_eq!(seeds(&conn, "Judy", 50), Vec::<i64>::new());
+    }
+
+    // ------------------------------------------------------------------
+    // Chunked equals single
+    // ------------------------------------------------------------------
+
+    /// A deterministic pseudo-random generator, so a failure reproduces.
+    struct Lcg(u64);
+
+    impl Lcg
+    {
+        fn next(&mut self) -> f32
+        {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+        }
+    }
+
+    /// One fixture face: (id, image, face index on that image, vector).
+    type FixtureFace = (i64, i64, u32, Vec<f32>);
+
+    /// Faces 1..=40 on 24 images (images 1001–1012 hold two to four faces),
+    /// 8-d, each face its own index on its image. Ties are built in on purpose:
+    /// faces 1 and 2 share a vector (two SEEDS that tie on every candidate);
+    /// faces 31 and 32 share a vector AND an image (two CANDIDATES that tie on
+    /// every seed); face 40 shares face 5's vector and image. Faces 41 and 42
+    /// are the unit axes e1 and e2 on ONE image (1041): seeded from
+    /// themselves each scores EXACTLY 1.0, so when 42's call comes first the
+    /// held match is 42 and only the face-id rule hands the image to 41 when
+    /// 41's call arrives — the cross-call tie a single call never meets.
+    fn fixture_vectors() -> Vec<FixtureFace>
+    {
+        let mut lcg = Lcg(0x5195_0104);
+        let mut faces: Vec<FixtureFace> = Vec::new();
+        for id in 1..=40_i64
+        {
+            let image = if id <= 24 { 1000 + id } else { 1000 + (id % 12) + 1 };
+            faces.push((id, image, 0, (0..8).map(|_| lcg.next()).collect::<Vec<f32>>()));
+        }
+        let axis = |index: usize| (0..8).map(|position| if position == index { 1.0 } else { 0.0 }).collect::<Vec<f32>>();
+        faces.push((41, 1041, 0, axis(0)));
+        faces.push((42, 1041, 0, axis(1)));
+        let one = faces[0].3.clone();
+        faces[1].3 = one;
+        let thirty_one = faces[30].3.clone();
+        faces[31].3 = thirty_one;
+        faces[31].1 = faces[30].1;
+        let five = faces[4].3.clone();
+        faces[39].3 = five;
+        // A unique face index per image, in id order.
+        let mut next_index = std::collections::HashMap::<i64, u32>::new();
+        for face in faces.iter_mut()
+        {
+            let index = next_index.entry(face.1).or_insert(0);
+            face.2 = *index;
+            *index += 1;
+        }
+        assert_eq!(faces[39].1, faces[4].1, "fixture: face 40 shares face 5's image");
+        faces
+    }
+
+    fn stored(faces: &[FixtureFace]) -> Vec<StoredFaceEmbedding>
+    {
+        let mut records = faces
+            .iter()
+            .map(|(id, image, face_index, vector)| StoredFaceEmbedding
+            {
+                face_observation_id: *id,
+                image_id: *image,
+                analyzed_image_id: *image,
+                face_index: *face_index,
+                vector: vector.clone(),
+            })
+            .collect::<Vec<_>>();
+        // `stored_face_embeddings`' own order.
+        records.sort_by(|left, right| left.face_observation_id.cmp(&right.face_observation_id));
+        records
+    }
+
+    fn keys(matches: &[FaceSearchMatchRecord]) -> Vec<(i64, i64, i64, u32, u64)>
+    {
+        matches
+            .iter()
+            .map(|m| (m.image_id, m.face_observation_id, m.seed_face_observation_id, m.face_index, m.cosine.to_bits()))
+            .collect()
+    }
+
+    /// One in-memory "call": the impl's seed filter, then the pure core.
+    fn call(
+        records: &[StoredFaceEmbedding],
+        seed_ids: &[i64],
+        candidates: Option<&std::collections::HashSet<i64>>,
+        threshold: f64,
+        limit: u32,
+        prior: Vec<FaceSearchMatchRecord>,
+    ) -> Vec<FaceSearchMatchRecord>
+    {
+        let seed_set = seed_ids.iter().copied().collect::<std::collections::HashSet<i64>>();
+        let seeds = records.iter().filter(|r| seed_set.contains(&r.face_observation_id)).collect::<Vec<_>>();
+        face_search_ordered_matches(face_search_best_by_image(records, &seeds, candidates, threshold, prior), limit)
+    }
+
+    /// The search loop exactly as it shipped before this slice (one call, the
+    /// old replace rule), kept to prove the single call's answer did not move.
+    fn pre_slice_single_call(
+        records: &[StoredFaceEmbedding],
+        seed_ids: &[i64],
+        candidates: Option<&std::collections::HashSet<i64>>,
+        threshold: f64,
+    ) -> Vec<FaceSearchMatchRecord>
+    {
+        let seed_set = seed_ids.iter().copied().collect::<std::collections::HashSet<i64>>();
+        let seeds = records.iter().filter(|r| seed_set.contains(&r.face_observation_id)).collect::<Vec<_>>();
+        let mut best_by_image = std::collections::HashMap::<i64, FaceSearchMatchRecord>::new();
+        for candidate in records.iter()
+        {
+            if let Some(candidate_ids) = candidates
+            {
+                if !candidate_ids.contains(&candidate.image_id)
+                {
+                    continue;
+                }
+            }
+            for seed in seeds.iter()
+            {
+                let cosine = cosine_f32(&seed.vector, &candidate.vector);
+                if cosine < threshold
+                {
+                    continue;
+                }
+                let match_record = FaceSearchMatchRecord
+                {
+                    image_id: candidate.image_id,
+                    face_observation_id: candidate.face_observation_id,
+                    seed_face_observation_id: seed.face_observation_id,
+                    face_index: candidate.face_index,
+                    cosine,
+                };
+                match best_by_image.get(&candidate.image_id)
+                {
+                    Some(existing)
+                        if existing.cosine > cosine
+                            || (existing.cosine == cosine
+                                && existing.face_observation_id <= candidate.face_observation_id) => {}
+                    _ =>
+                    {
+                        best_by_image.insert(candidate.image_id, match_record);
+                    }
+                }
+            }
+        }
+        face_search_ordered_matches(best_by_image, 0)
+    }
+
+    /// The ways Swift (or anyone) might split and order the reference faces.
+    fn splits(seed_ids: &[i64]) -> Vec<Vec<Vec<i64>>>
+    {
+        let mut orders = vec![seed_ids.to_vec()];
+        orders.push(seed_ids.iter().rev().copied().collect());
+        let mut rotated = seed_ids.to_vec();
+        rotated.rotate_left(seed_ids.len() / 2);
+        orders.push(rotated);
+        let mut interleaved = seed_ids.iter().step_by(2).copied().collect::<Vec<_>>();
+        interleaved.extend(seed_ids.iter().skip(1).step_by(2).copied());
+        orders.push(interleaved);
+
+        let mut result = Vec::new();
+        for order in orders
+        {
+            for size in 1..=order.len()
+            {
+                result.push(order.chunks(size).map(|chunk| chunk.to_vec()).collect());
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn any_split_of_the_reference_faces_answers_what_one_call_answers_in_memory()
+    {
+        let records = stored(&fixture_vectors());
+        let seed_ids = vec![1, 2, 5, 9, 14, 17, 22, 31, 33, 38, 41, 42];
+        let scope = (1001..=1012).chain([1041]).collect::<std::collections::HashSet<i64>>();
+
+        for candidates in [None, Some(&scope)]
+        {
+            for threshold in [-1.0, 0.0, 0.2, 0.55]
+            {
+                let single = call(&records, &seed_ids, candidates, threshold, 0, Vec::new());
+                assert!(!single.is_empty(), "vacuity: threshold {} answers something", threshold);
+                assert_eq!(
+                    keys(&single),
+                    keys(&pre_slice_single_call(&records, &seed_ids, candidates, threshold)),
+                    "the single call answers exactly what the pre-slice loop answered (threshold {})",
+                    threshold
+                );
+                for split in splits(&seed_ids)
+                {
+                    let mut prior = Vec::new();
+                    for chunk in &split
+                    {
+                        prior = call(&records, chunk, candidates, threshold, 0, prior);
+                    }
+                    assert_eq!(keys(&prior), keys(&single), "split {:?} at threshold {}", split, threshold);
+                }
+                // A limit on the LAST call cuts the merged answer like a limited single call.
+                let mut prior = Vec::new();
+                for chunk in seed_ids.chunks(3)
+                {
+                    prior = call(&records, chunk, candidates, threshold, 0, prior);
+                }
+                let last = call(&records, &[], candidates, threshold, 5, prior);
+                assert_eq!(keys(&last), keys(&call(&records, &seed_ids, candidates, threshold, 5, Vec::new())));
+            }
+        }
+
+        // The ties are real, and the order settles them the same way every time:
+        // seeds 1 and 2 share a vector, so a candidate they find is credited to 1;
+        // faces 31 and 32 share an image AND a vector, so 31 wins it.
+        let single = call(&records, &seed_ids, None, -1.0, 0, Vec::new());
+        assert!(single.iter().any(|m| m.seed_face_observation_id == 1), "vacuity: seed 1 wins something");
+        assert!(!single.iter().any(|m| m.seed_face_observation_id == 2), "seed 2 always ties seed 1, and loses on id");
+        let shared_image = records.iter().find(|r| r.face_observation_id == 31).map(|r| r.image_id).expect("31");
+        let winner = single.iter().find(|m| m.image_id == shared_image).expect("the shared image matches");
+        assert_eq!(winner.face_observation_id, 31, "two tied faces on one image: the lower id");
+
+        // The cross-call tie: 42's call first holds face 42 at exactly 1.0 for
+        // image 1041; 41's call then finds face 41 at exactly 1.0, and the
+        // face-id rule — not the visiting order — hands the image to 41.
+        let axis_winner = single.iter().find(|m| m.image_id == 1041).expect("image 1041 matches");
+        assert_eq!((axis_winner.face_observation_id, axis_winner.cosine), (41, 1.0), "the single call: face 41 at exactly 1.0");
+        let after_42 = call(&records, &[42], None, -1.0, 0, Vec::new());
+        let held = after_42.iter().find(|m| m.image_id == 1041).expect("42's call matches image 1041");
+        assert_eq!((held.face_observation_id, held.cosine), (42, 1.0), "vacuity: the prior holds face 42 at exactly 1.0");
+        let after_41 = call(&records, &[41], None, -1.0, 0, after_42);
+        let settled = after_41.iter().find(|m| m.image_id == 1041).expect("image 1041");
+        assert_eq!(settled.face_observation_id, 41, "an exact cross-call tie goes to the lower face id");
+    }
+
+    #[test]
+    fn a_nan_cosine_is_never_a_match_and_never_decides_an_order()
+    {
+        let mut faces = fixture_vectors();
+        faces[19].3[3] = f32::NAN;
+        let records = stored(&faces);
+        let seed_ids = vec![1, 5, 20, 31];
+        let single = call(&records, &seed_ids, None, -1.0, 0, Vec::new());
+        assert!(single.iter().all(|m| m.cosine.is_finite()), "no NaN reaches an answer");
+        assert!(single.iter().all(|m| m.face_observation_id != 20 && m.seed_face_observation_id != 20), "the NaN face matches nothing and finds nothing");
+        for split in splits(&seed_ids)
+        {
+            let mut prior = Vec::new();
+            for chunk in &split
+            {
+                prior = call(&records, chunk, None, -1.0, 0, prior);
+            }
+            assert_eq!(keys(&prior), keys(&single), "split {:?}", split);
+        }
+        // A NaN handed back as a prior match is dropped too.
+        let poisoned = vec![FaceSearchMatchRecord { image_id: 1001, face_observation_id: 1, seed_face_observation_id: 1, face_index: 0, cosine: f64::NAN }];
+        assert_eq!(keys(&call(&records, &seed_ids, None, -1.0, 0, poisoned)), keys(&single));
+    }
+
+    /// The process-global catalogue, installed for the life of this value.
+    struct Installed;
+
+    impl Installed
+    {
+        fn new(fixture: &Fixture, conn: Connection) -> Self
+        {
+            *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(conn);
+            *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fixture.catalogue.clone());
+            CATALOGUE.clear_poison();
+            CATALOGUE_PATH.clear_poison();
+            Installed
+        }
+
+        fn at_path(path: &std::path::Path, conn: Connection) -> Self
+        {
+            *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(conn);
+            *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path.to_path_buf());
+            CATALOGUE.clear_poison();
+            CATALOGUE_PATH.clear_poison();
+            Installed
+        }
+    }
+
+    impl Drop for Installed
+    {
+        fn drop(&mut self)
+        {
+            *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
+
+    fn serial() -> std::sync::MutexGuard<'static, ()>
+    {
+        super::swallowed_failure_tests::GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn search(seed_ids: Vec<i64>, candidates: Vec<i64>, threshold: f64, limit: u32, prior: Vec<FaceSearchMatchRecord>) -> FaceEmbeddingSearchResult
+    {
+        futures::executor::block_on(face_embedding_search_checked(
+            seed_ids,
+            candidates,
+            MODEL.to_string(),
+            PREPROCESSING.to_string(),
+            threshold,
+            limit,
+            prior,
+        ))
+    }
+
+    #[test]
+    fn chunked_calls_through_the_ffi_answer_exactly_what_one_call_answers()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("chunked-ffi");
+        let faces = fixture_vectors();
+        for (id, image, face_index, _) in &faces
+        {
+            conn.execute(
+                "INSERT INTO face_observation
+                     (id, image_id, analyzed_image_id, face_index, algorithm_version, analysis_run_id,
+                      bounding_box_x, bounding_box_y, bounding_box_width, bounding_box_height)
+                 VALUES (?1, ?2, ?2, ?3, 'v', 'run', 0.1, 0.1, 0.2, 0.2)",
+                params![id, image, *face_index as i64],
+            )
+            .expect("face observation");
+        }
+        // A pair TWIN of face 9 (a JPEG half on image 9009, detected on face
+        // 9's image): a seed given as the twin resolves through the pair.
+        let (_, nine_image, nine_index, _) = faces[8].clone();
+        conn.execute(
+            "INSERT INTO face_observation
+                 (id, image_id, analyzed_image_id, face_index, algorithm_version, analysis_run_id,
+                  bounding_box_x, bounding_box_y, bounding_box_width, bounding_box_height)
+             VALUES (90009, 9009, ?1, ?2, 'v', 'run', 0.1, 0.1, 0.2, 0.2)",
+            params![nine_image, nine_index as i64],
+        )
+        .expect("twin face observation");
+        let _installed = Installed::new(&fixture, conn);
+
+        let records = faces
+            .iter()
+            .map(|(id, image, face_index, vector)| FaceEmbeddingVectorRecord
+            {
+                face_observation_id: *id,
+                image_id: *image,
+                analyzed_image_id: *image,
+                face_index: *face_index,
+                model_name: "s195-104".to_string(),
+                model_version: MODEL.to_string(),
+                preprocessing_version: PREPROCESSING.to_string(),
+                input_size: 112,
+                color_order: "RGB".to_string(),
+                normalization: "none".to_string(),
+                embedding_dimension: 8,
+                embedding_l2_norm: 1.0,
+                vector: vector.clone(),
+            })
+            .collect::<Vec<_>>();
+        let stored = FACE_EMBEDDING_RUNTIME.block_on(upsert_face_embeddings_impl(records));
+        assert_eq!(stored.status, "stored", "fixture: {}", stored.message);
+        assert_eq!(stored.stored_count, 42);
+
+        // 90009 is face 9's twin: the seed list names the twin, as a RAW-half pick would.
+        let seed_ids = vec![1, 2, 5, 90009, 14, 17, 22, 31, 33, 38, 41, 42];
+        for (candidates, threshold) in [(Vec::new(), -1.0), (Vec::new(), 0.2), ((1001..=1012).collect::<Vec<i64>>(), 0.0)]
+        {
+            let single = search(seed_ids.clone(), candidates.clone(), threshold, 0, Vec::new());
+            assert!(single.ok, "{:?}", single.error_message);
+            assert!(!single.matches.is_empty(), "vacuity: the store answers");
+            assert!(
+                single.matches.iter().any(|m| m.seed_face_observation_id == 9),
+                "vacuity: the twin seed reached face 9's vector"
+            );
+            for split in splits(&seed_ids)
+            {
+                let mut prior = Vec::new();
+                for chunk in &split
+                {
+                    let part = search(chunk.clone(), candidates.clone(), threshold, 0, prior);
+                    assert!(part.ok, "{:?}", part.error_message);
+                    prior = part.matches;
+                }
+                assert_eq!(keys(&prior), keys(&single.matches), "split {:?} at threshold {}", split, threshold);
+            }
+            // The limit on the final call.
+            let mut prior = Vec::new();
+            for chunk in seed_ids.chunks(4)
+            {
+                prior = search(chunk.to_vec(), candidates.clone(), threshold, 0, prior).matches;
+            }
+            let limited_single = search(seed_ids.clone(), candidates.clone(), threshold, 7, Vec::new());
+            let limited_last = search(Vec::new(), candidates.clone(), threshold, 7, prior);
+            assert_eq!(keys(&limited_last.matches), keys(&limited_single.matches));
+            assert_eq!(limited_single.matches.len(), 7.min(single.matches.len()));
+        }
+        // `_installed` drops before `fixture` (reverse declaration order), so the
+        // global catalogue is cleared before its directory is removed.
+    }
+
+    // ------------------------------------------------------------------
+    // The recall measurement (env-gated; the coordinator runs it on a COPY)
+    // ------------------------------------------------------------------
+
+    /// ⭐ S195-104 — "Verify recall on Judy before calling it done."
+    ///
+    /// ```text
+    /// PLDIAG_FACE_SEED_DB=/path/to/COPY/catalogue.db \
+    /// PLDIAG_FACE_SEED_PERSON="Judy Wagner" \
+    /// cargo test --release --lib face_search_seed_tests::measure -- --nocapture
+    /// ```
+    ///
+    /// `vectors.lancedb` must sit beside the copy (the store resolves beside
+    /// the catalogue). Optional: `PLDIAG_FACE_SEED_THRESHOLD` (0.58, Medium),
+    /// `PLDIAG_FACE_SEED_LIMIT` (500 — the app's cap since fix round 1),
+    /// `PLDIAG_FACE_SEED_PER_CALL` (25 — the app's reference faces per call),
+    /// `PLDIAG_FACE_SEED_MODEL` / `PLDIAG_FACE_SEED_PREPROCESSING` (the app's),
+    /// `PLDIAG_FACE_SEED_SKIP_OLD=1` (skip the every-face search — ~15 min for
+    /// Judy). Reports the old and new seed counts, each search's matched
+    /// images and wall time, the chunked search's call count and its SLOWEST
+    /// call (how long one call holds the run — the Stop latency), that the
+    /// chunked search equals the single call on this data, and the FEW lines:
+    /// what the best 1, 10, 50 and 200 seeds alone find — how recall scales
+    /// with the seed count (the evidence behind the 500 cap). It only READS:
+    /// the searches and the seed queries write nothing.
+    #[test]
+    fn measure_named_search_seeds_on_a_catalogue_copy()
+    {
+        let Ok(path) = std::env::var("PLDIAG_FACE_SEED_DB") else
+        {
+            return;
+        };
+        let Ok(name) = std::env::var("PLDIAG_FACE_SEED_PERSON") else
+        {
+            eprintln!("PLDIAG face-seed: set PLDIAG_FACE_SEED_PERSON to the person's name");
+            return;
+        };
+        let model = std::env::var("PLDIAG_FACE_SEED_MODEL").unwrap_or_else(|_| "1.0-coreml-fp32".to_string());
+        let preprocessing = std::env::var("PLDIAG_FACE_SEED_PREPROCESSING").unwrap_or_else(|_| "expanded_square_v1".to_string());
+        let _serial = serial();
+        let path = std::path::PathBuf::from(path);
+        let conn = Connection::open(&path).expect("open the catalogue COPY");
+        fence_connection_against_extension_fetches(&conn);
+        measure_seed_recall(&path, conn, &name, &model, &preprocessing);
+    }
+
+    /// ⭐ S195-104 — the same measurement on a SYNTHETIC catalogue, built here
+    /// in a temp directory (so it runs anywhere, with no copy of anyone's
+    /// photos): `PLDIAG_FACE_SEED_SYNTHETIC=<total faces>` and optionally
+    /// `PLDIAG_FACE_SEED_SYNTHETIC_PERSON=<the person's faces>` (2,000).
+    /// 512-d vectors like AuraFace's: the person's faces scatter around one
+    /// identity vector (so they match each other at Medium), every other face
+    /// is random. All of them are resemblance matches with no chosen face —
+    /// the legacy shape every catalogue has today.
+    ///
+    /// ```text
+    /// PLDIAG_FACE_SEED_SYNTHETIC=57000 \
+    /// cargo test --release --lib face_search_seed_tests::measure_on_a_synthetic -- --nocapture
+    /// ```
+    #[test]
+    fn measure_on_a_synthetic_catalogue()
+    {
+        let Some(total) = std::env::var("PLDIAG_FACE_SEED_SYNTHETIC").ok().and_then(|v| v.parse::<i64>().ok()) else
+        {
+            return;
+        };
+        let person_faces = std::env::var("PLDIAG_FACE_SEED_SYNTHETIC_PERSON")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(2_000)
+            .min(total);
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("synthetic-measure");
+        conn.execute(
+            "INSERT INTO face_observation
+                 (id, image_id, analyzed_image_id, face_index, algorithm_version, analysis_run_id,
+                  bounding_box_x, bounding_box_y, bounding_box_width, bounding_box_height,
+                  face_capture_quality)
+             SELECT i, i, i, 0, 'v', 'run', 0.1, 0.1, 0.2, 0.2, ((i * 37) % 101) / 100.0
+             FROM range(1, ?1 + 1) t(i)",
+            params![total],
+        )
+        .expect("synthetic face observations");
+        conn.execute(
+            "INSERT INTO person (id, display_name, normalized_name) VALUES (1, 'Synthetic Judy', 'synthetic judy')",
+            [],
+        )
+        .expect("synthetic person");
+        conn.execute(
+            "INSERT INTO person_face_assignment
+                 (face_observation_id, person_id, image_id, analyzed_image_id, face_index, assignment_source)
+             SELECT i, 1, i, i, 0, 'face_search_match' FROM range(1, ?1 + 1) t(i)",
+            params![person_faces],
+        )
+        .expect("synthetic assignments");
+
+        let mut lcg = Lcg(0x5195_0104_5EED);
+        let identity = (0..512).map(|_| lcg.next()).collect::<Vec<f32>>();
+        let mut records = Vec::with_capacity(total as usize);
+        for id in 1..=total
+        {
+            let vector = if id <= person_faces
+            {
+                identity.iter().map(|value| value + 0.55 * lcg.next()).collect::<Vec<f32>>()
+            }
+            else
+            {
+                (0..512).map(|_| lcg.next()).collect::<Vec<f32>>()
+            };
+            records.push(FaceEmbeddingVectorRecord
+            {
+                face_observation_id: id,
+                image_id: id,
+                analyzed_image_id: id,
+                face_index: 0,
+                model_name: "s195-104".to_string(),
+                model_version: MODEL.to_string(),
+                preprocessing_version: PREPROCESSING.to_string(),
+                input_size: 112,
+                color_order: "RGB".to_string(),
+                normalization: "none".to_string(),
+                embedding_dimension: 512,
+                embedding_l2_norm: 1.0,
+                vector,
+            });
+        }
+        let catalogue = fixture.catalogue.clone();
+        let _installed = Installed::new(&fixture, conn);
+        let stored = FACE_EMBEDDING_RUNTIME.block_on(upsert_face_embeddings_impl(records));
+        assert_eq!(stored.status, "stored", "fixture: {}", stored.message);
+        drop(_installed);
+
+        let conn = Connection::open(&catalogue).expect("reopen the synthetic catalogue");
+        fence_connection_against_extension_fetches(&conn);
+        eprintln!("PLDIAG face-seed: SYNTHETIC · {} faces in the index · the person holds {}", total, person_faces);
+        measure_seed_recall(&catalogue, conn, "Synthetic Judy", MODEL, PREPROCESSING);
+    }
+
+    /// The measurement itself, on an open catalogue whose `vectors.lancedb`
+    /// sits beside `path`. Reads `PLDIAG_FACE_SEED_THRESHOLD` (0.58),
+    /// `PLDIAG_FACE_SEED_LIMIT` (500), `PLDIAG_FACE_SEED_PER_CALL` (25) and
+    /// `PLDIAG_FACE_SEED_SKIP_OLD`.
+    fn measure_seed_recall(path: &std::path::Path, conn: Connection, name: &str, model: &str, preprocessing: &str)
+    {
+        let env_f64 = |key: &str, default: f64| std::env::var(key).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(default);
+        let threshold = env_f64("PLDIAG_FACE_SEED_THRESHOLD", 0.58);
+        let limit = std::env::var("PLDIAG_FACE_SEED_LIMIT").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(500);
+        let per_call = std::env::var("PLDIAG_FACE_SEED_PER_CALL")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(25);
+        let skip_old = std::env::var("PLDIAG_FACE_SEED_SKIP_OLD").map(|v| v == "1").unwrap_or(false);
+        let model = model.to_string();
+        let preprocessing = preprocessing.to_string();
+        let name = name.to_string();
+        fence_connection_against_extension_fetches(&conn);
+        let person: i64 = conn
+            .query_row(
+                "SELECT id FROM person WHERE normalized_name = ?1",
+                params![normalized_person_name(&name)],
+                |row| row.get(0),
+            )
+            .expect("the person is in the copy");
+        let chosen_count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM person_face_assignment WHERE person_id = ?1 AND assignment_source IN {}",
+                    FACE_ASSIGNMENT_CHOSEN_SOURCES_SQL
+                ),
+                params![person],
+                |row| row.get(0),
+            )
+            .expect("chosen count");
+        let old_seeds = person_face_observation_ids_impl(&conn, person);
+        let new_seeds = person_search_seed_face_observation_ids_impl(&conn, person, limit).expect("new seeds");
+        eprintln!(
+            "PLDIAG face-seed: person {:?} (id {}) · assigned faces (OLD seeds) {} · chosen faces {} · NEW seeds {} ({}) · threshold {} · model {} / {}",
+            name,
+            person,
+            old_seeds.len(),
+            chosen_count,
+            new_seeds.len(),
+            if chosen_count > 0 { "chosen first, then the best others" } else { "legacy fallback: best assigned by quality" },
+            threshold,
+            model,
+            preprocessing
+        );
+        let _installed = Installed::at_path(path, conn);
+
+        let run = |seeds: Vec<i64>, prior: Vec<FaceSearchMatchRecord>| futures::executor::block_on(face_embedding_search_checked(
+            seeds,
+            Vec::new(),
+            model.clone(),
+            preprocessing.clone(),
+            threshold,
+            0,
+            prior,
+        ));
+
+        let started = std::time::Instant::now();
+        let new_single = run(new_seeds.clone(), Vec::new());
+        let new_single_time = started.elapsed();
+        assert!(new_single.ok, "{:?}", new_single.error_message);
+
+        // Exactly as the app runs it: `per_call` reference faces per call
+        // (25 — FaceRecognitionSearchChunking.referenceFacesPerCall).
+        let started = std::time::Instant::now();
+        let mut prior = Vec::new();
+        let mut calls = 0;
+        let mut slowest = std::time::Duration::ZERO;
+        for chunk in new_seeds.chunks(per_call)
+        {
+            let call_started = std::time::Instant::now();
+            let part = run(chunk.to_vec(), prior);
+            slowest = slowest.max(call_started.elapsed());
+            assert!(part.ok, "{:?}", part.error_message);
+            prior = part.matches;
+            calls += 1;
+        }
+        let new_chunked_time = started.elapsed();
+        assert_eq!(keys(&prior), keys(&new_single.matches), "the chunked search equals the single call on real data");
+        let new_images = new_single.matches.iter().map(|m| m.image_id).collect::<std::collections::HashSet<i64>>();
+        eprintln!(
+            "PLDIAG face-seed: NEW · {} matched images · single call {:.2?} · {} chunked calls of {} {:.2?} · slowest call {:.2?} · chunked == single: true",
+            new_images.len(),
+            new_single_time,
+            calls,
+            per_call,
+            new_chunked_time,
+            slowest
+        );
+
+        // How recall scales with the seed count: the k best seeds alone (read
+        // only: nothing is written). Round 1's chosen-only shape made a person
+        // with few chosen faces search from those alone; these lines were the
+        // evidence that moved fix round 1 to chosen-first-then-fill at 500.
+        let few = [1_usize, 10, 50, 200]
+            .iter()
+            .filter(|&&k| k < new_seeds.len())
+            .map(|&k|
+            {
+                let found = run(new_seeds[..k].to_vec(), Vec::new());
+                assert!(found.ok, "{:?}", found.error_message);
+                (k, found.matches.iter().map(|m| m.image_id).collect::<std::collections::HashSet<i64>>())
+            })
+            .collect::<Vec<_>>();
+        for (k, images) in &few
+        {
+            eprintln!(
+                "PLDIAG face-seed: FEW · the best {} seed(s) · {} matched images · {:.1}% of NEW",
+                k,
+                images.len(),
+                if new_images.is_empty() { 100.0 } else { 100.0 * images.intersection(&new_images).count() as f64 / new_images.len() as f64 }
+            );
+        }
+
+        if skip_old
+        {
+            eprintln!("PLDIAG face-seed: OLD skipped (PLDIAG_FACE_SEED_SKIP_OLD=1)");
+            return;
+        }
+        let started = std::time::Instant::now();
+        let old = run(old_seeds, Vec::new());
+        let old_time = started.elapsed();
+        assert!(old.ok, "{:?}", old.error_message);
+        let old_images = old.matches.iter().map(|m| m.image_id).collect::<std::collections::HashSet<i64>>();
+        let both = old_images.intersection(&new_images).count();
+        let percent_of_old = |images: &std::collections::HashSet<i64>| if old_images.is_empty()
+        {
+            100.0
+        }
+        else
+        {
+            100.0 * images.intersection(&old_images).count() as f64 / old_images.len() as f64
+        };
+        eprintln!(
+            "PLDIAG face-seed: OLD · {} matched images · {:.2?} · overlap {} · only OLD {} · only NEW {} · NEW finds {:.1}% of OLD",
+            old_images.len(),
+            old_time,
+            both,
+            old_images.len() - both,
+            new_images.len() - both,
+            percent_of_old(&new_images)
+        );
+        for (k, images) in &few
+        {
+            eprintln!("PLDIAG face-seed: FEW · the best {} seed(s) find {:.1}% of OLD", k, percent_of_old(images));
+        }
     }
 }
 
@@ -37278,6 +38932,484 @@ pub async fn update_directory_sync_states(states: Vec<DirectorySyncState>) -> u6
         }
     };
     update_directory_sync_states_impl(conn, &states)
+}
+
+// === ⭐ S195 — RULING 101: THE UNREADABLE-FILE MEMORY =========================
+//
+// Authority: DECISIONS.md, 2026-10-12, "S195: Folder Sync and the unreadable
+// file — rulings 101 and 102". Richard, ruling 101: "Okay, I agree with you
+// then, so let's do that. Remember what happened then."
+//
+// WHY IT EXISTS. Folder Sync's `+N` is "media on disk without a catalogue row"
+// (`FolderSyncSweep.computeDiffListing`). A file ImageIO cannot read never gets
+// a row, and nothing remembered the failure, so the post-sync re-diff found it
+// again and "+1 · Sync All" came straight back after every sync — each one
+// re-reading the file, re-showing "1 file could not be read", and starting the
+// whole-catalogue thumbnail pass and Intelligent Culling for nothing.
+//
+// THE TABLE. `unreadable_file` (see `UNREADABLE_FILE_TABLE_DDL`): one row per
+// path that an ordinary import pass tried and could not read, with the file's
+// logical size and whole-second modification date at that moment. Folder
+// Sync's offer excludes a remembered path only while BOTH still match, so a
+// file that changes is offered — and retried — again. It lives in
+// `catalogue.db`, so a full restore carries it and a reset clears it. It is
+// keyed by PATH, not by `images.id`: a remembered file has no catalogue row by
+// definition.
+//
+// ⭐ THE TABLE IS SMALL BY NATURE — a handful of broken files, never a library
+// — and every call below is built on that (fix round 1, REVIEW-1 M3, R-171):
+// it is read WHOLE and matched in memory, so no call's cost scales with the
+// number of paths a scan or a diff handles. Every FFI call does its Rust work
+// on the main thread through the `@MainActor` binding, and the old shape (an
+// `IN (…500 paths…)` probe per 500 candidates or read paths) was measured at
+// ~0.4 s per large diff and ~1.9 s per 300,000-file import as soon as ONE row
+// existed.
+//
+// THREE CALLS, plus the forget that every row-writing seam runs on its own:
+//   • `record_unreadable_files`     — upsert a batch of failures (one
+//     transaction);
+//   • `remembered_unreadable_paths` — the whole table's paths (the caller keeps
+//     the ones under the folder it is diffing and stats ONLY those);
+//   • `unreadable_files_matching`   — given those few files' CURRENT size and
+//     modification date, the subset remembered with BOTH matching;
+//   • `forget_unreadable_after_write` (internal) — called by `ingest_metadata`
+//     (scan + whole-machine ingest), `merge_records_into` (Lightroom / Apple
+//     Photos / Copy-and-Import) and the editor-save upsert, AFTER their own
+//     write committed: a path that now has a catalogue row is no longer an
+//     unreadable file.
+//
+// ⭐ THE FAILURE DIRECTION IS "OFFER IT AGAIN", deliberately, at every call: a
+// record or a lookup that fails answers 0 / empty, which leaves the file
+// offered exactly as it was before ruling 101. None of the three can therefore
+// hide a file the memory cannot vouch for. That is also why none of them is a
+// `ffi_panic_boundary` site (slice F / ruling 23, `Spikes/FfiPanicBoundaryGate`):
+// a bare `u32` or sequence cannot SAY it failed, so each body is written to be
+// panic-free — no `unwrap`, no `expect`, no unchecked index, every conversion
+// checked. ⚠️ A panic inside one would still end the process, like every other
+// unwrapped export.
+//
+// ⚠️ Every `Err` after `BEGIN` is a `ROLLBACK`, never a `COMMIT` (the S187 / E3
+// rule), and no decision here is taken on a reported change count (S179): the
+// counts returned are hints for a trace line, nothing more.
+
+/// The table, as ONE statement. Run by `open_and_migrate_catalogue_reporting`
+/// right after the schema batch, in the autocommit window, on EVERY open — so
+/// a brand-new catalogue is born with it and an existing catalogue gains it on
+/// its next launch (`CREATE TABLE IF NOT EXISTS`, no `ALTER`, no `DEFAULT`).
+///
+/// ⚠️ Deliberately NOT inside the schema batch. The table is optional
+/// bookkeeping: if it cannot be created the open must still succeed (the
+/// lookups then answer "nothing remembered", which is the behaviour before
+/// ruling 101), whereas a failing statement inside the batch aborts the batch
+/// and the catalogue open returns `None` — no library at all. Log-and-continue
+/// is only possible out here.
+///
+/// No index beyond the PRIMARY KEY (S179: no ART index on a hot-written
+/// column; a primary key is fine). Times are epoch seconds computed in Rust,
+/// never a SQL clock function (the S127 / E0 extension-autoload class).
+const UNREADABLE_FILE_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS unreadable_file (\
+     file_path TEXT PRIMARY KEY, \
+     file_size BIGINT NOT NULL, \
+     modified_epoch BIGINT NOT NULL, \
+     first_failed_at BIGINT NOT NULL, \
+     last_failed_at BIGINT NOT NULL, \
+     reason TEXT NOT NULL)";
+
+/// Rows per multi-row upsert: six bound parameters a row → 1,200 per
+/// statement, the same order of magnitude as `MEMBERSHIP_PROBE_CHUNK`'s 500.
+const UNREADABLE_FILE_WRITE_CHUNK: usize = 200;
+
+/// One remembered failure, as Swift hands it over: the path, the file's
+/// logical size and whole-second modification date when it failed, and a
+/// short reason token (`unreadable` or `damaged_zero_byte`). The failure
+/// times are the core's own clock. Mirrors the UDL `UnreadableFileRecord`.
+pub struct UnreadableFileRecord
+{
+    pub file_path: String,
+    pub file_size: u64,
+    pub modified_epoch: i64,
+    pub reason: String,
+}
+
+/// One candidate's CURRENT facts, for the match. Mirrors the UDL
+/// `UnreadableFileProbe`.
+pub struct UnreadableFileProbe
+{
+    pub file_path: String,
+    pub file_size: u64,
+    pub modified_epoch: i64,
+}
+
+/// Seconds since the Unix epoch, from the system clock. A clock set before
+/// 1970 answers 0 rather than failing the record (the times are diagnostic,
+/// never compared).
+fn unreadable_file_now_seconds() -> i64
+{
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+    {
+        Ok(elapsed) => i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
+
+/// `?, ?, …` — `count` bound-parameter placeholders.
+fn unreadable_file_placeholders(count: usize) -> String
+{
+    std::iter::repeat("?").take(count).collect::<Vec<_>>().join(", ")
+}
+
+/// ⭐ The whole table, read ONCE: path → (size, modified). The ordinary case —
+/// nothing has ever failed — is one read of an empty table. An `Err` (the
+/// table could not be created at open) is passed up; each caller turns it
+/// into its own "nothing remembered".
+///
+/// Slice 7 / R-31 — every row goes through the collector, so a row that cannot
+/// be decoded is logged and censused, never silently lost. Its path is then
+/// absent from the answer, which is the safe direction here: that file stays
+/// OFFERED.
+fn unreadable_file_table(conn: &Connection) -> Result<std::collections::HashMap<String, (i64, i64)>, String>
+{
+    let mut stmt = conn
+        .prepare("SELECT file_path, file_size, modified_epoch FROM unreadable_file")
+        .map_err(|e| format!("could not read unreadable_file: {}", e))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+        })
+        .map_err(|e| format!("could not read unreadable_file: {}", e))?;
+    let mut table = std::collections::HashMap::new();
+    for (path, size, modified) in collect_rows(rows, "unreadable_file_table")
+    {
+        table.insert(path, (size, modified));
+    }
+    Ok(table)
+}
+
+/// Body of `record_unreadable_files` against an explicit connection (the
+/// impl/wrapper pattern, for temp-file tests). `now` is the failure time.
+///
+/// A path that appears more than once keeps its LAST occurrence (a multi-row
+/// `ON CONFLICT DO UPDATE` may not touch one row twice in one statement). A
+/// row whose size cannot be represented as `BIGINT`, or whose path is empty,
+/// is skipped rather than failing the batch. An existing row keeps its
+/// `first_failed_at`; its size, date, reason and `last_failed_at` are
+/// replaced. Returns the number of rows submitted, or 0 when nothing was
+/// written (empty input, or a failure that rolled the batch back).
+fn record_unreadable_files_impl(conn: &Connection, records: &[UnreadableFileRecord], now: i64) -> u32
+{
+    if records.is_empty()
+    {
+        return 0;
+    }
+
+    // Last occurrence wins, in first-seen order.
+    let mut slot_of: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(records.len());
+    let mut rows: Vec<(&str, i64, i64, &str)> = Vec::with_capacity(records.len());
+    for record in records
+    {
+        if record.file_path.is_empty()
+        {
+            continue;
+        }
+        let size = match i64::try_from(record.file_size)
+        {
+            Ok(size) => size,
+            Err(_) => continue,
+        };
+        let row = (record.file_path.as_str(), size, record.modified_epoch, record.reason.as_str());
+        match slot_of.get(record.file_path.as_str())
+        {
+            Some(&slot) =>
+            {
+                if let Some(existing) = rows.get_mut(slot)
+                {
+                    *existing = row;
+                }
+            }
+            None =>
+            {
+                slot_of.insert(record.file_path.as_str(), rows.len());
+                rows.push(row);
+            }
+        }
+    }
+    if rows.is_empty()
+    {
+        return 0;
+    }
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("record_unreadable_files: begin failed: {}", e);
+        return 0;
+    }
+    for chunk in rows.chunks(UNREADABLE_FILE_WRITE_CHUNK)
+    {
+        let values = std::iter::repeat("(?, ?, ?, ?, ?, ?)")
+            .take(chunk.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT INTO unreadable_file \
+             (file_path, file_size, modified_epoch, first_failed_at, last_failed_at, reason) \
+             VALUES {} \
+             ON CONFLICT (file_path) DO UPDATE SET \
+             file_size = excluded.file_size, \
+             modified_epoch = excluded.modified_epoch, \
+             last_failed_at = excluded.last_failed_at, \
+             reason = excluded.reason",
+            values
+        );
+        let mut bound: Vec<Value> = Vec::with_capacity(chunk.len() * 6);
+        for (path, size, modified, reason) in chunk
+        {
+            bound.push(Value::Text((*path).to_string()));
+            bound.push(Value::BigInt(*size));
+            bound.push(Value::BigInt(*modified));
+            bound.push(Value::BigInt(now));
+            bound.push(Value::BigInt(now));
+            bound.push(Value::Text((*reason).to_string()));
+        }
+        if let Err(e) = conn.execute(&sql, params_from_iter(bound.iter()))
+        {
+            eprintln!("record_unreadable_files: upsert failed, rolling back: {}", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return 0;
+        }
+    }
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("record_unreadable_files: commit failed: {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return 0;
+    }
+    u32::try_from(rows.len()).unwrap_or(u32::MAX)
+}
+
+/// Body of `remembered_unreadable_paths`: every remembered path, sorted (so the
+/// answer is deterministic; the caller treats it as a set).
+fn remembered_unreadable_paths_impl(conn: &Connection) -> Result<Vec<String>, String>
+{
+    let mut paths: Vec<String> = unreadable_file_table(conn)?.into_keys().collect();
+    paths.sort();
+    Ok(paths)
+}
+
+/// Body of `unreadable_files_matching`: ⭐ THE MATCH. A probe is matched only
+/// when its path is remembered AND its current size AND its current
+/// modification date BOTH equal what was recorded. Either one moving means
+/// the file changed, so it is not matched — Folder Sync offers it, and the
+/// next import retries it. A probe whose size cannot be represented as
+/// `BIGINT` can match nothing. Distinct paths, in the order supplied; a
+/// repeated path is judged by its LAST probe.
+fn unreadable_files_matching_impl(
+    conn: &Connection,
+    probes: &[UnreadableFileProbe],
+) -> Result<Vec<String>, String>
+{
+    let mut current: std::collections::HashMap<&str, Option<(i64, i64)>> =
+        std::collections::HashMap::with_capacity(probes.len());
+    let mut order: Vec<&str> = Vec::with_capacity(probes.len());
+    for probe in probes
+    {
+        if probe.file_path.is_empty()
+        {
+            continue;
+        }
+        let facts = i64::try_from(probe.file_size).ok().map(|size| (size, probe.modified_epoch));
+        if current.insert(probe.file_path.as_str(), facts).is_none()
+        {
+            order.push(probe.file_path.as_str());
+        }
+    }
+    if order.is_empty()
+    {
+        return Ok(Vec::new());
+    }
+    let stored = unreadable_file_table(conn)?;
+    Ok(order
+        .into_iter()
+        .filter(|path| match (stored.get(*path), current.get(*path))
+        {
+            (Some(remembered), Some(Some(now))) => remembered == now,
+            _ => false,
+        })
+        .map(|p| p.to_string())
+        .collect())
+}
+
+/// Delete `paths` from the memory in ONE transaction (`MEMBERSHIP_PROBE_CHUNK`
+/// paths per `IN (…)` — exact match, never `LIKE`). Every `Err` after `BEGIN`
+/// is a ROLLBACK. Returns the engine's own deleted-row report as a hint (S179
+/// — never a decision), or 0 for empty input or a failure that rolled back.
+///
+/// ⚠️ Must not run inside a caller's open transaction — its own `BEGIN` would
+/// fail. Every caller runs it after its write committed.
+fn delete_unreadable_paths(conn: &Connection, paths: &[&str]) -> u32
+{
+    if paths.is_empty()
+    {
+        return 0;
+    }
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        eprintln!("forget_unreadable_after_write: begin failed: {}", e);
+        return 0;
+    }
+    let mut deleted: u64 = 0;
+    for chunk in paths.chunks(MEMBERSHIP_PROBE_CHUNK)
+    {
+        let sql = format!(
+            "DELETE FROM unreadable_file WHERE file_path IN ({})",
+            unreadable_file_placeholders(chunk.len())
+        );
+        let values: Vec<Value> = chunk.iter().map(|p| Value::Text((*p).to_string())).collect();
+        match conn.execute(&sql, params_from_iter(values.iter()))
+        {
+            Ok(n) => deleted = deleted.saturating_add(n as u64),
+            Err(e) =>
+            {
+                eprintln!("forget_unreadable_after_write: delete failed, rolling back: {}", e);
+                let _ = conn.execute_batch("ROLLBACK;");
+                return 0;
+            }
+        }
+    }
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        eprintln!("forget_unreadable_after_write: commit failed: {}", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return 0;
+    }
+    u32::try_from(deleted).unwrap_or(u32::MAX)
+}
+
+/// ⭐ FORGET — fix round 1 (REVIEW-1 M3 + L3). Every Rust seam that writes
+/// `images` rows calls this with the paths it just wrote, AFTER its own write
+/// committed: a path with a catalogue row is no longer an unreadable file.
+///
+/// Called by: `ingest_metadata_impl` (the scan's batches and the whole-machine
+/// general ingest — both go through `ingest_metadata`), `merge_records_into`
+/// (Lightroom, Apple Photos and Copy-and-Import) and
+/// `upsert_editor_saved_image_database` (the editor's save). So the brief's
+/// rule — "forget when a later ingest of the same path succeeds (a row is
+/// written)" — holds whichever door the row came through.
+///
+/// ⭐ COST SCALES WITH THE MEMORY, NOT WITH THE WRITE: one read of the (small)
+/// table, a hash probe per written path, and a DELETE only for the paths that
+/// were actually remembered — usually none, so usually no statement at all.
+/// An empty table costs one read that returns nothing.
+///
+/// ⚠️ OUTSIDE the writer's transaction, deliberately (the S187 / E3 rule): an
+/// optional statement that fails inside a transaction forces a ROLLBACK, so
+/// putting the forget inside would let bookkeeping un-import a photo. Here it
+/// runs under the SAME catalogue lock and the same FFI call, immediately after
+/// the commit, in a transaction of its own; a failure is logged and rolled
+/// back and changes nothing the writer reports. A crash between the two
+/// commits leaves a remembered row for a path that HAS a catalogue row, which
+/// Folder Sync never asks about — inert, and the next write of that path
+/// forgets it.
+fn forget_unreadable_after_write<'a>(conn: &Connection, written: impl IntoIterator<Item = &'a str>, site: &'static str) -> u32
+{
+    let remembered = match unreadable_file_table(conn)
+    {
+        Ok(table) => table,
+        Err(e) =>
+        {
+            eprintln!("{}: forget skipped — {}", site, e);
+            return 0;
+        }
+    };
+    if remembered.is_empty()
+    {
+        return 0;
+    }
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let hits: Vec<&str> = written
+        .into_iter()
+        .filter(|path| remembered.contains_key(*path) && seen.insert(*path))
+        .collect();
+    delete_unreadable_paths(conn, &hits)
+}
+
+/// ⭐ Ruling 101 — RECORD. Upsert a batch of files an import pass tried and
+/// could not read (see `record_unreadable_files_impl`). Empty input returns 0
+/// without touching the catalogue.
+pub async fn record_unreadable_files(records: Vec<UnreadableFileRecord>) -> u32
+{
+    if records.is_empty()
+    {
+        return 0;
+    }
+    let catalogue = lock_catalogue();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return 0;
+        }
+    };
+    record_unreadable_files_impl(conn, &records, unreadable_file_now_seconds())
+}
+
+/// ⭐ Ruling 101 — every remembered path (the whole, small table). The caller
+/// keeps the ones under the folder it is diffing and stats only those. Empty
+/// on an empty table and on any failure ("nothing remembered" — the files stay
+/// offered).
+pub async fn remembered_unreadable_paths() -> Vec<String>
+{
+    let catalogue = lock_catalogue();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+    match remembered_unreadable_paths_impl(conn)
+    {
+        Ok(paths) => paths,
+        Err(e) =>
+        {
+            eprintln!("remembered_unreadable_paths: {} — answering 'nothing remembered'", e);
+            Vec::new()
+        }
+    }
+}
+
+/// ⭐ Ruling 101 — THE MATCH: given candidates' CURRENT size and modification
+/// date, the subset remembered with BOTH matching. Empty on empty input and
+/// on any failure ("nothing excluded" — the files stay offered).
+pub async fn unreadable_files_matching(probes: Vec<UnreadableFileProbe>) -> Vec<String>
+{
+    if probes.is_empty()
+    {
+        return Vec::new();
+    }
+    let catalogue = lock_catalogue();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+    match unreadable_files_matching_impl(conn, &probes)
+    {
+        Ok(paths) => paths,
+        Err(e) =>
+        {
+            eprintln!("unreadable_files_matching: {} — answering 'nothing excluded'", e);
+            Vec::new()
+        }
+    }
 }
 
 /// Body of `remove_images_by_ids` against an explicit connection (the
@@ -45864,6 +47996,7 @@ mod swallowed_failure_tests
             "prep-1".to_string(),
             0.55,
             50,
+            Vec::new(),
         ));
         assert!(
             !unreadable.ok,
@@ -45905,6 +48038,7 @@ mod swallowed_failure_tests
             "prep-1".to_string(),
             0.55,
             50,
+            Vec::new(),
         ));
         assert!(
             never_built.ok,
@@ -45930,6 +48064,7 @@ mod swallowed_failure_tests
             "prep-1".to_string(),
             0.55,
             50,
+            Vec::new(),
         ));
         assert!(
             empty_store.ok,
@@ -45970,6 +48105,7 @@ mod swallowed_failure_tests
             "prep-1".to_string(),
             0.55,
             50,
+            Vec::new(),
         ));
         assert!(
             !mismatched.ok,
@@ -48423,6 +50559,7 @@ mod panic_boundary_tests
                 PREPROCESSING.to_string(),
                 0.5,
                 10,
+                Vec::new(),
             ))
         });
         assert!(search.is_ok(), "the checked search yields a RESULT, not a crash");
@@ -48472,6 +50609,7 @@ mod panic_boundary_tests
             PREPROCESSING.to_string(),
             0.5,
             10,
+            Vec::new(),
         ));
         assert!(
             !FACE_WORKER_LOCK_PANIC_ARMED.load(Ordering::SeqCst),
@@ -48576,6 +50714,7 @@ mod panic_boundary_tests
             PREPROCESSING.to_string(),
             0.5,
             10,
+            Vec::new(),
         ));
         assert!(!search.ok);
         assert!(search.error_message.as_deref().unwrap_or("").contains("face embedding runtime"));
@@ -48853,6 +50992,7 @@ mod panic_boundary_tests
                 PREPROCESSING.to_string(),
                 0.5,
                 10,
+                Vec::new(),
             )));
         assert!(!r.ok && says_injected(r.error_message.as_deref().unwrap_or("")));
 
@@ -56346,5 +58486,439 @@ mod similar_unit_set_write_tests
             all_equal &= differing == 0;
         }
         assert!(all_equal, "the set-based unit write and the per-member reference disagree at scale");
+    }
+}
+
+// === ⭐ S195 — ruling 101's cargo pins ========================================
+//
+// Every test runs on a REAL temp-file catalogue opened through the production
+// `open_and_migrate_catalogue` (which fences the connection against extension
+// fetches under `cfg(test)` — engine tests never fetch).
+#[cfg(test)]
+mod unreadable_file_tests
+{
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static UNREADABLE_FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn fresh_catalogue(tag: &str) -> (std::path::PathBuf, Connection)
+    {
+        let n = UNREADABLE_FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "plcore-unreadable-file-test-{}-{}-{}.db",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+        let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+        (path, conn)
+    }
+
+    fn cleanup(path: &std::path::Path)
+    {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+    }
+
+    fn record(path: &str, size: u64, modified: i64, reason: &str) -> UnreadableFileRecord
+    {
+        UnreadableFileRecord
+        {
+            file_path: path.to_string(),
+            file_size: size,
+            modified_epoch: modified,
+            reason: reason.to_string(),
+        }
+    }
+
+    fn probe(path: &str, size: u64, modified: i64) -> UnreadableFileProbe
+    {
+        UnreadableFileProbe
+        {
+            file_path: path.to_string(),
+            file_size: size,
+            modified_epoch: modified,
+        }
+    }
+
+    fn strings(paths: &[&str]) -> Vec<String>
+    {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    fn row_count(conn: &Connection) -> i64
+    {
+        conn.query_row("SELECT COUNT(*) FROM unreadable_file", [], |r| r.get(0))
+            .expect("count unreadable_file")
+    }
+
+    /// A still image as the scan / importers hand it over.
+    fn image(file_path: &str) -> ImageMetadata
+    {
+        let file_name = file_path.rsplit('/').next().unwrap_or(file_path).to_string();
+        ImageMetadata
+        {
+            file_path: file_path.to_string(),
+            file_size: 1000,
+            file_name,
+            file_extension: Some("jpg".to_string()),
+            created_timestamp: 1_700_000_000,
+            modified_timestamp: 1_700_000_000,
+            camera_make: None,
+            camera_model: None,
+            lens_model: None,
+            focal_length: None,
+            aperture: None,
+            shutter_speed: None,
+            iso: None,
+            capture_datetime: None,
+            pixel_width: None,
+            pixel_height: None,
+            color_space: None,
+            bit_depth: None,
+            gps_latitude: None,
+            gps_longitude: None,
+            gps_altitude: None,
+            copyright: None,
+            creator: None,
+            description: None,
+            rating: None,
+            flag: None,
+            color_label: None,
+            rotation: None,
+            is_video: false,
+            duration_seconds: None,
+            frame_rate: None,
+            video_kind: None,
+            video_codec: None,
+            video_bitrate: None,
+            color_primaries: None,
+            color_transfer: None,
+            color_matrix: None,
+            color_range: None,
+            dv_profile: None,
+            has_audio: None,
+            audio_codec: None,
+            audio_channels: None,
+            audio_sample_rate: None,
+            audio_bitrate: None,
+            live_photo_id: None,
+            external_source_id: None,
+        }
+    }
+
+    /// The table's shape: (column, type, nullable), ordered by column name.
+    fn shape(conn: &Connection) -> Vec<(String, String, bool)>
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.column_name, c.data_type, c.is_nullable \
+                 FROM duckdb_columns() c JOIN duckdb_tables() t ON c.table_oid = t.table_oid \
+                 WHERE t.table_name = 'unreadable_file' ORDER BY c.column_name",
+            )
+            .expect("shape statement");
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .expect("shape rows");
+        rows.map(|r| r.expect("shape row")).collect()
+    }
+
+    fn expected_shape() -> Vec<(String, String, bool)>
+    {
+        vec![
+            ("file_path".to_string(), "VARCHAR".to_string(), false),
+            ("file_size".to_string(), "BIGINT".to_string(), false),
+            ("first_failed_at".to_string(), "BIGINT".to_string(), false),
+            ("last_failed_at".to_string(), "BIGINT".to_string(), false),
+            ("modified_epoch".to_string(), "BIGINT".to_string(), false),
+            ("reason".to_string(), "VARCHAR".to_string(), false),
+        ]
+    }
+
+    /// A fresh open is born with the table, keyed by path and carrying no
+    /// index beyond its primary key (S179).
+    #[test]
+    fn a_fresh_open_has_the_table()
+    {
+        let (path, conn) = fresh_catalogue("fresh");
+        assert_eq!(shape(&conn), expected_shape(), "the unreadable_file shape");
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM duckdb_indexes() WHERE table_name = 'unreadable_file'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("index count");
+        assert_eq!(indexes, 0, "no secondary index on unreadable_file — the primary key is its only key");
+        assert_eq!(row_count(&conn), 0);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// A catalogue created BEFORE ruling 101 (no table) gains it on its next
+    /// open, empty, with the same shape a fresh catalogue has.
+    #[test]
+    fn a_reopen_of_a_catalogue_without_the_table_gains_it()
+    {
+        let (path, conn) = fresh_catalogue("upgrade");
+        conn.execute_batch("DROP TABLE unreadable_file; CHECKPOINT;")
+            .expect("simulate a catalogue from before ruling 101");
+        assert!(shape(&conn).is_empty(), "the simulated older catalogue has no table");
+        drop(conn);
+
+        let reopened = open_and_migrate_catalogue(&path).expect("reopen");
+        assert_eq!(shape(&reopened), expected_shape(), "the upgraded table's shape");
+        assert_eq!(row_count(&reopened), 0);
+        assert_eq!(
+            record_unreadable_files_impl(&reopened, &[record("/v/a.dng", 10, 1_000, "unreadable")], 5),
+            1,
+            "the gained table takes writes"
+        );
+        drop(reopened);
+        cleanup(&path);
+    }
+
+    /// Upsert → lookup → match → forget, end to end.
+    #[test]
+    fn upsert_lookup_match_and_forget_round_trip()
+    {
+        let (path, conn) = fresh_catalogue("roundtrip");
+        let written = record_unreadable_files_impl(
+            &conn,
+            &[
+                record("/v/b.jpg", 0, 2_000, "damaged_zero_byte"),
+                record("/v/a.dng", 10, 1_000, "unreadable"),
+            ],
+            100,
+        );
+        assert_eq!(written, 2);
+        assert_eq!(row_count(&conn), 2);
+
+        assert_eq!(
+            remembered_unreadable_paths_impl(&conn).expect("lookup"),
+            strings(&["/v/a.dng", "/v/b.jpg"]),
+            "every remembered path, sorted"
+        );
+
+        let matched = unreadable_files_matching_impl(
+            &conn,
+            &[probe("/v/a.dng", 10, 1_000), probe("/v/b.jpg", 0, 2_000), probe("/v/c.jpg", 1, 1)],
+        )
+        .expect("match");
+        assert_eq!(matched, strings(&["/v/a.dng", "/v/b.jpg"]));
+
+        assert_eq!(forget_unreadable_after_write(&conn, ["/v/a.dng", "/v/z.jpg", "/v/a.dng"], "test"), 1);
+        assert_eq!(row_count(&conn), 1);
+        assert_eq!(
+            remembered_unreadable_paths_impl(&conn).expect("lookup"),
+            strings(&["/v/b.jpg"]),
+            "a forgotten path is no longer remembered"
+        );
+        assert!(
+            unreadable_files_matching_impl(&conn, &[probe("/v/a.dng", 10, 1_000)]).expect("match").is_empty(),
+            "a forgotten path no longer matches"
+        );
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// A re-recorded failure replaces the facts, the reason and the last
+    /// failure time but keeps the FIRST failure time; within one batch the
+    /// LAST occurrence of a path wins.
+    #[test]
+    fn an_upsert_keeps_the_first_failure_and_replaces_the_facts()
+    {
+        let (path, conn) = fresh_catalogue("upsert");
+        assert_eq!(record_unreadable_files_impl(&conn, &[record("/v/a.dng", 10, 1_000, "unreadable")], 100), 1);
+        assert_eq!(
+            record_unreadable_files_impl(
+                &conn,
+                &[record("/v/a.dng", 11, 1_500, "unreadable"), record("/v/a.dng", 12, 2_000, "damaged_zero_byte")],
+                200,
+            ),
+            1,
+            "a path repeated in one batch is ONE row"
+        );
+        let row: (i64, i64, i64, i64, String) = conn
+            .query_row(
+                "SELECT file_size, modified_epoch, first_failed_at, last_failed_at, reason \
+                 FROM unreadable_file WHERE file_path = '/v/a.dng'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("the row");
+        assert_eq!(row, (12, 2_000, 100, 200, "damaged_zero_byte".to_string()));
+        assert_eq!(row_count(&conn), 1);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// ⭐ THE MATCH RULE: a size OR an mtime mismatch is NOT matched.
+    #[test]
+    fn a_size_or_mtime_mismatch_is_not_matched()
+    {
+        let (path, conn) = fresh_catalogue("mismatch");
+        record_unreadable_files_impl(&conn, &[record("/v/a.dng", 10, 1_000, "unreadable")], 100);
+        let matches = |p: UnreadableFileProbe| unreadable_files_matching_impl(&conn, &[p]).expect("match");
+        assert!(matches(probe("/v/a.dng", 11, 1_000)).is_empty(), "a SIZE mismatch must not match");
+        assert!(matches(probe("/v/a.dng", 10, 1_001)).is_empty(), "an MTIME mismatch must not match");
+        assert!(matches(probe("/v/a.dng", 9, 999)).is_empty(), "both moved must not match");
+        assert!(matches(probe("/v/A.dng", 10, 1_000)).is_empty(), "a different path (case) must not match");
+        assert_eq!(matches(probe("/v/a.dng", 10, 1_000)), strings(&["/v/a.dng"]), "both facts equal → matched");
+        assert!(
+            matches(probe("/v/a.dng", u64::MAX, 1_000)).is_empty(),
+            "a size that cannot be stored can match nothing"
+        );
+        assert_eq!(
+            unreadable_files_matching_impl(&conn, &[probe("/v/a.dng", 10, 1_000), probe("/v/a.dng", 10, 9)])
+                .expect("match"),
+            Vec::<String>::new(),
+            "a repeated path is judged by its LAST probe"
+        );
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// Empty inputs are no-ops: nothing written, nothing read, nothing deleted.
+    /// A row that cannot be stored (an empty path, a size beyond `BIGINT`) is
+    /// skipped, never wrapped and never a failed batch.
+    #[test]
+    fn empty_list_calls_are_no_ops()
+    {
+        let (path, conn) = fresh_catalogue("empty");
+        assert_eq!(record_unreadable_files_impl(&conn, &[], 1), 0);
+        assert_eq!(record_unreadable_files_impl(&conn, &[record("", 1, 1, "unreadable")], 1), 0, "an empty path is skipped");
+        assert_eq!(
+            record_unreadable_files_impl(&conn, &[record("/v/huge", u64::MAX, 1, "unreadable")], 1),
+            0,
+            "a size that cannot be stored is skipped, never wrapped"
+        );
+        assert_eq!(row_count(&conn), 0);
+        assert!(remembered_unreadable_paths_impl(&conn).expect("lookup").is_empty());
+        assert!(unreadable_files_matching_impl(&conn, &[]).expect("match").is_empty());
+        assert!(unreadable_files_matching_impl(&conn, &[probe("/v/a.dng", 1, 1)]).expect("match").is_empty());
+        assert_eq!(forget_unreadable_after_write(&conn, std::iter::empty::<&str>(), "test"), 0);
+        assert_eq!(forget_unreadable_after_write(&conn, ["/v/a.dng"], "test"), 0, "an empty memory forgets nothing");
+        assert_eq!(delete_unreadable_paths(&conn, &[]), 0);
+        assert_eq!(row_count(&conn), 0);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// Every `Err` after `BEGIN` is a ROLLBACK (the S187 / E3 rule): a failed
+    /// upsert or forget leaves NO transaction open behind it.
+    ///
+    /// The seam is real: the table is replaced by a VIEW of the same columns,
+    /// so every read still answers and every write fails INSIDE its own
+    /// transaction with the engine's own error.
+    #[test]
+    fn a_failed_write_rolls_back_and_leaves_no_transaction_open()
+    {
+        let (path, conn) = fresh_catalogue("rollback");
+        conn.execute_batch(
+            "DROP TABLE unreadable_file; \
+             CREATE VIEW unreadable_file AS SELECT '/v/a.dng' AS file_path, \
+             CAST(10 AS BIGINT) AS file_size, CAST(1000 AS BIGINT) AS modified_epoch, \
+             CAST(1 AS BIGINT) AS first_failed_at, CAST(1 AS BIGINT) AS last_failed_at, \
+             'unreadable' AS reason;",
+        )
+        .expect("a read-only stand-in for the table");
+
+        assert_eq!(
+            record_unreadable_files_impl(&conn, &[record("/v/b.dng", 1, 1, "unreadable")], 100),
+            0,
+            "a failed upsert reports nothing written"
+        );
+        conn.execute_batch("BEGIN TRANSACTION; COMMIT;")
+            .expect("⛔ the failed upsert left its transaction OPEN — every Err after BEGIN must ROLLBACK");
+
+        assert_eq!(forget_unreadable_after_write(&conn, ["/v/a.dng"], "test"), 0, "a failed forget reports nothing deleted");
+        conn.execute_batch("BEGIN TRANSACTION; COMMIT;")
+            .expect("⛔ the failed forget left its transaction OPEN — every Err after BEGIN must ROLLBACK");
+
+        assert_eq!(
+            unreadable_files_matching_impl(&conn, &[probe("/v/a.dng", 10, 1_000)]).expect("match"),
+            strings(&["/v/a.dng"]),
+            "the reads still answer"
+        );
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// Fix round 1 (REVIEW-1 L1) — every chunked loop is crossed: 1,200
+    /// records (six upsert chunks of 200), the remembered path that matters in
+    /// the LAST position of a 1,201-probe match, and a 1,500-path write whose
+    /// 1,200 remembered paths need three DELETE chunks of 500.
+    #[test]
+    fn every_chunk_boundary_is_crossed()
+    {
+        let (path, conn) = fresh_catalogue("chunks");
+        let paths: Vec<String> = (0..1_200).map(|i| format!("/v/chunk/p{:04}.dng", i)).collect();
+        let records: Vec<UnreadableFileRecord> =
+            paths.iter().map(|p| record(p, 7, 70, "unreadable")).collect();
+        assert_eq!(record_unreadable_files_impl(&conn, &records, 1), 1_200);
+        assert_eq!(row_count(&conn), 1_200, "every upsert chunk was written");
+        assert_eq!(remembered_unreadable_paths_impl(&conn).expect("lookup").len(), 1_200);
+
+        let mut probes: Vec<UnreadableFileProbe> = vec![probe("/v/chunk/unknown.dng", 7, 70)];
+        probes.extend(paths.iter().map(|p| probe(p, 7, 70)));
+        let matched = unreadable_files_matching_impl(&conn, &probes).expect("match");
+        assert_eq!(matched.len(), 1_200);
+        assert_eq!(matched.last().map(|s| s.as_str()), Some("/v/chunk/p1199.dng"), "the last probe is judged too");
+
+        let mut written: Vec<String> = (0..300).map(|i| format!("/v/other/q{:04}.jpg", i)).collect();
+        written.extend(paths.iter().cloned());
+        assert_eq!(
+            forget_unreadable_after_write(&conn, written.iter().map(|p| p.as_str()), "test"),
+            1_200
+        );
+        assert_eq!(row_count(&conn), 0, "every DELETE chunk ran");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// Fix round 1 (REVIEW-1 M3 + L3) — every Rust seam that writes `images`
+    /// rows forgets the paths it wrote: the scan / whole-machine ingest, the
+    /// Lightroom / Apple Photos / Copy-and-Import merge, and the editor save
+    /// (insert and in-place refresh). A path nothing wrote stays remembered.
+    #[test]
+    fn every_row_writing_seam_forgets_what_it_wrote()
+    {
+        let (path, conn) = fresh_catalogue("seams");
+        let remembered = ["/v/s/ingest.jpg", "/v/s/merge.jpg", "/v/s/save.jpg", "/v/s/refresh.jpg", "/v/s/untouched.jpg"];
+        let records: Vec<UnreadableFileRecord> = remembered.iter().map(|p| record(p, 1, 1, "unreadable")).collect();
+        assert_eq!(record_unreadable_files_impl(&conn, &records, 1), 5);
+
+        assert_eq!(ingest_metadata_impl(&conn, &[image("/v/s/ingest.jpg"), image("/v/s/new.jpg")], None), 2);
+        assert!(!remembered_unreadable_paths_impl(&conn).expect("lookup").contains(&"/v/s/ingest.jpg".to_string()),
+                "⛔ the scan ingest wrote the path but did not forget it");
+
+        let merged = merge_records_into(&conn, &[image("/v/s/merge.jpg")]);
+        assert_eq!(merged.inserted, 1);
+        assert!(!remembered_unreadable_paths_impl(&conn).expect("lookup").contains(&"/v/s/merge.jpg".to_string()),
+                "⛔ the importers' merge wrote the path but did not forget it");
+
+        let saved = upsert_editor_saved_image_database(&conn, &image("/v/s/save.jpg"), true).expect("save insert");
+        assert!(matches!(saved.status, EditorSavedImageCatalogueStatus::Inserted));
+        assert!(!remembered_unreadable_paths_impl(&conn).expect("lookup").contains(&"/v/s/save.jpg".to_string()),
+                "⛔ the editor save inserted the path but did not forget it");
+
+        assert_eq!(ingest_metadata_impl(&conn, &[image("/v/s/refresh.jpg")], None), 1);
+        record_unreadable_files_impl(&conn, &[record("/v/s/refresh.jpg", 1, 1, "unreadable")], 2);
+        let refreshed = upsert_editor_saved_image_database(&conn, &image("/v/s/refresh.jpg"), true).expect("save refresh");
+        assert!(matches!(refreshed.status, EditorSavedImageCatalogueStatus::Refreshed));
+        assert!(!remembered_unreadable_paths_impl(&conn).expect("lookup").contains(&"/v/s/refresh.jpg".to_string()),
+                "⛔ the editor save refreshed the path but did not forget it");
+
+        assert_eq!(
+            remembered_unreadable_paths_impl(&conn).expect("lookup"),
+            strings(&["/v/s/untouched.jpg"]),
+            "a path nothing wrote stays remembered"
+        );
+        drop(conn);
+        cleanup(&path);
     }
 }

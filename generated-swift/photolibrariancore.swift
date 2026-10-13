@@ -5191,6 +5191,126 @@ public func FfiConverterTypeSimilarPhotoWorkUnit_lower(_ value: SimilarPhotoWork
 }
 
 
+public struct UnreadableFileProbe: Equatable, Hashable {
+    public var filePath: String
+    public var fileSize: UInt64
+    public var modifiedEpoch: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(filePath: String, fileSize: UInt64, modifiedEpoch: Int64) {
+        self.filePath = filePath
+        self.fileSize = fileSize
+        self.modifiedEpoch = modifiedEpoch
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension UnreadableFileProbe: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeUnreadableFileProbe: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UnreadableFileProbe {
+        return
+            try UnreadableFileProbe(
+                filePath: FfiConverterString.read(from: &buf), 
+                fileSize: FfiConverterUInt64.read(from: &buf), 
+                modifiedEpoch: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: UnreadableFileProbe, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.filePath, into: &buf)
+        FfiConverterUInt64.write(value.fileSize, into: &buf)
+        FfiConverterInt64.write(value.modifiedEpoch, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUnreadableFileProbe_lift(_ buf: RustBuffer) throws -> UnreadableFileProbe {
+    return try FfiConverterTypeUnreadableFileProbe.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUnreadableFileProbe_lower(_ value: UnreadableFileProbe) -> RustBuffer {
+    return FfiConverterTypeUnreadableFileProbe.lower(value)
+}
+
+
+public struct UnreadableFileRecord: Equatable, Hashable {
+    public var filePath: String
+    public var fileSize: UInt64
+    public var modifiedEpoch: Int64
+    public var reason: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(filePath: String, fileSize: UInt64, modifiedEpoch: Int64, reason: String) {
+        self.filePath = filePath
+        self.fileSize = fileSize
+        self.modifiedEpoch = modifiedEpoch
+        self.reason = reason
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension UnreadableFileRecord: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeUnreadableFileRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UnreadableFileRecord {
+        return
+            try UnreadableFileRecord(
+                filePath: FfiConverterString.read(from: &buf), 
+                fileSize: FfiConverterUInt64.read(from: &buf), 
+                modifiedEpoch: FfiConverterInt64.read(from: &buf), 
+                reason: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: UnreadableFileRecord, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.filePath, into: &buf)
+        FfiConverterUInt64.write(value.fileSize, into: &buf)
+        FfiConverterInt64.write(value.modifiedEpoch, into: &buf)
+        FfiConverterString.write(value.reason, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUnreadableFileRecord_lift(_ buf: RustBuffer) throws -> UnreadableFileRecord {
+    return try FfiConverterTypeUnreadableFileRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeUnreadableFileRecord_lower(_ value: UnreadableFileRecord) -> RustBuffer {
+    return FfiConverterTypeUnreadableFileRecord.lower(value)
+}
+
+
 public struct VideoDetails: Equatable, Hashable {
     public var durationSeconds: Double?
     public var frameRate: Double?
@@ -7158,6 +7278,56 @@ fileprivate struct FfiConverterSequenceTypeSimilarPhotoWorkUnit: FfiConverterRus
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeUnreadableFileProbe: FfiConverterRustBuffer {
+    typealias SwiftType = [UnreadableFileProbe]
+
+    public static func write(_ value: [UnreadableFileProbe], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeUnreadableFileProbe.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [UnreadableFileProbe] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [UnreadableFileProbe]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeUnreadableFileProbe.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeUnreadableFileRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [UnreadableFileRecord]
+
+    public static func write(_ value: [UnreadableFileRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeUnreadableFileRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [UnreadableFileRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [UnreadableFileRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeUnreadableFileRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeConnector: FfiConverterRustBuffer {
     typealias SwiftType = [Connector]
 
@@ -7849,11 +8019,11 @@ public func faceEmbeddingSearch(seedFaceObservationIds: [Int64], candidateImageI
             
         )
 }
-public func faceEmbeddingSearchChecked(seedFaceObservationIds: [Int64], candidateImageIds: [Int64], modelVersion: String, preprocessingVersion: String, threshold: Double, limit: UInt32)async  -> FaceEmbeddingSearchResult  {
+public func faceEmbeddingSearchChecked(seedFaceObservationIds: [Int64], candidateImageIds: [Int64], modelVersion: String, preprocessingVersion: String, threshold: Double, limit: UInt32, priorMatches: [FaceSearchMatchRecord] = [])async  -> FaceEmbeddingSearchResult  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_photolibrariancore_fn_func_face_embedding_search_checked(FfiConverterSequenceInt64.lower(seedFaceObservationIds),FfiConverterSequenceInt64.lower(candidateImageIds),FfiConverterString.lower(modelVersion),FfiConverterString.lower(preprocessingVersion),FfiConverterDouble.lower(threshold),FfiConverterUInt32.lower(limit)
+                uniffi_photolibrariancore_fn_func_face_embedding_search_checked(FfiConverterSequenceInt64.lower(seedFaceObservationIds),FfiConverterSequenceInt64.lower(candidateImageIds),FfiConverterString.lower(modelVersion),FfiConverterString.lower(preprocessingVersion),FfiConverterDouble.lower(threshold),FfiConverterUInt32.lower(limit),FfiConverterSequenceTypeFaceSearchMatchRecord.lower(priorMatches)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
@@ -8738,6 +8908,21 @@ public func personRepresentativeFaces()async  -> [PersonRepresentativeFaceRecord
             
         )
 }
+public func personSearchSeedFaceObservationIds(personId: Int64, limit: UInt32)async  -> [Int64]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_person_search_seed_face_observation_ids(FfiConverterInt64.lower(personId),FfiConverterUInt32.lower(limit)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceInt64.lift,
+            errorHandler: nil
+            
+        )
+}
 public func personSummaries()async  -> [PersonSummaryRecord]  {
     return
         try!  await uniffiRustCallAsync(
@@ -8873,6 +9058,21 @@ public func queryImagesScopedGallery(predicates: [QueryPredicate], connectors: [
             
         )
 }
+public func recordUnreadableFiles(records: [UnreadableFileRecord])async  -> UInt32  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_record_unreadable_files(FfiConverterSequenceTypeUnreadableFileRecord.lower(records)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u32,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u32,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u32,
+            liftFunc: FfiConverterUInt32.lift,
+            errorHandler: nil
+            
+        )
+}
 public func recoverInterruptedAnalysisJobs(jobKind: String, terminalStatus: String, lastError: String?)async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
@@ -8899,6 +9099,21 @@ public func relocateFilePathPrefix(oldPrefix: String, newPrefix: String)async  -
             completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeRelocateResult_lift,
+            errorHandler: nil
+            
+        )
+}
+public func rememberedUnreadablePaths()async  -> [String]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_remembered_unreadable_paths(
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceString.lift,
             errorHandler: nil
             
         )
@@ -9184,6 +9399,21 @@ public func similarPhotoStackSummariesForIds(ids: [Int64], algorithmVersion: Str
             completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeSimilarPhotoStackSummary.lift,
+            errorHandler: nil
+            
+        )
+}
+public func unreadableFilesMatching(probes: [UnreadableFileProbe])async  -> [String]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_unreadable_files_matching(FfiConverterSequenceTypeUnreadableFileProbe.lower(probes)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceString.lift,
             errorHandler: nil
             
         )
@@ -9555,7 +9785,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_face_embedding_search() != 34390) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_photolibrariancore_checksum_func_face_embedding_search_checked() != 31694) {
+    if (uniffi_photolibrariancore_checksum_func_face_embedding_search_checked() != 63106) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_face_embedding_search_vector() != 46484) {
@@ -9738,6 +9968,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_person_representative_faces() != 38251) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_person_search_seed_face_observation_ids() != 27244) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_person_summaries() != 22840) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -9765,10 +9998,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_query_images_scoped_gallery() != 28562) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_record_unreadable_files() != 4665) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_recover_interrupted_analysis_jobs() != 41065) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_relocate_file_path_prefix() != 30525) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_remembered_unreadable_paths() != 20483) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_remove_images_by_ids() != 22525) {
@@ -9826,6 +10065,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_similar_photo_stack_summaries_for_ids() != 43301) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_unreadable_files_matching() != 17872) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_analysis_job_breadcrumb() != 10254) {

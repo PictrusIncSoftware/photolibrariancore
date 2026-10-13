@@ -1090,6 +1090,15 @@ namespace photolibrariancore {
     // same answer as "no matching faces"; matches is then empty and the caller
     // must SAY SO rather than showing a zero-result search.
     // Supersedes face_embedding_search.
+    //
+    // ⭐ S195-104 (ruling 104) — prior_matches: the previous call's matches,
+    // handed back unchanged, so ONE search can run as several short calls (a
+    // few reference faces each) with a progress bar and Stop between them.
+    // Each call keeps the best match per image under one strict total order
+    // (higher cosine, then lower face id, then lower seed id), so any split
+    // answers exactly what one call with every reference face answers. A
+    // chunked caller passes limit 0. Appended LAST with an empty default
+    // (S65): today's single search.
     [Async]
     FaceEmbeddingSearchResult face_embedding_search_checked(
         sequence<i64> seed_face_observation_ids,
@@ -1097,7 +1106,8 @@ namespace photolibrariancore {
         string model_version,
         string preprocessing_version,
         f64 threshold,
-        u32 limit
+        u32 limit,
+        optional sequence<FaceSearchMatchRecord> prior_matches = []
     );
 
     // R-08 — the drawn-region ("Manually Select Face to Search…") search, with
@@ -1111,6 +1121,40 @@ namespace photolibrariancore {
         f64 threshold,
         u32 limit
     );
+
+    // ⭐ S195 — ruling 101: the unreadable-file memory (the `unreadable_file`
+    // table). Folder Sync stops offering a file an import tried and could not
+    // read while its size AND modification date are unchanged. The table is
+    // small by nature and every call reads it whole; every failure answers
+    // 0 / empty, which leaves the file OFFERED exactly as before the ruling.
+    // There is no forget export: every Rust seam that writes an `images` row
+    // (ingest_metadata, the importers' merge, the editor save) forgets the
+    // paths it wrote, after its own commit.
+    //
+    // RECORD — upsert a batch of failures (keeps the first failure time).
+    // Returns the rows submitted; 0 for empty input or a rolled-back failure.
+    [Async]
+    u32 record_unreadable_files(sequence<UnreadableFileRecord> records);
+
+    // Every remembered path (sorted) — the caller keeps the ones under the
+    // folder it is diffing and stats ONLY those.
+    [Async]
+    sequence<string> remembered_unreadable_paths();
+
+    // THE MATCH — the probes remembered with BOTH their current size AND their
+    // current modification date equal to what was recorded.
+    [Async]
+    sequence<string> unreadable_files_matching(sequence<UnreadableFileProbe> probes);
+
+    // ⭐ S195-104 — ruling 104 (fix round 1): a named face search seeds from
+    // the person's CHOSEN faces first (assignment_source chosen_seed or
+    // manual_label), then fills up to `limit` with the person's best other
+    // assigned faces; within each group best capture quality first (missing or
+    // invalid quality last), ties by face id; `limit` 0 = no cap. One query. A
+    // person who has faces never gets zero seeds. A read failure answers EMPTY
+    // (logged and censused); the caller always adds the face the user picked.
+    [Async]
+    sequence<i64> person_search_seed_face_observation_ids(i64 person_id, u32 limit);
 };
 
 // Image classification categories for JPEG+RAW pair handling.
@@ -2105,4 +2149,24 @@ dictionary FaceLeftWithOtherPersonRecord {
     f64 cosine;
     i64 owner_person_id;
     string owner_person_name;
+};
+
+// ⭐ S195 — ruling 101. One file an import pass tried and could not read:
+// its path, its logical size and whole-second modification date at that
+// moment, and a short reason token (`unreadable` or `damaged_zero_byte`). The
+// failure times are the core's own clock. Never an online-only placeholder —
+// Swift decides that with the shared classifier before handing one over.
+dictionary UnreadableFileRecord {
+    string file_path;
+    u64 file_size;
+    i64 modified_epoch;
+    string reason;
+};
+
+// ⭐ S195 — ruling 101. One Folder Sync candidate's CURRENT size and
+// whole-second modification date, for the match.
+dictionary UnreadableFileProbe {
+    string file_path;
+    u64 file_size;
+    i64 modified_epoch;
 };
