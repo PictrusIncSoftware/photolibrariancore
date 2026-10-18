@@ -6420,45 +6420,11 @@ fn execute_image_record_query(
         }
     };
 
-    let rows = match stmt.query_map(params![limit, offset], |row| {
-        // Format indexed_timestamp from Unix epoch seconds to ISO 8601 string
-        let epoch_secs: i64 = row.get(1)?;
-        let indexed_ts = format_epoch_to_iso8601(epoch_secs);
-
-        Ok(ImageRecord {
-            id: row.get(0)?,
-            indexed_timestamp: indexed_ts,
-            file_path: row.get(2)?,
-            file_size: row.get::<_, i64>(3)? as u64,
-            file_name: row.get(4)?,
-            file_extension: row.get(5)?,
-            created_timestamp: row.get(6)?,
-            modified_timestamp: row.get(7)?,
-            camera_make: row.get(8)?,
-            camera_model: row.get(9)?,
-            lens_model: row.get(10)?,
-            focal_length: row.get(11)?,
-            aperture: row.get(12)?,
-            shutter_speed: row.get(13)?,
-            iso: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
-            capture_datetime: row.get(15)?,
-            pixel_width: row.get::<_, Option<i64>>(16)?.map(|v| v as u32),
-            pixel_height: row.get::<_, Option<i64>>(17)?.map(|v| v as u32),
-            color_space: row.get(18)?,
-            bit_depth: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
-            gps_latitude: row.get(20)?,
-            gps_longitude: row.get(21)?,
-            gps_altitude: row.get(22)?,
-            copyright: row.get(23)?,
-            creator: row.get(24)?,
-            description: row.get(25)?,
-            rating: row.get::<_, Option<i64>>(26)?.map(|v| v as u8),
-            flag: row.get(27)?,
-            color_label: row.get(28)?,
-            rotation: row.get::<_, i64>(29)? as i32,
-            duplicate_group_id: row.get::<_, Option<i64>>(30)?,
-        })
-    }) {
+    // ⭐ Oct 17, 2026 launch-speed ruling, review fix round: the row decode is
+    // `image_record_from_row` (below), extracted VERBATIM so the keyset read
+    // `image_records_after` decodes its rows with the SAME code — every field
+    // identical by construction.
+    let rows = match stmt.query_map(params![limit, offset], image_record_from_row) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Failed to execute query: {}", e);
@@ -6475,6 +6441,54 @@ fn execute_image_record_query(
     }
 
     records
+}
+
+/// Decode one row of the shared 31-column `ImageRecord` projection — columns
+/// 0–29 in the order both `build_image_record_query_sql` branches and
+/// `build_image_records_after_sql` emit them, column 30 `duplicate_group_id`.
+/// Extracted VERBATIM from `execute_image_record_query`'s `query_map` closure
+/// (Oct 17, 2026 launch-speed ruling, review fix round) so the full-record
+/// keyset read decodes with the same code. Extra trailing columns (the
+/// wrapped branch's `focus_score` / similar-photo aliases) are never read.
+fn image_record_from_row(row: &duckdb::Row<'_>) -> duckdb::Result<ImageRecord>
+{
+    // Format indexed_timestamp from Unix epoch seconds to ISO 8601 string
+    let epoch_secs: i64 = row.get(1)?;
+    let indexed_ts = format_epoch_to_iso8601(epoch_secs);
+
+    Ok(ImageRecord {
+        id: row.get(0)?,
+        indexed_timestamp: indexed_ts,
+        file_path: row.get(2)?,
+        file_size: row.get::<_, i64>(3)? as u64,
+        file_name: row.get(4)?,
+        file_extension: row.get(5)?,
+        created_timestamp: row.get(6)?,
+        modified_timestamp: row.get(7)?,
+        camera_make: row.get(8)?,
+        camera_model: row.get(9)?,
+        lens_model: row.get(10)?,
+        focal_length: row.get(11)?,
+        aperture: row.get(12)?,
+        shutter_speed: row.get(13)?,
+        iso: row.get::<_, Option<i64>>(14)?.map(|v| v as u32),
+        capture_datetime: row.get(15)?,
+        pixel_width: row.get::<_, Option<i64>>(16)?.map(|v| v as u32),
+        pixel_height: row.get::<_, Option<i64>>(17)?.map(|v| v as u32),
+        color_space: row.get(18)?,
+        bit_depth: row.get::<_, Option<i64>>(19)?.map(|v| v as u32),
+        gps_latitude: row.get(20)?,
+        gps_longitude: row.get(21)?,
+        gps_altitude: row.get(22)?,
+        copyright: row.get(23)?,
+        creator: row.get(24)?,
+        description: row.get(25)?,
+        rating: row.get::<_, Option<i64>>(26)?.map(|v| v as u8),
+        flag: row.get(27)?,
+        color_label: row.get(28)?,
+        rotation: row.get::<_, i64>(29)? as i32,
+        duplicate_group_id: row.get::<_, Option<i64>>(30)?,
+    })
 }
 
 /// Build the SQL text `execute_image_record_query` prepares — the predicate
@@ -7169,6 +7183,234 @@ pub async fn get_all_images(
         "",
         media_type,
     )
+}
+
+// ===========================================================================
+// ⭐ Oct 17, 2026 launch-speed ruling (DECISIONS.md 2026-10-17, "Launch must
+// show photos straight away", item 1): the launch online-only reminder reads
+// paths and sizes only.
+// ===========================================================================
+//
+// The reminder (Swift `ThumbnailBuildPlanCoordinator.runLaunchCloudCheck`)
+// needs each catalogue row's `(file_path, file_size)` and nothing else. It
+// used to page `get_all_images(5000, offset, false, false, Both)` — 84 pages
+// on a 416,831-row catalogue, each computing `DUPLICATE_GROUP_ID_CASE`'s
+// window over the WHOLE table and lifting a 31-field `ImageRecord` per row —
+// and because the binding polls every FFI future on the main thread, main sat
+// in DuckDB for ~15 s at launch (measured on the Mac Studio).
+//
+// This read is the same RECORD SET with none of that machinery: no window,
+// no duplicate / RAW+JPEG / similar-photo collapse, no media predicate (the
+// caller passed `MediaType::Both`, which `media_predicate` maps to NO
+// predicate — stills and video together), and keyset paging (`id > cursor`)
+// in place of OFFSET, so page N costs what page 1 costs.
+//
+// `get_all_images` and every full-record caller (the build dialog, the
+// builder) are unchanged.
+
+/// One catalogue row reduced to what the launch online-only reminder reads:
+/// its id (the keyset cursor), its path and its stored size. Mirrors the UDL
+/// `ImagePathSize`. `file_size` decodes EXACTLY as `execute_image_record_query`
+/// decodes `ImageRecord.file_size` (`i64` read, `as u64`), so the Swift
+/// `Int64(clamping:)` tuple it becomes is identical to the one the full
+/// record produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImagePathSize
+{
+    pub id: i64,
+    pub file_path: String,
+    pub file_size: u64,
+}
+
+/// The ONE statement `image_paths_and_sizes_after` prepares. No `WHERE` beyond
+/// the cursor — the same row set as `get_all_images(…, false, false, Both)`,
+/// whose SQL carries no predicate at all — and `ORDER BY id`, a total order
+/// (`images.id` is the INTEGER PRIMARY KEY), so a page boundary can never lose
+/// or repeat a row.
+const IMAGE_PATHS_AND_SIZES_AFTER_SQL: &str =
+    "SELECT id, file_path, file_size FROM images WHERE id > ?1 ORDER BY id ASC LIMIT ?2";
+
+/// Body of `image_paths_and_sizes_after` against an explicit connection (the
+/// impl/wrapper pattern — the cargo pins drive it on temp-file catalogues).
+///
+/// `after_id` is the EXCLUSIVE lower bound: pass 0 for the first page (every
+/// `images.id` comes from `images_id_seq`, which starts at 1), then the `id`
+/// of the last row returned. `limit` 0 answers empty without touching the
+/// catalogue. Rows that fail to decode are counted in the dropped-row census
+/// (site `image_paths_and_sizes_after`) and left out, exactly as the full
+/// record query leaves them out; a prepare / query failure is an `Err`.
+fn image_paths_and_sizes_after_impl(
+    conn: &Connection,
+    after_id: i64,
+    limit: u32,
+) -> Result<Vec<ImagePathSize>, String>
+{
+    if limit == 0
+    {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = conn
+        .prepare(IMAGE_PATHS_AND_SIZES_AFTER_SQL)
+        .map_err(|e| format!("prepare {}", e))?;
+    let rows = stmt
+        .query_map(params![after_id, i64::from(limit)], |row| {
+            Ok(ImagePathSize
+            {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                file_size: row.get::<_, i64>(2)? as u64,
+            })
+        })
+        .map_err(|e| format!("query {}", e))?;
+    Ok(collect_rows(rows, "image_paths_and_sizes_after"))
+}
+
+/// ⭐ Oct 17, 2026 launch-speed ruling — up to `limit` catalogue rows (stills
+/// AND videos) with `id > after_id`, ascending by id, each reduced to
+/// `(id, file_path, file_size)`. Keyset paging: the caller passes 0 first,
+/// then the last row's `id`, and stops at an empty page.
+///
+/// No failure channel (a bare list — ruling 23): a missing catalogue or a
+/// failed read answers EMPTY, logged and counted in the dropped-row census,
+/// which ends the caller's walk exactly as an empty `get_all_images` page
+/// ended the old one.
+pub async fn image_paths_and_sizes_after(after_id: i64, limit: u32) -> Vec<ImagePathSize>
+{
+    let catalogue = lock_catalogue();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    match image_paths_and_sizes_after_impl(conn, after_id, limit)
+    {
+        Ok(records) => records,
+        Err(message) =>
+        {
+            eprintln!("image_paths_and_sizes_after: {}", message);
+            record_dropped_rows("image_paths_and_sizes_after.query_failed", 1);
+            Vec::new()
+        }
+    }
+}
+
+// ===========================================================================
+// ⭐ Oct 17, 2026 launch-speed ruling, review fix round: the FULL-record
+// whole-catalogue read every thumbnail build, the build dialog and the stamp
+// backfill take, WITHOUT the duplicate-group window.
+// ===========================================================================
+//
+// Swift's `PhotosThumbnailBuilder.loadAllRecordsForBuild` paged
+// `get_all_images(5000, offset, false, false, Both)`, so every page computed
+// `DUPLICATE_GROUP_ID_CASE`'s window over the WHOLE table on the main thread
+// — ~15 s at 416,831 rows — on the launch resume of an interrupted build and
+// on every post-import / post-scan / Sync / File-menu build. No consumer of
+// those records reads `duplicate_group_id` (audited at every call site, Oct
+// 17, 2026: they read `file_path`, `file_size`, `id`, `rotation` and
+// `modified_timestamp`), so this read returns it as NULL and skips the
+// window. Same rows (the same `media_predicate` and nothing else — the two
+// collapse booleans were false), same order (`ORDER BY id`), same decode
+// (`image_record_from_row`), keyset-paged.
+
+/// The SQL `image_records_after` prepares: the 31-column `ImageRecord`
+/// projection in `image_record_from_row`'s column order with column 30 a typed
+/// NULL, the cursor, the caller's media stance (`media_predicate` — exactly
+/// what `get_all_images` applies), `ORDER BY id`, a bound. Pure, so the cargo
+/// pins read its text without a connection.
+fn build_image_records_after_sql(media_type: MediaType) -> String
+{
+    let media_clause = match media_predicate(media_type)
+    {
+        Some(predicate) => format!(" AND {}", predicate),
+        None => String::new(),
+    };
+    format!(
+        r#"
+            SELECT
+                id, epoch(indexed_timestamp) as indexed_ts_epoch,
+                file_path, file_size, file_name, file_extension,
+                created_timestamp, modified_timestamp,
+                camera_make, camera_model, lens_model,
+                focal_length, aperture, shutter_speed, iso,
+                capture_datetime,
+                pixel_width, pixel_height, color_space, bit_depth,
+                gps_latitude, gps_longitude, gps_altitude,
+                copyright, creator, description,
+                rating, flag, color_label, rotation,
+                CAST(NULL AS BIGINT) AS duplicate_group_id
+            FROM images
+            WHERE id > ?1{}
+            ORDER BY id ASC
+            LIMIT ?2
+        "#,
+        media_clause
+    )
+}
+
+/// Body of `image_records_after` against an explicit connection (the
+/// impl/wrapper pattern). `after_id` is the EXCLUSIVE lower bound — 0 for the
+/// first page, then the last row's `id`; `limit` 0 answers empty without
+/// reading. Rows that fail to decode are censused (site
+/// `image_records_after`) and left out, as the full-record query leaves them
+/// out; a prepare / query failure is an `Err`.
+fn image_records_after_impl(
+    conn: &Connection,
+    after_id: i64,
+    limit: u32,
+    media_type: MediaType,
+) -> Result<Vec<ImageRecord>, String>
+{
+    if limit == 0
+    {
+        return Ok(Vec::new());
+    }
+
+    let sql = build_image_records_after_sql(media_type);
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare {}", e))?;
+    let rows = stmt
+        .query_map(params![after_id, i64::from(limit)], image_record_from_row)
+        .map_err(|e| format!("query {}", e))?;
+    Ok(collect_rows(rows, "image_records_after"))
+}
+
+/// ⭐ Oct 17, 2026 launch-speed ruling, review fix round — up to `limit` full
+/// `ImageRecord`s with `id > after_id` under `media_type`, ascending by id,
+/// with `duplicate_group_id` always `None`. Keyset paging: pass 0 first, then
+/// the last row's `id`; stop at an empty page. The rows and every other field
+/// are exactly `get_all_images(…, false, false, media_type)`'s.
+///
+/// No failure channel (a bare list — ruling 23): a missing catalogue or a
+/// failed read answers EMPTY, logged and censused, which ends the caller's
+/// walk exactly as an empty `get_all_images` page ended the old one.
+pub async fn image_records_after(after_id: i64, limit: u32, media_type: MediaType) -> Vec<ImageRecord>
+{
+    let catalogue = lock_catalogue();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    match image_records_after_impl(conn, after_id, limit, media_type)
+    {
+        Ok(records) => records,
+        Err(message) =>
+        {
+            eprintln!("image_records_after: {}", message);
+            record_dropped_rows("image_records_after.query_failed", 1);
+            Vec::new()
+        }
+    }
 }
 
 fn image_records_with_same_basename_impl(
@@ -58920,5 +59162,631 @@ mod unreadable_file_tests
         );
         drop(conn);
         cleanup(&path);
+    }
+}
+
+// === ⭐ Oct 17, 2026 launch-speed ruling — `image_paths_and_sizes_after` =====
+//
+// The cargo pins for the launch online-only reminder's paths-and-sizes read
+// (DECISIONS.md 2026-10-17, "Launch must show photos straight away", item 1).
+// Every test runs on a REAL temp-file catalogue opened through the production
+// `open_and_migrate_catalogue`, fenced (engine tests never fetch).
+#[cfg(test)]
+mod image_paths_and_sizes_tests
+{
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct Fixture
+    {
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for Fixture
+    {
+        fn drop(&mut self)
+        {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn fresh_catalogue(tag: &str) -> (Fixture, Connection)
+    {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "plcore-launch-paths-{}-{}-{}",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        let conn = open_and_migrate_catalogue(&dir.join("catalogue.db")).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH.
+        fence_connection_against_extension_fetches(&conn);
+        (Fixture { dir }, conn)
+    }
+
+    /// A row as the scan / importers hand it over. `is_video` rows carry a
+    /// video extension; the size is the caller's.
+    fn media(file_path: &str, file_size: u64, is_video: bool) -> ImageMetadata
+    {
+        let file_name = file_path.rsplit('/').next().unwrap_or(file_path).to_string();
+        let file_extension = file_name.rsplit('.').next().map(|e| e.to_lowercase());
+        ImageMetadata
+        {
+            file_path: file_path.to_string(),
+            file_size,
+            file_name,
+            file_extension,
+            created_timestamp: 1_700_000_000,
+            modified_timestamp: 1_700_000_000,
+            camera_make: None,
+            camera_model: None,
+            lens_model: None,
+            focal_length: None,
+            aperture: None,
+            shutter_speed: None,
+            iso: None,
+            capture_datetime: Some("2026:10:17 09:00:00".to_string()),
+            pixel_width: None,
+            pixel_height: None,
+            color_space: None,
+            bit_depth: None,
+            gps_latitude: None,
+            gps_longitude: None,
+            gps_altitude: None,
+            copyright: None,
+            creator: None,
+            description: None,
+            rating: None,
+            flag: None,
+            color_label: None,
+            rotation: None,
+            is_video,
+            duration_seconds: None,
+            frame_rate: None,
+            video_kind: None,
+            video_codec: None,
+            video_bitrate: None,
+            color_primaries: None,
+            color_transfer: None,
+            color_matrix: None,
+            color_range: None,
+            dv_profile: None,
+            has_audio: None,
+            audio_codec: None,
+            audio_channels: None,
+            audio_sample_rate: None,
+            audio_bitrate: None,
+            live_photo_id: None,
+            external_source_id: None,
+        }
+    }
+
+    /// Walk the whole table exactly as the Swift reminder does: cursor 0,
+    /// then the last id returned, until an EMPTY page. Pages are checked as
+    /// they arrive (bounded, ascending, past the cursor).
+    fn walk(conn: &Connection, limit: u32) -> (Vec<ImagePathSize>, usize)
+    {
+        let mut all: Vec<ImagePathSize> = Vec::new();
+        let mut cursor: i64 = 0;
+        let mut pages = 0usize;
+        loop
+        {
+            let page = image_paths_and_sizes_after_impl(conn, cursor, limit).expect("a page");
+            if page.is_empty()
+            {
+                break;
+            }
+            pages += 1;
+            assert!(page.len() <= limit as usize, "a page carried {} rows over its limit {}", page.len(), limit);
+            assert!(page[0].id > cursor, "a page restarted at or before its cursor {}", cursor);
+            assert!(page.windows(2).all(|w| w[0].id < w[1].id), "a page is not strictly ascending by id");
+            cursor = page[page.len() - 1].id;
+            all.extend(page);
+            assert!(pages < 10_000, "the walk never ended");
+        }
+        (all, pages)
+    }
+
+    /// The table's own (id, file_path, file_size) in id order — the truth.
+    fn table(conn: &Connection) -> Vec<ImagePathSize>
+    {
+        let mut stmt = conn
+            .prepare("SELECT id, file_path, file_size FROM images ORDER BY id")
+            .expect("truth statement");
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ImagePathSize
+                {
+                    id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    file_size: row.get::<_, i64>(2)? as u64,
+                })
+            })
+            .expect("truth rows");
+        rows.map(|r| r.expect("truth row")).collect()
+    }
+
+    /// `get_all_images(limit, offset, false, false, MediaType::Both)` is a
+    /// thin delegate to exactly this call — paged the way the retired Swift
+    /// `loadAllRecordsForBuild` paged it (stop at a short page).
+    fn get_all_images_walk(conn: &Connection, page_size: i64, media_type: MediaType) -> Vec<ImageRecord>
+    {
+        let mut all: Vec<ImageRecord> = Vec::new();
+        let mut offset: i64 = 0;
+        loop
+        {
+            let page = execute_image_record_query(
+                conn, "", "id", page_size, offset, false, false, false, "", media_type,
+            );
+            let short = (page.len() as i64) < page_size;
+            all.extend(page);
+            if short
+            {
+                break;
+            }
+            offset += page_size;
+        }
+        all
+    }
+
+    #[test]
+    fn keyset_pages_cover_every_row_exactly_once_across_id_gaps()
+    {
+        let (_fixture, conn) = fresh_catalogue("gaps");
+        let rows: Vec<ImageMetadata> = (1..=23)
+            .map(|n| media(&format!("/v/gaps/IMG_{:04}.jpg", n), 1000 + n, false))
+            .collect();
+        assert_eq!(ingest_metadata_impl(&conn, &rows, None), 23);
+        // Gaps at the start, in runs, and at the very end — including a run
+        // that straddles a page boundary at limit 4.
+        conn.execute_batch("DELETE FROM images WHERE id IN (1, 2, 7, 8, 9, 15, 23);")
+            .expect("open gaps in the id sequence");
+
+        let truth = table(&conn);
+        assert_eq!(truth.len(), 16);
+
+        for limit in [1u32, 2, 3, 4, 5, 16, 17, 5000]
+        {
+            let (walked, pages) = walk(&conn, limit);
+            assert_eq!(walked, truth, "limit {}: the walk is not the table, row for row", limit);
+            let expected_pages = (truth.len() + limit as usize - 1) / limit as usize;
+            assert_eq!(pages, expected_pages, "limit {}: {} pages, not {}", limit, pages, expected_pages);
+        }
+
+        // A cursor that sits INSIDE a gap resumes at the next live row.
+        let resumed = image_paths_and_sizes_after_impl(&conn, 7, 2).expect("page after a deleted id");
+        assert_eq!(resumed.iter().map(|r| r.id).collect::<Vec<_>>(), vec![10, 11]);
+        // Past the last row: empty, not an error.
+        let past = image_paths_and_sizes_after_impl(&conn, 22, 5000).expect("page past the end");
+        assert!(past.is_empty(), "a cursor past the last id must answer empty, got {:?}", past);
+    }
+
+    #[test]
+    fn an_empty_catalogue_and_a_zero_limit_answer_empty()
+    {
+        let (_fixture, conn) = fresh_catalogue("empty");
+        assert_eq!(image_paths_and_sizes_after_impl(&conn, 0, 5000), Ok(Vec::new()));
+        assert_eq!(walk(&conn, 5000), (Vec::new(), 0));
+
+        assert_eq!(ingest_metadata_impl(&conn, &[media("/v/e/one.jpg", 10, false)], None), 1);
+        assert_eq!(image_paths_and_sizes_after_impl(&conn, 0, 0), Ok(Vec::new()),
+                   "limit 0 answers empty without reading");
+        assert_eq!(image_paths_and_sizes_after_impl(&conn, 0, 1).expect("one row").len(), 1);
+    }
+
+    #[test]
+    fn videos_are_included_alongside_stills()
+    {
+        let (_fixture, conn) = fresh_catalogue("videos");
+        let rows = vec![
+            media("/v/m/a.jpg", 100, false),
+            media("/v/m/b.mov", 2_000_000, true),
+            media("/v/m/c.nef", 300, false),
+            media("/v/m/d.mp4", 4_000_000, true),
+            media("/v/m/e.heic", 500, false),
+        ];
+        assert_eq!(ingest_metadata_impl(&conn, &rows, None), 5);
+        let video_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM images WHERE is_video IS TRUE", [], |r| r.get(0))
+            .expect("video count");
+        assert_eq!(video_count, 2, "the fixture must really carry two video rows");
+
+        let (walked, _) = walk(&conn, 2);
+        let paths: Vec<&str> = walked.iter().map(|r| r.file_path.as_str()).collect();
+        assert_eq!(paths, vec!["/v/m/a.jpg", "/v/m/b.mov", "/v/m/c.nef", "/v/m/d.mp4", "/v/m/e.heic"]);
+        let mov = walked.iter().find(|r| r.file_path == "/v/m/b.mov").expect("the .mov row");
+        assert_eq!(mov.file_size, 2_000_000);
+    }
+
+    #[test]
+    fn the_row_set_and_sizes_match_get_all_images_both_unfiltered()
+    {
+        let (_fixture, conn) = fresh_catalogue("parity");
+        let mut rows = vec![
+            // A RAW+JPEG pair (the collapse get_all_images is called WITHOUT).
+            media("/v/p/pair/RSW_0001.NEF", 25_000_000, false),
+            media("/v/p/pair/RSW_0001.JPG", 4_000_000, false),
+            // A cross-directory duplicate set (same name, size and capture date
+            // — the DUPLICATE_GROUP_ID_CASE window's subject).
+            media("/v/p/one/DUP_0001.jpg", 777, false),
+            media("/v/p/two/DUP_0001.jpg", 777, false),
+            media("/v/p/three/DUP_0001.jpg", 777, false),
+            // Videos.
+            media("/v/p/clip.mov", 9_000_000, true),
+            media("/v/p/clip.mp4", 8_000_000, true),
+            // R-116: a saturated Lightroom size, stored as BIGINT Int64::MAX.
+            media("/v/p/huge.tif", i64::MAX as u64, false),
+        ];
+        for n in 0..40
+        {
+            rows.push(media(&format!("/v/p/bulk/B_{:03}.jpg", n), 5_000 + n, n % 7 == 0));
+        }
+        let inserted = ingest_metadata_impl(&conn, &rows, None);
+        assert_eq!(inserted as usize, rows.len());
+        conn.execute_batch("DELETE FROM images WHERE id IN (4, 11, 12, 30);")
+            .expect("open gaps");
+
+        let legacy: Vec<(i64, String, u64)> = get_all_images_walk(&conn, 5, MediaType::Both)
+            .into_iter()
+            .map(|r| (r.id, r.file_path, r.file_size))
+            .collect();
+        let (walked, _) = walk(&conn, 5);
+        let keyset: Vec<(i64, String, u64)> =
+            walked.into_iter().map(|r| (r.id, r.file_path, r.file_size)).collect();
+
+        assert_eq!(keyset.len(), rows.len() - 4);
+        assert_eq!(keyset, legacy,
+                   "the paths-and-sizes walk must return EXACTLY get_all_images(…, false, false, Both)'s rows, \
+                    in the same order, with the same decoded sizes");
+        assert!(keyset.iter().any(|(_, path, size)| path == "/v/p/huge.tif" && *size == i64::MAX as u64));
+    }
+
+    #[test]
+    fn the_read_carries_no_window_and_no_offset()
+    {
+        // TEXT: the cursor, a total order, a bound — and none of the
+        // full-record machinery.
+        let sql = IMAGE_PATHS_AND_SIZES_AFTER_SQL;
+        assert!(sql.contains("WHERE id > ?1"), "the keyset cursor is gone: {}", sql);
+        assert!(sql.contains("ORDER BY id ASC"), "the total order is gone: {}", sql);
+        assert!(sql.contains("LIMIT ?2"), "the page bound is gone: {}", sql);
+        for forbidden in ["OVER", "OFFSET", "PARTITION", "is_video", "spgm", "similar", "image_kind"]
+        {
+            assert!(!sql.contains(forbidden), "the read regained `{}`: {}", forbidden, sql);
+        }
+
+        // PLAN: the engine is not asked to evaluate a window.
+        let (_fixture, conn) = fresh_catalogue("plan");
+        assert_eq!(ingest_metadata_impl(&conn, &[media("/v/w/a.jpg", 1, false)], None), 1);
+        let explain = format!("EXPLAIN {}", sql.replace("?1", "0").replace("?2", "5000"));
+        let mut stmt = conn.prepare(&explain).expect("explain statement");
+        let plan: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("explain rows")
+            .map(|r| r.expect("explain row"))
+            .collect();
+        let plan_text = plan.join("\n");
+        assert!(!plan_text.is_empty(), "EXPLAIN returned no plan");
+        assert!(!plan_text.contains("WINDOW"), "the plan computes a window:\n{}", plan_text);
+
+        // And the control: the full-record query DOES carry one, so the plan
+        // check above is able to see a window when there is one.
+        let full = build_image_record_query_sql("", "id", false, false, false, "", MediaType::Both);
+        let full_explain = format!("EXPLAIN {}", full.replace("?1", "5000").replace("?2", "0"));
+        let mut full_stmt = conn.prepare(&full_explain).expect("control explain statement");
+        let full_plan: Vec<String> = full_stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("control explain rows")
+            .map(|r| r.expect("control explain row"))
+            .collect();
+        assert!(full_plan.join("\n").contains("WINDOW"),
+                "control: the get_all_images plan should show its WINDOW — the check above would be vacuous");
+    }
+
+    #[test]
+    fn a_cursor_outside_the_integer_id_range_never_fails_the_read()
+    {
+        let (_fixture, conn) = fresh_catalogue("range");
+        let rows: Vec<ImageMetadata> = (1..=3).map(|n| media(&format!("/v/r/{}.jpg", n), n, false)).collect();
+        assert_eq!(ingest_metadata_impl(&conn, &rows, None), 3);
+        assert_eq!(image_paths_and_sizes_after_impl(&conn, i64::MIN, 10).expect("i64::MIN cursor").len(), 3);
+        assert_eq!(image_paths_and_sizes_after_impl(&conn, -1, 10).expect("negative cursor").len(), 3);
+        assert_eq!(image_paths_and_sizes_after_impl(&conn, i64::MAX, 10), Ok(Vec::new()));
+        assert_eq!(image_paths_and_sizes_after_impl(&conn, 0, u32::MAX).expect("u32::MAX limit").len(), 3);
+    }
+
+    // ── The review fix round: `image_records_after`, the full-record read ──
+
+    /// Walk `image_records_after_impl` the way `loadAllRecordsForBuild` now
+    /// does: cursor 0, then the last id, until an EMPTY page.
+    fn full_walk(conn: &Connection, limit: u32, media_type: MediaType) -> Vec<ImageRecord>
+    {
+        let mut all: Vec<ImageRecord> = Vec::new();
+        let mut cursor: i64 = 0;
+        let mut pages = 0usize;
+        loop
+        {
+            let page = image_records_after_impl(conn, cursor, limit, media_type).expect("a full-record page");
+            if page.is_empty()
+            {
+                break;
+            }
+            pages += 1;
+            assert!(page.len() <= limit as usize, "a page carried {} rows over its limit {}", page.len(), limit);
+            assert!(page[0].id > cursor, "a page restarted at or before its cursor {}", cursor);
+            assert!(page.windows(2).all(|w| w[0].id < w[1].id), "a page is not strictly ascending by id");
+            assert!(page.iter().all(|r| r.duplicate_group_id.is_none()),
+                    "the keyset read must never carry a duplicate group");
+            cursor = page[page.len() - 1].id;
+            all.extend(page);
+            assert!(pages < 10_000, "the walk never ended");
+        }
+        all
+    }
+
+    /// Every field of an `ImageRecord` EXCEPT `duplicate_group_id`, as text
+    /// (`ImageRecord` is `Debug` but not `PartialEq`; Debug prints every field,
+    /// so a field added to the struct joins the comparison automatically).
+    fn without_duplicate_group(records: &[ImageRecord]) -> Vec<String>
+    {
+        records
+            .iter()
+            .map(|r|
+            {
+                let mut copy = r.clone();
+                copy.duplicate_group_id = None;
+                format!("{:?}", copy)
+            })
+            .collect()
+    }
+
+    /// A row with EVERY optional field populated and distinct per `n`, so a
+    /// swapped or dropped column cannot hide behind equal or NULL values.
+    fn rich(file_path: &str, n: u32, is_video: bool) -> ImageMetadata
+    {
+        let mut row = media(file_path, 10_000 + u64::from(n), is_video);
+        let f = f64::from(n);
+        row.created_timestamp = 1_600_000_000 + i64::from(n);
+        row.modified_timestamp = 1_650_000_000 + i64::from(n);
+        row.camera_make = Some(format!("Make{}", n));
+        row.camera_model = Some(format!("Model{}", n));
+        row.lens_model = Some(format!("Lens{}", n));
+        row.focal_length = Some(10.0 + f);
+        row.aperture = Some(1.4 + f / 10.0);
+        row.shutter_speed = Some(1.0 / (100.0 + f));
+        row.iso = Some(100 + n);
+        row.capture_datetime = Some(format!("2026:10:{:02} 09:{:02}:00", 1 + n % 28, n % 60));
+        row.pixel_width = Some(4000 + n);
+        row.pixel_height = Some(3000 + n);
+        row.color_space = Some(format!("Space{}", n));
+        row.bit_depth = Some(8 + n % 9);
+        row.gps_latitude = Some(28.0 + f / 100.0);
+        row.gps_longitude = Some(-81.0 - f / 100.0);
+        row.gps_altitude = Some(-5.0 + f);
+        row.copyright = Some(format!("Copyright{}", n));
+        row.creator = Some(format!("Creator{}", n));
+        row.description = Some(format!("Description{}", n));
+        row.rating = Some((n % 6) as u8);
+        row.flag = Some(if n % 2 == 0 { "pick" } else { "reject" }.to_string());
+        row.color_label = Some(["red", "yellow", "green", "blue", "purple"][(n % 5) as usize].to_string());
+        row.rotation = Some([0, 90, 180, 270][(n % 4) as usize]);
+        row
+    }
+
+    #[test]
+    fn full_records_keyset_pages_cover_every_row_exactly_once_across_id_gaps()
+    {
+        let (_fixture, conn) = fresh_catalogue("full-gaps");
+        let rows: Vec<ImageMetadata> = (1..=23)
+            .map(|n| rich(&format!("/v/fg/IMG_{:04}.jpg", n), n, n % 5 == 0))
+            .collect();
+        assert_eq!(ingest_metadata_impl(&conn, &rows, None), 23);
+        conn.execute_batch("DELETE FROM images WHERE id IN (1, 2, 7, 8, 9, 15, 23);")
+            .expect("open gaps in the id sequence");
+        let truth: Vec<i64> = table(&conn).into_iter().map(|r| r.id).collect();
+        assert_eq!(truth.len(), 16);
+
+        for limit in [1u32, 2, 3, 4, 5, 16, 17, 5000]
+        {
+            let walked: Vec<i64> = full_walk(&conn, limit, MediaType::Both).into_iter().map(|r| r.id).collect();
+            assert_eq!(walked, truth, "limit {}: the full-record walk is not the table, id for id", limit);
+        }
+        assert_eq!(image_records_after_impl(&conn, 22, 5000, MediaType::Both).expect("past the end").len(), 0);
+        assert_eq!(image_records_after_impl(&conn, 0, 0, MediaType::Both).expect("limit 0").len(), 0,
+                   "limit 0 answers empty without reading");
+        assert_eq!(image_records_after_impl(&conn, i64::MIN, 100, MediaType::Both).expect("i64::MIN").len(), 16);
+        assert_eq!(image_records_after_impl(&conn, i64::MAX, 100, MediaType::Both).expect("i64::MAX").len(), 0);
+
+        let (_empty_fixture, empty) = fresh_catalogue("full-empty");
+        assert!(full_walk(&empty, 5000, MediaType::Both).is_empty());
+    }
+
+    #[test]
+    fn full_records_match_get_all_images_field_for_field_under_every_media_type()
+    {
+        let (_fixture, conn) = fresh_catalogue("full-parity");
+        let mut rows = vec![
+            // A RAW+JPEG pair, and a cross-directory duplicate set — the
+            // DUPLICATE_GROUP_ID_CASE window gives these a group in the legacy read.
+            rich("/v/fp/pair/RSW_0001.NEF", 1, false),
+            rich("/v/fp/pair/RSW_0001.JPG", 2, false),
+            media("/v/fp/one/DUP_0001.jpg", 777, false),
+            media("/v/fp/two/DUP_0001.jpg", 777, false),
+            media("/v/fp/three/DUP_0001.jpg", 777, false),
+            // R-116: a saturated size.
+            rich("/v/fp/huge.tif", 3, false),
+        ];
+        rows[5].file_size = i64::MAX as u64;
+        for n in 10..50u32
+        {
+            let is_video = n % 6 == 0;
+            let extension = if is_video { "mov" } else { "jpg" };
+            rows.push(rich(&format!("/v/fp/bulk/B_{:03}.{}", n, extension), n, is_video));
+        }
+        // NULL optionals too, a still and a video.
+        rows.push(media("/v/fp/sparse.jpg", 5, false));
+        rows.push(media("/v/fp/sparse.mp4", 6, true));
+        assert_eq!(ingest_metadata_impl(&conn, &rows, None) as usize, rows.len());
+        conn.execute_batch("DELETE FROM images WHERE id IN (4, 11, 12, 30);").expect("open gaps");
+
+        let mut saw_a_duplicate_group = false;
+        for media_type in [MediaType::Both, MediaType::StillsOnly, MediaType::VideosOnly]
+        {
+            let legacy = get_all_images_walk(&conn, 7, media_type);
+            let keyset = full_walk(&conn, 7, media_type);
+            assert!(!legacy.is_empty(), "{:?}: the fixture must carry rows for this stance", media_type);
+            assert_eq!(keyset.len(), legacy.len(), "{:?}: the row counts differ", media_type);
+            assert_eq!(without_duplicate_group(&keyset), without_duplicate_group(&legacy),
+                       "{:?}: the keyset read must match get_all_images(…, false, false, {:?}) row for row and \
+                        field for field (duplicate_group_id aside)", media_type, media_type);
+            saw_a_duplicate_group |= legacy.iter().any(|r| r.duplicate_group_id.is_some());
+        }
+        assert!(saw_a_duplicate_group,
+                "control: the legacy read should carry a duplicate group on this fixture, or the \
+                 'duplicate_group_id aside' clause above compares nothing");
+        let video_ids: Vec<i64> = full_walk(&conn, 50, MediaType::VideosOnly).iter().map(|r| r.id).collect();
+        let still_ids: Vec<i64> = full_walk(&conn, 50, MediaType::StillsOnly).iter().map(|r| r.id).collect();
+        assert!(!video_ids.is_empty() && !still_ids.is_empty());
+        assert!(video_ids.iter().all(|id| !still_ids.contains(id)), "a row is both a still and a video");
+        assert_eq!(video_ids.len() + still_ids.len(), full_walk(&conn, 50, MediaType::Both).len());
+    }
+
+    #[test]
+    fn the_full_record_read_carries_no_window_and_the_get_all_images_media_predicate()
+    {
+        for media_type in [MediaType::Both, MediaType::StillsOnly, MediaType::VideosOnly]
+        {
+            let sql = build_image_records_after_sql(media_type);
+            assert!(sql.contains("WHERE id > ?1"), "{:?}: the keyset cursor is gone", media_type);
+            assert!(sql.contains("ORDER BY id ASC"), "{:?}: the total order is gone", media_type);
+            assert!(sql.contains("LIMIT ?2"), "{:?}: the page bound is gone", media_type);
+            assert!(sql.contains("CAST(NULL AS BIGINT) AS duplicate_group_id"),
+                    "{:?}: column 30 is no longer a typed NULL", media_type);
+            for forbidden in ["OVER", "OFFSET", "PARTITION", "spgm", "image_kind"]
+            {
+                assert!(!sql.contains(forbidden), "{:?}: the read regained `{}`", media_type, forbidden);
+            }
+            match media_predicate(media_type)
+            {
+                Some(predicate) => assert!(sql.contains(&format!("AND {}", predicate)),
+                                           "{:?}: the media predicate is not get_all_images' `{}`",
+                                           media_type, predicate),
+                None => assert!(!sql.contains("is_video"), "Both must carry no media predicate"),
+            }
+        }
+
+        let (_fixture, conn) = fresh_catalogue("full-plan");
+        assert_eq!(ingest_metadata_impl(&conn, &[media("/v/fw/a.jpg", 1, false)], None), 1);
+        let sql = build_image_records_after_sql(MediaType::Both).replace("?1", "0").replace("?2", "5000");
+        let mut stmt = conn.prepare(&format!("EXPLAIN {}", sql)).expect("explain statement");
+        let plan: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("explain rows")
+            .map(|r| r.expect("explain row"))
+            .collect();
+        assert!(!plan.is_empty() && !plan.join("\n").contains("WINDOW"),
+                "the full-record keyset plan computes a window:\n{}", plan.join("\n"));
+    }
+
+    /// The MEASUREMENT behind the ruling's "the reminder stops lifting full
+    /// records": the Mac Studio's catalogue size (416,831 rows), one keyset
+    /// walk at the reminder's page size against sample pages of the retired
+    /// `get_all_images` walk. `#[ignore]`d — the dev profile builds bundled
+    /// DuckDB's C++ at -O0, so only a `--release` run is evidence. Prints; it
+    /// asserts only that both reads see the same rows.
+    #[test]
+    #[ignore = "scale evidence — run explicitly: cargo test --lib --release image_paths_and_sizes_tests -- --ignored --nocapture"]
+    fn scale_evidence_keyset_walk_against_get_all_images_pages()
+    {
+        const ROWS: i64 = 416_831;
+        const PAGE: u32 = 5_000;
+        let (_fixture, conn) = fresh_catalogue("scale");
+        conn.execute_batch(&format!(
+            "INSERT INTO images (file_path, file_size, file_name, file_stem, file_extension, image_kind,
+                                 created_timestamp, modified_timestamp, capture_datetime, camera_model,
+                                 pixel_width, pixel_height, is_video)
+             SELECT '/Volumes/Scale/' || (i // 1000) || '/IMG_' || i || '.jpg',
+                    1000000 + i, 'IMG_' || i || '.jpg', 'IMG_' || (i % 50000), 'jpg', 'jpeg',
+                    1700000000, 1700000000,
+                    '2026:10:' || (1 + i % 28) || ' 09:00:00', 'Z 8', 8256, 5504, (i % 97 = 0)
+             FROM range({}) t(i);",
+            ROWS
+        ))
+        .expect("scale rows");
+
+        let started = std::time::Instant::now();
+        let mut cursor: i64 = 0;
+        let mut pages = 0usize;
+        let mut rows = 0usize;
+        let mut slowest = std::time::Duration::ZERO;
+        loop
+        {
+            let page_started = std::time::Instant::now();
+            let page = image_paths_and_sizes_after_impl(&conn, cursor, PAGE).expect("a page");
+            slowest = slowest.max(page_started.elapsed());
+            if page.is_empty()
+            {
+                break;
+            }
+            pages += 1;
+            rows += page.len();
+            cursor = page[page.len() - 1].id;
+        }
+        let walk = started.elapsed();
+        println!(
+            "MEASURE keyset walk: {} rows · {} pages (+1 empty) · total {:.1} ms · slowest page {:.2} ms",
+            rows,
+            pages,
+            walk.as_secs_f64() * 1000.0,
+            slowest.as_secs_f64() * 1000.0
+        );
+        assert_eq!(rows as i64, ROWS, "the walk must see every row");
+
+        // The review fix round's full-record keyset read, at the same scale.
+        let started = std::time::Instant::now();
+        let mut cursor: i64 = 0;
+        let mut full_rows = 0usize;
+        let mut full_pages = 0usize;
+        let mut full_slowest = std::time::Duration::ZERO;
+        loop
+        {
+            let page_started = std::time::Instant::now();
+            let page = image_records_after_impl(&conn, cursor, PAGE, MediaType::Both).expect("a full page");
+            full_slowest = full_slowest.max(page_started.elapsed());
+            if page.is_empty()
+            {
+                break;
+            }
+            full_pages += 1;
+            full_rows += page.len();
+            cursor = page[page.len() - 1].id;
+        }
+        println!(
+            "MEASURE full-record keyset walk: {} rows · {} pages (+1 empty) · total {:.1} ms · slowest page {:.2} ms",
+            full_rows,
+            full_pages,
+            started.elapsed().as_secs_f64() * 1000.0,
+            full_slowest.as_secs_f64() * 1000.0
+        );
+        assert_eq!(full_rows as i64, ROWS, "the full-record walk must see every row");
+
+        for offset in [0i64, 200_000, 410_000]
+        {
+            let page_started = std::time::Instant::now();
+            let page = execute_image_record_query(
+                &conn, "", "id", i64::from(PAGE), offset, false, false, false, "", MediaType::Both,
+            );
+            println!(
+                "MEASURE get_all_images page at offset {}: {} rows · {:.1} ms",
+                offset,
+                page.len(),
+                page_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
     }
 }

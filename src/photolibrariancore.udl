@@ -1155,6 +1155,27 @@ namespace photolibrariancore {
     // (logged and censused); the caller always adds the face the user picked.
     [Async]
     sequence<i64> person_search_seed_face_observation_ids(i64 person_id, u32 limit);
+
+    // ⭐ Oct 17, 2026 launch-speed ruling (DECISIONS.md 2026-10-17, item 1):
+    // the launch online-only reminder reads paths and sizes only. Up to
+    // `limit` catalogue rows — stills AND videos, the same row set as
+    // get_all_images(…, false, false, Both) — with id > after_id, ascending
+    // by id. Keyset paging: pass 0 first, then the last row's id; stop at an
+    // empty page. No window function, no duplicate / collapse machinery. A
+    // missing catalogue or failed read answers EMPTY (logged and censused).
+    [Async]
+    sequence<ImagePathSize> image_paths_and_sizes_after(i64 after_id, u32 limit);
+
+    // ⭐ Oct 17, 2026 launch-speed ruling (review fix round): the full-record
+    // whole-catalogue read the thumbnail builds, the build dialog and the stamp
+    // backfill take. Up to `limit` ImageRecords with id > after_id under
+    // `media_type`, ascending by id — exactly get_all_images(…, false, false,
+    // media_type)'s rows and fields, EXCEPT duplicate_group_id, which is always
+    // null (no whole-table window; no consumer of these records reads it).
+    // Keyset paging: pass 0 first, then the last row's id; stop at an empty
+    // page. A missing catalogue or failed read answers EMPTY (logged, censused).
+    [Async]
+    sequence<ImageRecord> image_records_after(i64 after_id, u32 limit, MediaType media_type);
 };
 
 // Image classification categories for JPEG+RAW pair handling.
@@ -2169,4 +2190,13 @@ dictionary UnreadableFileProbe {
     string file_path;
     u64 file_size;
     i64 modified_epoch;
+};
+
+// ⭐ Oct 17, 2026 launch-speed ruling. One catalogue row reduced to what the
+// launch online-only reminder reads: its id (the keyset cursor), its path and
+// its stored size (decoded exactly as ImageRecord.file_size).
+dictionary ImagePathSize {
+    i64 id;
+    string file_path;
+    u64 file_size;
 };

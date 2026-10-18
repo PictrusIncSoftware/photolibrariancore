@@ -3189,6 +3189,64 @@ public func FfiConverterTypeImageMetadata_lower(_ value: ImageMetadata) -> RustB
 }
 
 
+public struct ImagePathSize: Equatable, Hashable {
+    public var id: Int64
+    public var filePath: String
+    public var fileSize: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: Int64, filePath: String, fileSize: UInt64) {
+        self.id = id
+        self.filePath = filePath
+        self.fileSize = fileSize
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ImagePathSize: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeImagePathSize: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ImagePathSize {
+        return
+            try ImagePathSize(
+                id: FfiConverterInt64.read(from: &buf), 
+                filePath: FfiConverterString.read(from: &buf), 
+                fileSize: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ImagePathSize, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.id, into: &buf)
+        FfiConverterString.write(value.filePath, into: &buf)
+        FfiConverterUInt64.write(value.fileSize, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImagePathSize_lift(_ buf: RustBuffer) throws -> ImagePathSize {
+    return try FfiConverterTypeImagePathSize.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImagePathSize_lower(_ value: ImagePathSize) -> RustBuffer {
+    return FfiConverterTypeImagePathSize.lower(value)
+}
+
+
 public struct ImageRecord: Equatable, Hashable {
     public var id: Int64
     public var indexedTimestamp: String
@@ -6778,6 +6836,31 @@ fileprivate struct FfiConverterSequenceTypeImageMetadata: FfiConverterRustBuffer
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeImagePathSize: FfiConverterRustBuffer {
+    typealias SwiftType = [ImagePathSize]
+
+    public static func write(_ value: [ImagePathSize], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeImagePathSize.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ImagePathSize] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ImagePathSize]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeImagePathSize.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeImageRecord: FfiConverterRustBuffer {
     typealias SwiftType = [ImageRecord]
 
@@ -8571,6 +8654,36 @@ public func hiddenKeywordsForImage(imageId: Int64)async  -> [KeywordRow]  {
             
         )
 }
+public func imagePathsAndSizesAfter(afterId: Int64, limit: UInt32)async  -> [ImagePathSize]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_image_paths_and_sizes_after(FfiConverterInt64.lower(afterId),FfiConverterUInt32.lower(limit)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeImagePathSize.lift,
+            errorHandler: nil
+            
+        )
+}
+public func imageRecordsAfter(afterId: Int64, limit: UInt32, mediaType: MediaType)async  -> [ImageRecord]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_image_records_after(FfiConverterInt64.lower(afterId),FfiConverterUInt32.lower(limit),FfiConverterTypeMediaType_lower(mediaType)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeImageRecord.lift,
+            errorHandler: nil
+            
+        )
+}
 public func imageRecordsInDirectory(directoryPath: String, mediaType: MediaType)async  -> [ImageRecord]  {
     return
         try!  await uniffiRustCallAsync(
@@ -9897,6 +10010,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_hidden_keywords_for_image() != 10588) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_image_paths_and_sizes_after() != 34011) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_image_records_after() != 19255) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_image_records_in_directory() != 49545) {
