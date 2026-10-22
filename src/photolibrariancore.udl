@@ -1176,6 +1176,35 @@ namespace photolibrariancore {
     // page. A missing catalogue or failed read answers EMPTY (logged, censused).
     [Async]
     sequence<ImageRecord> image_records_after(i64 after_id, u32 limit, MediaType media_type);
+
+    // ⭐ S196 — film-negative detection (Docs/DESIGN-Film-Negative-Detection.md
+    // §3). Its own pass and queue, modelled on Intelligent Culling's: still
+    // images, a RAW hidden behind a same-stem JPEG/HEIF collapsed away, and a
+    // row whose negative_detection_status is NULL, whose version is NULL or
+    // not detector_version, or that a run OTHER than analysis_run_id left
+    // unreadable/failed. The counts are bare (a failure answers 0).
+    [Async]
+    u64 negative_detection_candidate_count(string detector_version, string analysis_run_id);
+
+    [Async]
+    u64 negative_detection_candidate_count_for_ids(sequence<i64> ids, string detector_version, string analysis_run_id);
+
+    // A page ORDER BY id, limit clamped 1…5000. query_ok = false means the
+    // work set could not be BUILT (UNKNOWN, never "nothing to do");
+    // dropped_rows > 0 means it is short.
+    [Async]
+    NegativeDetectionCandidatePage negative_detection_candidate_page(u32 limit, string detector_version, string analysis_run_id);
+
+    [Async]
+    NegativeDetectionCandidatePage negative_detection_candidate_page_for_ids(sequence<i64> ids, u32 limit, string detector_version, string analysis_run_id);
+
+    // One transaction per call. A complete verdict is copied to the hidden
+    // RAW twin, adds its managed keywords (origin auto) and retracts the
+    // managed auto keywords it no longer carries; unreadable/failed touch no
+    // keywords. A failed chunk answers updated = 0 with failure_stage and
+    // failed_reason set, plus a warning that begins "negative_writeback_failed:".
+    [Async]
+    NegativeDetectionWritebackResult update_negative_detection_results(sequence<NegativeDetectionResult> results);
 };
 
 // Image classification categories for JPEG+RAW pair handling.
@@ -2199,4 +2228,55 @@ dictionary ImagePathSize {
     i64 id;
     string file_path;
     u64 file_size;
+};
+
+// ⭐ S196 — film-negative detection (Docs/DESIGN-Film-Negative-Detection.md
+// §3). One candidate: culling's narrow carrier plus the camera make/model the
+// detector's metadata prior reads.
+dictionary NegativeDetectionCandidate {
+    i64 id;
+    string file_path;
+    u64 file_size;
+    string? camera_make = null;
+    string? camera_model = null;
+};
+
+// The culling page's shape (R-31). Rust constructs it; Swift only reads it.
+dictionary NegativeDetectionCandidatePage {
+    sequence<NegativeDetectionCandidate> candidates;
+    u64 dropped_rows;
+    boolean query_ok = true;
+    string? query_error = null;
+};
+
+// One verdict. status = complete / unreadable / failed (anything else is
+// quarantined to failed). negative_kind = "color" / "black and white" / null.
+// auto_keywords may carry only "film negative", "negative", "color negative" and
+// "black and white negative"; any other label is dropped with a warning.
+dictionary NegativeDetectionResult {
+    i64 id;
+    string detector_version;
+    string analysis_run_id;
+    string status;
+    f64? negative_confidence = null;
+    string? negative_kind = null;
+    string? signals_json = null;
+    sequence<string> auto_keywords;
+};
+
+// updated counts rows stamped (a RAW twin included); keywords_added /
+// keywords_retracted count managed keyword rows given / relieved of the auto
+// bit. Every warning is "<negative_writeback_* token>: <detail>". A failed
+// chunk answers updated = 0, failure_stage = catalogue / planning / begin /
+// apply / commit (the focus receipt's tokens), failed_reason = the full
+// context with the DuckDB error, AND a "negative_writeback_failed:" warning;
+// both failure fields are null on success. They are appended LAST with
+// defaults (S65).
+dictionary NegativeDetectionWritebackResult {
+    u64 updated;
+    u64 keywords_added;
+    u64 keywords_retracted;
+    sequence<string> warnings;
+    string? failure_stage = null;
+    string? failed_reason = null;
 };

@@ -664,6 +664,12 @@ mod editor_saved_image_tests
                  face_quality_min DOUBLE,
                  face_eyes_open_count INTEGER,
                  face_blink_risk_count INTEGER,
+                 negative_detection_status TEXT,
+                 negative_detection_version TEXT,
+                 negative_detection_run_id TEXT,
+                 negative_confidence DOUBLE,
+                 negative_kind TEXT,
+                 negative_signals TEXT,
                  is_video BOOLEAN NOT NULL DEFAULT FALSE,
                  duration_seconds DOUBLE,
                  frame_rate DOUBLE,
@@ -1613,6 +1619,78 @@ pub struct FocusAnalysisWritebackWarning
     pub matching_rows: i64,
     pub distinct_rowids: i64,
     pub detail: String,
+}
+
+/// One still-image row that needs film-negative detection (S196;
+/// `Docs/DESIGN-Film-Negative-Detection.md` §3). Narrow like
+/// `FocusAnalysisCandidate`, plus the camera make/model the detector's
+/// metadata prior reads (a scanner name raises the prior, never decides).
+#[derive(Debug, Clone)]
+pub struct NegativeDetectionCandidate
+{
+    pub id: i64,
+    pub file_path: String,
+    pub file_size: u64,
+    pub camera_make: Option<String>,
+    pub camera_model: Option<String>,
+}
+
+/// A page of film-negative detection candidates — the culling page's shape
+/// (R-31): `dropped_rows > 0` means the work set is short, and
+/// `query_ok = false` means it could not be BUILT, so the answer is UNKNOWN,
+/// never "nothing to do". Rust constructs it; Swift only reads it.
+#[derive(Debug, Clone)]
+pub struct NegativeDetectionCandidatePage
+{
+    pub candidates: Vec<NegativeDetectionCandidate>,
+    pub dropped_rows: u64,
+    pub query_ok: bool,
+    pub query_error: Option<String>,
+}
+
+/// One detector verdict for one image (S196). `status` is `complete`,
+/// `unreadable` or `failed`; anything else is quarantined to `failed`.
+/// `auto_keywords` may carry ONLY the managed labels
+/// (`NEGATIVE_DETECTION_MANAGED_KEYWORDS`); any other label is dropped with a
+/// warning and never written.
+#[derive(Debug, Clone)]
+pub struct NegativeDetectionResult
+{
+    pub id: i64,
+    pub detector_version: String,
+    pub analysis_run_id: String,
+    pub status: String,
+    pub negative_confidence: Option<f64>,
+    pub negative_kind: Option<String>,
+    pub signals_json: Option<String>,
+    pub auto_keywords: Vec<String>,
+}
+
+/// Receipt for one film-negative writeback chunk.
+///
+/// `updated` counts catalogue rows stamped (a complete verdict copied to its
+/// hidden RAW twin counts that row too). `keywords_added` counts managed
+/// keyword rows inserted or given the auto bit; `keywords_retracted` counts
+/// managed keyword rows whose auto bit this chunk cleared.
+///
+/// A failed chunk reports `updated == 0` (and both keyword counts 0),
+/// `failure_stage` = a stable token (`catalogue` / `planning` / `begin` /
+/// `apply` / `commit` — the focus receipt's vocabulary) and `failed_reason` =
+/// the full helper/statement context with the underlying DuckDB error. Both are
+/// `None` on success. The failure is ALSO recorded as a warning beginning
+/// `negative_writeback_failed:`. Every warning starts with a stable
+/// `negative_writeback_*` token and a colon. The two failure fields were
+/// appended LAST with `.udl` `= null` defaults (S65; coordinator approval,
+/// Oct 22 2026).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NegativeDetectionWritebackResult
+{
+    pub updated: u64,
+    pub keywords_added: u64,
+    pub keywords_retracted: u64,
+    pub warnings: Vec<String>,
+    pub failure_stage: Option<String>,
+    pub failed_reason: Option<String>,
 }
 
 /// One detected human face from the Vision enrichment pass.
@@ -2977,6 +3055,18 @@ fn open_and_migrate_catalogue_reporting(
             face_eyes_open_count INTEGER,    -- Heuristic count of faces whose eyes appear open
             face_blink_risk_count INTEGER,   -- Heuristic count of faces with likely blink/closed eyes
 
+            -- === Film-negative detection (S196; Docs/DESIGN-Film-Negative-Detection.md) ===
+            -- Its OWN pass with its own version column and queue, so a detector
+            -- change never re-runs culling. NULL status = pending. Advisory
+            -- scalars only; the pass's keywords live in `keyword` (origin 2).
+            -- ⛔ No index on any of these (S179): the writeback UPDATE writes all six.
+            negative_detection_status TEXT,  -- complete / unreadable / failed
+            negative_detection_version TEXT, -- detector version, e.g. "film-negative-v1"
+            negative_detection_run_id TEXT,  -- the run that last stamped the row
+            negative_confidence DOUBLE,      -- 0…1; NULL until analysed
+            negative_kind TEXT,              -- "color" / "black and white" / NULL
+            negative_signals TEXT,           -- JSON of every per-signal score
+
             -- === Video / unified-media support (Session 70; Docs/DESIGN-Video-Schema-Unified-Table.md) ===
             -- is_video discriminates stills (FALSE) from video (TRUE). CREATE-time
             -- default is safe; the ALTER path below adds it WITHOUT a default then
@@ -3074,6 +3164,16 @@ fn open_and_migrate_catalogue_reporting(
         ALTER TABLE images ADD COLUMN IF NOT EXISTS face_quality_min DOUBLE;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS face_eyes_open_count INTEGER;
         ALTER TABLE images ADD COLUMN IF NOT EXISTS face_blink_risk_count INTEGER;
+
+        -- Film-negative detection columns (S196). ADD COLUMN with NO default
+        -- (S62 WAL rule) and NO index (S179). Existing rows stay NULL and so
+        -- form the pass's pending queue.
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS negative_detection_status TEXT;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS negative_detection_version TEXT;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS negative_detection_run_id TEXT;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS negative_confidence DOUBLE;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS negative_kind TEXT;
+        ALTER TABLE images ADD COLUMN IF NOT EXISTS negative_signals TEXT;
 
         -- Video / unified-media columns (Session 70). ADD COLUMN IF NOT EXISTS with
         -- NO default (an ALTER ... ADD COLUMN ... DEFAULT <expr> does not survive
@@ -4013,6 +4113,20 @@ fn open_and_migrate_catalogue_reporting(
         ),
     }
 
+    // ⭐ S196 (Richard, Oct 22, 2026) — the film-negative pass's retroactive
+    // keyword + collection step. AUTOCOMMIT window, after the row migration,
+    // its own transaction, LOG-AND-CONTINUE: it can never fail the open. One
+    // bounded read decides; a catalogue with nothing to do writes nothing.
+    match backfill_negative_detection_keywords_and_collections(&conn)
+    {
+        Ok(report) => eprintln!("[migration] {}", report),
+        Err(message) => eprintln!(
+            "[migration] the film-negative keyword/collection backfill did not apply ({}); the catalogue \
+             opens as before and the next launch retries it",
+            message
+        ),
+    }
+
     // DuckDB 1.2.2 can fail WAL replay when a pending ALTER TABLE ADD COLUMN is
     // replayed against a table whose primary key default references a sequence.
     // Checkpoint after startup schema/migration work so future launches do not
@@ -4031,6 +4145,189 @@ fn open_and_migrate_catalogue_reporting(
     // --- End backfill migration --------------------------------------------
 
     Some((conn, outcome))
+}
+
+/// ⭐ S196 — Richard's rulings of Oct 22, 2026 applied RETROACTIVELY to what
+/// the film-negative pass had already written ("make negatives its own
+/// collection and also make it a keyword"; "It should be under both film
+/// negative and negative"; "film negative should be a collection").
+///
+/// For every image with an ACTIVE "film negative" row carrying the auto bit
+/// (the pass's own rows; the hidden RAW twins carry their own and are handled
+/// the same way):
+/// - those "film negative" rows join the "film negative" collection;
+/// - a "negative" keyword exists with the auto bit — S62 flip-or-insert: every
+///   ACTIVE "negative" row on the image (a hand-made one included) gains the
+///   auto bit and joins the "negative" collection (origin OR, never cleared),
+///   and an image with no active "negative" row gets one INSERTed.
+/// The collection halves follow `negative_detection_label_is_a_collection`.
+/// No row is renamed, hidden or deleted.
+///
+/// ONE-TIME and IDEMPOTENT by construction: a single bounded read of the two
+/// labels' rows decides everything, and a catalogue already converged (or one
+/// whose "film negative" collection was flipped by hand) has nothing to write,
+/// so every later launch costs that read alone. Writes are by keyword PRIMARY
+/// KEY / one INSERT … SELECT, in ONE transaction: any error rolls back, never
+/// COMMIT after an error (S187). Counts come from the read, not from engine
+/// change counts (S179).
+fn backfill_negative_detection_keywords_and_collections(conn: &Connection) -> Result<String, String>
+{
+    let started = std::time::Instant::now();
+    let rows =
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, image_id, path, status, origin, COALESCE(collection, FALSE)
+                 FROM keyword
+                 WHERE path IN ('film negative', 'negative')",
+            )
+            .map_err(|e| format!("prepare failed: {}", e))?;
+        let mapped = stmt
+            .query_map([], |row|
+            {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            })
+            .map_err(|e| format!("read failed: {}", e))?;
+        let (mut rows, dropped) = collect_rows_counted(mapped, "backfill_negative_detection_keywords_and_collections");
+        if dropped > 0
+        {
+            return Err(format!("the read lost {} row(s); nothing written", dropped));
+        }
+        rows.sort_by_key(|row| row.0);
+        rows.dedup_by_key(|row| row.0);
+        rows
+    };
+
+    let auto = KEYWORD_ORIGIN_AUTO as i64;
+    let film_member = NEGATIVE_DETECTION_FILM_NEGATIVE_IS_A_COLLECTION;
+    let negative_member = NEGATIVE_DETECTION_NEGATIVE_IS_A_COLLECTION;
+    let mut images = std::collections::BTreeSet::new();
+    let mut by_image: std::collections::HashMap<i64, Vec<&(i64, i64, String, i64, i64, bool)>> =
+        std::collections::HashMap::new();
+    for row in &rows
+    {
+        let (_, image_id, path, status, origin, _) = row;
+        if path == "film negative" && *status == 1 && origin & auto != 0
+        {
+            images.insert(*image_id);
+        }
+        by_image.entry(*image_id).or_default().push(row);
+    }
+
+    // (keyword id, new origin, new collection) and image ids needing an INSERT.
+    let mut updates: Vec<(i64, i64, bool)> = Vec::new();
+    let mut inserts: Vec<i64> = Vec::new();
+    let mut film_flips = 0u64;
+    let mut negative_merges = 0u64;
+    for image_id in &images
+    {
+        let mut has_active_negative = false;
+        let image_rows = by_image.get(image_id).map(|rows| rows.as_slice()).unwrap_or(&[]);
+        for (keyword_id, _, path, status, origin, collection) in image_rows.iter().copied()
+        {
+            if *status != 1
+            {
+                continue;
+            }
+            if path == "film negative" && origin & auto != 0 && film_member && !*collection
+            {
+                updates.push((*keyword_id, *origin, true));
+                film_flips += 1;
+            }
+            if path == "negative"
+            {
+                has_active_negative = true;
+                let collection_after = *collection || negative_member;
+                if origin & auto == 0 || collection_after != *collection
+                {
+                    updates.push((*keyword_id, origin | auto, collection_after));
+                    negative_merges += 1;
+                }
+            }
+        }
+        if !has_active_negative
+        {
+            inserts.push(*image_id);
+        }
+    }
+
+    if updates.is_empty() && inserts.is_empty()
+    {
+        return Ok(format!(
+            "film-negative keyword/collection backfill: nothing to do ({} image(s) carry the pass's \"film negative\"; read in {:.1} ms)",
+            images.len(),
+            started.elapsed().as_secs_f64() * 1000.0
+        ));
+    }
+
+    conn.execute_batch("BEGIN TRANSACTION;")
+        .map_err(|e| format!("BEGIN failed: {}", e))?;
+    let applied = (|| -> Result<(), String>
+    {
+        for chunk in updates.chunks(1000)
+        {
+            let values = chunk
+                .iter()
+                .map(|(id, origin, collection)| format!("({}, {}, {})", id, origin, collection))
+                .collect::<Vec<_>>()
+                .join(", ");
+            conn.execute_batch(&format!(
+                "UPDATE keyword SET origin = v.origin, collection = v.collection
+                 FROM (VALUES {}) AS v(id, origin, collection)
+                 WHERE keyword.id = v.id;",
+                values
+            ))
+            .map_err(|e| format!("UPDATE failed: {}", e))?;
+        }
+        for chunk in inserts.chunks(1000)
+        {
+            let values = chunk
+                .iter()
+                .map(|image_id| format!("({})", image_id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            conn.execute_batch(&format!(
+                "INSERT INTO keyword (image_id, label, path, status, origin, created_at, collection, is_video)
+                 SELECT v.image_id, 'negative', 'negative', 1, {}, CURRENT_TIMESTAMP, {},
+                        COALESCE((SELECT i.is_video FROM images i WHERE i.id = v.image_id LIMIT 1), FALSE)
+                 FROM (VALUES {}) AS v(image_id);",
+                auto, negative_member, values
+            ))
+            .map_err(|e| format!("INSERT failed: {}", e))?;
+        }
+        Ok(())
+    })();
+    if let Err(message) = applied
+    {
+        // S187: after an error inside the transaction, ROLLBACK — never COMMIT.
+        let rollback = conn
+            .execute_batch("ROLLBACK;")
+            .map(|_| String::new())
+            .unwrap_or_else(|e| format!("; ROLLBACK failed: {}", e));
+        return Err(format!("{}{}", message, rollback));
+    }
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return Err(format!("COMMIT failed: {}", e));
+    }
+
+    Ok(format!(
+        "film-negative keyword/collection backfill: {} image(s); {} \"film negative\" row(s) joined the collection; \
+         {} \"negative\" row(s) merged; {} \"negative\" row(s) inserted; {:.1} ms",
+        images.len(),
+        film_flips,
+        negative_merges,
+        inserts.len(),
+        started.elapsed().as_secs_f64() * 1000.0
+    ))
 }
 
 /// ⭐ W4-21 / ruling 80 — the `images` measurement columns that were 32-bit
@@ -5532,7 +5829,13 @@ fn editor_saved_image_invalidate_analysis(
              face_quality_average = NULL,
              face_quality_min = NULL,
              face_eyes_open_count = NULL,
-             face_blink_risk_count = NULL
+             face_blink_risk_count = NULL,
+             negative_detection_status = NULL,
+             negative_detection_version = NULL,
+             negative_detection_run_id = NULL,
+             negative_confidence = NULL,
+             negative_kind = NULL,
+             negative_signals = NULL
          WHERE id IN ({0});
          DELETE FROM similar_photo_featureprint WHERE image_id IN ({0});",
         affected
@@ -8838,6 +9141,10 @@ fn predicate_to_sql(p: &QueryPredicate) -> String {
         "face_quality_min_num" => numeric_predicate_sql(p, "face_quality_min"),
         "eyes_open_count_num" => numeric_predicate_sql(p, "face_eyes_open_count"),
         "blink_risk_count_num" => numeric_predicate_sql(p, "face_blink_risk_count"),
+        // S196 — film-negative detection. `negative_confidence` is DOUBLE (0…1),
+        // so it takes the 64-bit `{:e}` atom (ruling 80), not the FLOAT-precision
+        // one. NULL (not yet analysed) never matches.
+        "negative_conf_num" => numeric_predicate_sql(p, "negative_confidence"),
         // Video numeric subjects (S75) — same machinery, new columns. Duration
         // is seconds (DOUBLE); frame_rate is fps (DOUBLE). A NULL column (a
         // still) never matches, exactly like the exposure numerics above.
@@ -11091,6 +11398,7 @@ pub async fn distinct_numeric_values(field: String) -> Vec<f64> {
         "face_quality_min" => "face_quality_min",
         "face_eyes_open_count" => "face_eyes_open_count",
         "face_blink_risk_count" => "face_blink_risk_count",
+        "negative_confidence" => "negative_confidence", // S196 — Negative confidence subject dropdown
         "duration_seconds" => "duration_seconds", // S75 — Duration subject dropdown
         "frame_rate" => "frame_rate",             // S75 — Frame rate subject dropdown
         other => {
@@ -12723,7 +13031,195 @@ fn rollback_focus_analysis_failure(
     (failure, true)
 }
 
+/// Every row ONE writeback result stamps: the source itself, plus — when the
+/// source is a JPEG/HEIF and is its same-stem group's deterministic visible
+/// representative — every same-stem RAW in the same directory (the hidden
+/// twins `RAW_JPEG_COLLAPSE_PREDICATE` collapses away). Its THREE production
+/// callers: `plan_focus_analysis_writebacks`, `plan_negative_detection_writebacks`
+/// (both through `writeback_target_ids_with_directory_cache`, one cache per
+/// planning call) and `upsert_editor_saved_image_database` (the editor
+/// saved-image refresh, which takes the edited image's affected ids from it) —
+/// one rule, so the representative cannot drift between them.
 fn focus_analysis_writeback_target_ids(
+    conn: &Connection,
+    image_id: i64,
+) -> Result<Vec<i64>, String>
+{
+    writeback_target_ids_with_directory_cache(conn, image_id, &mut WritebackDirectoryCache::new())
+}
+
+/// One planning call's directory reads, keyed by the stored `directory_path`:
+/// `(id, image_kind, file_path, file_stem)` for every row of that directory.
+/// Valid only while nothing writes `images` — planning runs BEFORE `BEGIN`
+/// under the catalogue mutex, so a cache never outlives the call that built it.
+type WritebackDirectoryCache = std::collections::HashMap<String, Vec<(i64, Option<String>, String, Option<String>)>>;
+
+/// ⭐ S196 (coordinator GO, Oct 22 2026; reworked after the live drive) — the
+/// twin lookup WITHOUT a per-result multi-filter scan:
+///   1. The source by primary key (`id = ?` — a single filter, an ART
+///      `Index Scan` on the bundled DuckDB 1.5.5, measured with EXPLAIN
+///      ANALYZE on a copy of the owner's catalogue).
+///   2. Only for a `jpeg`/`heif` source with both keys stored: EVERY row of
+///      its directory, `WHERE directory_path = ?` — a SINGLE filter, so 1.5.5
+///      serves it from `idx_images_directory_path` when the directory holds
+///      at most `index_scan_max_count` (2,048) rows, and falls back to one
+///      filtered sequential scan for a larger directory (measured on the
+///      copy: 0.24 ms vs ~2.8 ms for the 33,305-photo directory; forcing the
+///      index there costs 125 ms, so the fallback is the right plan). The
+///      stem / kind match is finished in Rust, exactly as SQL equality did it
+///      (byte-exact, case-sensitive; `image_kind` in jpeg/heif/raw).
+///   3. ⭐ The directory read is CACHED for the planning call: a chunk's
+///      results come from one queue page in id order and share a handful of
+///      directories, so a 16-result chunk reads its directory ONCE, not 16
+///      times. That removes the per-result scan the live sample showed fanned
+///      out over DuckDB's worker threads.
+/// The representative is chosen in Rust in EXACTLY the old order — `jpeg`
+/// before `heif`, then `file_path` ascending (DuckDB's default binary
+/// collation = Rust's byte order), then `id` ascending. The original OR-join
+/// query (which ran a hash join per result) is kept as
+/// `focus_analysis_writeback_target_ids_or_join_oracle` (`cfg(test)`), and
+/// `twin_lookup_tests` asserts the two agree on every id of a mixed fixture,
+/// including a directory over 2,048 photos (the fallback plan).
+///
+/// Fail closed: a source that does not exist, a failed read, or a directory
+/// row that could not be read is an `Err` (the chunk fails at planning) — a
+/// short target list is never returned silently.
+fn writeback_target_ids_with_directory_cache(
+    conn: &Connection,
+    image_id: i64,
+    cache: &mut WritebackDirectoryCache,
+) -> Result<Vec<i64>, String>
+{
+    let source = conn.query_row(
+        "SELECT image_kind, file_stem, directory_path FROM images WHERE id = ?1 LIMIT 1",
+        params![image_id],
+        |row|
+        {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    );
+    let (kind, stem, directory) = match source
+    {
+        Ok(source) => source,
+        Err(duckdb::Error::QueryReturnedNoRows) =>
+        {
+            return Err(format!(
+                "focus_analysis_writeback_target_ids: target SELECT found no catalogue row for source_image_id={}",
+                image_id
+            ));
+        }
+        Err(e) =>
+        {
+            return Err(format!(
+                "focus_analysis_writeback_target_ids: source read failed for source_image_id={}: {}",
+                image_id, e
+            ));
+        }
+    };
+
+    let (stem, directory) = match (kind.as_deref(), stem, directory)
+    {
+        (Some("jpeg") | Some("heif"), Some(stem), Some(directory)) => (stem, directory),
+        // Not a rendered sibling, or a legacy row without its keys: the SQL
+        // equality the old join used could never match, so only the source.
+        _ => return Ok(vec![image_id]),
+    };
+
+    if !cache.contains_key(&directory)
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, image_kind, file_path, file_stem
+                 FROM images
+                 WHERE directory_path = ?1",
+            )
+            .map_err(|e| format!(
+                "focus_analysis_writeback_target_ids: prepare directory read failed for source_image_id={}: {}",
+                image_id, e
+            ))?;
+        let rows = stmt
+            .query_map(params![&directory], |row|
+            {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(|e| format!(
+                "focus_analysis_writeback_target_ids: directory read failed for source_image_id={}: {}",
+                image_id, e
+            ))?;
+        let (rows, dropped) = collect_rows_counted(rows, "focus_analysis_writeback_target_ids");
+        if dropped > 0
+        {
+            return Err(format!(
+                "focus_analysis_writeback_target_ids: the directory read lost {} row(s) for source_image_id={}; nothing planned",
+                dropped, image_id
+            ));
+        }
+        cache.insert(directory.clone(), rows);
+    }
+    let directory_rows = cache.get(&directory).map(|rows| rows.as_slice()).unwrap_or(&[]);
+
+    // The old join's `file_stem = ?` AND `image_kind IN (…)`, finished in Rust.
+    let group = directory_rows
+        .iter()
+        .filter(|(_, kind, _, row_stem)|
+        {
+            row_stem.as_deref() == Some(stem.as_str())
+                && matches!(kind.as_deref(), Some("jpeg") | Some("heif") | Some("raw"))
+        })
+        .collect::<Vec<_>>();
+
+    let rank = |kind: Option<&str>| -> u8
+    {
+        match kind
+        {
+            Some("jpeg") => 0,
+            Some("heif") => 1,
+            _ => 2,
+        }
+    };
+    let representative = group
+        .iter()
+        .filter(|(_, kind, _, _)| matches!(kind.as_deref(), Some("jpeg") | Some("heif")))
+        .min_by(|a, b|
+        {
+            rank(a.1.as_deref())
+                .cmp(&rank(b.1.as_deref()))
+                .then_with(|| a.2.as_bytes().cmp(b.2.as_bytes()))
+                .then_with(|| a.0.cmp(&b.0))
+        })
+        .map(|(id, _, _, _)| *id);
+
+    let mut ids = vec![image_id];
+    if representative == Some(image_id)
+    {
+        ids.extend(
+            group
+                .iter()
+                .filter(|(_, kind, _, _)| kind.as_deref() == Some("raw"))
+                .map(|(id, _, _, _)| *id),
+        );
+    }
+    // Keep the old helper's contract: sorted, never the same target twice.
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// The PRE-S196 twin lookup, kept ONLY as the equivalence oracle for
+/// `focus_analysis_writeback_target_ids` (`twin_lookup_tests`). ⛔ Never call
+/// it from product code: its OR join cannot use an index and ran a full hash
+/// join per writeback result on the owner's catalogue.
+#[cfg(test)]
+fn focus_analysis_writeback_target_ids_or_join_oracle(
     conn: &Connection,
     image_id: i64,
 ) -> Result<Vec<i64>, String> {
@@ -12842,12 +13338,14 @@ fn plan_focus_analysis_writebacks(
     }
     let mut claimed_target_ids = source_ids.clone();
     let mut emitted_source_ids = std::collections::HashSet::<i64>::new();
+    // S196: one directory read per directory per planning call.
+    let mut directory_cache = WritebackDirectoryCache::new();
 
     results
         .into_iter()
         .map(|result| {
             let mut target_ids = if result.status == "complete" {
-                focus_analysis_writeback_target_ids(conn, result.id).map_err(|reason| {
+                writeback_target_ids_with_directory_cache(conn, result.id, &mut directory_cache).map_err(|reason| {
                     FocusAnalysisWritebackFailure::new(
                         FOCUS_WRITEBACK_STAGE_PLANNING,
                         reason,
@@ -14268,6 +14766,1603 @@ pub async fn update_focus_analysis_results(
         None,
     )
     .into_result())
+}
+
+// =============================================================================
+// ⭐ S196 — FILM-NEGATIVE DETECTION (Docs/DESIGN-Film-Negative-Detection.md §2–3)
+//
+// Its own pass, modelled on Intelligent Culling's queue and writeback: its own
+// version column and queue rule (a detector change never re-runs culling), the
+// culling page's R-31 carrier, the RAW-twin fan-out through the SAME planning
+// helper culling uses, one transaction per chunk (ROLLBACK on any error, never
+// COMMIT after one — S187), and S179's doctrine: a reported change count is
+// never grounds to fail; the write is verified on the TABLE, a chunk whose
+// write the table cannot confirm is retried once after a ROLLBACK that itself
+// succeeded, and survived anomalies ride the warnings carrier.
+//
+// Unlike every other automatic keyword, the three MANAGED labels are revisable:
+// a complete verdict retracts a managed label it no longer carries — the auto
+// bit only, so a user's own keyword survives; a row left with origin 0 is
+// soft-hidden exactly as an editor save hides a pure-auto row
+// (`editor_saved_image_remove_auto_keyword_origin`).
+// =============================================================================
+
+/// The only labels the film-negative pass writes, and the only labels it may
+/// retract. Lowercase, flat, no hyphens (the auto-keyword normaliser turns `-`
+/// into a space). Design §1, "Managed labels"; "negative" added by Richard's
+/// ruling of Oct 22, 2026 ("It should be under both film negative and
+/// negative"): a confident verdict carries BOTH "film negative" and "negative".
+const NEGATIVE_DETECTION_MANAGED_KEYWORDS: [&str; 4] =
+    ["film negative", "negative", "color negative", "black and white negative"];
+
+/// ⭐ Richard, Oct 22, 2026: "make negatives its own collection and also make
+/// it a keyword" … "film negative should be a collection." Every managed row
+/// the pass writes or merges is ALSO a collection member (the S62 model: one
+/// keyword row, the `collection` switch on it), and the pass's own membership
+/// is withdrawn with its auto bit. "film negative" as a collection is his
+/// ruling.
+const NEGATIVE_DETECTION_FILM_NEGATIVE_IS_A_COLLECTION: bool = true;
+
+/// "negative" as a collection is a RECOMMENDATION he can reverse — flip this
+/// one constant to `false` to stop making "negative" rows collection members
+/// (the keyword is written either way).
+const NEGATIVE_DETECTION_NEGATIVE_IS_A_COLLECTION: bool = true;
+
+/// Whether the pass puts `label`'s rows in the collection of that name. Kind
+/// labels ("color negative", "black and white negative") stay keywords only.
+fn negative_detection_label_is_a_collection(label: &str) -> bool
+{
+    match label
+    {
+        "film negative" => NEGATIVE_DETECTION_FILM_NEGATIVE_IS_A_COLLECTION,
+        "negative" => NEGATIVE_DETECTION_NEGATIVE_IS_A_COLLECTION,
+        _ => false,
+    }
+}
+
+/// `negative_kind`'s whole vocabulary (NULL aside).
+const NEGATIVE_DETECTION_KINDS: [&str; 2] = ["color", "black and white"];
+
+/// `negative_signals` is diagnostic JSON. A payload over this size is dropped
+/// whole (with a warning) rather than truncated into invalid JSON.
+const NEGATIVE_DETECTION_SIGNALS_MAX_BYTES: usize = 64 * 1024;
+
+/// Warning tokens. Every warning string is `<token>: <detail>`, and the token
+/// is a stable vocabulary Swift may copy into the Operation Log verbatim.
+const NEGATIVE_WRITEBACK_WARNING_FAILED: &str = "negative_writeback_failed";
+const NEGATIVE_WRITEBACK_WARNING_COUNT_ANOMALY: &str = "negative_writeback_count_anomaly";
+const NEGATIVE_WRITEBACK_WARNING_CHUNK_RETRIED: &str = "negative_writeback_chunk_retried";
+const NEGATIVE_WRITEBACK_WARNING_LABEL_DROPPED: &str = "negative_writeback_label_dropped";
+const NEGATIVE_WRITEBACK_WARNING_VALUE_DROPPED: &str = "negative_writeback_value_dropped";
+const NEGATIVE_WRITEBACK_WARNING_QUARANTINED: &str = "negative_writeback_result_quarantined";
+
+/// Every `images` column `update_negative_detection_target` assigns. An index
+/// on ANY of them would put that UPDATE on DuckDB's DELETE + INSERT branch
+/// (S179). Read only by `negative_detection_writeback_columns_carry_no_index`.
+#[cfg(test)]
+const NEGATIVE_DETECTION_WRITEBACK_UPDATED_COLUMNS: [&str; 6] = [
+    "negative_detection_status",
+    "negative_detection_version",
+    "negative_detection_run_id",
+    "negative_confidence",
+    "negative_kind",
+    "negative_signals",
+];
+
+fn is_valid_negative_detection_status(status: &str) -> bool
+{
+    matches!(status, "complete" | "unreadable" | "failed")
+}
+
+/// The film-negative queue: still images (not video), a RAW hidden behind a
+/// same-stem JPEG/HEIF collapsed away (its visible sibling is analysed and a
+/// complete verdict is copied to it at writeback), and a row that is pending —
+/// never analysed, analysed under another detector version, or left in a
+/// retryable status by a run OTHER than this one (`?1` = detector version,
+/// `?2` = analysis run id). Mirrors `focus_analysis_queue_where_clause`.
+fn negative_detection_queue_where_clause(id_predicate: Option<&str>) -> String
+{
+    let mut predicates = vec![
+        "is_video IS NOT TRUE".to_string(),
+        RAW_JPEG_COLLAPSE_PREDICATE.to_string(),
+        "(
+             negative_detection_status IS NULL
+             OR negative_detection_version IS NULL
+             OR negative_detection_version <> ?1
+             OR (
+                 negative_detection_status IN ('unreadable', 'failed')
+                 AND (
+                     negative_detection_run_id IS NULL
+                     OR negative_detection_run_id <> ?2
+                 )
+             )
+         )"
+        .to_string(),
+    ];
+    if let Some(predicate) = id_predicate
+    {
+        predicates.push(format!("({})", predicate));
+    }
+
+    format!("WHERE {}", predicates.join(" AND "))
+}
+
+/// The work set could not be built. ⛔ Never present this as "nothing to do".
+fn negative_detection_candidate_page_failure(message: String) -> NegativeDetectionCandidatePage
+{
+    NegativeDetectionCandidatePage
+    {
+        candidates: Vec::new(),
+        dropped_rows: 0,
+        query_ok: false,
+        query_error: Some(message),
+    }
+}
+
+fn negative_detection_candidates_impl(
+    conn: &Connection,
+    limit: u32,
+    detector_version: &str,
+    analysis_run_id: &str,
+    scoped_ids: Option<&[i64]>,
+) -> NegativeDetectionCandidatePage
+{
+    // An EMPTY explicit selection is a legitimate empty queue, NOT a failure.
+    let empty_queue = NegativeDetectionCandidatePage
+    {
+        candidates: Vec::new(),
+        dropped_rows: 0,
+        query_ok: true,
+        query_error: None,
+    };
+    // The selection scope is culling's: the ids plus their RAW/JPEG/HEIF
+    // same-stem siblings, so a selected hidden RAW reaches its visible twin.
+    let scope_filter = match scoped_ids
+    {
+        Some(ids) => match focus_analysis_scope_predicate(ids)
+        {
+            Some(filter) => Some(filter),
+            None => return empty_queue,
+        },
+        None => None,
+    };
+    let where_clause = negative_detection_queue_where_clause(scope_filter.as_deref());
+    let capped_limit = limit.clamp(1, 5000) as i64;
+    let sql = format!(
+        "SELECT id, file_path, file_size, camera_make, camera_model
+         FROM images
+         {}
+         ORDER BY id
+         LIMIT ?3",
+        where_clause
+    );
+    let mut stmt = match conn.prepare(&sql)
+    {
+        Ok(s) => s,
+        Err(e) =>
+        {
+            let message = format!("negative_detection_candidates: prepare {}", e);
+            eprintln!("{}", message);
+            return negative_detection_candidate_page_failure(message);
+        }
+    };
+
+    let mapped = stmt.query_map(
+        params![detector_version, analysis_run_id, capped_limit],
+        |row|
+        {
+            Ok(NegativeDetectionCandidate
+            {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                file_size: row.get::<_, i64>(2)? as u64,
+                camera_make: row.get(3)?,
+                camera_model: row.get(4)?,
+            })
+        },
+    );
+
+    match mapped
+    {
+        Ok(iter) =>
+        {
+            let (candidates, dropped_rows) =
+                collect_rows_counted(iter, "negative_detection_candidates");
+            NegativeDetectionCandidatePage
+            {
+                candidates,
+                dropped_rows,
+                query_ok: true,
+                query_error: None,
+            }
+        }
+        Err(e) =>
+        {
+            let message = format!("negative_detection_candidates: query {}", e);
+            eprintln!("{}", message);
+            negative_detection_candidate_page_failure(message)
+        }
+    }
+}
+
+fn negative_detection_candidate_count_impl(
+    conn: &Connection,
+    detector_version: &str,
+    analysis_run_id: &str,
+    scoped_ids: Option<&[i64]>,
+) -> u64
+{
+    let scope_filter = match scoped_ids
+    {
+        Some(ids) => match focus_analysis_scope_predicate(ids)
+        {
+            Some(filter) => Some(filter),
+            None => return 0,
+        },
+        None => None,
+    };
+    let where_clause = negative_detection_queue_where_clause(scope_filter.as_deref());
+    let sql = format!("SELECT COUNT(*) FROM images {}", where_clause);
+
+    match conn.query_row(&sql, params![detector_version, analysis_run_id], |row|
+    {
+        row.get::<_, i64>(0)
+    })
+    {
+        Ok(count) => count.max(0) as u64,
+        Err(e) =>
+        {
+            eprintln!("negative_detection_candidate_count: query {}", e);
+            0
+        }
+    }
+}
+
+/// How many still images the film-negative pass still owes under
+/// `detector_version` — the determinate progress bar's denominator. A bare
+/// count (ruling 23: not wrapped); a missing catalogue or failed query answers 0.
+pub async fn negative_detection_candidate_count(
+    detector_version: String,
+    analysis_run_id: String,
+) -> u64
+{
+    let catalogue = lock_catalogue();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("negative_detection_candidate_count: catalogue not initialized");
+            return 0;
+        }
+    };
+
+    negative_detection_candidate_count_impl(conn, &detector_version, &analysis_run_id, None)
+}
+
+/// The same count, intersected with an explicit selection (plus its
+/// RAW/JPEG/HEIF siblings). An empty selection counts zero.
+pub async fn negative_detection_candidate_count_for_ids(
+    ids: Vec<i64>,
+    detector_version: String,
+    analysis_run_id: String,
+) -> u64
+{
+    let catalogue = lock_catalogue();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("negative_detection_candidate_count_for_ids: catalogue not initialized");
+            return 0;
+        }
+    };
+
+    negative_detection_candidate_count_impl(conn, &detector_version, &analysis_run_id, Some(&ids))
+}
+
+/// One page of film-negative candidates, `ORDER BY id`, `limit` clamped
+/// 1…5000, with the dropped-row count and the `query_ok` failure channel. A
+/// panic inside is reported as `query_ok: false`, never an empty queue.
+pub async fn negative_detection_candidate_page(
+    limit: u32,
+    detector_version: String,
+    analysis_run_id: String,
+) -> NegativeDetectionCandidatePage
+{
+    ffi_panic_boundary("negative_detection_candidate_page.panic.query_failed", || -> NegativeDetectionCandidatePage
+    {
+        let catalogue = lock_catalogue();
+        let conn = match catalogue.as_ref()
+        {
+            Some(c) => c,
+            None =>
+            {
+                let message = "negative_detection_candidate_page: catalogue not initialized";
+                eprintln!("{}", message);
+                return negative_detection_candidate_page_failure(message.to_string());
+            }
+        };
+
+        negative_detection_candidates_impl(conn, limit, &detector_version, &analysis_run_id, None)
+    },
+    |panic| negative_detection_candidate_page_failure(ffi_panic_report(
+        "read the list of photos to check for film negatives",
+        &panic,
+    )))
+}
+
+/// The same page, intersected with an explicit selection (plus its
+/// RAW/JPEG/HEIF siblings). An empty selection is an empty queue.
+pub async fn negative_detection_candidate_page_for_ids(
+    ids: Vec<i64>,
+    limit: u32,
+    detector_version: String,
+    analysis_run_id: String,
+) -> NegativeDetectionCandidatePage
+{
+    ffi_panic_boundary("negative_detection_candidate_page_for_ids.panic.query_failed", || -> NegativeDetectionCandidatePage
+    {
+        let catalogue = lock_catalogue();
+        let conn = match catalogue.as_ref()
+        {
+            Some(c) => c,
+            None =>
+            {
+                let message = "negative_detection_candidate_page_for_ids: catalogue not initialized";
+                eprintln!("{}", message);
+                return negative_detection_candidate_page_failure(message.to_string());
+            }
+        };
+
+        negative_detection_candidates_impl(
+            conn,
+            limit,
+            &detector_version,
+            &analysis_run_id,
+            Some(&ids),
+        )
+    },
+    |panic| negative_detection_candidate_page_failure(ffi_panic_report(
+        "read the list of photos to check for film negatives",
+        &panic,
+    )))
+}
+
+/// Validate one verdict before anything is planned. Anything the catalogue
+/// must not hold is removed, and every removal is recorded as a warning:
+///
+/// - a status outside complete/unreadable/failed, or a `complete` verdict
+///   without a finite confidence, is QUARANTINED to `failed` with every value
+///   and keyword cleared (culling's `sanitized_focus_result` rule) — a
+///   `failed` row re-queues on a later run;
+/// - a finite confidence is clamped to 0…1;
+/// - a kind outside `NEGATIVE_DETECTION_KINDS` becomes NULL;
+/// - signals over `NEGATIVE_DETECTION_SIGNALS_MAX_BYTES` become NULL;
+/// - `unreadable` / `failed` carry no confidence, kind or keywords;
+/// - a `complete` verdict's keywords are trimmed, matched case-insensitively
+///   against the managed set, written in the canonical lowercase spelling and
+///   deduplicated; any other label is dropped, and so is a kind label
+///   ("color negative" / "black and white negative") whose kind is not the
+///   verdict's own `negative_kind` (checked after the kind is validated).
+fn sanitized_negative_detection_result(
+    mut result: NegativeDetectionResult,
+    warnings: &mut Vec<String>,
+) -> NegativeDetectionResult
+{
+    let confidence_is_finite = result
+        .negative_confidence
+        .map(|confidence| confidence.is_finite())
+        .unwrap_or(true);
+    let quarantine_reason = if !is_valid_negative_detection_status(&result.status)
+    {
+        Some(format!("status {:?} is not complete, unreadable or failed", result.status))
+    }
+    else if !confidence_is_finite
+    {
+        Some(format!(
+            "negative_confidence {:?} is not a finite number",
+            result.negative_confidence
+        ))
+    }
+    else if result.status == "complete" && result.negative_confidence.is_none()
+    {
+        Some("a complete verdict carries no negative_confidence".to_string())
+    }
+    else
+    {
+        None
+    };
+
+    if let Some(reason) = quarantine_reason
+    {
+        warnings.push(format!(
+            "{}: source_image_id={}: {}; written as failed with no values or keywords",
+            NEGATIVE_WRITEBACK_WARNING_QUARANTINED, result.id, reason
+        ));
+        result.status = "failed".to_string();
+        result.negative_confidence = None;
+        result.negative_kind = None;
+        result.signals_json = None;
+        result.auto_keywords.clear();
+        return result;
+    }
+
+    if let Some(signals) = result.signals_json.as_deref()
+    {
+        if signals.len() > NEGATIVE_DETECTION_SIGNALS_MAX_BYTES
+        {
+            warnings.push(format!(
+                "{}: source_image_id={}: signals_json is {} bytes, over the {}-byte cap; stored as NULL",
+                NEGATIVE_WRITEBACK_WARNING_VALUE_DROPPED,
+                result.id,
+                signals.len(),
+                NEGATIVE_DETECTION_SIGNALS_MAX_BYTES
+            ));
+            result.signals_json = None;
+        }
+    }
+
+    if result.status != "complete"
+    {
+        result.negative_confidence = None;
+        result.negative_kind = None;
+        result.auto_keywords.clear();
+        return result;
+    }
+
+    if let Some(confidence) = result.negative_confidence
+    {
+        let clamped = confidence.clamp(0.0, 1.0);
+        if clamped != confidence
+        {
+            warnings.push(format!(
+                "{}: source_image_id={}: negative_confidence {} clamped to {}",
+                NEGATIVE_WRITEBACK_WARNING_VALUE_DROPPED, result.id, confidence, clamped
+            ));
+        }
+        result.negative_confidence = Some(clamped);
+    }
+
+    if let Some(kind) = result.negative_kind.as_deref()
+    {
+        if !NEGATIVE_DETECTION_KINDS.contains(&kind)
+        {
+            warnings.push(format!(
+                "{}: source_image_id={}: negative_kind {:?} is not \"color\" or \"black and white\"; stored as NULL",
+                NEGATIVE_WRITEBACK_WARNING_VALUE_DROPPED, result.id, kind
+            ));
+            result.negative_kind = None;
+        }
+    }
+
+    let mut labels: Vec<String> = Vec::new();
+    for label in &result.auto_keywords
+    {
+        let trimmed = label.trim();
+        match NEGATIVE_DETECTION_MANAGED_KEYWORDS
+            .iter()
+            .find(|managed| managed.eq_ignore_ascii_case(trimmed))
+        {
+            Some(managed) =>
+            {
+                // Review F3 — a KIND label must agree with the verdict's own
+                // kind (design §1: "color negative" = film negative AND kind
+                // colour; likewise black and white). "film negative" is
+                // unaffected; its confidence threshold is Swift's policy.
+                let required_kind = match *managed
+                {
+                    "color negative" => Some("color"),
+                    "black and white negative" => Some("black and white"),
+                    _ => None,
+                };
+                if let Some(required_kind) = required_kind
+                {
+                    if result.negative_kind.as_deref() != Some(required_kind)
+                    {
+                        warnings.push(format!(
+                            "{}: source_image_id={}: label {:?} needs negative_kind {:?} but the verdict's kind is {:?}; not written",
+                            NEGATIVE_WRITEBACK_WARNING_LABEL_DROPPED,
+                            result.id,
+                            label,
+                            required_kind,
+                            result.negative_kind
+                        ));
+                        continue;
+                    }
+                }
+                if !labels.iter().any(|kept| kept == managed)
+                {
+                    labels.push(managed.to_string());
+                }
+            }
+            None =>
+            {
+                warnings.push(format!(
+                    "{}: source_image_id={}: label {:?} is not a managed film-negative keyword; not written",
+                    NEGATIVE_WRITEBACK_WARNING_LABEL_DROPPED, result.id, label
+                ));
+            }
+        }
+    }
+    labels.sort();
+    result.auto_keywords = labels;
+    result
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NegativeDetectionWritebackFailure
+{
+    stage: &'static str,
+    reason: String,
+    /// TRUE only for S179's class: the engine's change count was not 1 AND the
+    /// table could not confirm the write. The one failure the chunk retries.
+    unverified_write: bool,
+}
+
+impl NegativeDetectionWritebackFailure
+{
+    fn new(stage: &'static str, reason: String) -> Self
+    {
+        Self
+        {
+            stage,
+            reason,
+            unverified_write: false,
+        }
+    }
+
+    fn into_result(self, mut warnings: Vec<String>) -> NegativeDetectionWritebackResult
+    {
+        warnings.push(format!(
+            "{}: stage={}: {}",
+            NEGATIVE_WRITEBACK_WARNING_FAILED, self.stage, self.reason
+        ));
+        NegativeDetectionWritebackResult
+        {
+            updated: 0,
+            keywords_added: 0,
+            keywords_retracted: 0,
+            warnings,
+            failure_stage: Some(self.stage.to_string()),
+            failed_reason: Some(self.reason),
+        }
+    }
+}
+
+/// What one committed attempt wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct NegativeDetectionWritebackCounts
+{
+    updated: u64,
+    keywords_added: u64,
+    keywords_retracted: u64,
+}
+
+struct NegativeDetectionWritebackPlan
+{
+    result: NegativeDetectionResult,
+    target_ids: Vec<i64>,
+}
+
+/// Freeze every writeback target before the transaction modifies `images` —
+/// `plan_focus_analysis_writebacks`' rules, through the SAME target helper
+/// (`focus_analysis_writeback_target_ids`): a result always owns its own row; a
+/// COMPLETE JPEG/HEIF verdict also copies to the hidden same-stem RAW owned by
+/// the deterministic visible representative; never to another visible
+/// JPEG/HEIF; a chunk-wide claim set targets each row at most once; a
+/// duplicate source id fails the chunk at planning.
+///
+/// ⭐ ONE RUN PER CHUNK (review F4): every result in a chunk must carry the
+/// same `analysis_run_id`, or the chunk fails at planning. V2's baseline
+/// counts rows OUTSIDE the plan carrying a run id; a chunk that restamped a
+/// row from one of its run ids to another would move that count and refuse a
+/// write that landed exactly once. Swift stamps one run id per chunk.
+fn plan_negative_detection_writebacks(
+    conn: &Connection,
+    results: Vec<NegativeDetectionResult>,
+) -> Result<Vec<NegativeDetectionWritebackPlan>, NegativeDetectionWritebackFailure>
+{
+    if let Some(first) = results.first()
+    {
+        if let Some(other) = results
+            .iter()
+            .find(|result| result.analysis_run_id != first.analysis_run_id)
+        {
+            return Err(NegativeDetectionWritebackFailure::new(
+                FOCUS_WRITEBACK_STAGE_PLANNING,
+                format!(
+                    "plan_negative_detection_writebacks: writeback chunk mixes analysis_run_id values ({:?} for source_image_id={}, {:?} for source_image_id={}); one chunk carries one run",
+                    first.analysis_run_id, first.id, other.analysis_run_id, other.id
+                ),
+            ));
+        }
+    }
+
+    let mut source_ids = std::collections::HashSet::<i64>::new();
+    for result in &results
+    {
+        if !source_ids.insert(result.id)
+        {
+            return Err(NegativeDetectionWritebackFailure::new(
+                FOCUS_WRITEBACK_STAGE_PLANNING,
+                format!(
+                    "plan_negative_detection_writebacks: writeback chunk contains duplicate source_image_id={}",
+                    result.id
+                ),
+            ));
+        }
+    }
+    let mut claimed_target_ids = source_ids.clone();
+    let mut emitted_source_ids = std::collections::HashSet::<i64>::new();
+    // One directory read per directory per planning call (S196).
+    let mut directory_cache = WritebackDirectoryCache::new();
+
+    let mut plans = Vec::with_capacity(results.len());
+    for result in results
+    {
+        let mut target_ids = if result.status == "complete"
+        {
+            writeback_target_ids_with_directory_cache(conn, result.id, &mut directory_cache).map_err(|reason|
+            {
+                NegativeDetectionWritebackFailure::new(
+                    FOCUS_WRITEBACK_STAGE_PLANNING,
+                    format!("plan_negative_detection_writebacks: {}", reason),
+                )
+            })?
+        }
+        else
+        {
+            vec![result.id]
+        };
+        target_ids.retain(|target_id|
+        {
+            if *target_id == result.id
+            {
+                emitted_source_ids.insert(*target_id)
+            }
+            else if source_ids.contains(target_id)
+            {
+                false
+            }
+            else
+            {
+                claimed_target_ids.insert(*target_id)
+            }
+        });
+        plans.push(NegativeDetectionWritebackPlan { result, target_ids });
+    }
+    Ok(plans)
+}
+
+/// Test-only seam for the apply-stage UPDATE: report `reported_row_count` in
+/// place of the engine's change count for `target_id`, optionally WITHOUT
+/// running the real UPDATE (so the table genuinely cannot confirm the write).
+/// `fire_limit` bounds the attempts it fires on ("first attempt only" is the
+/// retry test). `extra_stamp_id` stands in for the engine stamping a row the
+/// chunk never planned (same run id, inside the same statement window) — the
+/// case V1 cannot see and only V2 can (review F1). Outside `cfg(test)` the
+/// referent type is uninhabited, so the probe can only ever be `None`.
+#[cfg(test)]
+struct NegativeApplyProbe
+{
+    target_id: i64,
+    run_real_update: bool,
+    reported_row_count: usize,
+    fire_limit: Option<u32>,
+    extra_stamp_id: Option<i64>,
+    firings: std::cell::Cell<u32>,
+}
+
+#[cfg(test)]
+impl NegativeApplyProbe
+{
+    fn new(target_id: i64, run_real_update: bool, reported_row_count: usize) -> Self
+    {
+        Self
+        {
+            target_id,
+            run_real_update,
+            reported_row_count,
+            fire_limit: None,
+            extra_stamp_id: None,
+            firings: std::cell::Cell::new(0),
+        }
+    }
+
+    fn firing_at_most(mut self, attempts: u32) -> Self
+    {
+        self.fire_limit = Some(attempts);
+        self
+    }
+
+    fn also_stamping(mut self, extra_stamp_id: i64) -> Self
+    {
+        self.extra_stamp_id = Some(extra_stamp_id);
+        self
+    }
+}
+
+#[cfg(test)]
+type NegativeApplyProbeRef<'a> = Option<&'a NegativeApplyProbe>;
+
+#[cfg(not(test))]
+type NegativeApplyProbeRef<'a> = Option<&'a std::convert::Infallible>;
+
+/// `Some((row_count_to_report, run_real_update, extra_stamp_id))` when armed
+/// for this target on this attempt.
+#[cfg(test)]
+fn negative_apply_probe_report(probe: NegativeApplyProbeRef<'_>, target_id: i64) -> Option<(usize, bool, Option<i64>)>
+{
+    let probe = probe?;
+    if probe.target_id != target_id
+    {
+        return None;
+    }
+    let firings = probe.firings.get();
+    if let Some(limit) = probe.fire_limit
+    {
+        if firings >= limit
+        {
+            return None;
+        }
+    }
+    probe.firings.set(firings + 1);
+    Some((probe.reported_row_count, probe.run_real_update, probe.extra_stamp_id))
+}
+
+#[cfg(not(test))]
+fn negative_apply_probe_report(_probe: NegativeApplyProbeRef<'_>, _target_id: i64) -> Option<(usize, bool, Option<i64>)>
+{
+    None
+}
+
+/// The confidence and kind a verdict stamps: written only for a complete
+/// verdict. (The signals JSON rides every status — it can explain a failure as
+/// well as a miss.) Shared by the UPDATE and its verification, so the two can
+/// never disagree about what "the write landed" means.
+fn negative_stamp_values(result: &NegativeDetectionResult) -> (Option<f64>, Option<&str>)
+{
+    if result.status == "complete"
+    {
+        (result.negative_confidence, result.negative_kind.as_deref())
+    }
+    else
+    {
+        (None, None)
+    }
+}
+
+/// The six-column stamp for ONE frozen target.
+fn update_negative_detection_target(
+    conn: &Connection,
+    result: &NegativeDetectionResult,
+    target_id: i64,
+    probe: NegativeApplyProbeRef<'_>,
+) -> Result<usize, duckdb::Error>
+{
+    let (confidence, kind) = negative_stamp_values(result);
+
+    // Test-only. In production `probe_report` is provably `None`.
+    let probe_report = negative_apply_probe_report(probe, target_id);
+    if let Some((reported_row_count, false, _)) = probe_report
+    {
+        return Ok(reported_row_count);
+    }
+
+    // The target set was frozen before BEGIN. One explicit primary key; this
+    // statement never re-scans `images` for siblings.
+    let row_count = conn.execute(
+        "UPDATE images
+         SET negative_detection_status = ?2,
+             negative_detection_version = ?3,
+             negative_detection_run_id = ?4,
+             negative_confidence = ?5,
+             negative_kind = ?6,
+             negative_signals = ?7
+         WHERE id = ?1",
+        params![
+            target_id,
+            &result.status,
+            &result.detector_version,
+            &result.analysis_run_id,
+            confidence,
+            kind,
+            result.signals_json.as_deref(),
+        ],
+    )?;
+
+    // Test-only (review F1): a row OUTSIDE the plan stamped with this run id
+    // in the same statement window. Only V2 can see it.
+    if let Some((_, _, Some(extra_stamp_id))) = probe_report
+    {
+        conn.execute(
+            "UPDATE images SET negative_detection_run_id = ?2 WHERE id = ?1",
+            params![extra_stamp_id, &result.analysis_run_id],
+        )?;
+    }
+
+    Ok(probe_report.map_or(row_count, |(reported_row_count, _, _)| reported_row_count))
+}
+
+/// The pre-write state V2 compares against, for ONE run id in the chunk.
+///
+/// The six columns carry no per-transaction timestamp (culling's V2 keys on
+/// `focus_scored_at = CURRENT_TIMESTAMP`; this pass has no such column), so the
+/// transaction-wide check is made exact by a BASELINE taken right after BEGIN,
+/// before any write: how many rows carried the run id in total, and which of
+/// the chunk's planned targets already carried it.
+struct NegativeRunBaseline
+{
+    run_id: String,
+    /// Every target this chunk plans to stamp with `run_id`, sorted, unique.
+    planned_ids: Vec<i64>,
+    total_before: i64,
+    planned_before: Vec<i64>,
+}
+
+fn negative_id_csv(ids: &[i64]) -> String
+{
+    ids.iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn negative_run_ids_in_planned(
+    conn: &Connection,
+    run_id: &str,
+    planned_ids: &[i64],
+) -> Result<Vec<i64>, String>
+{
+    if planned_ids.is_empty()
+    {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT id FROM images
+             WHERE negative_detection_run_id = ?1
+               AND id IN ({})
+             ORDER BY id",
+            negative_id_csv(planned_ids)
+        ))
+        .map_err(|e| format!("prepare failed: {}", e))?;
+    let rows = stmt
+        .query_map(params![run_id], |row| row.get::<_, i64>(0))
+        .map_err(|e| format!("query failed: {}", e))?;
+    // ⚠️ NOT deduplicated, deliberately (culling's strict V2): a repeat is a
+    // physical row nobody planned to write. A row that could not be read
+    // makes the answer unknown, never short.
+    let (ids, dropped) = collect_rows_counted(rows, "negative_run_ids_in_planned");
+    if dropped > 0
+    {
+        return Err(format!("{} row(s) could not be read", dropped));
+    }
+    Ok(ids)
+}
+
+fn negative_run_total(conn: &Connection, run_id: &str) -> Result<i64, String>
+{
+    conn.query_row(
+        "SELECT COUNT(*) FROM images WHERE negative_detection_run_id = ?1",
+        params![run_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn negative_run_baselines(
+    conn: &Connection,
+    plans: &[NegativeDetectionWritebackPlan],
+) -> Result<Vec<NegativeRunBaseline>, NegativeDetectionWritebackFailure>
+{
+    let mut by_run: std::collections::BTreeMap<String, Vec<i64>> = std::collections::BTreeMap::new();
+    for plan in plans
+    {
+        by_run
+            .entry(plan.result.analysis_run_id.clone())
+            .or_default()
+            .extend(plan.target_ids.iter().copied());
+    }
+
+    let mut baselines = Vec::with_capacity(by_run.len());
+    for (run_id, mut planned_ids) in by_run
+    {
+        planned_ids.sort_unstable();
+        planned_ids.dedup();
+        let fail = |what: &str, e: String|
+        {
+            NegativeDetectionWritebackFailure::new(
+                FOCUS_WRITEBACK_STAGE_APPLY,
+                format!(
+                    "update_negative_detection_results: the verification baseline's {} failed for negative_detection_run_id={:?}: {}",
+                    what, run_id, e
+                ),
+            )
+        };
+        let total_before = negative_run_total(conn, &run_id).map_err(|e| fail("run count", e))?;
+        let planned_before = negative_run_ids_in_planned(conn, &run_id, &planned_ids)
+            .map_err(|e| fail("planned-row read", e))?;
+        baselines.push(NegativeRunBaseline
+        {
+            run_id,
+            planned_ids,
+            total_before,
+            planned_before,
+        });
+    }
+    Ok(baselines)
+}
+
+/// What the table says after a change count other than 1. Both checks run with
+/// index scans disabled (S179's guard, reused):
+///
+/// - V1, the TARGET: exactly one live row for the id, carrying the whole
+///   six-column stamp this write set, on one physical rowid.
+/// - V2, the TRANSACTION: the planned rows carrying the run id are exactly the
+///   ones written so far plus the ones that already carried it at BEGIN (a
+///   strict list, so a duplicate physical row shows), and no row OUTSIDE the
+///   plan gained the run id.
+struct NegativeWritebackVerification
+{
+    rows_for_id: i64,
+    matching_rows: i64,
+    distinct_rowids: i64,
+    stamped_planned: Vec<i64>,
+    expected_planned: Vec<i64>,
+    outside_now: i64,
+    outside_before: i64,
+    note: String,
+}
+
+impl NegativeWritebackVerification
+{
+    fn confirms_single_write(&self) -> bool
+    {
+        self.note.is_empty()
+            && self.rows_for_id == 1
+            && self.matching_rows == 1
+            && self.distinct_rowids == 1
+            && self.stamped_planned == self.expected_planned
+            && self.outside_now == self.outside_before
+    }
+
+    fn describe(&self) -> String
+    {
+        format!(
+            "rows_for_id={} matching_rows={} distinct_rowids={}; planned rows carrying the run id {:?}, expected {:?}; rows outside the plan carrying it {} (before the writes {}){}",
+            self.rows_for_id,
+            self.matching_rows,
+            self.distinct_rowids,
+            self.stamped_planned,
+            self.expected_planned,
+            self.outside_now,
+            self.outside_before,
+            self.note
+        )
+    }
+}
+
+fn negative_writeback_verification(
+    conn: &Connection,
+    result: &NegativeDetectionResult,
+    target_id: i64,
+    baseline: &NegativeRunBaseline,
+    written_ids: &[i64],
+) -> NegativeWritebackVerification
+{
+    let index_scans = FocusWritebackIndexScansDisabled::new(conn);
+    let mut note = String::new();
+    if !index_scans.active
+    {
+        note = "; the index-scan settings could not be applied, so this verification may have run through the ART".to_string();
+    }
+
+    // V1 matches the WHOLE six-column stamp, not the run id alone: a target
+    // that already carried this run id at BEGIN (a resubmitted verdict) would
+    // otherwise "confirm" a write that never landed.
+    let (confidence, kind) = negative_stamp_values(result);
+    let (rows_for_id, matching_rows, distinct_rowids) = match conn.query_row(
+        "SELECT COUNT(*),
+                COUNT(*) FILTER (
+                    WHERE negative_detection_status IS NOT DISTINCT FROM ?2
+                      AND negative_detection_version IS NOT DISTINCT FROM ?3
+                      AND negative_detection_run_id IS NOT DISTINCT FROM ?4
+                      AND negative_confidence IS NOT DISTINCT FROM ?5
+                      AND negative_kind IS NOT DISTINCT FROM ?6
+                      AND negative_signals IS NOT DISTINCT FROM ?7
+                ),
+                COUNT(DISTINCT rowid)
+         FROM images
+         WHERE id = ?1",
+        params![
+            target_id,
+            &result.status,
+            &result.detector_version,
+            &result.analysis_run_id,
+            confidence,
+            kind,
+            result.signals_json.as_deref(),
+        ],
+        |row|
+        {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )
+    {
+        Ok(counts) => counts,
+        Err(e) =>
+        {
+            note = format!("{}; the target-row verification SELECT failed: {}", note, e);
+            (-1, -1, -1)
+        }
+    };
+
+    let mut expected_planned = written_ids
+        .iter()
+        .copied()
+        .chain(baseline.planned_before.iter().copied())
+        .collect::<Vec<_>>();
+    expected_planned.sort_unstable();
+    expected_planned.dedup();
+
+    let stamped_planned = match negative_run_ids_in_planned(conn, &baseline.run_id, &baseline.planned_ids)
+    {
+        Ok(ids) => ids,
+        Err(e) =>
+        {
+            note = format!("{}; the planned-row verification SELECT failed: {}", note, e);
+            Vec::new()
+        }
+    };
+    let outside_now = match negative_run_total(conn, &baseline.run_id)
+    {
+        Ok(total) => total - stamped_planned.len() as i64,
+        Err(e) =>
+        {
+            note = format!("{}; the run-wide verification SELECT failed: {}", note, e);
+            -1
+        }
+    };
+
+    NegativeWritebackVerification
+    {
+        rows_for_id,
+        matching_rows,
+        distinct_rowids,
+        stamped_planned,
+        expected_planned,
+        outside_now,
+        outside_before: baseline.total_before - baseline.planned_before.len() as i64,
+        note,
+    }
+}
+
+/// Add and retract the managed labels for ONE complete target, with ONE read
+/// of that image's keyword rows (`WHERE image_id = ?` — a single filter, an
+/// `idx_keyword_image_id` Index Scan on the bundled 1.5.5) and every write by
+/// keyword PRIMARY KEY. It replaces a per-label existence check, a merge
+/// UPDATE and a retraction read that each carried three or four filters and
+/// so ran as sequential scans of `keyword` (S196 live drive; plans measured
+/// with EXPLAIN ANALYZE on a copy of the owner's catalogue).
+///
+/// The decisions are exactly the earlier statements', made in Rust:
+///
+/// - ADD (each label in `keep`, which sanitising made canonical and unique):
+///   if ACTIVE rows with that path exist, every one lacking the auto bit gains
+///   it (`insert_or_merge_active_keyword_for_image`'s merge); otherwise one
+///   row is INSERTed — its statement, `is_video` read by primary key, the
+///   S124 `LIMIT 1` kept. Counted once per label that changed.
+/// - RETRACT (each managed path NOT in `keep` that has an active row carrying
+///   the auto bit): every active row of that path loses the auto bit, then
+///   every active row of that path left at origin 0 with no collection or
+///   colour membership is soft-hidden (`status = 0`, `hidden_at`) —
+///   `editor_saved_image_remove_auto_keyword_origin`'s treatment. USER and
+///   FACE bits are never touched. Counted once per path.
+///
+/// Counts come from the read, never from an engine change count (S179). A
+/// read that loses a row fails closed. Rows are de-duplicated by keyword id,
+/// so a doubled row version (the S124 class) cannot double a write.
+fn apply_negative_detection_keywords(
+    conn: &Connection,
+    image_id: i64,
+    keep: &[String],
+) -> Result<(u64, u64), String>
+{
+    let mut rows =
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, path, status, origin,
+                        COALESCE(collection, FALSE), COALESCE(color, FALSE)
+                 FROM keyword
+                 WHERE image_id = ?1",
+            )
+            .map_err(|e| format!("apply_negative_detection_keywords: prepare failed for image_id={}: {}", image_id, e))?;
+        let mapped = stmt
+            .query_map(params![image_id], |row|
+            {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            })
+            .map_err(|e| format!("apply_negative_detection_keywords: read failed for image_id={}: {}", image_id, e))?;
+        let (rows, dropped) = collect_rows_counted(mapped, "apply_negative_detection_keywords");
+        if dropped > 0
+        {
+            // An un-performed read is not an empty read.
+            return Err(format!(
+                "apply_negative_detection_keywords: the keyword read lost {} row(s) for image_id={}",
+                dropped, image_id
+            ));
+        }
+        rows
+    };
+    rows.sort_by_key(|row| row.0);
+    rows.dedup_by_key(|row| row.0);
+
+    let auto = KEYWORD_ORIGIN_AUTO as i64;
+    // Origin AND the collection switch in one primary-key write.
+    let set_origin_and_collection = |keyword_id: i64, origin: i64, collection: bool| -> Result<(), String>
+    {
+        conn.execute(
+            "UPDATE keyword SET origin = ?2, collection = ?3 WHERE id = ?1",
+            params![keyword_id, origin, collection],
+        )
+        .map(|_| ())
+        .map_err(|e| format!(
+            "apply_negative_detection_keywords: origin/collection update failed for image_id={} keyword id={}: {}",
+            image_id, keyword_id, e
+        ))
+    };
+
+    let mut added = 0u64;
+    for label in keep
+    {
+        let active = rows
+            .iter()
+            .filter(|(_, path, status, _, _, _)| path == label && *status == 1)
+            .collect::<Vec<_>>();
+        let make_member = negative_detection_label_is_a_collection(label);
+        if active.is_empty()
+        {
+            // S62 flip-or-insert, INSERT arm: one flat row that is the keyword
+            // and (for a collection label) the collection member.
+            conn.execute(
+                "INSERT INTO keyword (image_id, label, path, status, origin, created_at, collection, is_video) \
+                 VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP, ?, COALESCE((SELECT is_video FROM images WHERE id = ? LIMIT 1), FALSE))",
+                params![image_id, label, label, KEYWORD_ORIGIN_AUTO, make_member, image_id],
+            )
+            .map_err(|e| format!(
+                "apply_negative_detection_keywords: INSERT keyword failed for image_id={} label={:?}: {}",
+                image_id, label, e
+            ))?;
+            added += 1;
+            continue;
+        }
+        // S62 flip-or-insert, FLIP arm, on every ACTIVE row of the label: the
+        // auto bit merged in and (for a collection label) the collection
+        // switch turned ON. Status is never touched; a row already both is
+        // left alone; a row already a member keeps its membership.
+        let mut merged = false;
+        for (keyword_id, _, _, origin, collection, _) in active
+        {
+            let collection_after = *collection || make_member;
+            if origin & auto == 0 || collection_after != *collection
+            {
+                set_origin_and_collection(*keyword_id, origin | auto, collection_after)?;
+            }
+            if origin & auto == 0
+            {
+                merged = true;
+            }
+        }
+        if merged
+        {
+            added += 1;
+        }
+    }
+
+    let mut retracted = 0u64;
+    for managed in NEGATIVE_DETECTION_MANAGED_KEYWORDS
+    {
+        if keep.iter().any(|kept| kept.as_str() == managed)
+        {
+            continue;
+        }
+        let active = rows
+            .iter()
+            .filter(|(_, path, status, _, _, _)| path == managed && *status == 1)
+            .collect::<Vec<_>>();
+        let withdraw_membership = negative_detection_label_is_a_collection(managed);
+        // An ACTIVE origin-0 member of a collection label can only be one of
+        // this pass's rows whose auto bit an editor save cleared
+        // (`editor_saved_image_remove_auto_keyword_origin` keeps collection
+        // rows active): the pass withdraws that membership too, so after an
+        // edit the collection still follows the verdict.
+        let orphaned_member = |origin: i64, collection: bool| withdraw_membership && origin == 0 && collection;
+        if !active
+            .iter()
+            .any(|(_, _, _, origin, collection, _)| origin & auto != 0 || orphaned_member(*origin, *collection))
+        {
+            continue;
+        }
+        for (keyword_id, _, _, origin, collection, color) in active
+        {
+            // A row carrying the auto bit loses it; for a collection label it
+            // also leaves the collection (S65: remove = flip FALSE) — UNLESS
+            // the user bit remains: a hand-made keyword/collection row the
+            // pass merged into keeps its membership (provenance of the switch
+            // is not recorded, so the user's choice wins). A row without the
+            // auto bit is the user's and is never touched.
+            let cleared = origin & !auto;
+            let was_ours = cleared != *origin || orphaned_member(*origin, *collection);
+            let collection_after = if was_ours
+                && withdraw_membership
+                && cleared & (KEYWORD_ORIGIN_USER as i64) == 0
+            {
+                false
+            }
+            else
+            {
+                *collection
+            };
+            if cleared != *origin || collection_after != *collection
+            {
+                set_origin_and_collection(*keyword_id, cleared, collection_after)?;
+            }
+            if cleared == 0 && !collection_after && !*color
+            {
+                conn.execute(
+                    "UPDATE keyword SET status = 0, hidden_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                    params![keyword_id],
+                )
+                .map_err(|e| format!(
+                    "apply_negative_detection_keywords: hide failed for image_id={} keyword id={}: {}",
+                    image_id, keyword_id, e
+                ))?;
+            }
+        }
+        retracted += 1;
+    }
+
+    Ok((added, retracted))
+}
+
+/// Write the frozen plans inside the caller's open transaction. `warnings` is
+/// an OUT parameter so an anomaly observed before a later failure survives as
+/// evidence (folded into the failure text by the caller).
+fn write_negative_detection_plans_in_transaction(
+    conn: &Connection,
+    plans: &[NegativeDetectionWritebackPlan],
+    baselines: &[NegativeRunBaseline],
+    probe: NegativeApplyProbeRef<'_>,
+    warnings: &mut Vec<String>,
+) -> Result<NegativeDetectionWritebackCounts, NegativeDetectionWritebackFailure>
+{
+    let mut counts = NegativeDetectionWritebackCounts::default();
+    let mut written_this_transaction: Vec<(i64, &str)> = Vec::new();
+
+    for plan in plans
+    {
+        let result = &plan.result;
+        let mut updated_target_ids = Vec::with_capacity(plan.target_ids.len());
+
+        for target_id in &plan.target_ids
+        {
+            let row_count = update_negative_detection_target(conn, result, *target_id, probe)
+                .map_err(|e|
+                {
+                    NegativeDetectionWritebackFailure::new(
+                        FOCUS_WRITEBACK_STAGE_APPLY,
+                        format!(
+                            "update_negative_detection_target: UPDATE images failed for source_image_id={} target_image_id={}: {}",
+                            result.id, target_id, e
+                        ),
+                    )
+                })?;
+            written_this_transaction.push((*target_id, result.analysis_run_id.as_str()));
+
+            if row_count != 1
+            {
+                // S179: the engine's change count is never grounds to fail.
+                // Ask the TABLE whether the write landed exactly once.
+                let baseline = baselines
+                    .iter()
+                    .find(|baseline| baseline.run_id == result.analysis_run_id);
+                let verification = baseline.map(|baseline|
+                {
+                    let written = written_this_transaction
+                        .iter()
+                        .filter(|(_, run)| *run == baseline.run_id.as_str())
+                        .map(|(id, _)| *id)
+                        .collect::<Vec<_>>();
+                    negative_writeback_verification(conn, result, *target_id, baseline, &written)
+                });
+                let description = verification
+                    .as_ref()
+                    .map(|verification| verification.describe())
+                    .unwrap_or_else(|| "no verification baseline exists for this run id".to_string());
+
+                if verification.as_ref().map_or(false, |verification| verification.confirms_single_write())
+                {
+                    warnings.push(format!(
+                        "{}: UPDATE images reported {} rows for source_image_id={} target_image_id={}, but the catalogue confirms one write of negative_detection_run_id={:?}: {}",
+                        NEGATIVE_WRITEBACK_WARNING_COUNT_ANOMALY,
+                        row_count,
+                        result.id,
+                        target_id,
+                        result.analysis_run_id,
+                        description
+                    ));
+                }
+                else
+                {
+                    let mut failure = NegativeDetectionWritebackFailure::new(
+                        FOCUS_WRITEBACK_STAGE_APPLY,
+                        format!(
+                            "update_negative_detection_target: UPDATE images reported {} rows for source_image_id={} target_image_id={} and the catalogue could not confirm the write of negative_detection_run_id={:?}: {}",
+                            row_count, result.id, target_id, result.analysis_run_id, description
+                        ),
+                    );
+                    failure.unverified_write = true;
+                    return Err(failure);
+                }
+            }
+            counts.updated += 1;
+            updated_target_ids.push(*target_id);
+        }
+
+        if result.status != "complete"
+        {
+            // `unreadable` / `failed` touch no keywords.
+            continue;
+        }
+
+        // Each complete target — the source and any hidden RAW twin it copies
+        // to — gets the same keyword treatment, exactly as culling's auto
+        // keywords reach every updated target.
+        for target_id in &updated_target_ids
+        {
+            let (added, retracted) = apply_negative_detection_keywords(conn, *target_id, &result.auto_keywords)
+                .map_err(|e|
+                {
+                    NegativeDetectionWritebackFailure::new(
+                        FOCUS_WRITEBACK_STAGE_APPLY,
+                        format!(
+                            "update_negative_detection_results: keyword write failed for source_image_id={} target_image_id={}: {}",
+                            result.id, target_id, e
+                        ),
+                    )
+                })?;
+            counts.keywords_added += added;
+            counts.keywords_retracted += retracted;
+        }
+    }
+
+    Ok(counts)
+}
+
+/// Roll the chunk back; the bool says whether the ROLLBACK itself succeeded
+/// (a replay on a connection in an unknown state is not a recovery).
+fn rollback_negative_detection_failure(
+    conn: &Connection,
+    mut failure: NegativeDetectionWritebackFailure,
+    attempt_warnings: Vec<String>,
+) -> (NegativeDetectionWritebackFailure, bool)
+{
+    // A rolled-back attempt's anomalies describe writes that no longer exist:
+    // their TEXT is kept in the failure reason, the warnings are dropped.
+    if !attempt_warnings.is_empty()
+    {
+        failure.reason = format!(
+            "{}; the rolled-back attempt had also recorded: {}",
+            failure.reason,
+            attempt_warnings.join(" | ")
+        );
+    }
+    if let Err(rollback_error) = conn.execute_batch("ROLLBACK;")
+    {
+        failure.reason = format!(
+            "{}; update_negative_detection_results: ROLLBACK failed: {}",
+            failure.reason, rollback_error
+        );
+        return (failure, false);
+    }
+    (failure, true)
+}
+
+/// Plan, BEGIN, baseline, apply and COMMIT ONE attempt at a chunk. On failure
+/// the transaction is already rolled back and the bool reports whether that
+/// ROLLBACK succeeded (`false` when no transaction was open — planning and
+/// BEGIN failures, which are never retried).
+fn negative_detection_writeback_attempt(
+    conn: &Connection,
+    results: Vec<NegativeDetectionResult>,
+    probe: NegativeApplyProbeRef<'_>,
+    warnings: &mut Vec<String>,
+) -> Result<NegativeDetectionWritebackCounts, (NegativeDetectionWritebackFailure, bool)>
+{
+    // Planning stays BEFORE BEGIN (culling's rule): a re-scan of `images`
+    // after an UPDATE in the same transaction can see both row versions.
+    let plans = plan_negative_detection_writebacks(conn, results).map_err(|failure|
+    {
+        eprintln!(
+            "update_negative_detection_results: {} failure: {}",
+            failure.stage, failure.reason
+        );
+        (failure, false)
+    })?;
+
+    if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+    {
+        let failure = NegativeDetectionWritebackFailure::new(
+            FOCUS_WRITEBACK_STAGE_BEGIN,
+            format!("update_negative_detection_results: BEGIN TRANSACTION failed: {}", e),
+        );
+        eprintln!("{}", failure.reason);
+        return Err((failure, false));
+    }
+
+    let mut attempt_warnings: Vec<String> = Vec::new();
+    let applied = negative_run_baselines(conn, &plans).and_then(|baselines|
+    {
+        write_negative_detection_plans_in_transaction(conn, &plans, &baselines, probe, &mut attempt_warnings)
+    });
+    let counts = match applied
+    {
+        Ok(counts) => counts,
+        Err(failure) =>
+        {
+            let (failure, rolled_back) = rollback_negative_detection_failure(conn, failure, attempt_warnings);
+            eprintln!(
+                "update_negative_detection_results: {} failure: {}",
+                failure.stage, failure.reason
+            );
+            return Err((failure, rolled_back));
+        }
+    };
+
+    if let Err(e) = conn.execute_batch("COMMIT;")
+    {
+        let failure = NegativeDetectionWritebackFailure::new(
+            FOCUS_WRITEBACK_STAGE_COMMIT,
+            format!("update_negative_detection_results: COMMIT failed: {}", e),
+        );
+        let (failure, rolled_back) = rollback_negative_detection_failure(conn, failure, attempt_warnings);
+        eprintln!("{}", failure.reason);
+        return Err((failure, rolled_back));
+    }
+
+    warnings.append(&mut attempt_warnings);
+    Ok(counts)
+}
+
+fn successful_negative_detection_writeback(
+    counts: NegativeDetectionWritebackCounts,
+    warnings: Vec<String>,
+) -> NegativeDetectionWritebackResult
+{
+    NegativeDetectionWritebackResult
+    {
+        updated: counts.updated,
+        keywords_added: counts.keywords_added,
+        keywords_retracted: counts.keywords_retracted,
+        warnings,
+        failure_stage: None,
+        failed_reason: None,
+    }
+}
+
+fn update_negative_detection_results_impl(
+    conn: &Connection,
+    results: Vec<NegativeDetectionResult>,
+    probe: NegativeApplyProbeRef<'_>,
+) -> NegativeDetectionWritebackResult
+{
+    let mut warnings = Vec::new();
+    if results.is_empty()
+    {
+        return successful_negative_detection_writeback(NegativeDetectionWritebackCounts::default(), warnings);
+    }
+
+    // Sanitised ONCE: its warnings describe the inputs, so they ride the
+    // receipt whether or not the chunk commits, and a retry does not repeat them.
+    let results = results
+        .into_iter()
+        .map(|result| sanitized_negative_detection_result(result, &mut warnings))
+        .collect::<Vec<_>>();
+    let retry_results = results.clone();
+
+    let (first_failure, rolled_back) =
+        match negative_detection_writeback_attempt(conn, results, probe, &mut warnings)
+        {
+            Ok(counts) => return successful_negative_detection_writeback(counts, warnings),
+            Err(failure) => failure,
+        };
+
+    // S179: retry ONE time, only for an apply-stage write the table could not
+    // confirm, and only after a ROLLBACK that succeeded. Every other failure
+    // (a real DuckDB error, a keyword statement, BEGIN/COMMIT) fails as is.
+    if !(first_failure.unverified_write && rolled_back)
+    {
+        return first_failure.into_result(warnings);
+    }
+
+    warnings.push(format!(
+        "{}: {}",
+        NEGATIVE_WRITEBACK_WARNING_CHUNK_RETRIED, first_failure.reason
+    ));
+    eprintln!(
+        "update_negative_detection_results: replaying the chunk once after an unverified apply-stage row count: {}",
+        first_failure.reason
+    );
+
+    match negative_detection_writeback_attempt(conn, retry_results, probe, &mut warnings)
+    {
+        Ok(counts) => successful_negative_detection_writeback(counts, warnings),
+        Err((mut failure, _)) =>
+        {
+            failure.reason = format!(
+                "{}; update_negative_detection_results: the chunk still failed after one retry",
+                failure.reason
+            );
+            failure.into_result(warnings)
+        }
+    }
+}
+
+/// Batch writeback for film-negative verdicts (design §3). One transaction per
+/// call; see `NegativeDetectionWritebackResult` for how a failure reads. A
+/// panic inside is reported the same way instead of killing the app.
+pub async fn update_negative_detection_results(
+    results: Vec<NegativeDetectionResult>,
+) -> NegativeDetectionWritebackResult
+{
+    ffi_panic_boundary("update_negative_detection_results.panic.query_failed", || -> NegativeDetectionWritebackResult
+    {
+        if results.is_empty()
+        {
+            return successful_negative_detection_writeback(NegativeDetectionWritebackCounts::default(), Vec::new());
+        }
+
+        let catalogue = lock_catalogue();
+        let conn = match catalogue.as_ref()
+        {
+            Some(c) => c,
+            None =>
+            {
+                let failure = NegativeDetectionWritebackFailure::new(
+                    FOCUS_WRITEBACK_STAGE_CATALOGUE,
+                    "update_negative_detection_results: catalogue unavailable: catalogue not initialized"
+                        .to_string(),
+                );
+                eprintln!("{}", failure.reason);
+                return failure.into_result(Vec::new());
+            }
+        };
+
+        update_negative_detection_results_impl(conn, results, None)
+    },
+    |panic| NegativeDetectionWritebackFailure::new(
+        FOCUS_WRITEBACK_STAGE_CATALOGUE,
+        format!(
+            "update_negative_detection_results: {}",
+            ffi_panic_report("save these film-negative results to the catalogue", &panic)
+        ),
+    )
+    .into_result(Vec::new()))
 }
 
 /// Count durable face observations for the requested focus/enrichment algorithm
@@ -29392,6 +31487,20 @@ mod keyword_tests {
             predicate_to_sql(&num("blink_risk_count_num", "lte", 0.0, None)),
             "(face_blink_risk_count <= 0e0)"
         );
+        // S196 — Negative confidence: DOUBLE, so the 64-bit `{:e}` atom.
+        assert_eq!(
+            predicate_to_sql(&num("negative_conf_num", "gte", 0.6, None)),
+            "(negative_confidence >= 6e-1)"
+        );
+        assert_eq!(
+            predicate_to_sql(&num("negative_conf_num", "between", 0.4, Some(0.6))),
+            "(negative_confidence BETWEEN 4e-1 AND 6e-1)"
+        );
+        assert_eq!(
+            predicate_to_sql(&num("negative_conf_num", "eq", 1.0, None)),
+            "(negative_confidence = 1e0)"
+        );
+        assert_eq!(predicate_to_sql(&num("negative_conf_num", "gte", f64::NAN, None)), "(FALSE)");
         assert!(predicate_to_sql(&num("focus_quality", "gte", 8.0, None))
             .contains("quantile_cont(score, 0.7)"));
         assert!(
@@ -45459,7 +47568,8 @@ mod schema_upgrade_fixture_tests
     /// (S184, committed in 5bad24c), the first fixture named by its content
     /// hash (ruling 32); V8 is slice S24's `similar_photo_group_member.origin`
     /// (2026-10-02), the last state with 32-bit REAL measurement columns; V9 is
-    /// W4-21's six DOUBLE measurement columns (2026-10-11): the identity control.
+    /// W4-21's six DOUBLE measurement columns (2026-10-11); V10 is S196's six
+    /// film-negative detection columns (2026-10-22): the identity control.
     ///
     /// ⚠️ NARROWED in fix round 1 (2026-09-25, reviewer finding K-F1). ⛔ The old
     /// wording, "the reachable window OPENS on 2026-07-03", does **not** follow
@@ -45478,7 +47588,7 @@ mod schema_upgrade_fixture_tests
     /// one column comment — which is why the fixture is named for 8193d5d and is
     /// byte-exact against 8193d5d's blob. 8193d5d is also the S111 commit at which
     /// such a catalogue first became BACKUP-able.
-    const VINTAGES: [Vintage; 11] = [
+    const VINTAGES: [Vintage; 12] = [
         Vintage
         {
             tag: "V1",
@@ -45587,7 +47697,8 @@ mod schema_upgrade_fixture_tests
         // gps_longitude, gps_altitude) are DOUBLE in the CREATE body; every
         // older vintage reaches DOUBLE through
         // `migrate_measurement_columns_to_double`, which is why assertion (e)
-        // stays allow-list-free for V1…V8. THE IDENTITY CONTROL. Named by the
+        // stays allow-list-free for V1…V8. The identity control until S196
+        // (its flag and its identity assertion moved to V10). Named by the
         // SHA-256 of its own bytes (ruling 32): `shasum -a 256` of the file
         // begins 24bf811ec9fc. Cut from the working tree; `source_commit` stays
         // `None` until someone fills it in (never a rename).
@@ -45598,6 +47709,24 @@ mod schema_upgrade_fixture_tests
             date: "2026-10-11",
             file: "sha256-24bf811ec9fc.sql",
             ddl: include_str!("schema_fixtures/sha256-24bf811ec9fc.sql"),
+            allowed: &[],
+            is_identity_control: false,
+        },
+        // ⭐ V10 — S196 film-negative detection (2026-10-22): six nullable
+        // `images` columns (negative_detection_status / _version / _run_id,
+        // negative_confidence DOUBLE, negative_kind, negative_signals) in the
+        // CREATE body plus their bare `ALTER … ADD COLUMN IF NOT EXISTS` lines
+        // (no default — S62; no index — S179). THE IDENTITY CONTROL. Named by
+        // the SHA-256 of its own bytes (ruling 32): `shasum -a 256` of the file
+        // begins 633e6ae734f6. Cut from the working tree; `source_commit` stays
+        // `None` until someone fills it in (never a rename).
+        Vintage
+        {
+            tag: "V10",
+            source_commit: None,
+            date: "2026-10-22",
+            file: "sha256-633e6ae734f6.sql",
+            ddl: include_str!("schema_fixtures/sha256-633e6ae734f6.sql"),
             allowed: &[],
             is_identity_control: true,
         },
@@ -45660,7 +47789,7 @@ mod schema_upgrade_fixture_tests
     /// `VINTAGES` row is added or removed without updating it. The detector for a
     /// moved schema batch is
     /// `the_identity_control_fixture_is_byte_identical_to_the_in_tree_schema_batch`.
-    const EXPECTED_VINTAGE_COUNT: usize = 11;
+    const EXPECTED_VINTAGE_COUNT: usize = 12;
 
     /// ⭐ RULING 32 (2026-09-27) — the ONLY fixtures that keep a COMMIT name,
     /// because their provenance is real: each reproduces byte-for-byte from its
@@ -46056,7 +48185,7 @@ mod schema_upgrade_fixture_tests
         // only; W4-21's measurement migration drops and rebuilds every index on
         // `images` on every vintage older than V9, so a lost or altered index
         // would be invisible to (e). No allow-list: measured equal on all
-        // eleven vintages.
+        // eleven vintages at W4-21, and on all twelve since S196's V10.
         assert_index_shapes(v, &fresh, &upgraded);
 
         drop(upgraded);
@@ -46294,7 +48423,7 @@ mod schema_upgrade_fixture_tests
             "exactly one vintage must be the identity control (the working tree's own \
              schema batch); without it a green sweep proves nothing about the comparison"
         );
-        for tag in ["V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "TIER3-4599235", "GENESIS"]
+        for tag in ["V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "V10", "TIER3-4599235", "GENESIS"]
         {
             let v = vintage(tag);
             assert!(
@@ -46426,17 +48555,27 @@ mod schema_upgrade_fixture_tests
         assert_vintage_upgrades(vintage("V8"));
     }
 
-    /// K-2 — THE IDENTITY CONTROL. V9 is the working tree's own schema batch, so
-    /// its upgrade must produce ZERO divergence. This is the assertion that
+    /// V9 — W4-21's state (2026-10-11), the six DOUBLE measurement columns. It
+    /// was the identity control until S196's film-negative columns made V10 the
+    /// working tree; its identity assertion moved to V10's test with the flag
+    /// (S196).
+    #[test]
+    fn v9_2026_10_11_upgrades_to_the_current_schema()
+    {
+        assert_vintage_upgrades(vintage("V9"));
+    }
+
+    /// K-2 — THE IDENTITY CONTROL. V10 is the working tree's own schema batch,
+    /// so its upgrade must produce ZERO divergence. This is the assertion that
     /// proves a green K-1 means something rather than that the comparison is
     /// broken.
     #[test]
-    fn v9_the_identity_control_upgrades_to_a_byte_identical_schema()
+    fn v10_the_identity_control_upgrades_to_a_byte_identical_schema()
     {
-        let v = vintage("V9");
+        let v = vintage("V10");
         assert!(
             v.is_identity_control,
-            "V9 must be flagged as the identity control"
+            "V10 must be flagged as the identity control"
         );
         assert_vintage_upgrades(v);
     }
@@ -49808,13 +51947,18 @@ mod swallowed_failure_tests
     /// ⭐ This list is the point of Lock A: a NEW `query_map` that drops rows
     /// silently is red unless somebody deliberately adds its function here,
     /// and a name that stops matching is red too, so the list cannot rot.
-    const ROW_COLLECTOR_EXEMPT: [&str; 18] = [
+    ///
+    /// S196: `focus_analysis_writeback_target_ids` LEFT this list — its
+    /// two-read rewrite consumes its rows through
+    /// `collect_rows_counted` and fails closed on a dropped row. The old
+    /// OR-join body survives only as a `cfg(test)` oracle, which this scan
+    /// does not read.
+    const ROW_COLLECTOR_EXEMPT: [&str; 17] = [
         "execute_image_record_query",
         "execute_file_path_projection_query",
         "execute_image_record_projection_query",
         "execute_id_projection_query",
         "project_raw_jpeg_visible_ids_impl",
-        "focus_analysis_writeback_target_ids",
         "focus_writeback_stamped_ids",
         "focus_writeback_target_diagnostic",
         "pending_face_vector_delete_ids_impl",
@@ -51146,6 +53290,46 @@ mod panic_boundary_tests
         assert_eq!(r.failure_stage.as_deref(), Some("catalogue"), "an EXISTING stage the runner reads as failure");
         assert_eq!(r.updated, 0);
         assert!(says_injected(r.failed_reason.as_deref().unwrap_or("")));
+
+        // S196 — the film-negative pass's three wrapped functions.
+        let r = caught("negative_detection_candidate_page.panic.query_failed", 1, ||
+            futures::executor::block_on(negative_detection_candidate_page(
+                10,
+                "film-negative-v1".to_string(),
+                "run".to_string(),
+            )));
+        assert!(!r.query_ok && r.candidates.is_empty() && says_injected(r.query_error.as_deref().unwrap_or("")));
+
+        let r = caught("negative_detection_candidate_page_for_ids.panic.query_failed", 1, ||
+            futures::executor::block_on(negative_detection_candidate_page_for_ids(
+                vec![1],
+                10,
+                "film-negative-v1".to_string(),
+                "run".to_string(),
+            )));
+        assert!(!r.query_ok && says_injected(r.query_error.as_deref().unwrap_or("")));
+
+        let r = caught("update_negative_detection_results.panic.query_failed", 1, ||
+            futures::executor::block_on(update_negative_detection_results(vec![NegativeDetectionResult
+            {
+                id: 1,
+                detector_version: "film-negative-v1".to_string(),
+                analysis_run_id: "run".to_string(),
+                status: "failed".to_string(),
+                negative_confidence: None,
+                negative_kind: None,
+                signals_json: None,
+                auto_keywords: Vec::new(),
+            }])));
+        assert_eq!((r.updated, r.keywords_added, r.keywords_retracted), (0, 0, 0));
+        assert_eq!(r.failure_stage.as_deref(), Some("catalogue"), "an EXISTING stage token");
+        assert!(says_injected(r.failed_reason.as_deref().unwrap_or("")));
+        assert!(
+            r.warnings.iter().any(|warning|
+                warning.starts_with("negative_writeback_failed: stage=catalogue") && says_injected(warning)),
+            "{:?}",
+            r.warnings
+        );
 
         let r = caught("accept_face_cluster_as_person.panic.query_failed", 1, ||
             futures::executor::block_on(accept_face_cluster_as_person("run".to_string(), 1, "Ada".to_string())));
@@ -59786,6 +61970,1498 @@ mod image_paths_and_sizes_tests
                 offset,
                 page.len(),
                 page_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+}
+
+/// ⭐ S196 — film-negative detection: schema, queue, writeback, keyword
+/// retraction and the Query Builder arms, against the REAL schema (every
+/// fixture opens through `open_and_migrate_catalogue`, which fences the
+/// connection against extension fetches in test builds; the helper fences it
+/// again so the rule is visible here).
+#[cfg(test)]
+mod negative_detection_tests
+{
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    const VERSION: &str = "film-negative-v1";
+    const RUN: &str = "run-a";
+
+    struct Fixture
+    {
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for Fixture
+    {
+        fn drop(&mut self)
+        {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(self.path.with_extension("db.wal"));
+        }
+    }
+
+    /// Ids: 1 a.jpg + 2 a.nef (the hidden RAW twin) · 3 b.jpg · 4 c.nef (a
+    /// RAW with no rendered sibling, so visible) · 5 v.mov (video) · 6 d.jpg
+    /// with scanner metadata.
+    fn fresh_catalogue(tag: &str) -> (Fixture, Connection)
+    {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "plcore-negative-detection-test-{}-{}-{}.db",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+        let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH.
+        fence_connection_against_extension_fetches(&conn);
+
+        for (id, file, kind, stem, is_video, make, model) in [
+            (1, "a.jpg", "jpeg", "a", false, None, None),
+            (2, "a.nef", "raw", "a", false, None, None),
+            (3, "b.jpg", "jpeg", "b", false, None, None),
+            (4, "c.nef", "raw", "c", false, None, None),
+            (5, "v.mov", "other", "v", true, None, None),
+            (6, "d.jpg", "jpeg", "d", false, Some("Nikon"), Some("LS-5000")),
+        ]
+        {
+            conn.execute(
+                "INSERT INTO images (id, file_path, file_name, file_size, created_timestamp,
+                                     modified_timestamp, file_stem, image_kind, directory_path,
+                                     is_video, camera_make, camera_model)
+                 VALUES (?1, ?2, ?3, 100, 0, 0, ?4, ?5, '/n', ?6, ?7, ?8)",
+                params![id, format!("/n/{}", file), file, stem, kind, is_video, make, model],
+            )
+            .expect("seed image");
+        }
+        (Fixture { path }, conn)
+    }
+
+    fn verdict(id: i64, status: &str, confidence: Option<f64>, kind: Option<&str>, labels: &[&str]) -> NegativeDetectionResult
+    {
+        NegativeDetectionResult
+        {
+            id,
+            detector_version: VERSION.to_string(),
+            analysis_run_id: RUN.to_string(),
+            status: status.to_string(),
+            negative_confidence: confidence,
+            negative_kind: kind.map(|kind| kind.to_string()),
+            signals_json: Some("{\"bright_border\":0.9}".to_string()),
+            auto_keywords: labels.iter().map(|label| label.to_string()).collect(),
+        }
+    }
+
+    type Columns = (Option<String>, Option<String>, Option<String>, Option<f64>, Option<String>, Option<String>);
+
+    fn columns(conn: &Connection, id: i64) -> Columns
+    {
+        conn.query_row(
+            "SELECT negative_detection_status, negative_detection_version, negative_detection_run_id,
+                    negative_confidence, negative_kind, negative_signals
+             FROM images WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        )
+        .expect("read negative columns")
+    }
+
+    fn stamp(conn: &Connection, id: i64, status: &str, version: Option<&str>, run: &str)
+    {
+        conn.execute(
+            "UPDATE images SET negative_detection_status = ?2, negative_detection_version = ?3,
+                               negative_detection_run_id = ?4
+             WHERE id = ?1",
+            params![id, status, version, run],
+        )
+        .expect("stamp");
+    }
+
+    fn page(conn: &Connection, version: &str, run: &str) -> Vec<i64>
+    {
+        let page = negative_detection_candidates_impl(conn, 200, version, run, None);
+        assert!(page.query_ok, "{:?}", page.query_error);
+        assert_eq!(page.dropped_rows, 0);
+        page.candidates.iter().map(|candidate| candidate.id).collect()
+    }
+
+    fn add_keyword(conn: &Connection, id: i64, path: &str, origin: i32, collection: bool)
+    {
+        conn.execute(
+            "INSERT INTO keyword (image_id, label, path, status, origin, collection, is_video)
+             VALUES (?1, ?2, ?2, 1, ?3, ?4, FALSE)",
+            params![id, path, origin, collection],
+        )
+        .expect("seed keyword");
+    }
+
+    /// `(path, status, origin, hidden)` of every row on one image, by path.
+    fn keywords(conn: &Connection, id: i64) -> Vec<(String, i32, i32, bool)>
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT path, status, origin, hidden_at IS NOT NULL FROM keyword
+                 WHERE image_id = ?1 ORDER BY path, status",
+            )
+            .expect("prepare keywords");
+        let rows = stmt
+            .query_map(params![id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .expect("query keywords");
+        rows.map(|row| row.expect("keyword row")).collect()
+    }
+
+    /// `(path, status, origin, collection)` of every row on one image, by path.
+    fn collection_rows(conn: &Connection, id: i64) -> Vec<(String, i32, i32, bool)>
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT path, status, origin, COALESCE(collection, FALSE) FROM keyword
+                 WHERE image_id = ?1 ORDER BY path, status, origin",
+            )
+            .expect("prepare collection rows");
+        let rows = stmt
+            .query_map(params![id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .expect("query collection rows");
+        rows.map(|row| row.expect("collection row")).collect()
+    }
+
+    #[test]
+    fn both_labels_are_written_as_keywords_and_collection_members_and_withdrawn_together()
+    {
+        let (_fixture, conn) = fresh_catalogue("collections");
+        let auto = KEYWORD_ORIGIN_AUTO;
+        let user_and_auto = KEYWORD_ORIGIN_USER | KEYWORD_ORIGIN_AUTO;
+        // Image 3 already carries a hand-made "negative" collection row.
+        conn.execute(
+            "INSERT INTO keyword (image_id, label, path, status, origin, collection, is_video)
+             VALUES (3, 'negative', 'negative', 1, ?1, TRUE, FALSE)",
+            params![KEYWORD_ORIGIN_USER],
+        )
+        .expect("hand-made negative collection row");
+
+        let receipt = update_negative_detection_results_impl(
+            &conn,
+            vec![
+                verdict(1, "complete", Some(0.9), Some("color"), &["film negative", "negative", "color negative"]),
+                verdict(3, "complete", Some(0.8), None, &["negative", "film negative"]),
+            ],
+            None,
+        );
+        assert_eq!(receipt.failure_stage, None, "{:?}", receipt.warnings);
+        assert_eq!((receipt.updated, receipt.keywords_added), (3, 8));
+        let expected_pair = vec![
+            ("color negative".to_string(), 1, auto, false),
+            ("film negative".to_string(), 1, auto, true),
+            ("negative".to_string(), 1, auto, true),
+        ];
+        assert_eq!(collection_rows(&conn, 1), expected_pair, "both labels are keywords AND collection members; the kind label is a keyword only");
+        assert_eq!(collection_rows(&conn, 2), expected_pair, "the hidden RAW twin's rows match");
+        assert_eq!(
+            collection_rows(&conn, 3),
+            vec![
+                ("film negative".to_string(), 1, auto, true),
+                ("negative".to_string(), 1, user_and_auto, true),
+            ],
+            "merged into the hand-made row: one row, origin user|auto, still a member"
+        );
+        assert!(negative_detection_label_is_a_collection("film negative"));
+        assert!(negative_detection_label_is_a_collection("negative"));
+        assert!(!negative_detection_label_is_a_collection("color negative"));
+
+        // A replay is a no-op: nothing added, nothing duplicated.
+        let replay = update_negative_detection_results_impl(
+            &conn,
+            vec![verdict(1, "complete", Some(0.9), Some("color"), &["film negative", "negative", "color negative"])],
+            None,
+        );
+        assert_eq!(replay.keywords_added, 0);
+        assert_eq!(collection_rows(&conn, 1).len(), 3);
+
+        // The verdict withdraws: auto bit AND membership go on both labels and
+        // on the twin; the user's own row keeps its user bit and membership.
+        let receipt = update_negative_detection_results_impl(
+            &conn,
+            vec![verdict(1, "complete", Some(0.1), None, &[]), verdict(3, "complete", Some(0.1), None, &[])],
+            None,
+        );
+        assert_eq!(receipt.keywords_retracted, 3 + 3 + 2);
+        let withdrawn = vec![
+            ("color negative".to_string(), 0, 0, false),
+            ("film negative".to_string(), 0, 0, false),
+            ("negative".to_string(), 0, 0, false),
+        ];
+        assert_eq!(collection_rows(&conn, 1), withdrawn);
+        assert_eq!(collection_rows(&conn, 2), withdrawn);
+        assert_eq!(
+            collection_rows(&conn, 3),
+            vec![
+                ("film negative".to_string(), 0, 0, false),
+                ("negative".to_string(), 1, KEYWORD_ORIGIN_USER, true),
+            ]
+        );
+    }
+
+    /// Richard's Oct 22 rulings applied retroactively at catalogue open.
+    #[test]
+    fn the_launch_backfill_adds_negative_and_flips_both_collections_once()
+    {
+        let (fixture, conn) = fresh_catalogue("backfill");
+        let auto = KEYWORD_ORIGIN_AUTO;
+        let user = KEYWORD_ORIGIN_USER;
+        let seed = |id: i64, path: &str, status: i32, origin: i32, collection: bool|
+        {
+            conn.execute(
+                "INSERT INTO keyword (image_id, label, path, status, origin, collection, is_video)
+                 VALUES (?1, ?2, ?2, ?3, ?4, ?5, FALSE)",
+                params![id, path, status, origin, collection],
+            )
+            .expect("seed keyword");
+        };
+        seed(1, "film negative", 1, auto, false); // the pass's row, before the ruling
+        seed(2, "film negative", 1, auto, false); // its hidden RAW twin
+        seed(3, "film negative", 1, auto, false); // + a hand-made "negative" collection row
+        seed(3, "negative", 1, user, true);
+        seed(4, "film negative", 1, auto, true); // already flipped by hand
+        seed(4, "negative", 1, auto, true); // and already converged
+        seed(6, "film negative", 1, user, false); // the user's own keyword: not the pass's
+        seed(5, "film negative", 0, auto, false); // a hidden row: not touched
+        conn.execute("UPDATE images SET is_video = TRUE WHERE id = 5", []).expect("video");
+
+        let report = backfill_negative_detection_keywords_and_collections(&conn).expect("backfill");
+        assert!(report.contains("4 image(s)") && report.contains("2 \"negative\" row(s) inserted"), "{}", report);
+
+        let member = vec![
+            ("film negative".to_string(), 1, auto, true),
+            ("negative".to_string(), 1, auto, true),
+        ];
+        assert_eq!(collection_rows(&conn, 1), member);
+        assert_eq!(collection_rows(&conn, 2), member);
+        assert_eq!(
+            collection_rows(&conn, 3),
+            vec![
+                ("film negative".to_string(), 1, auto, true),
+                ("negative".to_string(), 1, user | auto, true),
+            ],
+            "merged into the hand-made row, no duplicate"
+        );
+        assert_eq!(collection_rows(&conn, 4), member, "already converged: unchanged");
+        assert_eq!(collection_rows(&conn, 6), vec![("film negative".to_string(), 1, user, false)]);
+        assert_eq!(collection_rows(&conn, 5), vec![("film negative".to_string(), 0, auto, false)]);
+
+        // Idempotent: a second run (and a reopen, which runs it) writes nothing.
+        let again = backfill_negative_detection_keywords_and_collections(&conn).expect("second run");
+        assert!(again.contains("nothing to do"), "{}", again);
+        let before = (1..=6).map(|id| collection_rows(&conn, id)).collect::<Vec<_>>();
+        drop(conn);
+        let conn = open_and_migrate_catalogue(&fixture.path).expect("reopen");
+        fence_connection_against_extension_fetches(&conn);
+        let after = (1..=6).map(|id| collection_rows(&conn, id)).collect::<Vec<_>>();
+        assert_eq!(before, after, "the open-time step is idempotent");
+
+        // The collection subject finds them by label, membership-only.
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT id FROM images WHERE {} ORDER BY id",
+                predicate_to_sql(&QueryPredicate
+                {
+                    kind: "collection_is".to_string(),
+                    day: None,
+                    day_end: None,
+                    op: None,
+                    stars: None,
+                    value: Some("negative".to_string()),
+                    num: None,
+                    num_end: None,
+                })
+            ))
+            .expect("prepare collection_is");
+        let ids = stmt
+            .query_map([], |row| row.get::<_, i64>(0))
+            .expect("run collection_is")
+            .map(|row| row.expect("id"))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn the_six_columns_exist_nullable_and_unindexed()
+    {
+        let (_fixture, conn) = fresh_catalogue("schema");
+        let mut stmt = conn
+            .prepare(
+                "SELECT column_name, data_type, is_nullable FROM duckdb_columns()
+                 WHERE table_name = 'images' AND column_name LIKE 'negative_%'
+                 ORDER BY column_name",
+            )
+            .expect("prepare duckdb_columns()");
+        let found = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?)))
+            .expect("query duckdb_columns()")
+            .map(|row| row.expect("column row"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            found,
+            vec![
+                ("negative_confidence".to_string(), "DOUBLE".to_string(), true),
+                ("negative_detection_run_id".to_string(), "VARCHAR".to_string(), true),
+                ("negative_detection_status".to_string(), "VARCHAR".to_string(), true),
+                ("negative_detection_version".to_string(), "VARCHAR".to_string(), true),
+                ("negative_kind".to_string(), "VARCHAR".to_string(), true),
+                ("negative_signals".to_string(), "VARCHAR".to_string(), true),
+            ]
+        );
+        assert_eq!(columns(&conn, 1), (None, None, None, None, None, None), "NULL = pending");
+    }
+
+    /// The film-negative writeback's own S179 pin: no index may cover a column
+    /// `update_negative_detection_target` writes.
+    #[test]
+    fn negative_detection_writeback_columns_carry_no_index()
+    {
+        let (_fixture, conn) = fresh_catalogue("index");
+        let mut stmt = conn
+            .prepare(
+                "SELECT index_name, CAST(expressions AS VARCHAR) FROM duckdb_indexes()
+                 WHERE table_name = 'images'",
+            )
+            .expect("prepare duckdb_indexes()");
+        let indexes = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .expect("query duckdb_indexes()")
+            .map(|row| row.expect("index row"))
+            .collect::<Vec<_>>();
+        assert!(!indexes.is_empty(), "vacuity guard: images carries indexes to inspect");
+        for (index_name, expressions) in indexes
+        {
+            for column in NEGATIVE_DETECTION_WRITEBACK_UPDATED_COLUMNS
+            {
+                assert!(
+                    !expressions.contains(column),
+                    "index {} covers {}, a column the film-negative writeback WRITES — S179",
+                    index_name,
+                    column
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_queue_takes_pending_stills_and_skips_videos_hidden_raws_and_current_rows()
+    {
+        let (_fixture, conn) = fresh_catalogue("queue");
+
+        // Fresh: every still except the hidden RAW twin (2); never the video (5).
+        assert_eq!(page(&conn, VERSION, RUN), vec![1, 3, 4, 6]);
+        assert_eq!(negative_detection_candidate_count_impl(&conn, VERSION, RUN, None), 4);
+        let first = negative_detection_candidates_impl(&conn, 200, VERSION, RUN, None);
+        let scanner = first.candidates.iter().find(|candidate| candidate.id == 6).expect("candidate 6");
+        assert_eq!(
+            (scanner.file_path.as_str(), scanner.file_size, scanner.camera_make.as_deref(), scanner.camera_model.as_deref()),
+            ("/n/d.jpg", 100, Some("Nikon"), Some("LS-5000"))
+        );
+
+        stamp(&conn, 1, "complete", Some(VERSION), RUN); // current → done
+        stamp(&conn, 3, "complete", Some("film-negative-v0"), RUN); // older version → pending
+        stamp(&conn, 4, "failed", Some(VERSION), RUN); // retryable, THIS run → not re-fetched
+        stamp(&conn, 6, "unreadable", Some(VERSION), "run-old"); // retryable, another run → pending
+        assert_eq!(page(&conn, VERSION, RUN), vec![3, 6]);
+        assert_eq!(negative_detection_candidate_count_impl(&conn, VERSION, RUN, None), 2);
+
+        // A later run retries both retryable rows; the complete one stays done.
+        assert_eq!(page(&conn, VERSION, "run-b"), vec![3, 4, 6]);
+
+        // A NULL version with a status is still pending.
+        stamp(&conn, 1, "complete", None, RUN);
+        assert_eq!(page(&conn, VERSION, RUN), vec![1, 3, 6]);
+
+        // Limit is clamped 1…5000: 0 still returns one row, in id order.
+        let one = negative_detection_candidates_impl(&conn, 0, VERSION, RUN, None);
+        assert_eq!(one.candidates.iter().map(|c| c.id).collect::<Vec<_>>(), vec![1]);
+
+        // Selection scope: the hidden RAW (2) reaches its visible twin (1);
+        // the video never qualifies; an empty selection is an EMPTY queue.
+        let scoped = negative_detection_candidates_impl(&conn, 200, VERSION, RUN, Some(&[2, 5]));
+        assert!(scoped.query_ok);
+        assert_eq!(scoped.candidates.iter().map(|c| c.id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(negative_detection_candidate_count_impl(&conn, VERSION, RUN, Some(&[2, 5])), 1);
+        let empty = negative_detection_candidates_impl(&conn, 200, VERSION, RUN, Some(&[]));
+        assert!(empty.query_ok && empty.candidates.is_empty());
+        assert_eq!(negative_detection_candidate_count_impl(&conn, VERSION, RUN, Some(&[])), 0);
+    }
+
+    #[test]
+    fn a_complete_verdict_writes_the_columns_copies_to_the_raw_twin_and_adds_keywords()
+    {
+        let (_fixture, conn) = fresh_catalogue("complete");
+        let receipt = update_negative_detection_results_impl(
+            &conn,
+            vec![verdict(1, "complete", Some(0.91), Some("color"), &["film negative", "Color Negative "])],
+            None,
+        );
+        assert_eq!(
+            receipt,
+            NegativeDetectionWritebackResult
+            {
+                updated: 2,
+                keywords_added: 4,
+                keywords_retracted: 0,
+                warnings: Vec::new(),
+                failure_stage: None,
+                failed_reason: None,
+            }
+        );
+        let expected: Columns = (
+            Some("complete".to_string()),
+            Some(VERSION.to_string()),
+            Some(RUN.to_string()),
+            Some(0.91),
+            Some("color".to_string()),
+            Some("{\"bright_border\":0.9}".to_string()),
+        );
+        assert_eq!(columns(&conn, 1), expected);
+        assert_eq!(columns(&conn, 2), expected, "the hidden RAW twin carries the verdict");
+        for id in [1, 2]
+        {
+            assert_eq!(
+                keywords(&conn, id),
+                vec![
+                    ("color negative".to_string(), 1, KEYWORD_ORIGIN_AUTO, false),
+                    ("film negative".to_string(), 1, KEYWORD_ORIGIN_AUTO, false),
+                ],
+                "image {}: canonical lowercase spelling, origin auto",
+                id
+            );
+        }
+        // Done for this version: neither row is queued again.
+        assert_eq!(page(&conn, VERSION, "run-later"), vec![3, 4, 6]);
+
+        // A replay adds nothing (the rows already carry the auto bit).
+        let replay = update_negative_detection_results_impl(
+            &conn,
+            vec![verdict(1, "complete", Some(0.91), Some("color"), &["film negative", "color negative"])],
+            None,
+        );
+        assert_eq!((replay.updated, replay.keywords_added, replay.keywords_retracted), (2, 0, 0));
+        assert_eq!(keywords(&conn, 1).len(), 2, "no duplicate rows");
+    }
+
+    #[test]
+    fn failed_and_unreadable_verdicts_touch_no_keywords_and_never_reach_the_twin()
+    {
+        let (_fixture, conn) = fresh_catalogue("failed");
+        add_keyword(&conn, 1, "film negative", KEYWORD_ORIGIN_AUTO, false);
+
+        let receipt = update_negative_detection_results_impl(
+            &conn,
+            vec![
+                verdict(1, "failed", Some(0.95), Some("color"), &["color negative"]),
+                verdict(3, "unreadable", None, None, &[]),
+            ],
+            None,
+        );
+        assert_eq!((receipt.updated, receipt.keywords_added, receipt.keywords_retracted), (2, 0, 0));
+        assert!(receipt.warnings.is_empty(), "{:?}", receipt.warnings);
+        assert_eq!(
+            columns(&conn, 1),
+            (
+                Some("failed".to_string()),
+                Some(VERSION.to_string()),
+                Some(RUN.to_string()),
+                None,
+                None,
+                Some("{\"bright_border\":0.9}".to_string()),
+            ),
+            "a failed verdict carries no confidence or kind; its signals are kept"
+        );
+        assert_eq!(columns(&conn, 2), (None, None, None, None, None, None), "never copied to the twin");
+        assert_eq!(
+            keywords(&conn, 1),
+            vec![("film negative".to_string(), 1, KEYWORD_ORIGIN_AUTO, false)],
+            "the earlier auto keyword is untouched — failed is not a verdict"
+        );
+        assert_eq!(keywords(&conn, 3), Vec::new());
+    }
+
+    #[test]
+    fn a_complete_verdict_retracts_only_the_auto_bit_of_managed_labels_it_no_longer_carries()
+    {
+        let (_fixture, conn) = fresh_catalogue("retract");
+        let user_and_auto = KEYWORD_ORIGIN_USER | KEYWORD_ORIGIN_AUTO;
+        add_keyword(&conn, 3, "film negative", user_and_auto, false);
+        add_keyword(&conn, 3, "color negative", KEYWORD_ORIGIN_AUTO, false);
+        add_keyword(&conn, 3, "black and white negative", KEYWORD_ORIGIN_USER, false);
+        add_keyword(&conn, 3, "dog", KEYWORD_ORIGIN_AUTO, false);
+        add_keyword(&conn, 6, "film negative", KEYWORD_ORIGIN_AUTO, true);
+        add_keyword(&conn, 6, "color negative", KEYWORD_ORIGIN_AUTO, false);
+
+        // 3 is judged NOT a negative; 6 is still a negative but no longer colour.
+        let receipt = update_negative_detection_results_impl(
+            &conn,
+            vec![
+                verdict(3, "complete", Some(0.12), None, &[]),
+                verdict(6, "complete", Some(0.70), None, &["film negative"]),
+            ],
+            None,
+        );
+        assert_eq!((receipt.updated, receipt.keywords_added, receipt.keywords_retracted), (2, 0, 3));
+        assert!(receipt.warnings.is_empty(), "{:?}", receipt.warnings);
+
+        assert_eq!(
+            keywords(&conn, 3),
+            vec![
+                // USER-only managed row: never touched.
+                ("black and white negative".to_string(), 1, KEYWORD_ORIGIN_USER, false),
+                // Auto-only: auto bit cleared, origin 0, soft-hidden (editor-save precedent).
+                ("color negative".to_string(), 0, 0, true),
+                // A non-managed auto label: never touched.
+                ("dog".to_string(), 1, KEYWORD_ORIGIN_AUTO, false),
+                // User + auto: keeps the user bit, stays active.
+                ("film negative".to_string(), 1, KEYWORD_ORIGIN_USER, false),
+            ]
+        );
+        assert_eq!(
+            keywords(&conn, 6),
+            vec![
+                ("color negative".to_string(), 0, 0, true),
+                // Still carried: kept, untouched.
+                ("film negative".to_string(), 1, KEYWORD_ORIGIN_AUTO, false),
+            ]
+        );
+
+        // A collection-member pure-auto "film negative" row: since Richard's
+        // Oct 22 ruling the collection membership is the PASS's own, so the
+        // retraction withdraws it with the auto bit and the row is hidden.
+        let receipt = update_negative_detection_results_impl(
+            &conn,
+            vec![verdict(6, "complete", Some(0.05), None, &[])],
+            None,
+        );
+        assert_eq!(receipt.keywords_retracted, 1);
+        assert_eq!(keywords(&conn, 6)[1], ("film negative".to_string(), 0, 0, true));
+
+        // A later verdict re-adds a retracted label as a fresh active row; the
+        // hidden one stays hidden for history.
+        let receipt = update_negative_detection_results_impl(
+            &conn,
+            vec![verdict(3, "complete", Some(0.88), Some("color"), &["film negative", "color negative"])],
+            None,
+        );
+        assert_eq!((receipt.keywords_added, receipt.keywords_retracted), (2, 0));
+        assert_eq!(
+            keywords(&conn, 3),
+            vec![
+                ("black and white negative".to_string(), 1, KEYWORD_ORIGIN_USER, false),
+                ("color negative".to_string(), 0, 0, true),
+                ("color negative".to_string(), 1, KEYWORD_ORIGIN_AUTO, false),
+                ("dog".to_string(), 1, KEYWORD_ORIGIN_AUTO, false),
+                ("film negative".to_string(), 1, user_and_auto, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn labels_outside_the_managed_set_and_invalid_values_are_dropped_with_warnings()
+    {
+        let (_fixture, conn) = fresh_catalogue("sanitise");
+        let mut oversized = verdict(4, "complete", Some(1.7), Some("sepia"), &["film negative", "slide", "dog"]);
+        oversized.signals_json = Some("x".repeat(NEGATIVE_DETECTION_SIGNALS_MAX_BYTES + 1));
+        let receipt = update_negative_detection_results_impl(
+            &conn,
+            vec![
+                oversized,
+                verdict(3, "maybe", Some(0.5), Some("color"), &["film negative"]),
+                verdict(6, "complete", None, None, &["film negative"]),
+                verdict(1, "complete", Some(f64::NAN), None, &["film negative"]),
+            ],
+            None,
+        );
+        assert_eq!((receipt.updated, receipt.keywords_added, receipt.keywords_retracted), (4, 1, 0));
+        let count = |token: &str| receipt.warnings.iter().filter(|w| w.starts_with(&format!("{}: ", token))).count();
+        assert_eq!(count(NEGATIVE_WRITEBACK_WARNING_LABEL_DROPPED), 2, "{:?}", receipt.warnings);
+        assert_eq!(count(NEGATIVE_WRITEBACK_WARNING_VALUE_DROPPED), 3, "clamp, kind, signals: {:?}", receipt.warnings);
+        assert_eq!(count(NEGATIVE_WRITEBACK_WARNING_QUARANTINED), 3, "{:?}", receipt.warnings);
+        assert_eq!(receipt.warnings.len(), 8);
+
+        assert_eq!(
+            columns(&conn, 4),
+            (Some("complete".to_string()), Some(VERSION.to_string()), Some(RUN.to_string()), Some(1.0), None, None)
+        );
+        assert_eq!(keywords(&conn, 4), vec![("film negative".to_string(), 1, KEYWORD_ORIGIN_AUTO, false)]);
+        for id in [3, 6, 1]
+        {
+            assert_eq!(
+                columns(&conn, id),
+                (Some("failed".to_string()), Some(VERSION.to_string()), Some(RUN.to_string()), None, None, None),
+                "image {} is quarantined to failed",
+                id
+            );
+            assert_eq!(keywords(&conn, id), Vec::new());
+        }
+        assert_eq!(columns(&conn, 2), (None, None, None, None, None, None), "a quarantined verdict never reaches the twin");
+    }
+
+    #[test]
+    fn a_duplicate_source_fails_the_chunk_at_planning_and_writes_nothing()
+    {
+        let (_fixture, conn) = fresh_catalogue("duplicate");
+        let receipt = update_negative_detection_results_impl(
+            &conn,
+            vec![
+                verdict(3, "complete", Some(0.9), None, &["film negative"]),
+                verdict(3, "complete", Some(0.8), None, &["film negative"]),
+            ],
+            None,
+        );
+        assert_eq!((receipt.updated, receipt.keywords_added), (0, 0));
+        assert_eq!(receipt.warnings.len(), 1);
+        assert!(receipt.warnings[0].starts_with("negative_writeback_failed: stage=planning: "), "{:?}", receipt.warnings);
+        assert!(receipt.warnings[0].contains("duplicate source_image_id=3"));
+        assert_eq!(receipt.failure_stage.as_deref(), Some("planning"));
+        assert!(receipt.failed_reason.as_deref().unwrap_or("").contains("duplicate source_image_id=3"));
+        assert_eq!(columns(&conn, 3), (None, None, None, None, None, None));
+
+        let empty = update_negative_detection_results_impl(&conn, Vec::new(), None);
+        assert_eq!(
+            empty,
+            NegativeDetectionWritebackResult
+            {
+                updated: 0,
+                keywords_added: 0,
+                keywords_retracted: 0,
+                warnings: Vec::new(),
+                failure_stage: None,
+                failed_reason: None,
+            }
+        );
+    }
+
+    /// S179: a change count other than 1 that the TABLE confirms is accepted,
+    /// counted once and recorded; one the table cannot confirm rolls back and
+    /// is retried once; a second failure is a failure with nothing written.
+    #[test]
+    fn the_change_count_is_verified_on_the_table_and_an_unverified_chunk_retries_once()
+    {
+        let (_fixture, conn) = fresh_catalogue("verify");
+
+        // (1) Engine says 2, the write really landed once → accepted.
+        let probe = NegativeApplyProbe::new(1, true, 2);
+        let receipt = update_negative_detection_results_impl(
+            &conn,
+            vec![verdict(1, "complete", Some(0.8), Some("color"), &["film negative"]), verdict(3, "failed", None, None, &[])],
+            Some(&probe),
+        );
+        assert_eq!((receipt.updated, receipt.keywords_added), (3, 2), "{:?}", receipt.warnings);
+        assert_eq!(receipt.warnings.len(), 1, "{:?}", receipt.warnings);
+        assert!(receipt.warnings[0].starts_with("negative_writeback_count_anomaly: UPDATE images reported 2 rows"));
+        assert_eq!(columns(&conn, 1).0.as_deref(), Some("complete"));
+
+        // (2) The write never landed on the first attempt → rollback, one retry, success.
+        let first_attempt_only = NegativeApplyProbe::new(4, false, 0).firing_at_most(1);
+        let receipt = update_negative_detection_results_impl(
+            &conn,
+            vec![verdict(6, "complete", Some(0.7), None, &["film negative"]), verdict(4, "complete", Some(0.9), None, &["film negative"])],
+            Some(&first_attempt_only),
+        );
+        assert_eq!((receipt.updated, receipt.keywords_added), (2, 2), "{:?}", receipt.warnings);
+        assert_eq!(receipt.warnings.len(), 1, "{:?}", receipt.warnings);
+        assert!(receipt.warnings[0].starts_with("negative_writeback_chunk_retried: "), "{:?}", receipt.warnings);
+        assert_eq!((receipt.failure_stage.as_deref(), receipt.failed_reason.as_deref()), (None, None), "a retried chunk that commits is a success");
+        assert_eq!(columns(&conn, 4).0.as_deref(), Some("complete"));
+        assert_eq!(keywords(&conn, 6).len(), 1, "the rolled-back attempt left no keyword behind");
+
+        // (3) Unverifiable on BOTH attempts → failure, nothing from the chunk
+        // written. Image 3 ALREADY carries this run id (its `failed` stamp from
+        // (1)), so a V1 that matched the run id alone would wrongly confirm the
+        // write that never landed — measured: it did, before V1 compared the
+        // whole stamp.
+        let always = NegativeApplyProbe::new(3, false, 0);
+        let receipt = update_negative_detection_results_impl(
+            &conn,
+            vec![verdict(3, "complete", Some(0.9), None, &["film negative"])],
+            Some(&always),
+        );
+        assert_eq!((receipt.updated, receipt.keywords_added, receipt.keywords_retracted), (0, 0, 0));
+        assert_eq!(receipt.warnings.len(), 2, "{:?}", receipt.warnings);
+        assert!(receipt.warnings[0].starts_with("negative_writeback_chunk_retried: "));
+        assert!(receipt.warnings[1].starts_with("negative_writeback_failed: stage=apply: "));
+        assert!(receipt.warnings[1].contains("still failed after one retry"));
+        assert_eq!(receipt.failure_stage.as_deref(), Some("apply"));
+        assert!(receipt.failed_reason.as_deref().unwrap_or("").contains("still failed after one retry"));
+        assert_eq!(columns(&conn, 3).0.as_deref(), Some("failed"), "the earlier committed stamp, untouched");
+        assert_eq!(keywords(&conn, 3), Vec::new());
+    }
+
+    /// Review F1 — the V2 pin. The target row is right (V1 holds) but the
+    /// statement window also stamped a row OUTSIDE the plan with this run id:
+    /// V2 must refuse, the chunk rolls back, retries once, and fails with
+    /// nothing written. Mutation-proved: dropping V2's two conjuncts from
+    /// `confirms_single_write` turns this test red.
+    #[test]
+    fn v2_refuses_a_write_that_also_stamped_a_row_outside_the_plan()
+    {
+        let (_fixture, conn) = fresh_catalogue("v2");
+        let probe = NegativeApplyProbe::new(3, true, 2).also_stamping(6);
+        let receipt = update_negative_detection_results_impl(
+            &conn,
+            vec![verdict(3, "complete", Some(0.9), None, &["film negative"])],
+            Some(&probe),
+        );
+        assert_eq!(receipt.failure_stage.as_deref(), Some("apply"), "{:?}", receipt.warnings);
+        assert_eq!((receipt.updated, receipt.keywords_added), (0, 0));
+        assert!(receipt.failed_reason.as_deref().unwrap_or("").contains("rows outside the plan carrying it 1 (before the writes 0)"));
+        assert_eq!(columns(&conn, 3), (None, None, None, None, None, None));
+        assert_eq!(columns(&conn, 6).2, None, "the stray stamp was rolled back too");
+        assert_eq!(keywords(&conn, 3), Vec::new());
+    }
+
+    /// Review F3 — a kind label must agree with the verdict's kind; "film
+    /// negative" never depends on it.
+    #[test]
+    fn a_kind_label_that_disagrees_with_the_verdicts_kind_is_dropped()
+    {
+        let (_fixture, conn) = fresh_catalogue("kind-label");
+        let receipt = update_negative_detection_results_impl(
+            &conn,
+            vec![
+                verdict(3, "complete", Some(0.8), Some("black and white"), &["film negative", "color negative", "black and white negative"]),
+                verdict(6, "complete", Some(0.7), None, &["film negative", "color negative", "black and white negative"]),
+            ],
+            None,
+        );
+        assert_eq!((receipt.updated, receipt.keywords_added), (2, 3), "{:?}", receipt.warnings);
+        assert_eq!(receipt.warnings.len(), 3, "{:?}", receipt.warnings);
+        assert!(receipt.warnings.iter().all(|w| w.starts_with("negative_writeback_label_dropped: ")));
+        assert_eq!(
+            keywords(&conn, 3),
+            vec![
+                ("black and white negative".to_string(), 1, KEYWORD_ORIGIN_AUTO, false),
+                ("film negative".to_string(), 1, KEYWORD_ORIGIN_AUTO, false),
+            ]
+        );
+        assert_eq!(keywords(&conn, 6), vec![("film negative".to_string(), 1, KEYWORD_ORIGIN_AUTO, false)]);
+    }
+
+    /// Review F4 — one chunk carries one run; a mixed chunk fails at planning.
+    #[test]
+    fn a_chunk_that_mixes_run_ids_fails_at_planning()
+    {
+        let (_fixture, conn) = fresh_catalogue("mixed-runs");
+        let mut other_run = verdict(6, "complete", Some(0.9), None, &["film negative"]);
+        other_run.analysis_run_id = "run-b".to_string();
+        let receipt = update_negative_detection_results_impl(
+            &conn,
+            vec![verdict(3, "complete", Some(0.9), None, &["film negative"]), other_run],
+            None,
+        );
+        assert_eq!(receipt.failure_stage.as_deref(), Some("planning"));
+        assert_eq!(receipt.updated, 0);
+        assert!(receipt.failed_reason.as_deref().unwrap_or("").contains("mixes analysis_run_id values"));
+        assert_eq!(columns(&conn, 3), (None, None, None, None, None, None));
+        assert_eq!(columns(&conn, 6), (None, None, None, None, None, None));
+    }
+
+    /// SCALE EVIDENCE, not a pin (`#[ignore]`d; run with
+    /// `cargo test --release --lib negative_detection_scale_evidence -- --ignored --nocapture`).
+    /// A ~600k-row catalogue (every 10th row a RAW twin of the JPEG before it,
+    /// two keyword rows per image), then one page fetch, one count and 14-result
+    /// writeback chunks at 0, 100k and 500k rows already stamped by this run.
+    #[test]
+    #[ignore]
+    fn negative_detection_scale_evidence()
+    {
+        let (_fixture, conn) = fresh_catalogue("scale");
+        conn.execute_batch("DELETE FROM images;").expect("clear seed rows");
+        let started = std::time::Instant::now();
+        conn.execute_batch(
+            "INSERT INTO images (id, file_path, file_name, file_size, created_timestamp, modified_timestamp,
+                                 file_extension, file_stem, image_kind, directory_path, is_video)
+             SELECT i,
+                    '/scale/d' || (i // 1000) || '/f' || (CASE WHEN i % 10 = 0 THEN i - 1 ELSE i END)
+                        || (CASE WHEN i % 10 = 0 THEN '.nef' ELSE '.jpg' END),
+                    'f' || i, 1000, 0, 0,
+                    CASE WHEN i % 10 = 0 THEN 'nef' ELSE 'jpg' END,
+                    'f' || (CASE WHEN i % 10 = 0 THEN i - 1 ELSE i END),
+                    CASE WHEN i % 10 = 0 THEN 'raw' ELSE 'jpeg' END,
+                    '/scale/d' || (i // 1000),
+                    FALSE
+             FROM range(1, 600001) t(i);
+             INSERT INTO keyword (image_id, label, path, status, origin, is_video)
+             SELECT i, 'dog', 'dog', 1, 2, FALSE FROM range(1, 600001) t(i);
+             INSERT INTO keyword (image_id, label, path, status, origin, is_video)
+             SELECT i, 'Trip', 'Trip', 1, 1, FALSE FROM range(1, 600001) t(i);",
+        )
+        .expect("seed the scale catalogue");
+        println!("SCALE seed: 600000 images + 1200000 keyword rows in {:.1} s", started.elapsed().as_secs_f64());
+
+        for stamped in [0i64, 100_000, 500_000]
+        {
+            conn.execute_batch(&format!(
+                "UPDATE images SET negative_detection_status = NULL, negative_detection_version = NULL,
+                                   negative_detection_run_id = NULL;
+                 UPDATE images SET negative_detection_status = 'complete',
+                                   negative_detection_version = '{v}', negative_detection_run_id = '{r}',
+                                   negative_confidence = 0.1
+                 WHERE id <= {n};
+                 CHECKPOINT;",
+                v = VERSION,
+                r = RUN,
+                n = stamped
+            ))
+            .expect("stamp");
+
+            let t = std::time::Instant::now();
+            let page = negative_detection_candidates_impl(&conn, 200, VERSION, RUN, None);
+            let page_ms = t.elapsed().as_secs_f64() * 1000.0;
+            assert!(page.query_ok && page.candidates.len() == 200);
+
+            let t = std::time::Instant::now();
+            let count = negative_detection_candidate_count_impl(&conn, VERSION, RUN, None);
+            let count_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            let t = std::time::Instant::now();
+            let focus = focus_analysis_candidates_impl(&conn, 200, "focus-v-scale", "focus-run", None);
+            let focus_ms = t.elapsed().as_secs_f64() * 1000.0;
+            assert!(focus.query_ok);
+
+            let t = std::time::Instant::now();
+            let total = negative_run_total(&conn, RUN).expect("run total");
+            let run_total_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            let mut chunk_ms = Vec::new();
+            for chunk in page.candidates.chunks(14).take(5)
+            {
+                let results = chunk
+                    .iter()
+                    .map(|candidate| verdict(candidate.id, "complete", Some(0.9), Some("color"), &["film negative", "color negative"]))
+                    .collect::<Vec<_>>();
+                let t = std::time::Instant::now();
+                let receipt = update_negative_detection_results_impl(&conn, results, None);
+                chunk_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(receipt.failure_stage, None, "{:?}", receipt.warnings);
+            }
+            chunk_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+            // Phase split on fresh candidates: a chunk of failed verdicts (no
+            // keyword work), then one keyword upsert and one retraction read.
+            let fresh = negative_detection_candidates_impl(&conn, 200, VERSION, RUN, None);
+            let ids = fresh.candidates.iter().map(|c| c.id).collect::<Vec<_>>();
+            let results = ids[..14]
+                .iter()
+                .map(|id| verdict(*id, "failed", None, None, &[]))
+                .collect::<Vec<_>>();
+            let t = std::time::Instant::now();
+            let receipt = update_negative_detection_results_impl(&conn, results, None);
+            let no_keyword_ms = t.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(receipt.failure_stage, None);
+            let t = std::time::Instant::now();
+            insert_or_merge_active_keyword_for_image(&conn, ids[20], &["film negative".to_string()], KEYWORD_ORIGIN_AUTO)
+                .expect("upsert");
+            let upsert_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let t = std::time::Instant::now();
+            apply_negative_detection_keywords(&conn, ids[21], &[]).expect("retract");
+            let retract_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let t = std::time::Instant::now();
+            conn.execute("UPDATE images SET negative_kind = NULL WHERE id = ?1", params![ids[22]]).expect("update");
+            let update_ms = t.elapsed().as_secs_f64() * 1000.0;
+            // The same three statements INSIDE a transaction that has already
+            // updated `images` (the writeback's real shape).
+            conn.execute_batch("BEGIN TRANSACTION;").expect("begin");
+            conn.execute("UPDATE images SET negative_kind = 'color' WHERE id = ?1", params![ids[30]]).expect("txn update");
+            let t = std::time::Instant::now();
+            conn.query_row("SELECT 1 FROM keyword WHERE image_id = ? AND path = ? AND status = 1 LIMIT 1", params![ids[30], "dog"], |r| r.get::<_, i64>(0)).expect("exists");
+            let txn_exists_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let t = std::time::Instant::now();
+            conn.execute(
+                "INSERT INTO keyword (image_id, label, path, status, origin, created_at, is_video) \
+                 VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP, COALESCE((SELECT is_video FROM images WHERE id = ? LIMIT 1), FALSE))",
+                params![ids[30], "film negative", "film negative", KEYWORD_ORIGIN_AUTO, ids[30]],
+            ).expect("txn insert");
+            let txn_insert_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let t = std::time::Instant::now();
+            conn.query_row("SELECT 1 FROM keyword WHERE image_id = ? AND path = ? AND status = 1 LIMIT 1", params![ids[31], "dog"], |r| r.get::<_, i64>(0)).expect("exists after insert");
+            let txn_exists_after_insert_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let t = std::time::Instant::now();
+            apply_negative_detection_keywords(&conn, ids[31], &[]).expect("txn retract");
+            let txn_retract_ms = t.elapsed().as_secs_f64() * 1000.0;
+            conn.execute_batch("ROLLBACK;").expect("rollback");
+
+            // Planning's per-result twin lookup (culling's helper).
+            let t = std::time::Instant::now();
+            let twins = focus_analysis_writeback_target_ids(&conn, 9).expect("targets of id 9");
+            println!("SCALE stamped={:>6} focus_analysis_writeback_target_ids(9) = {:?} in {:.1} ms", stamped, twins, t.elapsed().as_secs_f64() * 1000.0);
+
+            // COMMIT cost of a transaction holding 32 keyword INSERTs.
+            conn.execute_batch("BEGIN TRANSACTION;").expect("begin 2");
+            let t = std::time::Instant::now();
+            for id in &ids[40..72]
+            {
+                conn.execute(
+                    "INSERT INTO keyword (image_id, label, path, status, origin, created_at, is_video) \
+                     VALUES (?, 'film negative', 'film negative', 1, 2, CURRENT_TIMESTAMP, FALSE)",
+                    params![id],
+                ).expect("insert");
+            }
+            let inserts_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let t = std::time::Instant::now();
+            conn.execute_batch("COMMIT;").expect("commit");
+            let commit_ms = t.elapsed().as_secs_f64() * 1000.0;
+            println!("SCALE stamped={:>6} 32 keyword INSERTs {:.1} ms · their COMMIT {:.1} ms", stamped, inserts_ms, commit_ms);
+            conn.execute_batch("BEGIN TRANSACTION;").expect("begin 3");
+            conn.execute("UPDATE images SET negative_kind = 'color' WHERE id = ?1", params![ids[80]]).expect("u");
+            let t = std::time::Instant::now();
+            conn.execute_batch("COMMIT;").expect("commit 3");
+            println!("SCALE stamped={:>6} COMMIT of one images UPDATE {:.1} ms", stamped, t.elapsed().as_secs_f64() * 1000.0);
+            println!(
+                "SCALE stamped={:>6} in-txn: exists {:.1} ms · insert {:.1} ms · exists after an insert {:.1} ms · retraction read after an insert {:.1} ms",
+                stamped, txn_exists_ms, txn_insert_ms, txn_exists_after_insert_ms, txn_retract_ms
+            );
+            println!(
+                "SCALE stamped={:>6} phases: 14 failed verdicts (no keywords) {:.1} ms · one keyword upsert {:.1} ms · one retraction read {:.1} ms · one PK UPDATE {:.1} ms",
+                stamped, no_keyword_ms, upsert_ms, retract_ms, update_ms
+            );
+            println!(
+                "SCALE stamped={:>6}: page {:.1} ms · count {:.1} ms ({} pending) · focus page {:.1} ms · run-id COUNT {:.1} ms ({} rows) · 14-result chunk median {:.1} ms (min {:.1}, max {:.1})",
+                stamped, page_ms, count_ms, count, focus_ms, run_total_ms, total,
+                chunk_ms[chunk_ms.len() / 2], chunk_ms[0], chunk_ms[chunk_ms.len() - 1]
+            );
+        }
+    }
+
+    #[test]
+    fn an_editor_save_nulls_the_six_columns_so_the_image_is_detected_again()
+    {
+        let (_fixture, conn) = fresh_catalogue("editor");
+        let receipt = update_negative_detection_results_impl(
+            &conn,
+            vec![verdict(3, "complete", Some(0.9), Some("black and white"), &["film negative", "black and white negative"])],
+            None,
+        );
+        assert_eq!(receipt.updated, 1);
+        editor_saved_image_invalidate_analysis(&conn, &[3], &[], &[], &[], &[]).expect("invalidate");
+        assert_eq!(columns(&conn, 3), (None, None, None, None, None, None));
+        assert_eq!(page(&conn, VERSION, RUN), vec![1, 3, 4, 6]);
+        // The editor-save auto-bit clear hides the pass's pure-auto KIND label;
+        // the "film negative" row is a collection member, so (S62 doctrine)
+        // the editor save keeps it active at origin 0.
+        assert_eq!(
+            keywords(&conn, 3),
+            vec![
+                ("black and white negative".to_string(), 0, 0, true),
+                ("film negative".to_string(), 1, 0, false),
+            ]
+        );
+        // A later NOT-negative verdict withdraws that orphaned membership, so
+        // the collection still follows the verdict after an edit.
+        let receipt = update_negative_detection_results_impl(
+            &conn,
+            vec![verdict(3, "complete", Some(0.1), None, &[])],
+            None,
+        );
+        assert_eq!(receipt.keywords_retracted, 1);
+        assert_eq!(
+            collection_rows(&conn, 3),
+            vec![
+                ("black and white negative".to_string(), 0, 0, false),
+                ("film negative".to_string(), 0, 0, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_query_builder_finds_photos_by_negative_confidence()
+    {
+        let (_fixture, conn) = fresh_catalogue("query");
+        let receipt = update_negative_detection_results_impl(
+            &conn,
+            vec![
+                verdict(1, "complete", Some(0.91), Some("color"), &["film negative", "color negative"]),
+                verdict(3, "complete", Some(0.30), None, &[]),
+                verdict(6, "complete", Some(0.65), Some("black and white"), &["film negative", "black and white negative"]),
+            ],
+            None,
+        );
+        assert_eq!(receipt.updated, 4);
+
+        let predicate = |op: &str, num: f64| QueryPredicate
+        {
+            kind: "negative_conf_num".to_string(),
+            day: None,
+            day_end: None,
+            op: Some(op.to_string()),
+            stars: None,
+            value: None,
+            num: Some(num),
+            num_end: None,
+        };
+        let ids = |sql: String| -> Vec<i64>
+        {
+            let mut stmt = conn
+                .prepare(&format!("SELECT id FROM images WHERE {} ORDER BY id", sql))
+                .expect("prepare predicate");
+            let rows = stmt.query_map([], |row| row.get::<_, i64>(0)).expect("run predicate");
+            rows.map(|row| row.expect("id")).collect()
+        };
+
+        assert_eq!(ids(predicate_to_sql(&predicate("gte", 0.6))), vec![1, 2, 6]);
+        assert_eq!(ids(predicate_to_sql(&predicate("lt", 0.6))), vec![3]);
+        assert_eq!(ids(predicate_to_sql(&predicate("eq", 0.65))), vec![6]);
+
+        // The "is exactly" dropdown source lists the stored doubles.
+        let mut stmt = conn.prepare(&distinct_numeric_values_sql("negative_confidence")).expect("prepare distinct");
+        let values = stmt
+            .query_map([], |row| row.get::<_, f64>(0))
+            .expect("run distinct")
+            .map(|row| row.expect("value"))
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![0.30, 0.65, 0.91]);
+    }
+}
+
+/// ⭐ S196 — the two-read twin lookup must answer EXACTLY what the
+/// old OR-join query answered, for every id, on the shapes a catalogue holds.
+#[cfg(test)]
+mod twin_lookup_tests
+{
+    use super::*;
+
+    fn seed(conn: &Connection, id: i64, path: &str, kind: &str, stem: Option<&str>, directory: Option<&str>, is_video: bool)
+    {
+        conn.execute(
+            "INSERT INTO images (id, file_path, file_name, file_size, created_timestamp, modified_timestamp,
+                                 file_stem, image_kind, directory_path, is_video)
+             VALUES (?1, ?2, ?2, 1, 0, 0, ?3, ?4, ?5, ?6)",
+            params![id, path, stem, kind, directory, is_video],
+        )
+        .expect("seed");
+    }
+
+    #[test]
+    fn the_indexed_twin_lookup_equals_the_old_or_join_on_every_id()
+    {
+        let path = std::env::temp_dir().join(format!("plcore-twin-lookup-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+        let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH.
+        fence_connection_against_extension_fetches(&conn);
+
+        let rows: [(i64, &str, &str, Option<&str>, Option<&str>, bool); 22] = [
+            (1, "/a/lone.jpg", "jpeg", Some("lone"), Some("/a"), false),          // lone JPEG
+            (2, "/a/pair.jpg", "jpeg", Some("pair"), Some("/a"), false),          // JPEG + RAW
+            (3, "/a/pair.nef", "raw", Some("pair"), Some("/a"), false),
+            (4, "/a/tri.heic", "heif", Some("tri"), Some("/a"), false),           // HEIF + RAW + JPEG
+            (5, "/a/tri.nef", "raw", Some("tri"), Some("/a"), false),
+            (6, "/a/tri.jpg", "jpeg", Some("tri"), Some("/a"), false),
+            (7, "/a/solo.cr3", "raw", Some("solo"), Some("/a"), false),           // RAW alone
+            (8, "/b/pair.jpg", "jpeg", Some("pair"), Some("/b"), false),          // same stem, other dir
+            (9, "/b/pair.arw", "raw", Some("pair"), Some("/b"), false),
+            (10, "/c/case.JPG", "jpeg", Some("case"), Some("/c"), false),         // case-variant extensions
+            (11, "/c/case.jpg", "jpeg", Some("case"), Some("/c"), false),
+            (12, "/c/case.NEF", "raw", Some("case"), Some("/c"), false),
+            (13, "/c/hh.heic", "heif", Some("hh"), Some("/c"), false),            // two HEIFs + RAW
+            (14, "/c/hh.HEIC", "heif", Some("hh"), Some("/c"), false),
+            (15, "/c/hh.dng", "raw", Some("hh"), Some("/c"), false),
+            (16, "/a/pair.mov", "other", Some("pair"), Some("/a"), true),         // video sharing a stem
+            (17, "/d/legacy.jpg", "jpeg", None, None, false),                     // legacy row, no keys
+            (18, "/d/legacy.nef", "raw", Some("legacy"), Some("/d"), false),
+            (19, "/e/Mixed.jpg", "jpeg", Some("Mixed"), Some("/e"), false),       // stem case differs
+            (20, "/e/mixed.nef", "raw", Some("mixed"), Some("/e"), false),
+            (21, "/f/two.raf", "raw", Some("two"), Some("/f"), false),            // two RAWs behind one JPEG
+            (22, "/f/two.jpg", "jpeg", Some("two"), Some("/f"), false),
+        ];
+        for (id, file, kind, stem, directory, is_video) in rows
+        {
+            seed(&conn, id, file, kind, stem, directory, is_video);
+        }
+        seed(&conn, 23, "/f/two.dng", "raw", Some("two"), Some("/f"), false);
+        // A directory OVER 2,048 rows (DuckDB's index-scan threshold), so the
+        // directory read falls back to a sequential scan: the answer must not
+        // change with the plan.
+        conn.execute_batch(
+            "INSERT INTO images (id, file_path, file_name, file_size, created_timestamp, modified_timestamp,
+                                 file_stem, image_kind, directory_path, is_video)
+             SELECT 1000 + i, '/big/f' || i || '.jpg', 'f' || i, 1, 0, 0, 'f' || i, 'jpeg', '/big', FALSE
+             FROM range(0, 2100) t(i);",
+        )
+        .expect("seed the big directory");
+        seed(&conn, 25, "/big/pp.jpg", "jpeg", Some("pp"), Some("/big"), false);
+        seed(&conn, 26, "/big/pp.nef", "raw", Some("pp"), Some("/big"), false);
+        seed(&conn, 27, "/big/pp.HEIC", "heif", Some("pp"), Some("/big"), false);
+        let plan =
+        {
+            let mut stmt = conn
+                .prepare("EXPLAIN ANALYZE SELECT id, image_kind, file_path, file_stem FROM images WHERE directory_path = '/big'")
+                .expect("explain big");
+            stmt.query_map([], |row| row.get::<_, String>(1)).expect("explain rows").map(|r| r.unwrap_or_default()).collect::<String>()
+        };
+        assert!(plan.contains("Sequential Scan"), "the >2,048 directory must exercise the fallback plan: {}", plan);
+        let small_plan =
+        {
+            let mut stmt = conn
+                .prepare("EXPLAIN ANALYZE SELECT id, image_kind, file_path, file_stem FROM images WHERE directory_path = '/a'")
+                .expect("explain small");
+            stmt.query_map([], |row| row.get::<_, String>(1)).expect("explain rows").map(|r| r.unwrap_or_default()).collect::<String>()
+        };
+        assert!(small_plan.contains("Index Scan"), "a small directory is served by idx_images_directory_path: {}", small_plan);
+
+        // Every id, uncached AND through one shared planning cache (the
+        // planners' path), against the old OR join.
+        let mut checked = 0;
+        let mut cache = WritebackDirectoryCache::new();
+        for id in (1..=28).chain([1000, 1500, 3099])
+        {
+            let new = focus_analysis_writeback_target_ids(&conn, id);
+            let cached = writeback_target_ids_with_directory_cache(&conn, id, &mut cache);
+            let old = focus_analysis_writeback_target_ids_or_join_oracle(&conn, id);
+            match (&new, &cached, &old)
+            {
+                (Ok(new), Ok(cached), Ok(old)) =>
+                {
+                    assert_eq!(new, old, "id {}", id);
+                    assert_eq!(cached, old, "id {} (cached)", id);
+                }
+                (Err(_), Err(_), Err(_)) => {}
+                _ => panic!("id {}: new {:?} cached {:?} vs old {:?}", id, new, cached, old),
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 31, "vacuity guard");
+        assert!(cache.contains_key("/big") && cache.contains_key("/a"), "the shared cache was exercised");
+
+        // The shapes the equivalence must actually exercise (not vacuous).
+        let targets = |id: i64| focus_analysis_writeback_target_ids(&conn, id).expect("targets");
+        assert_eq!(targets(2), vec![2, 3], "JPEG owns its RAW");
+        assert_eq!(targets(4), vec![4], "a HEIF is not the representative when a JPEG exists");
+        assert_eq!(targets(6), vec![5, 6], "the JPEG owns the RAW behind JPEG + HEIF");
+        assert_eq!(targets(3), vec![3], "a hidden twin as its own source stamps only itself");
+        assert_eq!(targets(8), vec![8, 9], "same stem in another directory stays independent");
+        assert_eq!(targets(10), vec![10, 12], "'/c/case.JPG' sorts before '/c/case.jpg' (binary order)");
+        assert_eq!(targets(11), vec![11]);
+        assert_eq!(targets(14), vec![14, 15], "'/c/hh.HEIC' sorts before '/c/hh.heic'");
+        assert_eq!(targets(17), vec![17], "a legacy row without keys stamps only itself");
+        assert_eq!(targets(19), vec![19], "stem equality is case-sensitive, as before");
+        assert_eq!(targets(22), vec![21, 22, 23], "every RAW behind the representative");
+        assert!(focus_analysis_writeback_target_ids(&conn, 24).is_err(), "a missing source fails closed");
+        assert_eq!(targets(25), vec![25, 26], "a big directory (fallback scan) answers the same");
+        assert_eq!(targets(27), vec![27], "HEIF loses to the JPEG in the big directory too");
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+    }
+
+    /// SCALE EVIDENCE on a COPY of a real catalogue (`#[ignore]`d). Point
+    /// `PL_TWIN_LOOKUP_CATALOGUE_COPY` at a copied catalogue.db (with its .wal
+    /// beside it) — ⛔ never the live file: the open migrates and the chunk
+    /// writes. Times the old OR join vs the two reads over the first
+    /// 200 film-negative candidates, then one 16-result writeback chunk.
+    #[test]
+    #[ignore]
+    fn twin_lookup_scale_evidence_on_a_catalogue_copy()
+    {
+        let Ok(path) = std::env::var("PL_TWIN_LOOKUP_CATALOGUE_COPY")
+        else
+        {
+            println!("TWIN set PL_TWIN_LOOKUP_CATALOGUE_COPY to a catalogue COPY");
+            return;
+        };
+        let conn = open_and_migrate_catalogue(std::path::Path::new(&path)).expect("open the copy");
+        fence_connection_against_extension_fetches(&conn);
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM images", [], |row| row.get(0)).expect("count");
+
+        let page = negative_detection_candidates_impl(&conn, 200, "twin-probe-v0", "twin-probe-run", None);
+        assert!(page.query_ok && !page.candidates.is_empty());
+        let ids = page.candidates.iter().map(|c| c.id).collect::<Vec<_>>();
+
+        let t = std::time::Instant::now();
+        let old = ids.iter().map(|id| focus_analysis_writeback_target_ids_or_join_oracle(&conn, *id)).collect::<Vec<_>>();
+        let old_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let t = std::time::Instant::now();
+        let new = ids.iter().map(|id| focus_analysis_writeback_target_ids(&conn, *id)).collect::<Vec<_>>();
+        let new_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let mut twins = 0;
+        for ((id, old), new) in ids.iter().zip(&old).zip(&new)
+        {
+            assert_eq!(old.as_ref().ok(), new.as_ref().ok(), "id {}", id);
+            twins += new.as_ref().map(|t| t.len() - 1).unwrap_or(0);
+        }
+        println!(
+            "TWIN copy {} images · {} candidates ({} RAW twins) · old OR join {:.1} ms ({:.2} ms/result, {:.1} ms per 16) · two reads (no hash join) {:.1} ms ({:.3} ms/result, {:.2} ms per 16)",
+            total, ids.len(), twins,
+            old_ms, old_ms / ids.len() as f64, old_ms / ids.len() as f64 * 16.0,
+            new_ms, new_ms / ids.len() as f64, new_ms / ids.len() as f64 * 16.0
+        );
+
+        let results = ids[..16.min(ids.len())]
+            .iter()
+            .map(|id| NegativeDetectionResult
+            {
+                id: *id,
+                detector_version: "twin-probe-v0".to_string(),
+                analysis_run_id: "twin-probe-run".to_string(),
+                status: "complete".to_string(),
+                negative_confidence: Some(0.1),
+                negative_kind: None,
+                signals_json: None,
+                auto_keywords: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let t = std::time::Instant::now();
+        let receipt = update_negative_detection_results_impl(&conn, results, None);
+        println!(
+            "TWIN copy: one 16-result writeback chunk (new lookup) {:.1} ms · updated {} · failure {:?}",
+            t.elapsed().as_secs_f64() * 1000.0, receipt.updated, receipt.failure_stage
+        );
+    }
+}
+
+/// ⭐ S196 — PLAN AND COST EVIDENCE for every per-result statement of the
+/// film-negative writeback, on a COPY of a real catalogue (`#[ignore]`d; set
+/// `PL_WRITEBACK_PLAN_CATALOGUE_COPY`; ⛔ never the live file — the open
+/// migrates and the chunks write). Prints each statement's EXPLAIN scan type
+/// and time, then 16- and 64-result chunk timings.
+#[cfg(test)]
+mod writeback_plan_evidence
+{
+    use super::*;
+
+    fn scan_kinds(conn: &Connection, sql: &str) -> String
+    {
+        // EXPLAIN ANALYZE: plain EXPLAIN prints "Sequential Scan" even for a
+        // primary-key lookup; the index decision is taken at execution.
+        let mut stmt = conn.prepare(&format!("EXPLAIN ANALYZE {}", sql)).expect("prepare EXPLAIN");
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("run EXPLAIN")
+            .map(|row| row.unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut kinds = Vec::new();
+        for marker in ["Index Scan", "Sequential Scan", "HASH_JOIN", "NESTED_LOOP_JOIN", "PIECEWISE_MERGE_JOIN"]
+        {
+            let n = rows.matches(marker).count();
+            if n > 0
+            {
+                kinds.push(format!("{}×{}", marker, n));
+            }
+        }
+        if kinds.is_empty()
+        {
+            kinds.push("no scan marker".to_string());
+        }
+        kinds.join(", ")
+    }
+
+    #[repr(C)]
+    struct Timeval
+    {
+        tv_sec: i64,
+        tv_usec: i32,
+    }
+
+    #[repr(C)]
+    struct Rusage
+    {
+        ru_utime: Timeval,
+        ru_stime: Timeval,
+        rest: [i64; 14],
+    }
+
+    extern "C"
+    {
+        fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+    }
+
+    /// Process CPU time (user + system), ms — all threads, DuckDB's included.
+    fn cpu_ms() -> f64
+    {
+        let mut usage = Rusage
+        {
+            ru_utime: Timeval { tv_sec: 0, tv_usec: 0 },
+            ru_stime: Timeval { tv_sec: 0, tv_usec: 0 },
+            rest: [0; 14],
+        };
+        // SAFETY: test-only evidence; `usage` is a valid, writable rusage.
+        let ok = unsafe { getrusage(0, &mut usage) } == 0;
+        if !ok
+        {
+            return f64::NAN;
+        }
+        let ms = |t: &Timeval| t.tv_sec as f64 * 1000.0 + t.tv_usec as f64 / 1000.0;
+        ms(&usage.ru_utime) + ms(&usage.ru_stime)
+    }
+
+    fn timed<T>(f: impl FnOnce() -> T) -> (T, f64)
+    {
+        let t = std::time::Instant::now();
+        let value = f();
+        (value, t.elapsed().as_secs_f64() * 1000.0)
+    }
+
+    #[test]
+    #[ignore]
+    fn writeback_statement_plans_and_chunk_costs_on_a_catalogue_copy()
+    {
+        let Ok(path) = std::env::var("PL_WRITEBACK_PLAN_CATALOGUE_COPY")
+        else
+        {
+            println!("PLAN set PL_WRITEBACK_PLAN_CATALOGUE_COPY to a catalogue COPY");
+            return;
+        };
+        let tag = std::env::var("PL_WRITEBACK_PLAN_TAG").unwrap_or_else(|_| "run".to_string());
+        let conn = open_and_migrate_catalogue(std::path::Path::new(&path)).expect("open the copy");
+        fence_connection_against_extension_fetches(&conn);
+
+        let images: i64 = conn.query_row("SELECT COUNT(*) FROM images", [], |r| r.get(0)).expect("images");
+        let keywords: i64 = conn.query_row("SELECT COUNT(*) FROM keyword", [], |r| r.get(0)).expect("keywords");
+        let (largest, over): (i64, i64) = conn
+            .query_row(
+                "SELECT MAX(n), COUNT(*) FILTER (WHERE n > 2048) FROM (SELECT COUNT(*) AS n FROM images GROUP BY directory_path)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("directory sizes");
+        println!("PLAN {} copy: {} images, {} keyword rows; largest directory {} photos; {} directories over 2,048", tag, images, keywords, largest, over);
+
+        let page = negative_detection_candidates_impl(&conn, 200, &format!("plan-{}-v", tag), "plan-run", None);
+        assert!(page.query_ok && page.candidates.len() >= 80);
+        let id = page.candidates[0].id;
+        let (directory, stem): (String, String) = conn
+            .query_row("SELECT directory_path, file_stem FROM images WHERE id = ?1", params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("source keys");
+        let q = |s: &str| s.replace('\'', "''");
+        let largest_directory: String = conn
+            .query_row("SELECT directory_path FROM images GROUP BY directory_path ORDER BY COUNT(*) DESC LIMIT 1", [], |r| r.get(0))
+            .expect("largest directory");
+        let largest_stem: String = conn
+            .query_row("SELECT file_stem FROM images WHERE directory_path = ?1 AND file_stem IS NOT NULL LIMIT 1", params![&largest_directory], |r| r.get(0))
+            .expect("a stem in the largest directory");
+        let any_keyword_id: i64 = conn
+            .query_row("SELECT id FROM keyword WHERE status = 1 ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .expect("a keyword id");
+        let source_directory_size: i64 = conn
+            .query_row("SELECT COUNT(*) FROM images WHERE directory_path = ?1", params![&directory], |r| r.get(0))
+            .expect("source directory size");
+        println!("PLAN {} probe source id {} in a directory of {} photos", tag, id, source_directory_size);
+        let statements = [
+            ("source by PK", format!("SELECT image_kind, file_stem, directory_path FROM images WHERE id = {} LIMIT 1", id)),
+            ("group read, 3 filters (pre-fix)", format!("SELECT id, image_kind, file_path FROM images WHERE directory_path = '{}' AND file_stem = '{}' AND image_kind IN ('jpeg', 'heif', 'raw')", q(&directory), q(&stem))),
+            ("group read, directory only (fix)", format!("SELECT id, image_kind, file_path, file_stem FROM images WHERE directory_path = '{}'", q(&directory))),
+            ("group read, 3 filters, LARGEST dir (pre-fix)", format!("SELECT id, image_kind, file_path FROM images WHERE directory_path = '{}' AND file_stem = 'x' AND image_kind IN ('jpeg', 'heif', 'raw')", q(&largest_directory))),
+            ("group read, dir only, LARGEST dir (fix)", format!("SELECT id, image_kind, file_path, file_stem FROM images WHERE directory_path = '{}'", q(&largest_directory))),
+            ("group read, file_path range (alt)", format!("SELECT id, image_kind, file_path, file_stem, directory_path FROM images WHERE file_path >= '{0}/{1}.' AND file_path < '{0}/{1}/'", q(&directory), q(&stem))),
+            ("group read, file_path range, LARGEST dir (alt)", format!("SELECT id, image_kind, file_path, file_stem, directory_path FROM images WHERE file_path >= '{0}/{1}.' AND file_path < '{0}/{1}/'", q(&largest_directory), q(&largest_stem))),
+            ("six-column UPDATE by PK", format!("UPDATE images SET negative_kind = negative_kind WHERE id = {}", id)),
+            ("keyword exists, 3 filters (pre-fix)", format!("SELECT 1 FROM keyword WHERE image_id = {} AND path = 'film negative' AND status = 1 LIMIT 1", id)),
+            ("keyword merge UPDATE, 4 filters (pre-fix)", format!("UPDATE keyword SET origin = (origin | 2) WHERE image_id = {} AND path = 'film negative' AND status = 1 AND (origin & 2) = 0", id)),
+            ("retraction read, 4 filters (pre-fix)", format!("SELECT DISTINCT path FROM keyword WHERE image_id = {} AND status = 1 AND (origin & 2) <> 0 AND path IN ('film negative', 'color negative', 'black and white negative')", id)),
+            ("keyword rows by image_id (fix)", format!("SELECT id, path, status, origin, collection, color FROM keyword WHERE image_id = {}", id)),
+            ("keyword UPDATE origin by PK (fix)", format!("UPDATE keyword SET origin = origin WHERE id = {}", any_keyword_id)),
+            ("keyword UPDATE status by PK (hide)", format!("UPDATE keyword SET status = status, hidden_at = hidden_at WHERE id = {}", any_keyword_id)),
+            ("keyword INSERT", format!("INSERT INTO keyword (image_id, label, path, status, origin, created_at, is_video) VALUES ({0}, 'film negative', 'film negative', 1, 2, CURRENT_TIMESTAMP, COALESCE((SELECT is_video FROM images WHERE id = {0} LIMIT 1), FALSE))", id)),
+            ("images six-column UPDATE by PK (real)", format!("UPDATE images SET negative_detection_status = 'complete', negative_detection_version = 'x', negative_detection_run_id = 'y', negative_confidence = 0.5, negative_kind = 'color', negative_signals = '{{}}' WHERE id = {}", id)),
+            ("INSERT's is_video subquery", format!("SELECT COALESCE((SELECT is_video FROM images WHERE id = {} LIMIT 1), FALSE)", id)),
+            ("run-id baseline COUNT (per chunk)", "SELECT COUNT(*) FROM images WHERE negative_detection_run_id = 'plan-run'".to_string()),
+            ("planned ids, run id + IN (pre-fix)", format!("SELECT id FROM images WHERE negative_detection_run_id = 'plan-run' AND id IN ({}, {})", id, id + 1)),
+            ("planned ids, IN only (fix)", format!("SELECT id, negative_detection_run_id FROM images WHERE id IN ({}, {})", id, id + 1)),
+        ];
+        if std::env::var("PL_WRITEBACK_PLAN_RAW").is_ok()
+        {
+            for (name, sql) in statements.iter().take(3)
+            {
+                for prefix in ["EXPLAIN", "EXPLAIN ANALYZE"]
+                {
+                    let mut stmt = conn.prepare(&format!("{} {}", prefix, sql)).expect("prepare raw explain");
+                    let text = stmt
+                        .query_map([], |row| row.get::<_, String>(1))
+                        .expect("raw explain")
+                        .map(|row| row.unwrap_or_default())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    println!("RAW {} — {}:\n{}", prefix, name, text);
+                }
+            }
+        }
+        conn.execute_batch("BEGIN TRANSACTION;").expect("begin");
+        for (name, sql) in &statements
+        {
+            let plan = scan_kinds(&conn, sql);
+            let mut times = Vec::new();
+            let cpu_start = cpu_ms();
+            for _ in 0..5
+            {
+                let (_, ms) = timed(|| conn.execute(sql, []).map(|_| ()).or_else(|_| conn.prepare(sql).and_then(|mut s| s.query([]).map(|_| ()))));
+                times.push(ms);
+            }
+            let cpu_each = (cpu_ms() - cpu_start) / 5.0;
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            println!("PLAN {} · {:<42} {:<40} median {:.2} ms wall · {:.2} ms CPU", tag, name, plan, times[2], cpu_each);
+        }
+        conn.execute_batch("ROLLBACK;").expect("rollback");
+
+        let photos_in_large: i64 = conn
+            .query_row("SELECT COALESCE(SUM(n), 0) FROM (SELECT COUNT(*) AS n FROM images GROUP BY directory_path HAVING COUNT(*) > 2048)", [], |r| r.get(0))
+            .expect("photos in large directories");
+        println!("PLAN {} photos living in directories over 2,048: {}", tag, photos_in_large);
+        conn.execute_batch("SET SESSION index_scan_max_count = 1000000;").expect("raise");
+        for (name, sql) in [
+            ("dir only, LARGEST dir, index_scan_max_count raised", format!("SELECT id, image_kind, file_path, file_stem FROM images WHERE directory_path = '{}'", q(&largest_directory))),
+            ("dir only, probe dir, index_scan_max_count raised", format!("SELECT id, image_kind, file_path, file_stem FROM images WHERE directory_path = '{}'", q(&directory))),
+        ]
+        {
+            let plan = scan_kinds(&conn, &sql);
+            let mut times = Vec::new();
+            for _ in 0..5
+            {
+                let (_, ms) = timed(|| conn.prepare(&sql).and_then(|mut st| st.query_map([], |r| r.get::<_, i64>(0)).map(|rows| rows.count())));
+                times.push(ms);
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            println!("PLAN {} · {:<52} {:<20} median {:.2} ms", tag, name, plan, times[2]);
+        }
+        conn.execute_batch("RESET SESSION index_scan_max_count;").expect("reset");
+
+        for (n, offset) in [(16usize, 100usize), (16, 0), (64, 16)]
+        {
+            let add = page.candidates[offset..offset + n]
+                .iter()
+                .map(|c| NegativeDetectionResult
+                {
+                    id: c.id,
+                    detector_version: format!("plan-{}-v", tag),
+                    analysis_run_id: "plan-run".to_string(),
+                    status: "complete".to_string(),
+                    negative_confidence: Some(0.9),
+                    negative_kind: Some("color".to_string()),
+                    signals_json: Some("{}".to_string()),
+                    auto_keywords: vec!["film negative".to_string(), "color negative".to_string()],
+                })
+                .collect::<Vec<_>>();
+            let mut retract = add.clone();
+            for r in &mut retract
+            {
+                r.detector_version = format!("plan-{}-v2", tag);
+                r.analysis_run_id = "plan-run-2".to_string();
+                r.negative_kind = None;
+                r.auto_keywords.clear();
+            }
+            let cpu_before = cpu_ms();
+            let (first, add_ms) = timed(|| update_negative_detection_results_impl(&conn, add, None));
+            let cpu_add = cpu_ms() - cpu_before;
+            let cpu_before = cpu_ms();
+            let (second, retract_ms) = timed(|| update_negative_detection_results_impl(&conn, retract, None));
+            let cpu_retract = cpu_ms() - cpu_before;
+            println!(
+                "PLAN {} · {}-result chunk: add {:.1} ms wall / {:.1} ms CPU (updated {}, keywords +{}) · retract {:.1} ms wall / {:.1} ms CPU (updated {}, keywords -{}) · failures {:?}/{:?}",
+                tag, n, add_ms, cpu_add, first.updated, first.keywords_added, retract_ms, cpu_retract, second.updated, second.keywords_retracted,
+                first.failure_stage, second.failure_stage
             );
         }
     }

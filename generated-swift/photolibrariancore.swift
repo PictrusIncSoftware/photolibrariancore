@@ -3939,6 +3939,282 @@ public func FfiConverterTypeMergeSummary_lower(_ value: MergeSummary) -> RustBuf
 }
 
 
+public struct NegativeDetectionCandidate: Equatable, Hashable {
+    public var id: Int64
+    public var filePath: String
+    public var fileSize: UInt64
+    public var cameraMake: String?
+    public var cameraModel: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: Int64, filePath: String, fileSize: UInt64, cameraMake: String? = nil, cameraModel: String? = nil) {
+        self.id = id
+        self.filePath = filePath
+        self.fileSize = fileSize
+        self.cameraMake = cameraMake
+        self.cameraModel = cameraModel
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension NegativeDetectionCandidate: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNegativeDetectionCandidate: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NegativeDetectionCandidate {
+        return
+            try NegativeDetectionCandidate(
+                id: FfiConverterInt64.read(from: &buf), 
+                filePath: FfiConverterString.read(from: &buf), 
+                fileSize: FfiConverterUInt64.read(from: &buf), 
+                cameraMake: FfiConverterOptionString.read(from: &buf), 
+                cameraModel: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NegativeDetectionCandidate, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.id, into: &buf)
+        FfiConverterString.write(value.filePath, into: &buf)
+        FfiConverterUInt64.write(value.fileSize, into: &buf)
+        FfiConverterOptionString.write(value.cameraMake, into: &buf)
+        FfiConverterOptionString.write(value.cameraModel, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNegativeDetectionCandidate_lift(_ buf: RustBuffer) throws -> NegativeDetectionCandidate {
+    return try FfiConverterTypeNegativeDetectionCandidate.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNegativeDetectionCandidate_lower(_ value: NegativeDetectionCandidate) -> RustBuffer {
+    return FfiConverterTypeNegativeDetectionCandidate.lower(value)
+}
+
+
+public struct NegativeDetectionCandidatePage: Equatable, Hashable {
+    public var candidates: [NegativeDetectionCandidate]
+    public var droppedRows: UInt64
+    public var queryOk: Bool
+    public var queryError: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(candidates: [NegativeDetectionCandidate], droppedRows: UInt64, queryOk: Bool = true, queryError: String? = nil) {
+        self.candidates = candidates
+        self.droppedRows = droppedRows
+        self.queryOk = queryOk
+        self.queryError = queryError
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension NegativeDetectionCandidatePage: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNegativeDetectionCandidatePage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NegativeDetectionCandidatePage {
+        return
+            try NegativeDetectionCandidatePage(
+                candidates: FfiConverterSequenceTypeNegativeDetectionCandidate.read(from: &buf), 
+                droppedRows: FfiConverterUInt64.read(from: &buf), 
+                queryOk: FfiConverterBool.read(from: &buf), 
+                queryError: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NegativeDetectionCandidatePage, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeNegativeDetectionCandidate.write(value.candidates, into: &buf)
+        FfiConverterUInt64.write(value.droppedRows, into: &buf)
+        FfiConverterBool.write(value.queryOk, into: &buf)
+        FfiConverterOptionString.write(value.queryError, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNegativeDetectionCandidatePage_lift(_ buf: RustBuffer) throws -> NegativeDetectionCandidatePage {
+    return try FfiConverterTypeNegativeDetectionCandidatePage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNegativeDetectionCandidatePage_lower(_ value: NegativeDetectionCandidatePage) -> RustBuffer {
+    return FfiConverterTypeNegativeDetectionCandidatePage.lower(value)
+}
+
+
+public struct NegativeDetectionResult: Equatable, Hashable {
+    public var id: Int64
+    public var detectorVersion: String
+    public var analysisRunId: String
+    public var status: String
+    public var negativeConfidence: Double?
+    public var negativeKind: String?
+    public var signalsJson: String?
+    public var autoKeywords: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: Int64, detectorVersion: String, analysisRunId: String, status: String, negativeConfidence: Double? = nil, negativeKind: String? = nil, signalsJson: String? = nil, autoKeywords: [String]) {
+        self.id = id
+        self.detectorVersion = detectorVersion
+        self.analysisRunId = analysisRunId
+        self.status = status
+        self.negativeConfidence = negativeConfidence
+        self.negativeKind = negativeKind
+        self.signalsJson = signalsJson
+        self.autoKeywords = autoKeywords
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension NegativeDetectionResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNegativeDetectionResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NegativeDetectionResult {
+        return
+            try NegativeDetectionResult(
+                id: FfiConverterInt64.read(from: &buf), 
+                detectorVersion: FfiConverterString.read(from: &buf), 
+                analysisRunId: FfiConverterString.read(from: &buf), 
+                status: FfiConverterString.read(from: &buf), 
+                negativeConfidence: FfiConverterOptionDouble.read(from: &buf), 
+                negativeKind: FfiConverterOptionString.read(from: &buf), 
+                signalsJson: FfiConverterOptionString.read(from: &buf), 
+                autoKeywords: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NegativeDetectionResult, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.id, into: &buf)
+        FfiConverterString.write(value.detectorVersion, into: &buf)
+        FfiConverterString.write(value.analysisRunId, into: &buf)
+        FfiConverterString.write(value.status, into: &buf)
+        FfiConverterOptionDouble.write(value.negativeConfidence, into: &buf)
+        FfiConverterOptionString.write(value.negativeKind, into: &buf)
+        FfiConverterOptionString.write(value.signalsJson, into: &buf)
+        FfiConverterSequenceString.write(value.autoKeywords, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNegativeDetectionResult_lift(_ buf: RustBuffer) throws -> NegativeDetectionResult {
+    return try FfiConverterTypeNegativeDetectionResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNegativeDetectionResult_lower(_ value: NegativeDetectionResult) -> RustBuffer {
+    return FfiConverterTypeNegativeDetectionResult.lower(value)
+}
+
+
+public struct NegativeDetectionWritebackResult: Equatable, Hashable {
+    public var updated: UInt64
+    public var keywordsAdded: UInt64
+    public var keywordsRetracted: UInt64
+    public var warnings: [String]
+    public var failureStage: String?
+    public var failedReason: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(updated: UInt64, keywordsAdded: UInt64, keywordsRetracted: UInt64, warnings: [String], failureStage: String? = nil, failedReason: String? = nil) {
+        self.updated = updated
+        self.keywordsAdded = keywordsAdded
+        self.keywordsRetracted = keywordsRetracted
+        self.warnings = warnings
+        self.failureStage = failureStage
+        self.failedReason = failedReason
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension NegativeDetectionWritebackResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNegativeDetectionWritebackResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NegativeDetectionWritebackResult {
+        return
+            try NegativeDetectionWritebackResult(
+                updated: FfiConverterUInt64.read(from: &buf), 
+                keywordsAdded: FfiConverterUInt64.read(from: &buf), 
+                keywordsRetracted: FfiConverterUInt64.read(from: &buf), 
+                warnings: FfiConverterSequenceString.read(from: &buf), 
+                failureStage: FfiConverterOptionString.read(from: &buf), 
+                failedReason: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NegativeDetectionWritebackResult, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.updated, into: &buf)
+        FfiConverterUInt64.write(value.keywordsAdded, into: &buf)
+        FfiConverterUInt64.write(value.keywordsRetracted, into: &buf)
+        FfiConverterSequenceString.write(value.warnings, into: &buf)
+        FfiConverterOptionString.write(value.failureStage, into: &buf)
+        FfiConverterOptionString.write(value.failedReason, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNegativeDetectionWritebackResult_lift(_ buf: RustBuffer) throws -> NegativeDetectionWritebackResult {
+    return try FfiConverterTypeNegativeDetectionWritebackResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNegativeDetectionWritebackResult_lower(_ value: NegativeDetectionWritebackResult) -> RustBuffer {
+    return FfiConverterTypeNegativeDetectionWritebackResult.lower(value)
+}
+
+
 public struct OperationLogEntryInput: Equatable, Hashable {
     public var severity: String
     public var filePath: String?
@@ -6986,6 +7262,56 @@ fileprivate struct FfiConverterSequenceTypeLightroomVideoRecord: FfiConverterRus
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeNegativeDetectionCandidate: FfiConverterRustBuffer {
+    typealias SwiftType = [NegativeDetectionCandidate]
+
+    public static func write(_ value: [NegativeDetectionCandidate], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeNegativeDetectionCandidate.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [NegativeDetectionCandidate] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [NegativeDetectionCandidate]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeNegativeDetectionCandidate.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeNegativeDetectionResult: FfiConverterRustBuffer {
+    typealias SwiftType = [NegativeDetectionResult]
+
+    public static func write(_ value: [NegativeDetectionResult], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeNegativeDetectionResult.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [NegativeDetectionResult] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [NegativeDetectionResult]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeNegativeDetectionResult.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeOperationLogEntryInput: FfiConverterRustBuffer {
     typealias SwiftType = [OperationLogEntryInput]
 
@@ -8954,6 +9280,66 @@ public func mirrorKeywordRowsAcrossPairs()async  -> UInt64  {
             
         )
 }
+public func negativeDetectionCandidateCount(detectorVersion: String, analysisRunId: String)async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_negative_detection_candidate_count(FfiConverterString.lower(detectorVersion),FfiConverterString.lower(analysisRunId)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+public func negativeDetectionCandidateCountForIds(ids: [Int64], detectorVersion: String, analysisRunId: String)async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_negative_detection_candidate_count_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterString.lower(detectorVersion),FfiConverterString.lower(analysisRunId)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_u64,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_u64,
+            freeFunc: ffi_photolibrariancore_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+public func negativeDetectionCandidatePage(limit: UInt32, detectorVersion: String, analysisRunId: String)async  -> NegativeDetectionCandidatePage  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_negative_detection_candidate_page(FfiConverterUInt32.lower(limit),FfiConverterString.lower(detectorVersion),FfiConverterString.lower(analysisRunId)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeNegativeDetectionCandidatePage_lift,
+            errorHandler: nil
+            
+        )
+}
+public func negativeDetectionCandidatePageForIds(ids: [Int64], limit: UInt32, detectorVersion: String, analysisRunId: String)async  -> NegativeDetectionCandidatePage  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_negative_detection_candidate_page_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterUInt32.lower(limit),FfiConverterString.lower(detectorVersion),FfiConverterString.lower(analysisRunId)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeNegativeDetectionCandidatePage_lift,
+            errorHandler: nil
+            
+        )
+}
 public func operationLogEntries(runId: Int64, severityFilter: String?, limit: UInt32, offset: UInt32)async  -> [OperationLogEntryRecord]  {
     return
         try!  await uniffiRustCallAsync(
@@ -9681,6 +10067,21 @@ public func updateImageRotation(filePath: String, degrees: Int32)async  -> Bool 
             
         )
 }
+public func updateNegativeDetectionResults(results: [NegativeDetectionResult])async  -> NegativeDetectionWritebackResult  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_update_negative_detection_results(FfiConverterSequenceTypeNegativeDetectionResult.lower(results)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeNegativeDetectionWritebackResult_lift,
+            errorHandler: nil
+            
+        )
+}
 public func updateRatingForIds(ids: [Int64], rating: UInt32)async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
@@ -10072,6 +10473,18 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_mirror_keyword_rows_across_pairs() != 28156) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_negative_detection_candidate_count() != 16759) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_negative_detection_candidate_count_for_ids() != 19945) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_negative_detection_candidate_page() != 4853) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_negative_detection_candidate_page_for_ids() != 40783) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_operation_log_entries() != 11141) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -10217,6 +10630,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_image_rotation() != 63730) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_update_negative_detection_results() != 27645) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_update_rating_for_ids() != 35398) {

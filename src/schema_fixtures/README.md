@@ -177,8 +177,10 @@ reproduce this way, the eight legacy files from their own commits and
 `sha256-435bd241a6e6.sql` from `5bad24c`. `sha256-bfb49cce6d91.sql` (V8, the
 identity control from slice S24 until W4-21) was cut from the working tree on
 2026-10-02 and has no `source_commit` yet; its name proves its bytes.
-`sha256-24bf811ec9fc.sql` (V9, the identity control since W4-21) was cut from
-the working tree on 2026-10-11 and has no `source_commit` yet either.
+`sha256-24bf811ec9fc.sql` (V9, the identity control from W4-21 until S196) was
+cut from the working tree on 2026-10-11 and has no `source_commit` yet either.
+`sha256-633e6ae734f6.sql` (V10, the identity control since S196) was cut from
+the working tree on 2026-10-22 and has no `source_commit` yet either.
 
 ⚠️ Three traps, all hit during this work:
 
@@ -208,8 +210,8 @@ Fingerprinting **every** commit that touched the batch collapses the
 post-2026-07-03 window into **six** distinct committed states, V1…V6; **V7** is
 slice B's (S184, committed in `5bad24c`), the first fixture named by its content
 hash (ruling 32); **V8** is slice S24's (2026-10-02), the last state with
-32-bit REAL measurement columns; **V9** is W4-21's (2026-10-11): the identity
-control.
+32-bit REAL measurement columns; **V9** is W4-21's (2026-10-11); **V10** is
+S196's (2026-10-22), the film-negative detection columns: the identity control.
 
 ⚠️ **NARROWED in fix round 1 (2026-09-25, reviewer finding K-F1).** This section
 used to say "the reachable window opens on 2026-07-03". ⛔ **That does not
@@ -253,7 +255,8 @@ cannot happen.
 | **V6** | `2bc221e.sql` | `2bc221e` | 2026-09-18 | 765 | 45598 | 19 | 0 | S179. The identity control until S184 (its flag and its identity assertion moved to V7) |
 | **V7** | `sha256-435bd241a6e6.sql` | `5bad24c` | 2026-09-26 | 813 | 48210 | 21 | 0 | S184, slice B: the two `removed_image_tombstone*` tables and their index, CREATE-time. The identity control until slice S24 (its flag and its identity assertion moved to V8). ⭐ **Content-named** (ruling 32): cut as `PENDING-B.sql`, renamed `5bad24c.sql` on 2026-09-28, then to its content name by slice K2 — no byte changed |
 | **V8** | `sha256-bfb49cce6d91.sql` | — (`None`) | 2026-10-02 | 820 | 48712 | 21 | 0 | slice S24: `similar_photo_group_member.origin INTEGER`, LAST in the CREATE body, plus its bare `ALTER … ADD COLUMN IF NOT EXISTS origin INTEGER` (no default — S62). The identity control until W4-21 (its flag and its identity assertion moved to V9), and the LAST state with the six measurement columns as 32-bit REAL — its upgrade is W4-21's REAL → DOUBLE conversion. Content-named from its first cut (ruling 32); `source_commit` MAY be filled in once a commit carries it |
-| **V9** | `sha256-24bf811ec9fc.sql` | — (`None`) | 2026-10-11 | 824 | 49057 | 21 | 0 | W4-21 / ruling 80: the six `images` measurement columns (`focal_length`, `aperture`, `shutter_speed`, `gps_latitude`, `gps_longitude`, `gps_altitude`) `DOUBLE` in the CREATE body — they were 32-bit `REAL`. Every older vintage reaches `DOUBLE` through `migrate_measurement_columns_to_double` (Rust, after the batch), so no allow-list grew. **The identity control** — byte-identical to the working tree's batch, so its upgrade must produce ZERO divergence. Content-named from its first cut (ruling 32) |
+| **V9** | `sha256-24bf811ec9fc.sql` | — (`None`) | 2026-10-11 | 824 | 49057 | 21 | 0 | W4-21 / ruling 80: the six `images` measurement columns (`focal_length`, `aperture`, `shutter_speed`, `gps_latitude`, `gps_longitude`, `gps_altitude`) `DOUBLE` in the CREATE body — they were 32-bit `REAL`. Every older vintage reaches `DOUBLE` through `migrate_measurement_columns_to_double` (Rust, after the batch), so no allow-list grew. The identity control until S196 (its flag and its identity assertion moved to V10). Content-named from its first cut (ruling 32) |
+| **V10** | `sha256-633e6ae734f6.sql` | — (`None`) | 2026-10-22 | 846 | 50645 | 21 | 0 | S196, film-negative detection: six nullable `images` columns (`negative_detection_status`, `negative_detection_version`, `negative_detection_run_id`, `negative_confidence` DOUBLE, `negative_kind`, `negative_signals`) in the CREATE body plus their bare `ALTER … ADD COLUMN IF NOT EXISTS` lines (no default — S62; no index — S179). **The identity control** — byte-identical to the working tree's batch, so its upgrade must produce ZERO divergence. Content-named from its first cut (ruling 32) |
 | **T3** | `4599235.sql` | `4599235` | 2026-06-01 | 128 | 7370 | 2 | 0 | ⭐ **tier 3**, added in fix round 1 (K-F1). A catalogue **BORN 2026-06-01** — the shape a real 2026-07-03…~07-09 archive holds. The commit that introduced the `keyword` table, so it is the only fixture with a **June-born `keyword`**: nullable `origin` with no default, and no `collection`/`color`/`is_video`. Shows **all five** of R-42's columns at once (21 of the 32 historical states diverge, 18 of them in R-42's columns alone; this is the strongest single choice, and by 2026-06-22 the divergence is gone). |
 | **G** | `b3f9998.sql` | `b3f9998` | 2026-05-04 | 52 | 1827 | 1 | 0 | **genesis** — ⛔ **not "archival"**: the EXTREME instance of the Restore-reachable class, and the only fixture that can fail the "open returns `Some`" assertion under the S93 mutation. `87f2e93` is the same state. **Do not delete it.** |
 
@@ -274,6 +277,7 @@ b49df4acf4cc9bef312f81fc05491407cf4e13d73992e9198ab570567d3edeb6  2bc221e.sql
 435bd241a6e6a49a05a0b0495e77411348c49de795330ca7d4b8e25fc3619b93  sha256-435bd241a6e6.sql
 bfb49cce6d911f6eb7cbdc989a1dc00097737991c626b20abb2850e99d93f33b  sha256-bfb49cce6d91.sql
 24bf811ec9fc497c9a9866a91564a14280819fbdeacaed1000132264b87fd3a3  sha256-24bf811ec9fc.sql
+633e6ae734f6c1ae9da87414beae9ecd25e66564cd8647591a001d929e607ab3  sha256-633e6ae734f6.sql
 ```
 
 ## Why genesis is kept — ⛔ and why it must not be deleted
