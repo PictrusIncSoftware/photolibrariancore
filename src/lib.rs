@@ -6814,6 +6814,82 @@ fn build_image_record_query_sql(
     media_type: MediaType,
 ) -> String
 {
+    build_image_query_sql(
+        ImageQueryShape::RecordPage,
+        where_clause,
+        order_by,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+        apply_similar_photo_collapse,
+        similar_algorithm_version,
+        media_type,
+    )
+}
+
+/// ⭐ Oct 22, 2026 (gallery ⌘A, the scoped id projection) — the SQL text
+/// `execute_ordered_id_query` prepares: EVERY id the paged record query would
+/// return across all of its pages, in the SAME order, and nothing else.
+///
+/// Built by the SAME `build_image_query_sql` as the record page, so the inner
+/// WHERE, the RAW/JPEG collapse, the media stance, the duplicate window, the
+/// similar-photo visible-representative window and the total `ORDER BY …, id
+/// ASC` are one code path by construction. The only differences are the
+/// projection (`id`) and the missing `LIMIT ?1 OFFSET ?2` tail — pinned as
+/// text by `scoped_gallery_id_projection_tests::
+/// the_id_sql_differs_from_the_record_sql_only_by_projection_and_paging_tail`.
+///
+/// Because the order is TOTAL (`images.id` is the primary key and closes every
+/// order), concatenating the record query's pages in offset order yields
+/// exactly this list.
+fn build_ordered_image_id_query_sql(
+    where_clause: &str,
+    order_by: &str,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+    apply_similar_photo_collapse: bool,
+    similar_algorithm_version: &str,
+    media_type: MediaType,
+) -> String
+{
+    build_image_query_sql(
+        ImageQueryShape::OrderedIds,
+        where_clause,
+        order_by,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+        apply_similar_photo_collapse,
+        similar_algorithm_version,
+        media_type,
+    )
+}
+
+/// What `build_image_query_sql` emits: the paged full-record page, or every
+/// matching id in the same total order with no paging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageQueryShape
+{
+    /// `SELECT *` (or the full projection) … `ORDER BY … LIMIT ?1 OFFSET ?2`.
+    /// Byte-identical to the pre-Oct-22 `build_image_record_query_sql` (T2
+    /// in `paging_tie_order_tests` compares it against the frozen pre-E1
+    /// templates).
+    RecordPage,
+    /// `SELECT id` … `ORDER BY …` — no LIMIT/OFFSET, no bound parameters.
+    OrderedIds,
+}
+
+/// The one builder behind both shapes. See `build_image_record_query_sql`
+/// (the page) and `build_ordered_image_id_query_sql` (the id list).
+fn build_image_query_sql(
+    shape: ImageQueryShape,
+    where_clause: &str,
+    order_by: &str,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+    apply_similar_photo_collapse: bool,
+    similar_algorithm_version: &str,
+    media_type: MediaType,
+) -> String
+{
     // Assemble the inner WHERE from the caller-supplied predicate text
     // and the RAW+JPEG collapse predicate (both stored-column references;
     // both safely composable with AND at the inner level).
@@ -6877,6 +6953,15 @@ fn build_image_record_query_sql(
     // `order_by` is never interpolated on its own.
     let total_order_by = format!("{}, id ASC", order_by);
 
+    // The two shapes differ ONLY in what the outermost SELECT projects and in
+    // the paging tail. For `RecordPage` these substitute the exact text the
+    // pre-Oct-22 templates carried, so the page SQL is byte-identical.
+    let (outer_projection, paging_tail) = match shape
+    {
+        ImageQueryShape::RecordPage => ("*", "LIMIT ?1 OFFSET ?2"),
+        ImageQueryShape::OrderedIds => ("id", ""),
+    };
+
     // Branch on outer filters. Duplicate and similar-photo collapse both need
     // projection aliases, so they share the same wrap shape. When inactive,
     // emit the minimal top-level projection.
@@ -6920,16 +7005,16 @@ fn build_image_record_query_sql(
         };
         format!(
             r#"
-            SELECT * FROM (
+            SELECT {} FROM (
                 {}
             )
             WHERE {}
             ORDER BY {}
-            LIMIT ?1 OFFSET ?2
+            {}
         "#,
-            filtered_source, outer_filters, total_order_by
+            outer_projection, filtered_source, outer_filters, total_order_by, paging_tail
         )
-    } else {
+    } else if shape == ImageQueryShape::RecordPage {
         format!(
             r#"
             SELECT
@@ -6950,6 +7035,22 @@ fn build_image_record_query_sql(
             LIMIT ?1 OFFSET ?2
         "#,
             DUPLICATE_GROUP_ID_CASE, inner_where, total_order_by
+        )
+    } else {
+        // The plain branch's id list: the same `FROM images` + inner WHERE +
+        // total ORDER BY as the page above. The page's projected
+        // `duplicate_group_id` window is display-only on this branch (no
+        // outer filter reads it), so the id list skips it; the row set and the
+        // order are unchanged because the ORDER BY reads only stored columns
+        // and ends in the primary key.
+        format!(
+            r#"
+            SELECT id
+            FROM images
+            {}
+            ORDER BY {}
+        "#,
+            inner_where, total_order_by
         )
     };
 
@@ -9530,13 +9631,47 @@ pub async fn query_images_scoped_gallery(
         }
     };
 
-    let where_clause = build_scoped_filter_predicate(
+    query_images_scoped_gallery_impl(
+        conn,
         &predicates,
         &connectors,
         &scope_predicates,
         &scope_connectors,
+        limit,
+        offset,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+        apply_similar_photo_collapse,
+        &similar_algorithm_version,
+        media_type,
+    )
+}
+
+/// The body of `query_images_scoped_gallery`, on a borrowed connection so the
+/// scoped id projection's parity tests can page the REAL record query.
+#[allow(clippy::too_many_arguments)]
+fn query_images_scoped_gallery_impl(
+    conn: &Connection,
+    predicates: &[QueryPredicate],
+    connectors: &[Connector],
+    scope_predicates: &[QueryPredicate],
+    scope_connectors: &[Connector],
+    limit: u32,
+    offset: u32,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+    apply_similar_photo_collapse: bool,
+    similar_algorithm_version: &str,
+    media_type: MediaType,
+) -> Vec<ImageRecord>
+{
+    let where_clause = build_scoped_filter_predicate(
+        predicates,
+        connectors,
+        scope_predicates,
+        scope_connectors,
     );
-    let order_by = order_by_for_filter(&predicates);
+    let order_by = order_by_for_filter(predicates);
 
     execute_image_record_query(
         conn,
@@ -9547,7 +9682,7 @@ pub async fn query_images_scoped_gallery(
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
         apply_similar_photo_collapse,
-        &similar_algorithm_version,
+        similar_algorithm_version,
         media_type,
     )
 }
@@ -9572,11 +9707,40 @@ pub async fn count_query_images_scoped_gallery(
         }
     };
 
-    let where_clause = build_scoped_filter_predicate(
+    count_query_images_scoped_gallery_impl(
+        conn,
         &predicates,
         &connectors,
         &scope_predicates,
         &scope_connectors,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+        apply_similar_photo_collapse,
+        &similar_algorithm_version,
+        media_type,
+    )
+}
+
+/// The body of `count_query_images_scoped_gallery`, on a borrowed connection.
+#[allow(clippy::too_many_arguments)]
+fn count_query_images_scoped_gallery_impl(
+    conn: &Connection,
+    predicates: &[QueryPredicate],
+    connectors: &[Connector],
+    scope_predicates: &[QueryPredicate],
+    scope_connectors: &[Connector],
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+    apply_similar_photo_collapse: bool,
+    similar_algorithm_version: &str,
+    media_type: MediaType,
+) -> u64
+{
+    let where_clause = build_scoped_filter_predicate(
+        predicates,
+        connectors,
+        scope_predicates,
+        scope_connectors,
     );
 
     let count = execute_image_count_query(
@@ -9585,15 +9749,153 @@ pub async fn count_query_images_scoped_gallery(
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
         apply_similar_photo_collapse,
-        &similar_algorithm_version,
+        similar_algorithm_version,
         media_type,
     );
 
-    if count < 0 {
+    if count < 0
+    {
         0
-    } else {
+    }
+    else
+    {
         count as u64
     }
+}
+
+/// ⭐ Oct 22, 2026 — gallery ⌘A inside a scoped Find: every id of
+/// `query_images_scoped_gallery`'s result, across all of its pages, in the
+/// SAME order, with the SAME collapse semantics (one visible representative
+/// per similar stack, JPEG/HEIF before a hidden RAW representative, the
+/// duplicate filter's winner, the RAW/JPEG collapse, the media stance).
+///
+/// It exists for the one gallery shape `query_image_ids_gallery` cannot
+/// express: a Find chain with OR/XOR connectors inside a sidebar scope of
+/// several parts. The page query ANDs the two groups as two parenthesized
+/// folds (`build_scoped_filter_predicate`); no single left-to-right fold
+/// reproduces that, so this takes both groups exactly as the record query does.
+///
+/// Same predicate assembly (`build_scoped_filter_predicate` +
+/// `order_by_for_filter` over the Find predicates), same SQL builder
+/// (`build_image_query_sql`, the `OrderedIds` shape). No failure channel (a
+/// bare list, like its siblings): a missing catalogue or failed read answers
+/// EMPTY, logged and counted in the dropped-row census as
+/// `query_image_ids_scoped_gallery.query_failed`.
+pub async fn query_image_ids_scoped_gallery(
+    predicates: Vec<QueryPredicate>,
+    connectors: Vec<Connector>,
+    scope_predicates: Vec<QueryPredicate>,
+    scope_connectors: Vec<Connector>,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+    apply_similar_photo_collapse: bool,
+    similar_algorithm_version: String,
+    media_type: MediaType,
+) -> Vec<i64>
+{
+    let catalogue = lock_catalogue();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            eprintln!("Catalogue not initialized");
+            return Vec::new();
+        }
+    };
+
+    match query_image_ids_scoped_gallery_impl(
+        conn,
+        &predicates,
+        &connectors,
+        &scope_predicates,
+        &scope_connectors,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+        apply_similar_photo_collapse,
+        &similar_algorithm_version,
+        media_type,
+    )
+    {
+        Ok(ids) => ids,
+        Err(message) =>
+        {
+            eprintln!("query_image_ids_scoped_gallery: {}", message);
+            record_dropped_rows("query_image_ids_scoped_gallery.query_failed", 1);
+            Vec::new()
+        }
+    }
+}
+
+/// The body of `query_image_ids_scoped_gallery`, on a borrowed connection.
+/// Mirrors `query_images_scoped_gallery_impl` line for line, minus the paging.
+#[allow(clippy::too_many_arguments)]
+fn query_image_ids_scoped_gallery_impl(
+    conn: &Connection,
+    predicates: &[QueryPredicate],
+    connectors: &[Connector],
+    scope_predicates: &[QueryPredicate],
+    scope_connectors: &[Connector],
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+    apply_similar_photo_collapse: bool,
+    similar_algorithm_version: &str,
+    media_type: MediaType,
+) -> Result<Vec<i64>, String>
+{
+    let where_clause = build_scoped_filter_predicate(
+        predicates,
+        connectors,
+        scope_predicates,
+        scope_connectors,
+    );
+    let order_by = order_by_for_filter(predicates);
+
+    execute_ordered_id_query(
+        conn,
+        &where_clause,
+        order_by,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+        apply_similar_photo_collapse,
+        similar_algorithm_version,
+        media_type,
+    )
+}
+
+/// Run `build_ordered_image_id_query_sql`: every id `execute_image_record_query`
+/// would return for the same arguments across all of its pages, in order.
+/// Prepare/query failures are an `Err` (the caller logs and censuses them); a
+/// row that fails to decode is counted by the dropped-row collector.
+#[allow(clippy::too_many_arguments)]
+fn execute_ordered_id_query(
+    conn: &Connection,
+    where_clause: &str,
+    order_by: &str,
+    apply_duplicate_filter: bool,
+    apply_raw_jpeg_collapse: bool,
+    apply_similar_photo_collapse: bool,
+    similar_algorithm_version: &str,
+    media_type: MediaType,
+) -> Result<Vec<i64>, String>
+{
+    let query_sql = build_ordered_image_id_query_sql(
+        where_clause,
+        order_by,
+        apply_duplicate_filter,
+        apply_raw_jpeg_collapse,
+        apply_similar_photo_collapse,
+        similar_algorithm_version,
+        media_type,
+    );
+
+    let mut stmt = conn
+        .prepare(&query_sql)
+        .map_err(|e| format!("prepare {}", e))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|e| format!("query {}", e))?;
+    Ok(collect_rows(rows, "execute_ordered_id_query"))
 }
 
 // ============================================================================
@@ -63464,5 +63766,859 @@ mod writeback_plan_evidence
                 first.failure_stage, second.failure_stage
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod scoped_gallery_id_projection_tests
+{
+    //! ⭐ Oct 22, 2026 — `query_image_ids_scoped_gallery`, the id projection
+    //! of the scoped gallery record query (gallery ⌘A inside a scoped Find).
+    //!
+    //! The contract under test: for every scope × Find chain × collapse flag ×
+    //! media stance, the id list equals the ids of paging
+    //! `query_images_scoped_gallery` to exhaustion, IN ORDER, and its length
+    //! equals `count_query_images_scoped_gallery`. Every case runs through the
+    //! REAL `_impl` bodies the three FFIs call.
+    //!
+    //! ⭐ Anti-vacuity is asserted, not assumed: the matrix must contain cases
+    //! where each collapse flag changes the answer, where the order is not
+    //! ascending id, and where flattening the two groups into one
+    //! left-to-right fold changes the answer — so a grouping mutation or a
+    //! dropped collapse cannot pass on a fixture that never exercises it.
+    //!
+    //! ⭐⭐ ENGINE TESTS NEVER FETCH: every connection is opened through the
+    //! production `open_and_migrate_catalogue` on a real temp FILE and then
+    //! fenced with `fence_connection_against_extension_fetches`.
+    use super::*;
+    use std::collections::HashMap;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    const SIMILAR_VERSION: &str = "scoped-ids-v1";
+
+    /// Small on purpose, so the record sweep crosses several page boundaries.
+    const PAGE: u32 = 7;
+
+    struct Fixture
+    {
+        path: std::path::PathBuf,
+        conn: Option<Connection>,
+    }
+
+    impl Fixture
+    {
+        fn new(tag: &str) -> Fixture
+        {
+            let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let path = std::env::temp_dir().join(format!(
+                "plcore-scoped-ids-{}-{}-{}.db",
+                std::process::id(),
+                n,
+                tag
+            ));
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path.with_extension("db.wal"));
+            let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+            fence_connection_against_extension_fetches(&conn);
+            Fixture
+            {
+                path,
+                conn: Some(conn),
+            }
+        }
+
+        fn conn(&self) -> &Connection
+        {
+            self.conn.as_ref().expect("fixture connection is open")
+        }
+    }
+
+    impl Drop for Fixture
+    {
+        fn drop(&mut self)
+        {
+            drop(self.conn.take());
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(self.path.with_extension("db.wal"));
+        }
+    }
+
+    fn qp(kind: &str) -> QueryPredicate
+    {
+        QueryPredicate
+        {
+            kind: kind.to_string(),
+            day: None,
+            day_end: None,
+            op: None,
+            stars: None,
+            value: None,
+            num: None,
+            num_end: None,
+        }
+    }
+
+    fn rating(op: &str, stars: u8) -> QueryPredicate
+    {
+        let mut p = qp("rating");
+        p.op = Some(op.to_string());
+        p.stars = Some(stars);
+        p
+    }
+
+    fn value_pred(kind: &str, value: &str) -> QueryPredicate
+    {
+        let mut p = qp(kind);
+        p.value = Some(value.to_string());
+        p
+    }
+
+    fn focus_at_least(value: f64) -> QueryPredicate
+    {
+        let mut p = qp("focus_num");
+        p.op = Some("gte".to_string());
+        p.num = Some(value);
+        p
+    }
+
+    struct Row
+    {
+        id: i64,
+        dir: &'static str,
+        stem: String,
+        ext: &'static str,
+        kind: &'static str,
+        capture: Option<String>,
+        created: i64,
+        rating: Option<i64>,
+        flag: Option<&'static str>,
+        color: Option<&'static str>,
+        focus: Option<f64>,
+        is_video: bool,
+    }
+
+    fn special(
+        id: i64,
+        dir: &'static str,
+        stem: &str,
+        kind: &'static str,
+        capture: &str,
+        rating: Option<i64>,
+        flag: Option<&'static str>,
+        color: Option<&'static str>,
+    ) -> Row
+    {
+        let ext = match kind
+        {
+            "raw" => "nef",
+            "heif" => "heic",
+            _ => "jpg",
+        };
+        Row
+        {
+            id,
+            dir,
+            stem: stem.to_string(),
+            ext,
+            kind,
+            capture: Some(capture.to_string()),
+            created: 1_700_000_100,
+            rating,
+            flag,
+            color,
+            focus: Some(2.5),
+            is_video: false,
+        }
+    }
+
+    fn insert_rows(conn: &Connection, rows: &[Row])
+    {
+        for row in rows
+        {
+            let file_name = format!("{}.{}", row.stem, row.ext);
+            let file_path = format!("{}{}", row.dir, file_name);
+            let directory_path = row.dir.trim_end_matches('/').to_string();
+            conn.execute(
+                "INSERT INTO images (id, file_path, file_size, file_name, file_extension, \
+                 file_stem, image_kind, directory_path, created_timestamp, modified_timestamp, \
+                 camera_model, pixel_width, pixel_height, capture_datetime, rating, flag, \
+                 color_label, focus_score, is_video) \
+                 VALUES (?1, ?2, 1000, ?3, ?4, ?5, ?6, ?7, ?8, 1700000000, 'Z 8', 100, 100, \
+                 ?9, ?10, ?11, ?12, ?13, ?14)",
+                duckdb::params![
+                    row.id,
+                    file_path,
+                    file_name,
+                    row.ext,
+                    row.stem,
+                    row.kind,
+                    directory_path,
+                    row.created,
+                    row.capture,
+                    row.rating,
+                    row.flag,
+                    row.color,
+                    row.focus,
+                    row.is_video
+                ],
+            )
+            .unwrap_or_else(|e| panic!("seeding row {} failed: {}", row.id, e));
+        }
+    }
+
+    fn insert_group(conn: &Connection, group_id: i64, representative: i64, members: &[i64])
+    {
+        for (rank, member) in members.iter().enumerate()
+        {
+            conn.execute(
+                "INSERT INTO similar_photo_group_member (image_id, group_id, representative_id, \
+                 member_rank, distance_to_representative, algorithm_version, threshold) \
+                 VALUES (?1, ?2, ?3, ?4, 0.1, ?5, 8.5)",
+                duckdb::params![*member, group_id, representative, rank as i64, SIMILAR_VERSION],
+            )
+            .unwrap_or_else(|e| panic!("seeding group member {} failed: {}", member, e));
+        }
+    }
+
+    /// 60 generated rows across four folders (one of them the `/lib/A/sub/`
+    /// subtree the scopes subtract), three capture days with tie blocks,
+    /// ratings / flags / colors / focus spread, lone RAWs, HEIFs and videos;
+    /// plus hand-placed RAW+JPEG and RAW+HEIF pairs, a three-way duplicate
+    /// set across folders, and two similar-photo stacks — one whose durable
+    /// representative is a RAW with a same-folder JPEG twin, one spanning
+    /// folders.
+    fn seed_matrix_fixture(conn: &Connection)
+    {
+        const DIRS: [&str; 4] = ["/lib/A/", "/lib/A/sub/", "/lib/B/", "/lib/C/"];
+        let mut rows = Vec::new();
+        for i in 1..=60i64
+        {
+            let is_video = i % 13 == 0;
+            let (kind, ext) = if is_video
+            {
+                ("other", "mov")
+            }
+            else if i % 7 == 0
+            {
+                ("raw", "nef")
+            }
+            else if i % 11 == 0
+            {
+                ("heif", "heic")
+            }
+            else
+            {
+                ("jpeg", "jpg")
+            };
+            rows.push(Row
+            {
+                id: i,
+                dir: DIRS[(i % 4) as usize],
+                stem: format!("img{:03}", i),
+                ext,
+                kind,
+                capture: if i % 9 == 0
+                {
+                    None
+                }
+                else
+                {
+                    Some(format!("2026:06:0{} 10:{:02}:00", 1 + i % 3, (i % 5) * 10))
+                },
+                created: 1_700_000_000 + (i % 3),
+                rating: match i % 6
+                {
+                    0 => None,
+                    r => Some(r),
+                },
+                flag: match i % 5
+                {
+                    0 => Some("pick"),
+                    1 => Some("reject"),
+                    _ => None,
+                },
+                color: if i % 4 == 2
+                {
+                    Some("red")
+                }
+                else if i % 8 == 3
+                {
+                    Some("blue")
+                }
+                else
+                {
+                    None
+                },
+                focus: if i % 10 == 0
+                {
+                    None
+                }
+                else
+                {
+                    Some(((i * 13) % 50) as f64 / 10.0)
+                },
+                is_video,
+            });
+        }
+
+        // RAW+JPEG / RAW+HEIF pairs (same stem, same folder).
+        rows.push(special(101, "/lib/A/", "pairA", "raw", "2026:06:01 11:00:00", Some(5), Some("pick"), None));
+        rows.push(special(102, "/lib/A/", "pairA", "jpeg", "2026:06:01 11:00:00", Some(5), Some("pick"), None));
+        rows.push(special(103, "/lib/B/", "pairB", "raw", "2026:06:03 12:00:00", Some(4), None, None));
+        rows.push(special(104, "/lib/B/", "pairB", "heif", "2026:06:03 12:00:00", Some(4), None, Some("red")));
+        rows.push(special(105, "/lib/A/sub/", "pairS", "raw", "2026:06:02 08:00:00", None, Some("pick"), None));
+        rows.push(special(106, "/lib/A/sub/", "pairS", "jpeg", "2026:06:02 08:00:00", None, Some("pick"), None));
+
+        // A three-way duplicate set across folders (the six-field fingerprint
+        // matches; LOWER(file_stem) folds DUP1). Winner = smallest file_path
+        // among the rows that survive the inner WHERE.
+        rows.push(special(111, "/lib/A/", "dup1", "jpeg", "2026:06:01 09:00:00", Some(2), Some("pick"), None));
+        rows.push(special(112, "/lib/B/", "DUP1", "jpeg", "2026:06:01 09:00:00", Some(5), None, Some("red")));
+        rows.push(special(113, "/lib/C/", "dup1", "jpeg", "2026:06:01 09:00:00", Some(4), Some("pick"), None));
+
+        // Stack 900: durable representative 121 is a RAW whose JPEG twin 122
+        // sits beside it; 123 shares the folder, 124 is in another folder.
+        rows.push(special(121, "/lib/A/", "sim1", "raw", "2026:06:02 14:00:00", Some(3), Some("pick"), None));
+        rows.push(special(122, "/lib/A/", "sim1", "jpeg", "2026:06:02 14:00:00", Some(3), Some("pick"), None));
+        rows.push(special(123, "/lib/A/", "sim1b", "jpeg", "2026:06:02 14:00:05", Some(4), None, None));
+        rows.push(special(124, "/lib/B/", "sim1c", "jpeg", "2026:06:02 14:00:09", Some(1), Some("pick"), None));
+
+        // Stack 901, spanning /lib/B/ and /lib/C/.
+        rows.push(special(131, "/lib/C/", "sim2", "jpeg", "2026:06:03 15:00:00", Some(5), None, Some("blue")));
+        rows.push(special(132, "/lib/B/", "sim2b", "jpeg", "2026:06:03 15:00:01", Some(2), Some("reject"), None));
+        rows.push(special(133, "/lib/C/", "sim2c", "heif", "2026:06:03 15:00:02", Some(4), Some("pick"), None));
+
+        insert_rows(conn, &rows);
+        insert_group(conn, 900, 121, &[121, 122, 123, 124]);
+        insert_group(conn, 901, 131, &[131, 132, 133]);
+    }
+
+    /// Page the REAL scoped record query to exhaustion, exactly the way the
+    /// gallery's old paged ⌘A workaround did, and keep the ids in order.
+    #[allow(clippy::too_many_arguments)]
+    fn paged_record_ids(
+        conn: &Connection,
+        predicates: &[QueryPredicate],
+        connectors: &[Connector],
+        scope_predicates: &[QueryPredicate],
+        scope_connectors: &[Connector],
+        dup: bool,
+        raw: bool,
+        similar: bool,
+        media: MediaType,
+    ) -> Vec<i64>
+    {
+        let mut ids = Vec::new();
+        let mut offset = 0u32;
+        loop
+        {
+            let page = query_images_scoped_gallery_impl(
+                conn,
+                predicates,
+                connectors,
+                scope_predicates,
+                scope_connectors,
+                PAGE,
+                offset,
+                dup,
+                raw,
+                similar,
+                SIMILAR_VERSION,
+                media,
+            );
+            let fetched = page.len() as u32;
+            ids.extend(page.iter().map(|r| r.id));
+            if fetched < PAGE
+            {
+                break;
+            }
+            offset += PAGE;
+            assert!(offset < 100_000, "the record sweep did not terminate");
+        }
+        ids
+    }
+
+    fn scopes() -> Vec<(&'static str, Vec<QueryPredicate>, Vec<Connector>)>
+    {
+        vec![
+            ("single folder", vec![value_pred("path_prefix", "/lib/A/")], vec![]),
+            (
+                "multi-folder OR",
+                vec![value_pred("path_prefix", "/lib/A/"), value_pred("path_prefix", "/lib/B/")],
+                vec![Connector::Or],
+            ),
+            (
+                "multi-date OR",
+                vec![
+                    value_pred("capture_prefix", "2026:06:01"),
+                    value_pred("capture_prefix", "2026:06:03"),
+                ],
+                vec![Connector::Or],
+            ),
+            (
+                "folder minus unreachable subtree (XOR)",
+                vec![value_pred("path_prefix", "/lib/A/"), value_pred("path_prefix", "/lib/A/sub/")],
+                vec![Connector::Xor],
+            ),
+            (
+                "multi-folder minus unreachable subtree",
+                vec![
+                    value_pred("path_prefix", "/lib/A/"),
+                    value_pred("path_prefix", "/lib/C/"),
+                    value_pred("path_prefix", "/lib/A/sub/"),
+                ],
+                vec![Connector::Or, Connector::Xor],
+            ),
+            (
+                "multi-date minus unreachable subtree",
+                vec![
+                    value_pred("capture_prefix", "2026:06:01"),
+                    value_pred("capture_prefix", "2026:06:02"),
+                    value_pred("path_prefix_not", "/lib/A/sub/"),
+                ],
+                vec![Connector::Or, Connector::And],
+            ),
+            ("no scope (whole catalogue)", vec![], vec![]),
+        ]
+    }
+
+    fn finds() -> Vec<(&'static str, Vec<QueryPredicate>, Vec<Connector>)>
+    {
+        vec![
+            (
+                "AND-only",
+                vec![value_pred("flag", "pick"), rating("gte", 1)],
+                vec![Connector::And],
+            ),
+            (
+                "OR (rating-first order)",
+                vec![rating("gte", 4), value_pred("flag", "pick")],
+                vec![Connector::Or],
+            ),
+            (
+                "XOR",
+                vec![value_pred("flag", "pick"), value_pred("color", "red")],
+                vec![Connector::Xor],
+            ),
+            (
+                "mixed AND/OR (focus-first order)",
+                vec![focus_at_least(1.0), value_pred("flag", "reject"), value_pred("color", "blue")],
+                vec![Connector::And, Connector::Or],
+            ),
+            ("single atom", vec![rating("gte", 3)], vec![]),
+            ("no Find", vec![], vec![]),
+        ]
+    }
+
+    const MEDIA: [MediaType; 3] = [MediaType::StillsOnly, MediaType::VideosOnly, MediaType::Both];
+
+    type CaseKey = (usize, usize, bool, bool, bool, usize);
+
+    /// ⭐ (1) + (2) — the matrix. The id list equals the paged record ids IN
+    /// ORDER, and the count equals its length, for every case.
+    #[test]
+    fn id_projection_equals_the_paged_scoped_record_query_for_every_case()
+    {
+        let fixture = Fixture::new("matrix");
+        let conn = fixture.conn();
+        seed_matrix_fixture(conn);
+
+        let scopes = scopes();
+        let finds = finds();
+        let mut results: HashMap<CaseKey, Vec<i64>> = HashMap::new();
+        let mut cases = 0usize;
+        let mut nonempty = 0usize;
+        let mut out_of_id_order = 0usize;
+
+        for (si, (scope_name, scope, scope_conns)) in scopes.iter().enumerate()
+        {
+            for (fi, (find_name, find, find_conns)) in finds.iter().enumerate()
+            {
+                for dup in [false, true]
+                {
+                    for raw in [false, true]
+                    {
+                        for similar in [false, true]
+                        {
+                            for (mi, media) in MEDIA.iter().enumerate()
+                            {
+                                let label = format!(
+                                    "scope={} find={} dup={} raw={} similar={} media={:?}",
+                                    scope_name, find_name, dup, raw, similar, media
+                                );
+                                let ids = query_image_ids_scoped_gallery_impl(
+                                    conn, find, find_conns, scope, scope_conns, dup, raw, similar,
+                                    SIMILAR_VERSION, *media,
+                                )
+                                .unwrap_or_else(|e| panic!("{}: the id projection failed: {}", label, e));
+                                let paged = paged_record_ids(
+                                    conn, find, find_conns, scope, scope_conns, dup, raw, similar, *media,
+                                );
+                                assert_eq!(ids, paged, "ids vs paged record ids, in order — {}", label);
+
+                                let distinct: HashSet<i64> = ids.iter().copied().collect();
+                                assert_eq!(distinct.len(), ids.len(), "an id repeats — {}", label);
+
+                                let count = count_query_images_scoped_gallery_impl(
+                                    conn, find, find_conns, scope, scope_conns, dup, raw, similar,
+                                    SIMILAR_VERSION, *media,
+                                );
+                                assert_eq!(count, ids.len() as u64, "count vs id-list length — {}", label);
+
+                                cases += 1;
+                                if !ids.is_empty()
+                                {
+                                    nonempty += 1;
+                                }
+                                if ids.windows(2).any(|w| w[0] > w[1])
+                                {
+                                    out_of_id_order += 1;
+                                }
+                                results.insert((si, fi, dup, raw, similar, mi), ids);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Anti-vacuity: the matrix is the size it claims, mostly non-empty,
+        // and genuinely ordered by something other than id.
+        assert_eq!(cases, scopes.len() * finds.len() * 8 * MEDIA.len(), "the case list lost cases");
+        assert!(nonempty * 2 > cases, "too few non-empty cases ({} of {})", nonempty, cases);
+        assert!(out_of_id_order > 50, "the order is barely exercised ({} cases)", out_of_id_order);
+
+        // Each collapse flag must CHANGE the answer somewhere, or a dropped
+        // collapse would pass on this fixture.
+        let flips = |pick: &dyn Fn(&CaseKey) -> Option<CaseKey>| -> usize
+        {
+            results
+                .iter()
+                .filter_map(|(key, ids)| pick(key).map(|other| (ids, other)))
+                .filter(|(ids, other)| results.get(other).map_or(false, |o| o != *ids))
+                .count()
+        };
+        let similar_changes = flips(&|k| if !k.4 { Some((k.0, k.1, k.2, k.3, true, k.5)) } else { None });
+        let duplicate_changes = flips(&|k| if !k.2 { Some((k.0, k.1, true, k.3, k.4, k.5)) } else { None });
+        let raw_changes = flips(&|k| if !k.3 { Some((k.0, k.1, k.2, true, k.4, k.5)) } else { None });
+        assert!(similar_changes > 20, "the similar collapse rarely changes an answer ({})", similar_changes);
+        assert!(duplicate_changes > 10, "the duplicate filter rarely changes an answer ({})", duplicate_changes);
+        assert!(raw_changes > 10, "the RAW/JPEG collapse rarely changes an answer ({})", raw_changes);
+        let videos_seen = results.iter().filter(|(k, ids)| k.5 == 1 && !ids.is_empty()).count();
+        assert!(videos_seen > 0, "VideosOnly never selects anything");
+
+        // The two-group shape must MATTER on this fixture: flattening Find and
+        // scope into one left-to-right fold changes the answer for some OR/XOR
+        // chains in multi-part scopes. Without this, a grouping mutation could
+        // pass.
+        let mut flat_differs = 0usize;
+        for (scope_name, scope, scope_conns) in &scopes
+        {
+            for (find_name, find, find_conns) in &finds
+            {
+                if scope.is_empty() || find.is_empty()
+                {
+                    continue;
+                }
+                let mut flat = find.clone();
+                flat.extend(scope.iter().cloned());
+                let mut flat_conns = find_conns.clone();
+                flat_conns.push(Connector::And);
+                flat_conns.extend(scope_conns.iter().cloned());
+                let flat_ids = execute_ordered_id_query(
+                    conn,
+                    &build_filter_predicate(&flat, &flat_conns),
+                    order_by_for_filter(find),
+                    false,
+                    false,
+                    false,
+                    "",
+                    MediaType::Both,
+                )
+                .expect("flat fold");
+                let scoped = query_image_ids_scoped_gallery_impl(
+                    conn, find, find_conns, scope, scope_conns, false, false, false, "", MediaType::Both,
+                )
+                .expect("scoped");
+                if flat_ids != scoped
+                {
+                    flat_differs += 1;
+                    eprintln!("flat fold differs: scope={} find={}", scope_name, find_name);
+                }
+            }
+        }
+        assert!(flat_differs >= 5, "flattening the groups rarely matters ({})", flat_differs);
+    }
+
+    /// An INDEPENDENT oracle: hand-written SQL for two scoped OR/XOR shapes,
+    /// owing nothing to the product's predicate builders. A mutation in the
+    /// shared builder (which the matrix's equality cannot see, since both
+    /// sides share it) fails here.
+    #[test]
+    fn id_projection_matches_hand_written_sql_for_scoped_or_and_xor_chains()
+    {
+        let fixture = Fixture::new("oracle");
+        let conn = fixture.conn();
+        seed_matrix_fixture(conn);
+
+        let oracle = |sql: &str| -> Vec<i64>
+        {
+            let mut stmt = conn.prepare(sql).expect("oracle prepare");
+            let ids = stmt
+                .query_map([], |row| row.get::<_, i64>(0))
+                .expect("oracle query")
+                .collect::<Result<Vec<i64>, _>>()
+                .expect("oracle rows");
+            ids
+        };
+
+        // Find (rating >= 4 OR pick) inside scope (/lib/A/ OR /lib/B/).
+        let expected_or = oracle(
+            "SELECT id FROM images \
+             WHERE (starts_with(file_path, '/lib/A/') OR starts_with(file_path, '/lib/B/')) \
+               AND (rating >= 4 OR flag = 'pick') \
+             ORDER BY rating DESC NULLS LAST, capture_datetime DESC NULLS LAST, \
+                      created_timestamp DESC, id ASC",
+        );
+        let ids_or = query_image_ids_scoped_gallery_impl(
+            conn,
+            &[rating("gte", 4), value_pred("flag", "pick")],
+            &[Connector::Or],
+            &[value_pred("path_prefix", "/lib/A/"), value_pred("path_prefix", "/lib/B/")],
+            &[Connector::Or],
+            false,
+            false,
+            false,
+            "",
+            MediaType::Both,
+        )
+        .expect("OR case");
+        assert!(expected_or.len() > 10, "oracle OR case is too small ({})", expected_or.len());
+        assert_eq!(ids_or, expected_or, "scoped OR chain vs the hand-written oracle");
+
+        // Find (rating >= 2 XOR rating >= 4) inside scope (/lib/A/ OR /lib/C/)
+        // minus /lib/A/sub/.
+        let expected_xor = oracle(
+            "SELECT id FROM images \
+             WHERE ((starts_with(file_path, '/lib/A/') OR starts_with(file_path, '/lib/C/')) \
+                    <> starts_with(file_path, '/lib/A/sub/')) \
+               AND ((rating >= 2) <> (rating >= 4)) \
+             ORDER BY rating DESC NULLS LAST, capture_datetime DESC NULLS LAST, \
+                      created_timestamp DESC, id ASC",
+        );
+        let ids_xor = query_image_ids_scoped_gallery_impl(
+            conn,
+            &[rating("gte", 2), rating("gte", 4)],
+            &[Connector::Xor],
+            &[
+                value_pred("path_prefix", "/lib/A/"),
+                value_pred("path_prefix", "/lib/C/"),
+                value_pred("path_prefix", "/lib/A/sub/"),
+            ],
+            &[Connector::Or, Connector::Xor],
+            false,
+            false,
+            false,
+            "",
+            MediaType::Both,
+        )
+        .expect("XOR case");
+        assert!(expected_xor.len() > 3, "oracle XOR case is too small ({})", expected_xor.len());
+        assert_eq!(ids_xor, expected_xor, "scoped XOR chain vs the hand-written oracle");
+    }
+
+    /// ⭐ (3) — the stack whose DURABLE representative is a RAW: the visible
+    /// representative is its JPEG twin (JPEG/HEIF before RAW, then lowest id),
+    /// with the RAW/JPEG collapse on AND off, and the id list matches the
+    /// paged record query.
+    #[test]
+    fn a_stack_with_a_raw_durable_representative_projects_its_jpeg()
+    {
+        let fixture = Fixture::new("stack");
+        let conn = fixture.conn();
+        let rows = vec![
+            special(1, "/s/A/", "st", "raw", "2026:07:01 10:00:00", Some(3), None, None),
+            special(2, "/s/A/", "st", "jpeg", "2026:07:01 10:00:00", Some(3), None, None),
+            special(3, "/s/A/", "st2", "jpeg", "2026:07:01 10:00:01", Some(3), None, None),
+            special(4, "/s/A/", "lone", "jpeg", "2026:07:01 09:00:00", Some(3), None, None),
+            special(5, "/s/B/", "st3", "jpeg", "2026:07:01 10:00:02", Some(3), None, None),
+        ];
+        insert_rows(conn, &rows);
+        insert_group(conn, 7, 1, &[1, 2, 3, 5]);
+
+        let durable_rep: i64 = conn
+            .query_row(
+                "SELECT DISTINCT representative_id FROM similar_photo_group_member WHERE group_id = 7",
+                [],
+                |row| row.get(0),
+            )
+            .expect("durable representative");
+        assert_eq!(durable_rep, 1, "precondition: the durable representative is the RAW");
+
+        let find = [rating("gte", 1), value_pred("flag", "pick")];
+        let find_conns = [Connector::Or];
+        let scope = [value_pred("path_prefix", "/s/A/"), value_pred("path_prefix", "/s/B/")];
+        let scope_conns = [Connector::Or];
+
+        for (raw, similar, expected) in [
+            (true, true, vec![2i64, 4]),
+            (false, true, vec![2, 4]),
+            (true, false, vec![5, 3, 2, 4]),
+            // 1 and 2 tie on every order key; the total order breaks it by id.
+            (false, false, vec![5, 3, 1, 2, 4]),
+        ]
+        {
+            let label = format!("raw={} similar={}", raw, similar);
+            let ids = query_image_ids_scoped_gallery_impl(
+                conn, &find, &find_conns, &scope, &scope_conns, false, raw, similar, SIMILAR_VERSION,
+                MediaType::StillsOnly,
+            )
+            .expect("stack case");
+            assert_eq!(ids, expected, "{}", label);
+            assert_eq!(
+                ids,
+                paged_record_ids(conn, &find, &find_conns, &scope, &scope_conns, false, raw, similar,
+                                 MediaType::StillsOnly),
+                "vs paged record ids — {}",
+                label
+            );
+            assert_eq!(
+                count_query_images_scoped_gallery_impl(
+                    conn, &find, &find_conns, &scope, &scope_conns, false, raw, similar, SIMILAR_VERSION,
+                    MediaType::StillsOnly,
+                ),
+                expected.len() as u64,
+                "count — {}",
+                label
+            );
+        }
+    }
+
+    /// ⭐ (4) — nothing in, nothing out: an empty catalogue, a scope that
+    /// matches nothing, and a Find that matches nothing inside a multi-part
+    /// scope all answer an EMPTY list (Ok, not an error), with count 0.
+    #[test]
+    fn an_empty_scope_or_an_empty_find_answers_an_empty_list()
+    {
+        let empty = Fixture::new("empty");
+        let ids = query_image_ids_scoped_gallery_impl(
+            empty.conn(), &[], &[], &[], &[], true, true, true, SIMILAR_VERSION, MediaType::Both,
+        )
+        .expect("empty catalogue");
+        assert!(ids.is_empty(), "an empty catalogue answered {:?}", ids);
+
+        let fixture = Fixture::new("empty-scopes");
+        let conn = fixture.conn();
+        seed_matrix_fixture(conn);
+
+        let nowhere = [value_pred("path_prefix", "/nowhere/"), value_pred("path_prefix", "/also/nowhere/")];
+        let or = [Connector::Or];
+        let multi = [value_pred("path_prefix", "/lib/A/"), value_pred("path_prefix", "/lib/B/")];
+        let no_match_find = [value_pred("color", "green"), value_pred("color", "purple")];
+
+        for (label, find, find_conns, scope, scope_conns) in [
+            ("scope matches nothing", &[rating("gte", 1), value_pred("flag", "pick")][..], &or[..], &nowhere[..], &or[..]),
+            ("Find matches nothing", &no_match_find[..], &or[..], &multi[..], &or[..]),
+        ]
+        {
+            for (dup, raw, similar) in [(false, false, false), (true, true, true)]
+            {
+                let ids = query_image_ids_scoped_gallery_impl(
+                    conn, find, find_conns, scope, scope_conns, dup, raw, similar, SIMILAR_VERSION,
+                    MediaType::Both,
+                )
+                .expect(label);
+                assert!(ids.is_empty(), "{}: answered {:?}", label, ids);
+                assert_eq!(
+                    count_query_images_scoped_gallery_impl(
+                        conn, find, find_conns, scope, scope_conns, dup, raw, similar, SIMILAR_VERSION,
+                        MediaType::Both,
+                    ),
+                    0,
+                    "{}: count",
+                    label
+                );
+            }
+        }
+    }
+
+    fn normalise(text: &str) -> String
+    {
+        text.split_whitespace().collect::<Vec<&str>>().join(" ")
+    }
+
+    /// The SAME builder, pinned as text: the id SQL differs from the record
+    /// page SQL ONLY in the outermost projection and the paging tail — the
+    /// inner WHERE, every collapse window and the total ORDER BY are the
+    /// record query's own text.
+    #[test]
+    fn the_id_sql_differs_from_the_record_sql_only_by_projection_and_paging_tail()
+    {
+        let where_clause = build_scoped_filter_predicate(
+            &[rating("gte", 4), value_pred("flag", "pick")],
+            &[Connector::Or],
+            &[value_pred("path_prefix", "/lib/A/"), value_pred("path_prefix", "/lib/B/")],
+            &[Connector::Or],
+        );
+        let mut outer = 0usize;
+        let mut plain = 0usize;
+        for order_by in [DEFAULT_FILTER_ORDER_BY, RATING_FILTER_ORDER_BY, FOCUS_FILTER_ORDER_BY]
+        {
+            for where_text in ["", where_clause.as_str()]
+            {
+                for dup in [false, true]
+                {
+                    for raw in [false, true]
+                    {
+                        for similar in [false, true]
+                        {
+                            for media in MEDIA
+                            {
+                                let label = format!(
+                                    "order={:?} where={:?} dup={} raw={} similar={} media={:?}",
+                                    order_by, where_text, dup, raw, similar, media
+                                );
+                                let record = build_image_record_query_sql(
+                                    where_text, order_by, dup, raw, similar, SIMILAR_VERSION, media,
+                                );
+                                let ids = build_ordered_image_id_query_sql(
+                                    where_text, order_by, dup, raw, similar, SIMILAR_VERSION, media,
+                                );
+                                assert!(!ids.contains("LIMIT") && !ids.contains("OFFSET") && !ids.contains("?1"),
+                                        "the id SQL pages or binds — {}", label);
+                                assert!(normalise(&ids).contains(&format!("ORDER BY {}, id ASC", normalise(order_by))),
+                                        "the id SQL lost the total order — {}", label);
+                                if record.contains("SELECT * FROM (")
+                                {
+                                    outer += 1;
+                                    let expected = record
+                                        .replacen("SELECT * FROM (", "SELECT id FROM (", 1)
+                                        .replacen("LIMIT ?1 OFFSET ?2", "", 1);
+                                    assert_eq!(normalise(&ids), normalise(&expected), "outer branch — {}", label);
+                                }
+                                else
+                                {
+                                    plain += 1;
+                                    let record_from = record.find("FROM images").expect("record FROM");
+                                    let record_tail = record.find("LIMIT ?1 OFFSET ?2").expect("record tail");
+                                    let ids_from = ids.find("FROM images").expect("ids FROM");
+                                    assert_eq!(
+                                        normalise(&ids[ids_from..]),
+                                        normalise(&record[record_from..record_tail]),
+                                        "plain branch FROM/WHERE/ORDER BY — {}",
+                                        label
+                                    );
+                                    assert_eq!(normalise(&ids[..ids_from]), "SELECT id", "plain projection — {}", label);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(outer > 0 && plain > 0, "both branches must be covered (outer {}, plain {})", outer, plain);
     }
 }

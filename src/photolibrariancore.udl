@@ -1205,6 +1205,27 @@ namespace photolibrariancore {
     // failed_reason set, plus a warning that begins "negative_writeback_failed:".
     [Async]
     NegativeDetectionWritebackResult update_negative_detection_results(sequence<NegativeDetectionResult> results);
+
+    // ⭐ Oct 22, 2026 — gallery ⌘A inside a scoped Find: every id of
+    // query_images_scoped_gallery's result across all of its pages, in the
+    // SAME order, with the SAME collapse semantics (one visible representative
+    // per similar stack, JPEG/HEIF before a hidden RAW, the duplicate winner,
+    // the RAW/JPEG collapse, the media stance). The Find group and the scope
+    // group are ANDed as two parenthesized folds, exactly as the record query
+    // does. Same parameters as query_images_scoped_gallery minus limit/offset.
+    // A missing catalogue or failed read answers EMPTY (logged and censused).
+    [Async]
+    sequence<i64> query_image_ids_scoped_gallery(
+        sequence<QueryPredicate> predicates,
+        sequence<Connector> connectors,
+        sequence<QueryPredicate> scope_predicates,
+        sequence<Connector> scope_connectors,
+        boolean apply_duplicate_filter,
+        boolean apply_raw_jpeg_collapse,
+        boolean apply_similar_photo_collapse,
+        string similar_algorithm_version,
+        MediaType media_type
+    );
 };
 
 // Image classification categories for JPEG+RAW pair handling.
