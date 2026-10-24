@@ -16667,6 +16667,285 @@ pub async fn update_negative_detection_results(
     .into_result(Vec::new()))
 }
 
+// =============================================================================
+// ⭐ Round 2 (Oct 23, 2026) — the film-negative ROLL CUE's neighbor read.
+// DECISIONS.md "Film negatives, round 2", point 4: after a chunk is written,
+// the pass reads the directories that chunk touched and adopts a gray-band
+// frame whose adjacent frames are confident negatives. The decision is made in
+// Swift (`NegativeRollCue`, EditingCore, shared with the gate); this read only
+// hands it the rows it needs.
+//
+// The read is the twin lookup's shape (S196): every seed by PRIMARY KEY
+// (`id = ?` — an ART Index Scan), then each distinct directory ONCE by
+// `WHERE directory_path = ?` — a SINGLE filter, served by
+// `idx_images_directory_path` up to DuckDB's index-scan threshold (2,048 rows)
+// and by one filtered sequential scan above it (the measured right plan for a
+// big directory). Nothing else is filtered in SQL: the version, status, video
+// and confidence tests are finished in Rust, and the two wide columns
+// (`file_path`, `negative_signals`) are projected only for rows at or above
+// `minimum_confidence` (a CASE in the select list never changes the plan), so
+// a 33,000-photo directory hands Swift — and its @MainActor lift — only its
+// handful of candidates.
+// =============================================================================
+
+/// One analyzed still row the roll cue may read: a current-version COMPLETE
+/// verdict at or above the read's minimum confidence.
+#[derive(Debug, Clone)]
+pub struct NegativeRollFrame
+{
+    pub id: i64,
+    pub directory_path: String,
+    pub file_path: String,
+    pub file_stem: Option<String>,
+    pub image_kind: Option<String>,
+    pub capture_datetime: Option<String>,
+    pub negative_confidence: f64,
+    pub negative_kind: Option<String>,
+    pub negative_signals: Option<String>,
+}
+
+/// The directories' rows. `query_ok = false` means the read could not be
+/// performed (or lost rows): the answer is UNKNOWN, never "no neighbors".
+#[derive(Debug, Clone)]
+pub struct NegativeRollFramePage
+{
+    pub frames: Vec<NegativeRollFrame>,
+    pub query_ok: bool,
+    pub query_error: Option<String>,
+}
+
+/// The most seed ids one read accepts (a writeback chunk carries 64).
+const NEGATIVE_ROLL_MAX_SEEDS: usize = 5_000;
+
+/// The ONE directory statement: a single filter (`directory_path = ?1`), so
+/// `idx_images_directory_path` serves it; `?2` appears only in the select list.
+/// `negative_roll_tests` pins the plan with EXPLAIN ANALYZE.
+const NEGATIVE_ROLL_DIRECTORY_SQL: &str = "SELECT id,
+        file_stem,
+        image_kind,
+        capture_datetime,
+        negative_confidence,
+        negative_kind,
+        negative_detection_status,
+        negative_detection_version,
+        is_video,
+        CASE WHEN negative_confidence >= ?2 THEN file_path END,
+        CASE WHEN negative_confidence >= ?2 THEN negative_signals END
+ FROM images
+ WHERE directory_path = ?1";
+
+fn negative_roll_page_failure(message: String) -> NegativeRollFramePage
+{
+    NegativeRollFramePage
+    {
+        frames: Vec::new(),
+        query_ok: false,
+        query_error: Some(message),
+    }
+}
+
+fn negative_roll_frames_impl(
+    conn: &Connection,
+    seed_ids: &[i64],
+    minimum_confidence: f64,
+    detector_version: &str,
+) -> NegativeRollFramePage
+{
+    if !minimum_confidence.is_finite()
+    {
+        return negative_roll_page_failure(format!(
+            "negative_roll_frames_for_images: minimum_confidence {:?} is not a finite number",
+            minimum_confidence
+        ));
+    }
+    let mut seeds = seed_ids.to_vec();
+    seeds.sort_unstable();
+    seeds.dedup();
+    if seeds.len() > NEGATIVE_ROLL_MAX_SEEDS
+    {
+        return negative_roll_page_failure(format!(
+            "negative_roll_frames_for_images: {} seed ids is over the {}-id cap",
+            seeds.len(),
+            NEGATIVE_ROLL_MAX_SEEDS
+        ));
+    }
+
+    // 1. Each seed's directory, by primary key. A seed that no longer exists
+    //    (removed mid-pass) contributes nothing; a FAILED read is a failure.
+    let mut directories: Vec<String> = Vec::new();
+    for seed in &seeds
+    {
+        match conn.query_row(
+            "SELECT directory_path FROM images WHERE id = ?1 LIMIT 1",
+            params![seed],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        {
+            Ok(Some(directory)) =>
+            {
+                if !directories.contains(&directory)
+                {
+                    directories.push(directory);
+                }
+            }
+            Ok(None) | Err(duckdb::Error::QueryReturnedNoRows) => {}
+            Err(e) =>
+            {
+                return negative_roll_page_failure(format!(
+                    "negative_roll_frames_for_images: seed read failed for image_id={}: {}",
+                    seed, e
+                ));
+            }
+        }
+    }
+
+    // 2. Each directory ONCE, by its single indexed filter.
+    let mut frames = Vec::new();
+    for directory in &directories
+    {
+        let mut stmt = match conn.prepare(NEGATIVE_ROLL_DIRECTORY_SQL)
+        {
+            Ok(stmt) => stmt,
+            Err(e) =>
+            {
+                return negative_roll_page_failure(format!(
+                    "negative_roll_frames_for_images: prepare failed for directory {:?}: {}",
+                    directory, e
+                ));
+            }
+        };
+        type RollRow = (
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<f64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<bool>,
+            Option<String>,
+            Option<String>,
+        );
+        let mapped = match stmt.query_map(params![directory, minimum_confidence], |row| -> duckdb::Result<RollRow>
+        {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+            ))
+        })
+        {
+            Ok(mapped) => mapped,
+            Err(e) =>
+            {
+                return negative_roll_page_failure(format!(
+                    "negative_roll_frames_for_images: directory read failed for {:?}: {}",
+                    directory, e
+                ));
+            }
+        };
+        let (rows, dropped) = collect_rows_counted(mapped, "negative_roll_frames_for_images");
+        if dropped > 0
+        {
+            // An un-performed read is not an empty read.
+            return negative_roll_page_failure(format!(
+                "negative_roll_frames_for_images: the directory read lost {} row(s) for {:?}",
+                dropped, directory
+            ));
+        }
+        for (id, stem, kind, capture, confidence, negative_kind, status, version, is_video, file_path, signals) in rows
+        {
+            let confidence = match confidence
+            {
+                Some(confidence) if confidence.is_finite() && confidence >= minimum_confidence => confidence,
+                _ => continue,
+            };
+            if is_video == Some(true)
+                || status.as_deref() != Some("complete")
+                || version.as_deref() != Some(detector_version)
+            {
+                continue;
+            }
+            let Some(file_path) = file_path else
+            {
+                continue;
+            };
+            frames.push(NegativeRollFrame
+            {
+                id,
+                directory_path: directory.clone(),
+                file_path,
+                file_stem: stem,
+                image_kind: kind,
+                capture_datetime: capture,
+                negative_confidence: confidence,
+                negative_kind,
+                negative_signals: signals,
+            });
+        }
+    }
+    frames.sort_by_key(|frame| frame.id);
+    NegativeRollFramePage
+    {
+        frames,
+        query_ok: true,
+        query_error: None,
+    }
+}
+
+/// The roll cue's read: every current-version complete still row at or above
+/// `minimum_confidence` in the directories of `seed_ids` (each seed by primary
+/// key, each directory once by `directory_path = ?`). A panic or a failed read
+/// is `query_ok: false`, never an empty answer.
+///
+/// ⚠️ Not used by the app yet (ruling 1A, Oct 24, 2026): the pass skips the
+/// roll stage while `NegativeRollCue.enabledInPass` is false. The read, its
+/// tests and its FFI stay so turning the cue on needs no core change.
+pub async fn negative_roll_frames_for_images(
+    seed_ids: Vec<i64>,
+    minimum_confidence: f64,
+    detector_version: String,
+) -> NegativeRollFramePage
+{
+    ffi_panic_boundary("negative_roll_frames_for_images.panic.query_failed", || -> NegativeRollFramePage
+    {
+        if seed_ids.is_empty()
+        {
+            return NegativeRollFramePage
+            {
+                frames: Vec::new(),
+                query_ok: true,
+                query_error: None,
+            };
+        }
+        let catalogue = lock_catalogue();
+        let conn = match catalogue.as_ref()
+        {
+            Some(c) => c,
+            None =>
+            {
+                let message = "negative_roll_frames_for_images: catalog not initialized";
+                eprintln!("{}", message);
+                return negative_roll_page_failure(message.to_string());
+            }
+        };
+        negative_roll_frames_impl(conn, &seed_ids, minimum_confidence, &detector_version)
+    },
+    |panic| negative_roll_page_failure(ffi_panic_report(
+        "read the neighboring frames for the film-negative roll check",
+        &panic,
+    )))
+}
+
 /// Count durable face observations for the requested focus/enrichment algorithm
 /// version. This is intentionally scoped by version so old detection rows never
 /// leak into the current recognition/crop pipeline.
@@ -53633,6 +53912,15 @@ mod panic_boundary_tests
             r.warnings
         );
 
+        // Round 2 (Oct 23, 2026) — the roll cue's neighbor read.
+        let r = caught("negative_roll_frames_for_images.panic.query_failed", 1, ||
+            futures::executor::block_on(negative_roll_frames_for_images(
+                vec![1],
+                0.45,
+                "film-negative-v2".to_string(),
+            )));
+        assert!(!r.query_ok && r.frames.is_empty() && says_injected(r.query_error.as_deref().unwrap_or("")));
+
         let r = caught("accept_face_cluster_as_person.panic.query_failed", 1, ||
             futures::executor::block_on(accept_face_cluster_as_person("run".to_string(), 1, "Ada".to_string())));
         assert_eq!(r.status, "failed", "an EXISTING failure status");
@@ -64620,5 +64908,145 @@ mod scoped_gallery_id_projection_tests
             }
         }
         assert!(outer > 0 && plain > 0, "both branches must be covered (outer {}, plain {})", outer, plain);
+    }
+}
+
+#[cfg(test)]
+mod negative_roll_tests
+{
+    use super::*;
+
+    fn catalogue(tag: &str) -> (std::path::PathBuf, Connection)
+    {
+        let path = std::env::temp_dir().join(format!("plcore-negative-roll-{}-{}.db", std::process::id(), tag));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+        let conn = open_and_migrate_catalogue(&path).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH.
+        fence_connection_against_extension_fetches(&conn);
+        (path, conn)
+    }
+
+    fn cleanup(path: &std::path::Path)
+    {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seed(
+        conn: &Connection,
+        id: i64,
+        directory: &str,
+        file: &str,
+        kind: &str,
+        is_video: bool,
+        status: Option<&str>,
+        version: Option<&str>,
+        confidence: Option<f64>,
+    )
+    {
+        let stem = file.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(file);
+        conn.execute(
+            "INSERT INTO images (id, file_path, file_name, file_size, created_timestamp, modified_timestamp,
+                                 file_stem, image_kind, directory_path, is_video, capture_datetime,
+                                 negative_detection_status, negative_detection_version, negative_confidence,
+                                 negative_kind, negative_signals)
+             VALUES (?1, ?2, ?3, 1, 0, 0, ?4, ?5, ?6, ?7, '2026:07:21 18:32:37', ?8, ?9, ?10, NULL, ?11)",
+            params![
+                id,
+                format!("{}/{}", directory, file),
+                file,
+                stem,
+                kind,
+                directory,
+                is_video,
+                status,
+                version,
+                confidence,
+                format!("{{\"conf\":{},\"kind\":\"black and white\"}}", confidence.unwrap_or(0.0)),
+            ],
+        )
+        .expect("seed");
+    }
+
+    const V2: &str = "film-negative-v2";
+
+    fn fixture(tag: &str) -> (std::path::PathBuf, Connection)
+    {
+        let (path, conn) = catalogue(tag);
+        // /r: a roll. 1+2 a JPEG and its hidden RAW twin (copied verdict);
+        // 3 below the minimum; 4 a lone RAW; 5 a video; 6 an OLD version;
+        // 7 unreadable; 8 exactly at the minimum.
+        seed(&conn, 1, "/r", "_RW1001.JPG", "jpeg", false, Some("complete"), Some(V2), Some(0.60));
+        seed(&conn, 2, "/r", "_RW1001.NEF", "raw", false, Some("complete"), Some(V2), Some(0.60));
+        seed(&conn, 3, "/r", "_RW1002.JPG", "jpeg", false, Some("complete"), Some(V2), Some(0.30));
+        seed(&conn, 4, "/r", "_RW1003.NEF", "raw", false, Some("complete"), Some(V2), Some(0.90));
+        seed(&conn, 5, "/r", "clip.mov", "other", true, Some("complete"), Some(V2), Some(0.90));
+        seed(&conn, 6, "/r", "_RW1004.JPG", "jpeg", false, Some("complete"), Some("film-negative-v1"), Some(0.95));
+        seed(&conn, 7, "/r", "_RW1005.JPG", "jpeg", false, Some("unreadable"), Some(V2), None);
+        seed(&conn, 8, "/r", "_RW1006.JPG", "jpeg", false, Some("complete"), Some(V2), Some(0.45));
+        // /s: another directory.
+        seed(&conn, 9, "/s", "x1.JPG", "jpeg", false, Some("complete"), Some(V2), Some(0.99));
+        (path, conn)
+    }
+
+    #[test]
+    fn the_roll_read_returns_only_current_complete_stills_at_or_above_the_minimum_of_the_seeds_directories()
+    {
+        let (path, conn) = fixture("contract");
+
+        let page = negative_roll_frames_impl(&conn, &[3], 0.45, V2);
+        assert!(page.query_ok, "{:?}", page.query_error);
+        let ids = page.frames.iter().map(|frame| frame.id).collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 2, 4, 8], "below-minimum, video, old-version and unreadable rows are left out");
+        let first = &page.frames[0];
+        assert_eq!(first.directory_path, "/r");
+        assert_eq!(first.file_path, "/r/_RW1001.JPG");
+        assert_eq!(first.file_stem.as_deref(), Some("_RW1001"));
+        assert_eq!(first.image_kind.as_deref(), Some("jpeg"));
+        assert_eq!(first.capture_datetime.as_deref(), Some("2026:07:21 18:32:37"));
+        assert!(first.negative_signals.as_deref().unwrap_or("").contains("\"kind\""));
+
+        // Two seeds in two directories: each directory once; duplicates folded.
+        let page = negative_roll_frames_impl(&conn, &[9, 3, 3, 1], 0.45, V2);
+        assert!(page.query_ok);
+        assert_eq!(page.frames.iter().map(|frame| frame.id).collect::<Vec<_>>(), vec![1, 2, 4, 8, 9]);
+
+        // A seed that no longer exists contributes nothing; no seed, no rows.
+        let page = negative_roll_frames_impl(&conn, &[999], 0.45, V2);
+        assert!(page.query_ok && page.frames.is_empty());
+        let page = negative_roll_frames_impl(&conn, &[], 0.45, V2);
+        assert!(page.query_ok && page.frames.is_empty());
+
+        // The version is the caller's: the v1 row only for a v1 read.
+        let page = negative_roll_frames_impl(&conn, &[3], 0.45, "film-negative-v1");
+        assert_eq!(page.frames.iter().map(|frame| frame.id).collect::<Vec<_>>(), vec![6]);
+
+        // A non-finite minimum is a FAILURE, never an empty answer.
+        let page = negative_roll_frames_impl(&conn, &[3], f64::NAN, V2);
+        assert!(!page.query_ok && page.query_error.is_some());
+
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn the_roll_directory_read_is_served_by_the_directory_index()
+    {
+        let (path, conn) = fixture("plan");
+        let sql = NEGATIVE_ROLL_DIRECTORY_SQL.replace("?1", "'/r'").replace("?2", "0.45");
+        let plan =
+        {
+            let mut stmt = conn.prepare(&format!("EXPLAIN ANALYZE {}", sql)).expect("explain");
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .expect("explain rows")
+                .map(|row| row.unwrap_or_default())
+                .collect::<String>()
+        };
+        assert!(plan.contains("Index Scan"), "the roll read must be index-served: {}", plan);
+        assert!(!plan.contains("Sequential Scan"), "no sequential scan for a small directory: {}", plan);
+        drop(conn);
+        cleanup(&path);
     }
 }

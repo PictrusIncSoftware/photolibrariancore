@@ -4215,6 +4215,146 @@ public func FfiConverterTypeNegativeDetectionWritebackResult_lower(_ value: Nega
 }
 
 
+public struct NegativeRollFrame: Equatable, Hashable {
+    public var id: Int64
+    public var directoryPath: String
+    public var filePath: String
+    public var fileStem: String?
+    public var imageKind: String?
+    public var captureDatetime: String?
+    public var negativeConfidence: Double
+    public var negativeKind: String?
+    public var negativeSignals: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: Int64, directoryPath: String, filePath: String, fileStem: String? = nil, imageKind: String? = nil, captureDatetime: String? = nil, negativeConfidence: Double, negativeKind: String? = nil, negativeSignals: String? = nil) {
+        self.id = id
+        self.directoryPath = directoryPath
+        self.filePath = filePath
+        self.fileStem = fileStem
+        self.imageKind = imageKind
+        self.captureDatetime = captureDatetime
+        self.negativeConfidence = negativeConfidence
+        self.negativeKind = negativeKind
+        self.negativeSignals = negativeSignals
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension NegativeRollFrame: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNegativeRollFrame: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NegativeRollFrame {
+        return
+            try NegativeRollFrame(
+                id: FfiConverterInt64.read(from: &buf), 
+                directoryPath: FfiConverterString.read(from: &buf), 
+                filePath: FfiConverterString.read(from: &buf), 
+                fileStem: FfiConverterOptionString.read(from: &buf), 
+                imageKind: FfiConverterOptionString.read(from: &buf), 
+                captureDatetime: FfiConverterOptionString.read(from: &buf), 
+                negativeConfidence: FfiConverterDouble.read(from: &buf), 
+                negativeKind: FfiConverterOptionString.read(from: &buf), 
+                negativeSignals: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NegativeRollFrame, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.id, into: &buf)
+        FfiConverterString.write(value.directoryPath, into: &buf)
+        FfiConverterString.write(value.filePath, into: &buf)
+        FfiConverterOptionString.write(value.fileStem, into: &buf)
+        FfiConverterOptionString.write(value.imageKind, into: &buf)
+        FfiConverterOptionString.write(value.captureDatetime, into: &buf)
+        FfiConverterDouble.write(value.negativeConfidence, into: &buf)
+        FfiConverterOptionString.write(value.negativeKind, into: &buf)
+        FfiConverterOptionString.write(value.negativeSignals, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNegativeRollFrame_lift(_ buf: RustBuffer) throws -> NegativeRollFrame {
+    return try FfiConverterTypeNegativeRollFrame.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNegativeRollFrame_lower(_ value: NegativeRollFrame) -> RustBuffer {
+    return FfiConverterTypeNegativeRollFrame.lower(value)
+}
+
+
+public struct NegativeRollFramePage: Equatable, Hashable {
+    public var frames: [NegativeRollFrame]
+    public var queryOk: Bool
+    public var queryError: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(frames: [NegativeRollFrame], queryOk: Bool = true, queryError: String? = nil) {
+        self.frames = frames
+        self.queryOk = queryOk
+        self.queryError = queryError
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension NegativeRollFramePage: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNegativeRollFramePage: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NegativeRollFramePage {
+        return
+            try NegativeRollFramePage(
+                frames: FfiConverterSequenceTypeNegativeRollFrame.read(from: &buf), 
+                queryOk: FfiConverterBool.read(from: &buf), 
+                queryError: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NegativeRollFramePage, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeNegativeRollFrame.write(value.frames, into: &buf)
+        FfiConverterBool.write(value.queryOk, into: &buf)
+        FfiConverterOptionString.write(value.queryError, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNegativeRollFramePage_lift(_ buf: RustBuffer) throws -> NegativeRollFramePage {
+    return try FfiConverterTypeNegativeRollFramePage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNegativeRollFramePage_lower(_ value: NegativeRollFramePage) -> RustBuffer {
+    return FfiConverterTypeNegativeRollFramePage.lower(value)
+}
+
+
 public struct OperationLogEntryInput: Equatable, Hashable {
     public var severity: String
     public var filePath: String?
@@ -7312,6 +7452,31 @@ fileprivate struct FfiConverterSequenceTypeNegativeDetectionResult: FfiConverter
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeNegativeRollFrame: FfiConverterRustBuffer {
+    typealias SwiftType = [NegativeRollFrame]
+
+    public static func write(_ value: [NegativeRollFrame], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeNegativeRollFrame.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [NegativeRollFrame] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [NegativeRollFrame]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeNegativeRollFrame.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeOperationLogEntryInput: FfiConverterRustBuffer {
     typealias SwiftType = [OperationLogEntryInput]
 
@@ -9340,6 +9505,21 @@ public func negativeDetectionCandidatePageForIds(ids: [Int64], limit: UInt32, de
             
         )
 }
+public func negativeRollFramesForImages(seedIds: [Int64], minimumConfidence: Double, detectorVersion: String)async  -> NegativeRollFramePage  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_negative_roll_frames_for_images(FfiConverterSequenceInt64.lower(seedIds),FfiConverterDouble.lower(minimumConfidence),FfiConverterString.lower(detectorVersion)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeNegativeRollFramePage_lift,
+            errorHandler: nil
+            
+        )
+}
 public func operationLogEntries(runId: Int64, severityFilter: String?, limit: UInt32, offset: UInt32)async  -> [OperationLogEntryRecord]  {
     return
         try!  await uniffiRustCallAsync(
@@ -10498,6 +10678,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_negative_detection_candidate_page_for_ids() != 40783) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_negative_roll_frames_for_images() != 30462) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_operation_log_entries() != 11141) {

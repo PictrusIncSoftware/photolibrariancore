@@ -1226,6 +1226,15 @@ namespace photolibrariancore {
         string similar_algorithm_version,
         MediaType media_type
     );
+
+    // ⭐ Round 2 (Oct 23, 2026) — the film-negative ROLL CUE's neighbor read
+    // (DECISIONS.md "Film negatives, round 2", point 4). Every seed by primary
+    // key, then each distinct directory ONCE by directory_path = ? (the twin
+    // lookup's index-served shape); returns only current-version (detector_version)
+    // complete still rows at or above minimum_confidence. query_ok = false means
+    // the read could not be performed (UNKNOWN, never "no neighbors").
+    [Async]
+    NegativeRollFramePage negative_roll_frames_for_images(sequence<i64> seed_ids, f64 minimum_confidence, string detector_version);
 };
 
 // Image classification categories for JPEG+RAW pair handling.
@@ -2300,4 +2309,24 @@ dictionary NegativeDetectionWritebackResult {
     sequence<string> warnings;
     string? failure_stage = null;
     string? failed_reason = null;
+};
+
+// ⭐ Round 2 (Oct 23, 2026) — one row the film-negative roll cue reads. Rust
+// constructs it; Swift only reads it.
+dictionary NegativeRollFrame {
+    i64 id;
+    string directory_path;
+    string file_path;
+    string? file_stem = null;
+    string? image_kind = null;
+    string? capture_datetime = null;
+    f64 negative_confidence;
+    string? negative_kind = null;
+    string? negative_signals = null;
+};
+
+dictionary NegativeRollFramePage {
+    sequence<NegativeRollFrame> frames;
+    boolean query_ok = true;
+    string? query_error = null;
 };
