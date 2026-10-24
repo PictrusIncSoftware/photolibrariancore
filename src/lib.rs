@@ -1516,6 +1516,118 @@ pub struct FaceVectorDeleteRetryResult
     pub message: String,
     pub orphans_enqueued: u64,
     pub orphan_scan_ran: bool,
+    /// ⭐ Semantic search slice 1 (DESIGN-Semantic-Search.md §3.3) — the
+    /// IMAGE-vector drain and orphan sweep that the launch retry runs after the
+    /// face pass, appended LAST with a `.udl` default of null (S65). `None` =
+    /// the image pass did not run (every exit other than the FFI's completed
+    /// drain-and-sweep). Never folded into the face fields: `status` and the
+    /// counts above keep describing the FACE queue only.
+    pub image_vector_cleanup: Option<ImageVectorDeleteRetryResult>,
+}
+
+/// ⭐ Semantic search slice 1 — the image-vector twin of
+/// `FaceVectorDeleteRetryResult`, field for field. `status` reuses
+/// `FaceVectorDeleteRetryStatus`: its five states mean exactly the same thing
+/// for the `image_vector_pending_delete` queue and the `image_embeddings`
+/// table (the enum's name predates the second store).
+#[derive(Debug, Clone)]
+pub struct ImageVectorDeleteRetryResult
+{
+    pub status: FaceVectorDeleteRetryStatus,
+    pub pending_count: u64,
+    pub acknowledged_count: u64,
+    pub remaining_count: u64,
+    pub message: String,
+    pub orphans_enqueued: u64,
+    pub orphan_scan_ran: bool,
+}
+
+/// ⭐ Semantic search slice 1 — one photo's image embedding as Swift hands it
+/// over. `vector` is `embedding_dimension` little-endian `f32`s (`bytes`, never
+/// a `sequence<f32>` — ruling W4-17's bulk-payload rule).
+#[derive(Debug, Clone)]
+pub struct ImageEmbeddingRecord
+{
+    pub image_id: i64,
+    pub model_name: String,
+    pub model_version: String,
+    pub preprocessing_version: String,
+    pub embedding_dimension: u32,
+    pub vector: Vec<u8>,
+}
+
+/// A stale mark as the work page read it: consumed only while the table still
+/// holds exactly this `(image_id, generation)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ImageVectorStaleMark
+{
+    pub image_id: i64,
+    pub generation: i64,
+}
+
+/// What `upsert_image_embeddings` did. `status`: `empty` · `invalid` (no
+/// record passed validation) · `open_failed` · `batch_failed` ·
+/// `store_failed` · `stored`. `stored` = records committed by THIS call's one
+/// `merge_insert` (never Lance's statistics). `marks_consumed` = stale marks
+/// confirmed gone from the table by this call. `error` carries rejected records
+/// and a mark-consumption failure even when `status` is `stored`.
+#[derive(Debug, Clone)]
+pub struct ImageEmbeddingStoreResult
+{
+    pub status: String,
+    pub stored: u64,
+    pub marks_consumed: u64,
+    pub error: Option<String>,
+    /// ⭐ Fix round 1 (review finding 4) — valid records NOT stored because
+    /// their photo was no longer catalogued when the store lock was held (a
+    /// removal during the pass). Appended LAST, `.udl` default 0 (S65).
+    pub dropped_not_catalogued: u64,
+}
+
+/// `store_ok = false` = the store could not be read (never 0-as-truth); a
+/// never-built table is `store_ok = true, count = 0`.
+#[derive(Debug, Clone)]
+pub struct ImageEmbeddingCount
+{
+    pub store_ok: bool,
+    pub count: u64,
+}
+
+/// The search-index to-do list's size. `unreadable_half`: `"index"` (the
+/// vector store) or `"catalogue"`; `None` whenever `store_ok`.
+#[derive(Debug, Clone)]
+pub struct SearchIndexWorkCount
+{
+    pub store_ok: bool,
+    pub unreadable_half: Option<String>,
+    pub remaining: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchIndexWorkItem
+{
+    pub image_id: i64,
+    pub file_path: String,
+    pub is_video: bool,
+    pub stale_generation: Option<i64>,
+}
+
+/// One page of the to-do list, `image_id` ascending. ⛔ On `store_ok = false`
+/// `items` is EMPTY, never "everything is missing".
+#[derive(Debug, Clone)]
+pub struct SearchIndexWorkPage
+{
+    pub store_ok: bool,
+    pub unreadable_half: Option<String>,
+    pub items: Vec<SearchIndexWorkItem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImageVectorStaleMarkResult
+{
+    pub ok: bool,
+    pub marked: u64,
+    pub error: Option<String>,
 }
 
 /// Compact gallery metadata for a visible similar-photo representative.
@@ -1820,6 +1932,12 @@ pub struct BackupCounts {
     pub face_observation_count: u64,
     pub face_embedding_count: u64,
     pub untaken_counts: u32,
+    /// ⭐ Semantic search slice 1 (DESIGN-Semantic-Search.md §3.4) — the
+    /// `image_embeddings` row count, appended LAST with a `.udl` default of null
+    /// (S65). `None` = the count could not be taken (the 2026-10-04 rule: the
+    /// manifest omits the key), never a placeholder 0; a never-built table is
+    /// `Some(0)`.
+    pub image_embedding_count: Option<u64>,
 }
 
 /// `BackupCounts.untaken_counts` bits, one per count, in field order.
@@ -3832,6 +3950,26 @@ fn open_and_migrate_catalogue_reporting(
              keep offering files it could not read, exactly as before ruling 101",
             e
         );
+    }
+
+    // --- ⭐ Semantic search slice 1 — the search-index tables ----------------
+    //
+    // `image_vector_stale`, `image_vector_pending_delete` and the generation
+    // sequence (see `SEARCH_INDEX_TABLES_DDL`). Created HERE, on every open, in
+    // the autocommit window right after the schema batch: a brand-new catalogue
+    // is born with them and an existing one gains them at its next launch —
+    // CREATE … IF NOT EXISTS only, no ALTER, no DEFAULT (S62 cannot arise).
+    //
+    // ⚠️ Outside the schema batch ONLY because that batch is byte-locked to the
+    // frozen identity fixture (`schema_upgrade_fixture_tests`); the failure
+    // policy is the batch's own: `remove_catalogue_rows` writes both tables
+    // INSIDE its transaction, so a catalogue without them could not remove a
+    // photo — a failure here fails the open, exactly as the same statements
+    // would inside the batch.
+    if let Err(e) = conn.execute_batch(SEARCH_INDEX_TABLES_DDL)
+    {
+        eprintln!("open_and_migrate_catalogue: could not create the search-index tables: {}", e);
+        return None;
     }
 
     // --- ⭐ S173 — directory_path repair + index: ONE TIME, SELF-HEALING -----
@@ -20594,7 +20732,36 @@ enum OrphanSweepMode
 /// outside tests. Who reaches it: `OrphanSweepMode::DrainAndSweep`.
 async fn retry_pending_face_vector_deletes_impl() -> FaceVectorDeleteRetryResult
 {
-    retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, None).await
+    let mut result = retry_pending_face_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, None).await;
+    // ⭐ Semantic search slice 1 (DESIGN-Semantic-Search.md §3.3) — the launch
+    // retry also drains the IMAGE-vector queue and sweeps image-vector orphans,
+    // AFTER the face pass has released the store write lock (the image pass
+    // takes it itself — never nested). Reported in its own field, never folded
+    // into the face counts.
+    //
+    // ⭐ Fix round 1 (review finding 1) — the image pass runs as its OWN task
+    // on the current (face) runtime, so a panic inside it (lance 8.0.0 panics
+    // on some corrupt manifests in a debug build) is this task's `JoinError`
+    // and lands ONLY in `image_vector_cleanup` as `Failed`; the face fields
+    // above were computed first and are never touched by it.
+    let images = match tokio::spawn(retry_pending_image_vector_deletes_probed(
+        OrphanSweepMode::DrainAndSweep,
+        ORPHAN_VECTOR_SWEEP_CAP,
+    ))
+    .await
+    {
+        Ok(images) => images,
+        Err(error) => image_vector_retry_result(
+            FaceVectorDeleteRetryStatus::Failed,
+            0,
+            0,
+            0,
+            format!("Image-vector cleanup task failed: {}", error),
+        ),
+    };
+    warn_on_unfinished_image_vector_cleanup("launch retry", &images);
+    result.image_vector_cleanup = Some(images);
+    result
 }
 
 /// ⭐ Slice P / D4.2 + A-10 — the additive restore's cleanup: the queue drain
@@ -20674,6 +20841,7 @@ async fn retry_pending_face_vector_deletes_probed(
         message: format!("{} {}", drained.message, sweep.note),
         orphans_enqueued: sweep.enqueued,
         orphan_scan_ran: sweep.ran,
+        image_vector_cleanup: None,
     }
 }
 
@@ -21310,6 +21478,7 @@ async fn drain_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
                 pending_count: 0,
                 orphans_enqueued: 0,
                 orphan_scan_ran: false,
+                image_vector_cleanup: None,
                 acknowledged_count: 0,
                 remaining_count: 0,
                 message,
@@ -21325,6 +21494,7 @@ async fn drain_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
             pending_count: 0,
             orphans_enqueued: 0,
             orphan_scan_ran: false,
+            image_vector_cleanup: None,
             acknowledged_count: 0,
             remaining_count: 0,
             message: "No obsolete face vectors are waiting for deletion.".to_string(),
@@ -21357,6 +21527,7 @@ async fn drain_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
                         pending_count,
                         orphans_enqueued: 0,
                         orphan_scan_ran: false,
+                        image_vector_cleanup: None,
                         acknowledged_count,
                         remaining_count,
                         message: if remaining_count == 0
@@ -21377,6 +21548,7 @@ async fn drain_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
                     pending_count,
                     orphans_enqueued: 0,
                     orphan_scan_ran: false,
+                    image_vector_cleanup: None,
                     acknowledged_count: 0,
                     remaining_count: pending_count,
                     message,
@@ -21396,6 +21568,7 @@ async fn drain_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
                 pending_count,
                 orphans_enqueued: 0,
                 orphan_scan_ran: false,
+                image_vector_cleanup: None,
                 acknowledged_count: 0,
                 remaining_count: pending_count,
                 message,
@@ -21421,6 +21594,7 @@ async fn drain_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
                 pending_count,
                 orphans_enqueued: 0,
                 orphan_scan_ran: false,
+                image_vector_cleanup: None,
                 acknowledged_count,
                 remaining_count,
                 message: format!("Face-vector deletion was deferred: {}", error),
@@ -21440,6 +21614,7 @@ async fn drain_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
                     pending_count,
                     orphans_enqueued: 0,
                     orphan_scan_ran: false,
+                    image_vector_cleanup: None,
                     acknowledged_count,
                     remaining_count,
                     message,
@@ -21459,6 +21634,7 @@ async fn drain_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
                 pending_count,
                 orphans_enqueued: 0,
                 orphan_scan_ran: false,
+                image_vector_cleanup: None,
                 acknowledged_count,
                 remaining_count: pending_count.saturating_sub(acknowledged_count),
                 message,
@@ -21479,6 +21655,7 @@ async fn drain_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
         pending_count,
         orphans_enqueued: 0,
         orphan_scan_ran: false,
+        image_vector_cleanup: None,
         acknowledged_count,
         remaining_count,
         message: if remaining_count == 0
@@ -21501,6 +21678,11 @@ fn face_vector_delete_retry_result_for_user(
 ) -> FaceVectorDeleteRetryResult
 {
     result.message = strip_rust_source_locations(&result.message);
+    // Semantic search slice 1 — the image pass's message leaves the same way.
+    if let Some(images) = result.image_vector_cleanup.as_mut()
+    {
+        images.message = strip_rust_source_locations(&images.message);
+    }
     result
 }
 
@@ -21556,6 +21738,7 @@ pub async fn retry_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
                 pending_count: remaining_count,
                 orphans_enqueued: 0,
                 orphan_scan_ran: false,
+                image_vector_cleanup: None,
                 acknowledged_count: 0,
                 remaining_count,
                 message: failure.clone(),
@@ -21567,6 +21750,7 @@ pub async fn retry_pending_face_vector_deletes() -> FaceVectorDeleteRetryResult
             pending_count: 0,
             orphans_enqueued: 0,
             orphan_scan_ran: false,
+            image_vector_cleanup: None,
             acknowledged_count: 0,
             remaining_count: 0,
             message: format!(
@@ -21818,6 +22002,2059 @@ async fn canonicalize_face_embeddings_probed(
         vectors_deleted,
         vector_delete_failed,
     }
+}
+
+// ======================================================================
+// ⭐ SEMANTIC SEARCH, SLICE 1 — the `image_embeddings` store, the stale-vector
+// queue and the search-index to-do list (Docs/DESIGN-Semantic-Search.md §3,
+// §4; build order §13 S1).
+//
+// The face store's machinery, copied with the IMAGE id as the key:
+//   · ONE table, `image_embeddings`, in the SAME `vectors.lancedb`
+//     (`face_embedding_store_uri`), opened by a fresh `connect` +
+//     `open_table` for every operation (P11's handle-pinning invariant) and
+//     created ONLY on LanceDB's typed `TableNotFound` (R-62);
+//   · every write under `FACE_EMBEDDING_STORE_WRITE_LOCK` — one lock for the
+//     whole store directory (P14) — on `face_embedding_runtime` (R-25);
+//   · ONE `merge_insert` per upsert, keyed (image_id, model_version,
+//     preprocessing_version), never delete-then-add (R-50); nothing calls
+//     `optimize` (Q-09);
+//   · deletes go through `image_vector_pending_delete` (filled inside
+//     `remove_catalogue_rows`' transaction) and an orphan sweep capped at
+//     `ORPHAN_VECTOR_SWEEP_CAP` per launch;
+//   · staleness lives in DuckDB (`image_vector_stale`, one global generation
+//     sequence) and a mark is consumed only on an EXACT (image_id, generation)
+//     match, so a re-mark made while a pass runs survives it.
+// Vectors are derived data: losing them means re-embedding, never data loss.
+// ======================================================================
+
+const IMAGE_EMBEDDING_TABLE: &str = "image_embeddings";
+
+/// The search index's DuckDB objects. Run on every open, in the autocommit
+/// window right after the schema batch (`open_and_migrate_catalogue_reporting`).
+/// CREATE … IF NOT EXISTS only: no ALTER, no DEFAULT (S62).
+///
+/// · `image_vector_stale` — one row per photo whose thumbnail pixels changed
+///   after its vector was made; `generation` comes from the sequence, and every
+///   mark takes a FRESH one (`mark_image_vectors_stale_impl`).
+/// · `image_vector_pending_delete` — the durable cross-store delete queue: an
+///   id leaves it only after a confirmed LanceDB delete, a proof that the id
+///   holds no vector, or a proved-absent table.
+const SEARCH_INDEX_TABLES_DDL: &str = "\
+    CREATE SEQUENCE IF NOT EXISTS image_vector_stale_generation_seq START 1; \
+    CREATE TABLE IF NOT EXISTS image_vector_stale ( \
+        image_id BIGINT PRIMARY KEY, \
+        generation BIGINT NOT NULL \
+    ); \
+    CREATE TABLE IF NOT EXISTS image_vector_pending_delete ( \
+        image_id BIGINT PRIMARY KEY \
+    );";
+
+/// The widest embedding a record may declare. SigLIP 2 base is 768; the bound
+/// only stops a garbage dimension from sizing an allocation.
+const IMAGE_EMBEDDING_MAX_DIMENSION: u32 = 4096;
+
+/// `search_index_work_page`'s `limit` is clamped to 1…this.
+const SEARCH_INDEX_WORK_PAGE_MAX: u32 = 10_000;
+
+/// Candidates are read from DuckDB in keyset batches of this many rows.
+const SEARCH_INDEX_CANDIDATE_BATCH: usize = 10_000;
+
+/// Ids per DuckDB statement and per LanceDB delete — the face queue's 500.
+const IMAGE_VECTOR_CHUNK: usize = 500;
+
+/// Arrow's half-precision native type (`half::f16`), named through Arrow so the
+/// crate needs no direct `half` dependency.
+type Float16Native = <arrow_array::types::Float16Type as arrow_array::ArrowPrimitiveType>::Native;
+
+/// The table's schema. ⭐ The vector is `FixedSizeList(Float16)` — half the
+/// bytes of fp32 (≈ 645 MB against 1.29 GB at 420,000 photos, §3.1) — with a
+/// NULLABLE child, the S98 fix the face store carries.
+fn image_embedding_schema(dimension: u32) -> SchemaRef
+{
+    Arc::new(Schema::new(vec![
+        Field::new("image_id", DataType::Int64, false),
+        Field::new("model_name", DataType::Utf8, false),
+        Field::new("model_version", DataType::Utf8, false),
+        Field::new("preprocessing_version", DataType::Utf8, false),
+        Field::new("embedding_dimension", DataType::UInt32, false),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float16, true)),
+                dimension as i32,
+            ),
+            false,
+        ),
+    ]))
+}
+
+/// A record that passed validation, its vector decoded and L2-normalized.
+#[derive(Debug, Clone)]
+struct ValidImageEmbedding
+{
+    image_id: i64,
+    model_name: String,
+    model_version: String,
+    preprocessing_version: String,
+    vector: Vec<f32>,
+}
+
+fn image_embedding_batch(
+    records: &[ValidImageEmbedding],
+    dimension: u32,
+) -> Result<RecordBatch, arrow_schema::ArrowError>
+{
+    let width = dimension as usize;
+    let mut values = Vec::<Float16Native>::with_capacity(records.len().saturating_mul(width));
+    for record in records
+    {
+        if record.vector.len() != width
+        {
+            return Err(arrow_schema::ArrowError::InvalidArgumentError(format!(
+                "image {} carries {} value(s) for a {}-wide table",
+                record.image_id,
+                record.vector.len(),
+                width
+            )));
+        }
+        values.extend(record.vector.iter().map(|value| Float16Native::from_f32(*value)));
+    }
+    let vectors = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float16, true)),
+        dimension as i32,
+        Arc::new(arrow_array::Float16Array::from(values)),
+        None,
+    )?;
+    RecordBatch::try_new(
+        image_embedding_schema(dimension),
+        vec![
+            Arc::new(Int64Array::from_iter_values(records.iter().map(|record| record.image_id))),
+            Arc::new(StringArray::from_iter_values(
+                records.iter().map(|record| record.model_name.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                records.iter().map(|record| record.model_version.as_str()),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                records.iter().map(|record| record.preprocessing_version.as_str()),
+            )),
+            Arc::new(UInt32Array::from_iter_values(records.iter().map(|_| dimension))),
+            Arc::new(vectors),
+        ],
+    )
+}
+
+/// The call's contract, taken from its FIRST record: one model, one
+/// preprocessing, one dimension per call.
+struct ImageEmbeddingContract
+{
+    model_name: String,
+    model_version: String,
+    preprocessing_version: String,
+    dimension: u32,
+}
+
+/// What validation kept and why it refused the rest.
+struct ImageEmbeddingValidation
+{
+    valid: Vec<ValidImageEmbedding>,
+    dimension: u32,
+    rejected: u64,
+    first_rejection: Option<String>,
+}
+
+impl ImageEmbeddingValidation
+{
+    /// The rejection summary for `error`, `None` when nothing was rejected.
+    fn rejection_summary(&self) -> Option<String>
+    {
+        if self.rejected == 0
+        {
+            return None;
+        }
+        Some(format!(
+            "{} record(s) were rejected and not stored; the first: {}",
+            self.rejected,
+            self.first_rejection.as_deref().unwrap_or("no reason recorded")
+        ))
+    }
+}
+
+/// One record's decoded, L2-normalized vector — or why it is refused. Refused:
+/// a contract that differs from the call's first record, an empty model or
+/// version string, a dimension outside 1…`IMAGE_EMBEDDING_MAX_DIMENSION`, a
+/// payload that is not exactly 4 × dimension bytes, any non-finite value, and a
+/// zero (or non-finite) norm.
+fn image_embedding_vector_or_rejection(
+    record: &ImageEmbeddingRecord,
+    contract: &ImageEmbeddingContract,
+) -> Result<Vec<f32>, String>
+{
+    if record.model_name != contract.model_name
+        || record.model_version != contract.model_version
+        || record.preprocessing_version != contract.preprocessing_version
+        || record.embedding_dimension != contract.dimension
+    {
+        return Err(format!(
+            "its contract ({} / {} / {} / {}) differs from the call's first record ({} / {} / {} / {}) — one model, preprocessing and dimension per call",
+            record.model_name,
+            record.model_version,
+            record.preprocessing_version,
+            record.embedding_dimension,
+            contract.model_name,
+            contract.model_version,
+            contract.preprocessing_version,
+            contract.dimension
+        ));
+    }
+    if record.model_name.trim().is_empty()
+        || record.model_version.trim().is_empty()
+        || record.preprocessing_version.trim().is_empty()
+    {
+        return Err("an empty model name, model version or preprocessing version".to_string());
+    }
+    if record.embedding_dimension == 0 || record.embedding_dimension > IMAGE_EMBEDDING_MAX_DIMENSION
+    {
+        return Err(format!(
+            "the embedding dimension {} is outside 1…{}",
+            record.embedding_dimension, IMAGE_EMBEDDING_MAX_DIMENSION
+        ));
+    }
+    let width = record.embedding_dimension as usize;
+    let expected_bytes = width.saturating_mul(4);
+    if record.vector.len() != expected_bytes
+    {
+        return Err(format!(
+            "{} vector byte(s), expected {} (4 × {} little-endian f32)",
+            record.vector.len(),
+            expected_bytes,
+            width
+        ));
+    }
+    let mut vector = Vec::with_capacity(width);
+    for (index, chunk) in record.vector.chunks_exact(4).enumerate()
+    {
+        let bytes = match <[u8; 4]>::try_from(chunk)
+        {
+            Ok(bytes) => bytes,
+            Err(_) => return Err(format!("value {} is not four bytes wide", index)),
+        };
+        let value = f32::from_le_bytes(bytes);
+        if !value.is_finite()
+        {
+            return Err(format!("value {} is not finite ({})", index, value));
+        }
+        vector.push(value);
+    }
+    let norm = vector
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>()
+        .sqrt();
+    if !norm.is_finite() || norm <= 0.0
+    {
+        return Err(format!("its L2 norm is {} — a vector with no direction cannot be normalized", norm));
+    }
+    // ⭐ L2-normalized at write, so a dot product IS the cosine (§3.1).
+    Ok(vector.into_iter().map(|value| (f64::from(value) / norm) as f32).collect())
+}
+
+/// Validate a call's records against its first record's contract, and keep the
+/// LAST record per `image_id` (a replace means the last one wins, and
+/// `merge_insert` refuses a source holding two rows for one target row —
+/// `lance-8.0.0/src/dataset/write/merge_insert.rs:220`).
+fn validate_image_embedding_records(records: Vec<ImageEmbeddingRecord>) -> ImageEmbeddingValidation
+{
+    let contract = match records.first()
+    {
+        Some(first) => ImageEmbeddingContract
+        {
+            model_name: first.model_name.clone(),
+            model_version: first.model_version.clone(),
+            preprocessing_version: first.preprocessing_version.clone(),
+            dimension: first.embedding_dimension,
+        },
+        None =>
+        {
+            return ImageEmbeddingValidation
+            {
+                valid: Vec::new(),
+                dimension: 0,
+                rejected: 0,
+                first_rejection: None,
+            };
+        }
+    };
+
+    let mut valid = Vec::new();
+    let mut rejected = 0u64;
+    let mut first_rejection = None;
+    for record in records
+    {
+        match image_embedding_vector_or_rejection(&record, &contract)
+        {
+            Ok(vector) => valid.push(ValidImageEmbedding
+            {
+                image_id: record.image_id,
+                model_name: record.model_name,
+                model_version: record.model_version,
+                preprocessing_version: record.preprocessing_version,
+                vector,
+            }),
+            Err(reason) =>
+            {
+                rejected += 1;
+                if first_rejection.is_none()
+                {
+                    first_rejection = Some(format!("image {}: {}", record.image_id, reason));
+                }
+            }
+        }
+    }
+
+    let mut last_index = std::collections::HashMap::<i64, usize>::new();
+    for (index, record) in valid.iter().enumerate()
+    {
+        last_index.insert(record.image_id, index);
+    }
+    let valid = valid
+        .into_iter()
+        .enumerate()
+        .filter(|(index, record)| last_index.get(&record.image_id) == Some(index))
+        .map(|(_, record)| record)
+        .collect::<Vec<_>>();
+
+    ImageEmbeddingValidation
+    {
+        valid,
+        dimension: contract.dimension,
+        rejected,
+        first_rejection,
+    }
+}
+
+/// A failed store write, in the face store's status vocabulary.
+fn image_embedding_store_failure(status: &str, error: String) -> ImageEmbeddingStoreResult
+{
+    ImageEmbeddingStoreResult
+    {
+        status: status.to_string(),
+        stored: 0,
+        marks_consumed: 0,
+        error: Some(error),
+        dropped_not_catalogued: 0,
+    }
+}
+
+/// Store a batch of image embeddings, then consume the stale marks the caller
+/// read with them.
+///
+/// ⭐ Panic-guarded like `upsert_face_embeddings` (R-07: the runtime touch and
+/// the spawn inside `ffi_panic_boundary`; a panic INSIDE the task is the
+/// JoinError arm), and every exit's `error` is stripped of build-machine source
+/// locations (R-133) — it can reach the Operation Log.
+pub async fn upsert_image_embeddings(
+    records: Vec<ImageEmbeddingRecord>,
+    consumed_marks: Vec<ImageVectorStaleMark>,
+) -> ImageEmbeddingStoreResult
+{
+    let spawned = ffi_panic_boundary(
+        "upsert_image_embeddings.panic.query_failed",
+        ||
+        {
+            face_embedding_runtime("upsert_image_embeddings.face_runtime_unavailable.query_failed")
+                .map(|runtime| runtime.spawn(upsert_image_embeddings_impl(records, consumed_marks)))
+                .map_err(|message| format!("Image embeddings could not be stored: {}", message))
+        },
+        |panic| Err(ffi_panic_report("store the image embeddings", &panic)),
+    );
+    let mut result = match spawned
+    {
+        Ok(task) => match task.await
+        {
+            Ok(result) => result,
+            Err(error) => image_embedding_store_failure(
+                "store_failed",
+                format!("Image embedding runtime task failed: {}", error),
+            ),
+        },
+        Err(message) => image_embedding_store_failure("store_failed", message),
+    };
+    result.error = result.error.map(|error| strip_rust_source_locations(&error));
+    result
+}
+
+async fn upsert_image_embeddings_impl(
+    records: Vec<ImageEmbeddingRecord>,
+    consumed_marks: Vec<ImageVectorStaleMark>,
+) -> ImageEmbeddingStoreResult
+{
+    if records.is_empty()
+    {
+        return ImageEmbeddingStoreResult
+        {
+            status: "empty".to_string(),
+            stored: 0,
+            marks_consumed: 0,
+            error: None,
+            dropped_not_catalogued: 0,
+        };
+    }
+
+    let validation = validate_image_embedding_records(records);
+    let rejection = validation.rejection_summary();
+    if validation.valid.is_empty()
+    {
+        return image_embedding_store_failure(
+            "invalid",
+            rejection.unwrap_or_else(|| "No image embedding passed validation.".to_string()),
+        );
+    }
+    let dimension = validation.dimension;
+    let mut valid = validation.valid;
+
+    // ⭐ The ONE store write lock, taken after validation and held around the
+    // catalogue check, the open and the single commit. Never nested: no caller
+    // holds it.
+    let store_write = FACE_EMBEDDING_STORE_WRITE_LOCK.lock().await;
+
+    // ⭐ Fix round 1 (review finding 4) — under the lock and just before the
+    // Lance write, drop every record whose photo is no longer catalogued (ONE
+    // set-based read), so a photo removed while a pass was embedding it leaves
+    // no orphan: a removal that committed before this read is filtered out
+    // here, and one that commits after it has its drain wait on this lock and
+    // then find (and delete) the vector. A read that cannot be performed
+    // filters nothing — the vectors are stored, the launch sweep bounds any
+    // orphan — and says so in `error`.
+    let requested_ids = valid.iter().map(|record| record.image_id).collect::<Vec<_>>();
+    let (dropped_not_catalogued, catalogue_note) = match catalogued_image_ids_from_catalogue(&requested_ids)
+    {
+        Ok(catalogued) =>
+        {
+            let before = valid.len();
+            valid.retain(|record| catalogued.contains(&record.image_id));
+            ((before - valid.len()) as u64, None)
+        }
+        Err(message) =>
+        {
+            eprintln!("upsert_image_embeddings: the catalogue check was skipped: {}", message);
+            (
+                0,
+                Some(format!(
+                    "Whether every photo is still catalogued could not be checked; all were stored: {}",
+                    message
+                )),
+            )
+        }
+    };
+    let join_errors = |parts: Vec<Option<String>>| -> Option<String>
+    {
+        let parts = parts.into_iter().flatten().collect::<Vec<_>>();
+        if parts.is_empty()
+        {
+            None
+        }
+        else
+        {
+            Some(parts.join(" "))
+        }
+    };
+    if valid.is_empty()
+    {
+        // Every photo in the call has been removed since it was read: nothing
+        // to write, no table to create, no mark to consume.
+        return ImageEmbeddingStoreResult
+        {
+            status: "stored".to_string(),
+            stored: 0,
+            marks_consumed: 0,
+            error: join_errors(vec![rejection, catalogue_note]),
+            dropped_not_catalogued,
+        };
+    }
+
+    let table = match open_or_create_image_embedding_table(dimension).await
+    {
+        Ok(table) => table,
+        Err(error) =>
+        {
+            return image_embedding_store_failure(
+                "open_failed",
+                format!("Failed to open the LanceDB image embedding table: {}", error),
+            );
+        }
+    };
+
+    let batch = match image_embedding_batch(&valid, dimension)
+    {
+        Ok(batch) => batch,
+        Err(error) =>
+        {
+            return image_embedding_store_failure(
+                "batch_failed",
+                format!("Failed to build the Arrow batch for image embeddings: {}", error),
+            );
+        }
+    };
+
+    // ⭐ ONE Lance commit, keyed on the three columns, so only a row of the
+    // SAME model/preprocessing contract is replaced. ⛔ Never
+    // `use_lsm_write(true)`. ⛔ S179 across engines: `MergeResult`'s counts are
+    // statistics and are not read; `stored` is what this call committed.
+    let mut merge = table.merge_insert(&["image_id", "model_version", "preprocessing_version"]);
+    merge.when_matched_update_all(None).when_not_matched_insert_all();
+    let schema = batch.schema();
+    let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
+    if let Err(error) = merge.execute(Box::new(reader)).await
+    {
+        return image_embedding_store_failure(
+            "store_failed",
+            format!("Failed to store image embeddings: {}", error),
+        );
+    }
+    drop(table);
+    drop(store_write);
+
+    // ⭐ After a SUCCESSFUL commit only: consume the marks the caller read with
+    // these photos — and only for photos THIS commit stored (a mark for a
+    // photo that was rejected, dropped, or not sent was not re-embedded and
+    // must stay). A failure here leaves the marks (a harmless re-embed) and is
+    // REPORTED; it never fails the upsert, whose vectors are already committed.
+    let stored_ids = valid
+        .iter()
+        .map(|record| record.image_id)
+        .collect::<std::collections::HashSet<_>>();
+    let mut marks = consumed_marks
+        .into_iter()
+        .filter(|mark| stored_ids.contains(&mark.image_id))
+        .collect::<Vec<_>>();
+    marks.sort_unstable();
+    marks.dedup();
+    let (marks_consumed, marks_error) = match consume_image_vector_stale_marks_from_catalogue(&marks)
+    {
+        Ok(consumed) => (consumed, None),
+        Err(message) =>
+        {
+            eprintln!("upsert_image_embeddings: the stale marks were left in place: {}", message);
+            (
+                0,
+                Some(format!(
+                    "The vectors were stored, but {} stale mark(s) could not be cleared and will be re-embedded next time: {}",
+                    marks.len(),
+                    message
+                )),
+            )
+        }
+    };
+
+    ImageEmbeddingStoreResult
+    {
+        status: "stored".to_string(),
+        stored: valid.len() as u64,
+        marks_consumed,
+        error: join_errors(vec![rejection, catalogue_note, marks_error]),
+        dropped_not_catalogued,
+    }
+}
+
+/// The subset of `ids` still in `images` — ONE set-based read (the batch is
+/// at most a pass's 10,000 ids). ⛔ A read that dropped a row is an `Err`: a
+/// short set would discard live photos' vectors.
+fn catalogued_image_ids_from_catalogue(ids: &[i64]) -> Result<std::collections::HashSet<i64>, String>
+{
+    const SITE: &str = "upsert_image_embeddings.catalogued_ids";
+    let catalogue = lock_catalogue();
+    let conn = catalogue
+        .as_ref()
+        .ok_or_else(|| "the catalogue is not initialized".to_string())?;
+    let mut statement = conn
+        .prepare(&format!("SELECT id FROM images WHERE id IN ({})", editor_saved_image_id_csv(ids)))
+        .map_err(|error| format!("the catalogued-photo check could not be prepared: {}", error))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|error| format!("the catalogued-photo check failed: {}", error))?;
+    let (catalogued, dropped) = collect_rows_counted(rows, SITE);
+    if dropped > 0
+    {
+        return Err(format!("{} catalogued-photo row(s) could not be read", dropped));
+    }
+    Ok(catalogued.into_iter().collect())
+}
+
+/// What a READ-side open of the image-embedding table found (the R-08 split:
+/// never built is an honest empty answer; anything else is a failure).
+enum ImageEmbeddingTableState
+{
+    Present(lancedb::Table),
+    NeverBuilt,
+}
+
+/// The ONE benign-vs-real decision, on LanceDB 0.31's TYPED
+/// `lancedb::Error::TableNotFound`, never on text.
+fn classify_image_embedding_open_error(
+    error: lancedb::Error,
+    operation: &str,
+) -> Result<ImageEmbeddingTableState, String>
+{
+    match error
+    {
+        lancedb::Error::TableNotFound { .. } => Ok(ImageEmbeddingTableState::NeverBuilt),
+        other => Err(format!("{}: image-embedding table open failed: {}", operation, other)),
+    }
+}
+
+/// Open the image-embedding table at an explicit URI for READING. A missing
+/// store directory is never built, and a read never creates it.
+async fn open_image_embedding_table_at_uri(
+    uri: &str,
+    operation: &str,
+) -> Result<ImageEmbeddingTableState, String>
+{
+    match std::fs::metadata(uri)
+    {
+        Ok(metadata) =>
+        {
+            if !metadata.is_dir()
+            {
+                return Err(format!("{}: vector store path is not a directory: {}", operation, uri));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(ImageEmbeddingTableState::NeverBuilt);
+        }
+        Err(error) =>
+        {
+            return Err(format!("{}: vector store metadata failed for {}: {}", operation, uri, error));
+        }
+    }
+
+    let database = lancedb::connect(uri)
+        .execute()
+        .await
+        .map_err(|error| format!("{}: vector store connect failed: {}", operation, error))?;
+    match database.open_table(IMAGE_EMBEDDING_TABLE).execute().await
+    {
+        Ok(table) => Ok(ImageEmbeddingTableState::Present(table)),
+        Err(error) => classify_image_embedding_open_error(error, operation),
+    }
+}
+
+/// The production read-side open, beside the catalogue. An uninitialised
+/// catalogue path is a REAL failure, not "never built".
+async fn open_image_embedding_table_for_read(
+    operation: &str,
+) -> Result<ImageEmbeddingTableState, String>
+{
+    let uri = face_embedding_store_uri()
+        .ok_or_else(|| format!("{}: catalogue path is not initialized", operation))?;
+    open_image_embedding_table_at_uri(&uri, operation).await
+}
+
+/// The WRITE-side open: create the table ONLY on the typed `TableNotFound`
+/// (R-62); every other open failure is reported by name. A missing store
+/// directory falls through to `connect`, which creates it.
+async fn open_or_create_image_embedding_table(dimension: u32) -> Result<lancedb::Table, String>
+{
+    const OPERATION: &str = "upsert_image_embeddings";
+    let uri = face_embedding_store_uri()
+        .ok_or_else(|| format!("{}: catalogue path is not initialized", OPERATION))?;
+
+    match std::fs::metadata(&uri)
+    {
+        Ok(metadata) =>
+        {
+            if !metadata.is_dir()
+            {
+                return Err(format!("{}: vector store path is not a directory: {}", OPERATION, uri));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) =>
+        {
+            return Err(format!("{}: vector store metadata failed for {}: {}", OPERATION, uri, error));
+        }
+    }
+
+    let database = lancedb::connect(&uri)
+        .execute()
+        .await
+        .map_err(|error| format!("{}: vector store connect failed: {}", OPERATION, error))?;
+    match database.open_table(IMAGE_EMBEDDING_TABLE).execute().await
+    {
+        Ok(table) => Ok(table),
+        Err(error) => match classify_image_embedding_open_error(error, OPERATION)
+        {
+            Ok(ImageEmbeddingTableState::NeverBuilt) => database
+                .create_empty_table(IMAGE_EMBEDDING_TABLE, image_embedding_schema(dimension))
+                .execute()
+                .await
+                .map_err(|error| format!("{}: image-embedding table create failed: {}", OPERATION, error)),
+            // Unreachable from the classifier; answered without a panic (R-07).
+            Ok(ImageEmbeddingTableState::Present(table)) => Ok(table),
+            Err(message) => Err(message),
+        },
+    }
+}
+
+/// Open the image-embedding table for a DELETE without collapsing an error
+/// into "missing": absence is proved only by a missing store directory or a
+/// successful table census without the table (the face delete-side rule).
+async fn open_image_vector_table_for_delete(
+    operation: &str,
+) -> Result<FaceVectorTableForDelete, String>
+{
+    let uri = face_embedding_store_uri()
+        .ok_or_else(|| format!("{}: catalogue path is not initialized", operation))?;
+    match std::fs::metadata(&uri)
+    {
+        Ok(metadata) =>
+        {
+            if !metadata.is_dir()
+            {
+                return Err(format!("{}: vector store path is not a directory: {}", operation, uri));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(FaceVectorTableForDelete::Absent);
+        }
+        Err(error) =>
+        {
+            return Err(format!("{}: vector store metadata failed for {}: {}", operation, uri, error));
+        }
+    }
+
+    let database = lancedb::connect(&uri)
+        .execute()
+        .await
+        .map_err(|error| format!("{}: vector store connect failed: {}", operation, error))?;
+    let table_names = database
+        .table_names()
+        .execute()
+        .await
+        .map_err(|error| format!("{}: vector table census failed: {}", operation, error))?;
+    if !table_names.iter().any(|name| name == IMAGE_EMBEDDING_TABLE)
+    {
+        return Ok(FaceVectorTableForDelete::Absent);
+    }
+    database
+        .open_table(IMAGE_EMBEDDING_TABLE)
+        .execute()
+        .await
+        .map(FaceVectorTableForDelete::Present)
+        .map_err(|error| format!("{}: image-vector table open failed: {}", operation, error))
+}
+
+/// Every `image_id` the table holds (under `filter`, when given), projected to
+/// that ONE column — ⛔ never `vector`. Count-then-limit: a query's row cap is
+/// set from the matching count, so no default cap can shorten the answer.
+async fn stored_image_vector_ids(
+    table: &lancedb::Table,
+    filter: Option<String>,
+) -> Result<std::collections::HashSet<i64>, String>
+{
+    // The ONLY production call: the probe type is uninhabited outside tests.
+    stored_image_vector_ids_probed(table, filter, None).await
+}
+
+/// Test-only seam for the short-scan guard (fix round 1, review finding 3b):
+/// in a test, a row cap SMALLER than the count, standing in for a vendor that
+/// silently caps a scan. Uninhabited outside `cfg(test)`.
+#[cfg(test)]
+type ImageVectorScanProbeRef<'a> = Option<&'a usize>;
+
+#[cfg(not(test))]
+type ImageVectorScanProbeRef<'a> = Option<&'a std::convert::Infallible>;
+
+#[cfg(test)]
+fn image_vector_scan_limit(probe: ImageVectorScanProbeRef<'_>, matching: usize) -> usize
+{
+    probe.copied().unwrap_or(matching)
+}
+
+#[cfg(not(test))]
+fn image_vector_scan_limit(_probe: ImageVectorScanProbeRef<'_>, matching: usize) -> usize
+{
+    matching
+}
+
+async fn stored_image_vector_ids_probed(
+    table: &lancedb::Table,
+    filter: Option<String>,
+    probe: ImageVectorScanProbeRef<'_>,
+) -> Result<std::collections::HashSet<i64>, String>
+{
+    let matching = table
+        .count_rows(filter.clone())
+        .await
+        .map_err(|error| format!("the image-vector count failed: {}", error))?;
+    let mut ids = std::collections::HashSet::new();
+    if matching == 0
+    {
+        return Ok(ids);
+    }
+    let mut query = table
+        .query()
+        .select(lancedb::query::Select::columns(&["image_id"]))
+        .limit(image_vector_scan_limit(probe, matching));
+    if let Some(filter) = filter
+    {
+        query = query.only_if(filter);
+    }
+    let batches = query
+        .execute()
+        .await
+        .map_err(|error| format!("the image-vector id scan failed: {}", error))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|error| format!("the image-vector id scan failed: {}", error))?;
+    let mut rows = 0usize;
+    for batch in batches
+    {
+        let column = batch
+            .column_by_name("image_id")
+            .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| "the image-vector id scan returned no Int64 image_id column".to_string())?;
+        for row in 0..column.len()
+        {
+            if column.is_null(row)
+            {
+                return Err("the image-vector id scan returned a NULL image_id".to_string());
+            }
+            ids.insert(column.value(row));
+            rows += 1;
+        }
+    }
+    // The scan must have returned every row the count promised (a short scan
+    // would read as "missing" and re-embed photos that are indexed).
+    // ⚠️ DEFENCE ONLY against a future vendor change: lancedb 0.31.0 puts no
+    // default cap on a plain scan (`QueryRequest::default().limit = None`,
+    // `src/query.rs:819`; `scanner.limit(None)`, `src/table/query.rs:208`),
+    // so with today's crate this never fires; pinned through the test seam.
+    if rows != matching
+    {
+        return Err(format!(
+            "the image-vector id scan returned {} row(s) where the store counted {}",
+            rows, matching
+        ));
+    }
+    Ok(ids)
+}
+
+/// The ids stored for ONE model/preprocessing pair. Never built ⇒ empty.
+async fn stored_image_embedding_ids_for_version(
+    model_version: &str,
+    preprocessing_version: &str,
+) -> Result<std::collections::HashSet<i64>, String>
+{
+    match open_image_embedding_table_for_read("search_index_work").await?
+    {
+        ImageEmbeddingTableState::Present(table) =>
+        {
+            stored_image_vector_ids(
+                &table,
+                Some(face_embedding_version_filter(model_version, preprocessing_version)),
+            )
+            .await
+        }
+        ImageEmbeddingTableState::NeverBuilt => Ok(std::collections::HashSet::new()),
+    }
+}
+
+/// The row count for one model/preprocessing pair: never built = `Ok(0)`, an
+/// unreadable store or a failed count = `Err`.
+async fn image_embedding_count_checked(
+    model_version: String,
+    preprocessing_version: String,
+) -> Result<u64, String>
+{
+    match open_image_embedding_table_for_read("image_embedding_count").await?
+    {
+        ImageEmbeddingTableState::Present(table) => table
+            .count_rows(Some(face_embedding_version_filter(&model_version, &preprocessing_version)))
+            .await
+            .map(|count| count as u64)
+            .map_err(|error| format!("image_embedding_count: count_rows failed: {}", error)),
+        ImageEmbeddingTableState::NeverBuilt => Ok(0),
+    }
+}
+
+/// The table's whole row count, failure kept apart from empty — the backup
+/// manifest's `image_embedding_count`.
+async fn image_embedding_total_count_checked() -> Result<u64, String>
+{
+    match open_image_embedding_table_for_read("image_embedding_total_count").await?
+    {
+        ImageEmbeddingTableState::Present(table) => table
+            .count_rows(None)
+            .await
+            .map(|count| count as u64)
+            .map_err(|error| format!("image_embedding_total_count: count_rows failed: {}", error)),
+        ImageEmbeddingTableState::NeverBuilt => Ok(0),
+    }
+}
+
+/// How many vectors are stored for this model/preprocessing pair.
+/// `store_ok = false` = the store could not be read — never 0-as-truth.
+pub async fn image_embedding_count(
+    model_version: String,
+    preprocessing_version: String,
+) -> ImageEmbeddingCount
+{
+    let unreadable = ImageEmbeddingCount { store_ok: false, count: 0 };
+    let spawned = ffi_panic_boundary(
+        "image_embedding_count.panic.query_failed",
+        ||
+        {
+            face_embedding_runtime("image_embedding_count.face_runtime_unavailable.query_failed")
+                .map(|runtime| {
+                    runtime.spawn(image_embedding_count_checked(model_version, preprocessing_version))
+                })
+        },
+        |panic| Err(ffi_panic_report("count the image embeddings", &panic)),
+    );
+    match spawned
+    {
+        Ok(task) => match task.await
+        {
+            Ok(Ok(count)) => ImageEmbeddingCount { store_ok: true, count },
+            Ok(Err(message)) =>
+            {
+                eprintln!("{}", message);
+                unreadable
+            }
+            Err(error) =>
+            {
+                eprintln!("image_embedding_count: count task failed: {}", error);
+                unreadable
+            }
+        },
+        Err(_message) => unreadable,
+    }
+}
+
+// --- The stale-vector queue -------------------------------------------------
+
+/// `BEGIN` → `body` → `COMMIT`, and on ANY error a `ROLLBACK` — never a
+/// `COMMIT` after an error (S187: on the bundled 1.5.5 a COMMIT of an aborted
+/// transaction returns Ok and silently discards everything).
+fn search_index_transaction<T>(
+    conn: &Connection,
+    body: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String>
+{
+    conn.execute_batch("BEGIN TRANSACTION;")
+        .map_err(|error| format!("BEGIN failed: {}", error))?;
+    match body()
+    {
+        Ok(value) => match conn.execute_batch("COMMIT;")
+        {
+            Ok(()) => Ok(value),
+            Err(error) =>
+            {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(format!("COMMIT failed: {}", error))
+            }
+        },
+        Err(message) => match conn.execute_batch("ROLLBACK;")
+        {
+            Ok(()) => Err(format!("{}; nothing was changed (rolled back)", message)),
+            Err(error) => Err(format!("{}; its ROLLBACK also failed: {}", message, error)),
+        },
+    }
+}
+
+/// Mark `image_ids` stale: every id still in `images` gets a FRESH generation
+/// from `image_vector_stale_generation_seq` — re-marking an id that is already
+/// marked gives it a newer generation, which is what lets a mark made while a
+/// pass runs survive that pass's consume. Ids not in `images` are ignored.
+/// Returns the marks confirmed ON THE TABLE (S179).
+///
+/// ⭐ Fix round 1 (the DuckDB #23645 precondition, review 6b): a primary key is
+/// NEVER deleted and re-inserted in one transaction. Per 500-id chunk, inside
+/// ONE transaction: (1) read which ids are already marked — before any write,
+/// so no read meets a row this transaction changed; (2) `UPDATE … SET
+/// generation = nextval(…)` for those — `generation` carries NO index (only
+/// the `image_id` primary key does; `s1_marks_never_delete_and_reinsert_a_key`
+/// checks `duckdb_indexes()`), so this is DuckDB's in-place update branch, not
+/// the delete+insert one, and `nextval` is evaluated per row; (3) `INSERT` only
+/// the ids not yet marked, by explicit list — no ON CONFLICT (S46). Any error
+/// ⇒ ROLLBACK, never COMMIT (`search_index_transaction`).
+fn mark_image_vectors_stale_impl(conn: &Connection, image_ids: &[i64]) -> Result<u64, String>
+{
+    // The ONLY production call: the probe type is uninhabited outside tests.
+    mark_image_vectors_stale_probed(conn, image_ids, None)
+}
+
+/// Test-only seam (the S179 `FocusApplyProbe` discipline: private,
+/// parameter-threaded, no statics; outside `cfg(test)` the referent type is
+/// UNINHABITED, so production provably passes `None`). In a test it is the SQL
+/// that REPLACES the fresh-id INSERT — a statement that fails after the
+/// re-mark UPDATE has succeeded, so the ROLLBACK (never a COMMIT, S187) is
+/// observable on the table.
+#[cfg(test)]
+type MarkStaleProbeRef<'a> = Option<&'a str>;
+
+#[cfg(not(test))]
+type MarkStaleProbeRef<'a> = Option<&'a std::convert::Infallible>;
+
+#[cfg(test)]
+fn mark_stale_insert_sql(probe: MarkStaleProbeRef<'_>, real: String) -> String
+{
+    probe.map(|sql| sql.to_string()).unwrap_or(real)
+}
+
+#[cfg(not(test))]
+fn mark_stale_insert_sql(_probe: MarkStaleProbeRef<'_>, real: String) -> String
+{
+    real
+}
+
+fn mark_image_vectors_stale_probed(
+    conn: &Connection,
+    image_ids: &[i64],
+    probe: MarkStaleProbeRef<'_>,
+) -> Result<u64, String>
+{
+    const SITE: &str = "mark_image_vectors_stale.already_marked";
+    let mut ids = image_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty()
+    {
+        return Ok(0);
+    }
+    search_index_transaction(conn, ||
+    {
+        // ⭐ Fix round 2 — mark the photo the INDEX holds, not the id handed
+        // in: a RAW hidden behind a visible JPEG/HEIF twin is never a
+        // candidate (its twin is), so it is mapped to its twin(s) here, inside
+        // the transaction and before any write.
+        let targets = search_index_mark_targets(conn, &ids)?;
+        let mut marked = 0u64;
+        for chunk in targets.chunks(IMAGE_VECTOR_CHUNK)
+        {
+            let csv = editor_saved_image_id_csv(chunk);
+            let mut statement = conn
+                .prepare(&format!("SELECT image_id FROM image_vector_stale WHERE image_id IN ({})", csv))
+                .map_err(|error| format!("the existing stale marks could not be read: {}", error))?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, i64>(0))
+                .map_err(|error| format!("the existing stale marks could not be read: {}", error))?;
+            let (existing, dropped) = collect_rows_counted(rows, SITE);
+            if dropped > 0
+            {
+                return Err(format!("{} existing stale mark(s) could not be read", dropped));
+            }
+            let existing = existing.into_iter().collect::<std::collections::HashSet<i64>>();
+            let fresh = chunk.iter().copied().filter(|id| !existing.contains(id)).collect::<Vec<_>>();
+            if !existing.is_empty()
+            {
+                let mut existing_ids = existing.iter().copied().collect::<Vec<_>>();
+                existing_ids.sort_unstable();
+                conn.execute_batch(&format!(
+                    "UPDATE image_vector_stale \
+                        SET generation = nextval('image_vector_stale_generation_seq') \
+                      WHERE image_id IN ({});",
+                    editor_saved_image_id_csv(&existing_ids)
+                ))
+                .map_err(|error| format!("re-marking the image vectors stale failed: {}", error))?;
+            }
+            if !fresh.is_empty()
+            {
+                conn.execute_batch(&mark_stale_insert_sql(
+                    probe,
+                    format!(
+                        "INSERT INTO image_vector_stale (image_id, generation) \
+                         SELECT id, nextval('image_vector_stale_generation_seq') FROM images WHERE id IN ({});",
+                        editor_saved_image_id_csv(&fresh)
+                    ),
+                ))
+                .map_err(|error| format!("marking the image vectors stale failed: {}", error))?;
+            }
+            let confirmed = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM image_vector_stale WHERE image_id IN ({})", csv),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| format!("the stale marks could not be verified: {}", error))?;
+            marked += confirmed.max(0) as u64;
+        }
+        Ok(marked)
+    })
+}
+
+/// ⭐ Fix round 2 — the search-index CANDIDATES behind `ids`, deduplicated and
+/// ascending: the collapse rule of the to-do list (`RAW_JPEG_COLLAPSE_PREDICATE`)
+/// applied to marking, set-based, per 500-id chunk.
+///
+/// · An id that is a candidate passes through: every non-RAW, and a RAW with
+///   no JPEG/HEIF twin (a lone RAW — including one whose twin is gone).
+/// · A RAW hidden behind a visible twin maps to EVERY such twin: same
+///   `directory_path` (the indexed column) and same `file_stem`, kind `jpeg`
+///   or `heif` — exactly the predicate's pairing. A JPEG and a HEIF twin are
+///   both visible, so both are marked.
+/// · An id not in `images` yields nothing.
+///
+/// Read-only, run before the transaction writes anything.
+fn search_index_mark_targets(conn: &Connection, ids: &[i64]) -> Result<Vec<i64>, String>
+{
+    const SITE: &str = "mark_image_vectors_stale.targets";
+    let mut targets = std::collections::BTreeSet::new();
+    for chunk in ids.chunks(IMAGE_VECTOR_CHUNK)
+    {
+        let csv = editor_saved_image_id_csv(chunk);
+        let sql = format!(
+            "SELECT id FROM images WHERE id IN ({csv}) AND {visible} \
+             UNION \
+             SELECT j.id \
+               FROM images r \
+               JOIN images j \
+                 ON j.directory_path = r.directory_path \
+                AND j.file_stem = r.file_stem \
+              WHERE r.id IN ({csv}) \
+                AND r.image_kind = 'raw' \
+                AND j.image_kind IN ('jpeg', 'heif')",
+            csv = csv,
+            visible = RAW_JPEG_COLLAPSE_PREDICATE
+        );
+        let mut statement = conn
+            .prepare(&sql)
+            .map_err(|error| format!("the photos to mark could not be resolved: {}", error))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(|error| format!("the photos to mark could not be resolved: {}", error))?;
+        let (resolved, dropped) = collect_rows_counted(rows, SITE);
+        if dropped > 0
+        {
+            return Err(format!("{} photo(s) to mark could not be resolved", dropped));
+        }
+        targets.extend(resolved);
+    }
+    Ok(targets.into_iter().collect())
+}
+
+/// Delete exactly the consumed marks — each only while the table still holds
+/// that `(image_id, generation)`, so a NEWER mark (a re-mark after the pass
+/// read the old one) survives. Set-based, one transaction, verified on the
+/// table: returns how many of the pairs were present and are now gone.
+fn consume_image_vector_stale_marks_impl(
+    conn: &Connection,
+    marks: &[ImageVectorStaleMark],
+) -> Result<u64, String>
+{
+    let mut marks = marks.to_vec();
+    marks.sort_unstable();
+    marks.dedup();
+    if marks.is_empty()
+    {
+        return Ok(0);
+    }
+    search_index_transaction(conn, ||
+    {
+        let mut consumed = 0u64;
+        for chunk in marks.chunks(IMAGE_VECTOR_CHUNK)
+        {
+            let pairs = chunk
+                .iter()
+                .map(|mark| format!("({}, {})", mark.image_id, mark.generation))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let matching_sql = format!(
+                "SELECT COUNT(*) FROM image_vector_stale s \
+                   JOIN (VALUES {}) AS c(image_id, generation) \
+                     ON s.image_id = c.image_id AND s.generation = c.generation",
+                pairs
+            );
+            let before = conn
+                .query_row(&matching_sql, [], |row| row.get::<_, i64>(0))
+                .map_err(|error| format!("the consumed marks could not be read: {}", error))?;
+            conn.execute_batch(&format!(
+                "DELETE FROM image_vector_stale \
+                  WHERE EXISTS (SELECT 1 FROM (VALUES {}) AS c(image_id, generation) \
+                                 WHERE c.image_id = image_vector_stale.image_id \
+                                   AND c.generation = image_vector_stale.generation);",
+                pairs
+            ))
+            .map_err(|error| format!("the consumed marks could not be deleted: {}", error))?;
+            let after = conn
+                .query_row(&matching_sql, [], |row| row.get::<_, i64>(0))
+                .map_err(|error| format!("the consumed marks could not be re-read: {}", error))?;
+            if after != 0
+            {
+                return Err(format!("{} consumed mark(s) were still present after the delete", after));
+            }
+            consumed += before.max(0) as u64;
+        }
+        Ok(consumed)
+    })
+}
+
+fn consume_image_vector_stale_marks_from_catalogue(marks: &[ImageVectorStaleMark]) -> Result<u64, String>
+{
+    if marks.is_empty()
+    {
+        return Ok(0);
+    }
+    let catalogue = lock_catalogue();
+    let conn = catalogue
+        .as_ref()
+        .ok_or_else(|| "the catalogue is not initialized".to_string())?;
+    consume_image_vector_stale_marks_impl(conn, marks)
+}
+
+/// Mark photos whose thumbnail pixels changed (a rotation, an editor save over
+/// the same path, Folder Sync's staleness refresh — §3.3). An empty list is
+/// `ok`, 0. Panic-guarded (R-07); `error` is stripped (R-133).
+pub async fn mark_image_vectors_stale(image_ids: Vec<i64>) -> ImageVectorStaleMarkResult
+{
+    let failed = |message: String| ImageVectorStaleMarkResult
+    {
+        ok: false,
+        marked: 0,
+        error: Some(strip_rust_source_locations(&message)),
+    };
+    if image_ids.is_empty()
+    {
+        return ImageVectorStaleMarkResult { ok: true, marked: 0, error: None };
+    }
+    ffi_panic_boundary(
+        "mark_image_vectors_stale.panic.query_failed",
+        ||
+        {
+            let catalogue = lock_catalogue();
+            match catalogue.as_ref()
+            {
+                None => failed("The catalogue is not initialized.".to_string()),
+                Some(conn) => match mark_image_vectors_stale_impl(conn, &image_ids)
+                {
+                    Ok(marked) => ImageVectorStaleMarkResult { ok: true, marked, error: None },
+                    Err(message) =>
+                    {
+                        eprintln!("mark_image_vectors_stale: {}", message);
+                        failed(message)
+                    }
+                },
+            }
+        },
+        |panic| failed(ffi_panic_report("mark the image vectors stale", &panic)),
+    )
+}
+
+// --- The to-do list ---------------------------------------------------------
+
+/// The work set's catalogue half, read in keyset batches of
+/// `SEARCH_INDEX_CANDIDATE_BATCH`.
+struct SearchIndexWorkScan
+{
+    items: Vec<SearchIndexWorkItem>,
+    remaining: u64,
+}
+
+/// The CANDIDATES are every photo visible under the RAW+JPEG collapse rule —
+/// `RAW_JPEG_COLLAPSE_PREDICATE`, the same rule culling uses, so a RAW with a
+/// JPEG/HEIF twin is skipped and the twin is the candidate, and a lone RAW is a
+/// candidate — stills AND videos (a video is indexed by its poster frame). The
+/// WORK is the candidates with no stored vector for the version, plus every
+/// candidate holding a stale mark (with its generation). `page_limit = None`
+/// counts the whole set; `Some(n)` stops after `n` items with
+/// `image_id > after_image_id`.
+fn search_index_work_from_catalogue(
+    conn: &Connection,
+    stored: &std::collections::HashSet<i64>,
+    after_image_id: i64,
+    page_limit: Option<usize>,
+) -> Result<SearchIndexWorkScan, String>
+{
+    const SITE: &str = "search_index_work.candidates";
+    let sql = format!(
+        "SELECT images.id, images.file_path, COALESCE(images.is_video, FALSE), s.generation \
+           FROM images \
+           LEFT JOIN image_vector_stale s ON s.image_id = images.id \
+          WHERE images.id > ?1 AND {} \
+          ORDER BY images.id \
+          LIMIT {}",
+        RAW_JPEG_COLLAPSE_PREDICATE, SEARCH_INDEX_CANDIDATE_BATCH
+    );
+    let mut statement = conn
+        .prepare(&sql)
+        .map_err(|error| format!("the search-index candidates could not be prepared: {}", error))?;
+
+    let mut items = Vec::new();
+    let mut remaining = 0u64;
+    let mut cursor = after_image_id;
+    loop
+    {
+        let rows = statement
+            .query_map(params![cursor], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            })
+            .map_err(|error| format!("the search-index candidates could not be read: {}", error))?;
+        let (batch, dropped) = collect_rows_counted(rows, SITE);
+        // ⛔ A row that could not be read is NOT skipped: the cursor would move
+        // past it and the photo would never be indexed while "done" was claimed.
+        if dropped > 0
+        {
+            return Err(format!("{} search-index candidate row(s) could not be read", dropped));
+        }
+        let batch_len = batch.len();
+        for (image_id, file_path, is_video, stale_generation) in batch
+        {
+            cursor = image_id;
+            if stored.contains(&image_id) && stale_generation.is_none()
+            {
+                continue;
+            }
+            remaining += 1;
+            if let Some(limit) = page_limit
+            {
+                items.push(SearchIndexWorkItem { image_id, file_path, is_video, stale_generation });
+                if items.len() >= limit
+                {
+                    return Ok(SearchIndexWorkScan { items, remaining });
+                }
+            }
+        }
+        if batch_len < SEARCH_INDEX_CANDIDATE_BATCH
+        {
+            return Ok(SearchIndexWorkScan { items, remaining });
+        }
+    }
+}
+
+/// Which half of the work set could not be read (the wire token is spelled at
+/// the two FFI exits: `"index"` / `"catalogue"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchIndexWorkHalf
+{
+    Index,
+    Catalogue,
+}
+
+/// ⭐ Fix round 1 (review finding 2) — BOTH halves of the work set, run as
+/// ONE task on the embedding runtime, so the FFI future only awaits the handle
+/// and no DuckDB scan runs on the thread that polls it (ruling 79: the Rust
+/// work leaves the poller). The stored ids are read first (the INDEX half),
+/// then the catalogue lock is taken briefly, inside a panic boundary, for the
+/// keyset scan (the CATALOGUE half). `Err((half, message))` names the half
+/// that could not be read.
+async fn search_index_work_in_background(
+    model_version: String,
+    preprocessing_version: String,
+    after_image_id: i64,
+    page_limit: Option<usize>,
+    panic_site: &'static str,
+) -> Result<SearchIndexWorkScan, (SearchIndexWorkHalf, String)>
+{
+    let stored = stored_image_embedding_ids_for_version(&model_version, &preprocessing_version)
+        .await
+        .map_err(|message| (SearchIndexWorkHalf::Index, message))?;
+    ffi_panic_boundary(
+        panic_site,
+        ||
+        {
+            let catalogue = lock_catalogue();
+            let conn = catalogue
+                .as_ref()
+                .ok_or_else(|| "the catalogue is not initialized".to_string())?;
+            search_index_work_from_catalogue(conn, &stored, after_image_id, page_limit)
+        },
+        |panic| Err(ffi_panic_report("read the search-index candidates", &panic)),
+    )
+    .map_err(|message| (SearchIndexWorkHalf::Catalogue, message))
+}
+
+/// The spawned work task's answer, with a task that could not start or did not
+/// finish read as the INDEX half (the task's first act is the index read; a
+/// catalogue-half panic is caught inside it).
+async fn search_index_work_outcome(
+    spawned: Result<tokio::task::JoinHandle<Result<SearchIndexWorkScan, (SearchIndexWorkHalf, String)>>, String>,
+) -> Result<SearchIndexWorkScan, (SearchIndexWorkHalf, String)>
+{
+    match spawned
+    {
+        Ok(task) => task
+            .await
+            .unwrap_or_else(|error| Err((SearchIndexWorkHalf::Index, format!("search_index_work: the work task failed: {}", error)))),
+        Err(message) => Err((SearchIndexWorkHalf::Index, message)),
+    }
+}
+
+/// How many photos the search index still owes for this version (missing ∪
+/// stale). ⛔ A store that cannot be read is `store_ok = false,
+/// unreadable_half = "index"` — never "everything is missing".
+pub async fn search_index_work_count(
+    model_version: String,
+    preprocessing_version: String,
+) -> SearchIndexWorkCount
+{
+    // The runtime touch and the spawn inside the panic boundary (R-07); both
+    // halves run in the spawned task (fix round 1, finding 2).
+    let spawned = ffi_panic_boundary(
+        "search_index_work_count.panic.query_failed",
+        ||
+        {
+            face_embedding_runtime("search_index_work_count.face_runtime_unavailable.query_failed").map(|runtime|
+            {
+                runtime.spawn(search_index_work_in_background(
+                    model_version,
+                    preprocessing_version,
+                    i64::MIN,
+                    None,
+                    "search_index_work_count.panic.query_failed",
+                ))
+            })
+        },
+        |panic| Err(ffi_panic_report("read the search index", &panic)),
+    );
+    match search_index_work_outcome(spawned).await
+    {
+        Ok(scan) => SearchIndexWorkCount { store_ok: true, unreadable_half: None, remaining: scan.remaining },
+        Err((SearchIndexWorkHalf::Index, message)) =>
+        {
+            eprintln!("search_index_work_count: {}", message);
+            SearchIndexWorkCount { store_ok: false, unreadable_half: Some("index".to_string()), remaining: 0 }
+        }
+        Err((SearchIndexWorkHalf::Catalogue, message)) =>
+        {
+            eprintln!("search_index_work_count: {}", message);
+            SearchIndexWorkCount { store_ok: false, unreadable_half: Some("catalogue".to_string()), remaining: 0 }
+        }
+    }
+}
+
+/// One page of the to-do list: `image_id > after_image_id`, ascending, at most
+/// `limit` (clamped to 1…`SEARCH_INDEX_WORK_PAGE_MAX`). Each item carries its
+/// stale mark's generation, which `upsert_image_embeddings` consumes. ⛔ On a
+/// read failure `items` is EMPTY and `unreadable_half` names the half.
+pub async fn search_index_work_page(
+    model_version: String,
+    preprocessing_version: String,
+    after_image_id: i64,
+    limit: u32,
+) -> SearchIndexWorkPage
+{
+    let limit = limit.clamp(1, SEARCH_INDEX_WORK_PAGE_MAX) as usize;
+    let spawned = ffi_panic_boundary(
+        "search_index_work_page.panic.query_failed",
+        ||
+        {
+            face_embedding_runtime("search_index_work_page.face_runtime_unavailable.query_failed").map(|runtime|
+            {
+                runtime.spawn(search_index_work_in_background(
+                    model_version,
+                    preprocessing_version,
+                    after_image_id,
+                    Some(limit),
+                    "search_index_work_page.panic.query_failed",
+                ))
+            })
+        },
+        |panic| Err(ffi_panic_report("read the search index", &panic)),
+    );
+    match search_index_work_outcome(spawned).await
+    {
+        Ok(scan) => SearchIndexWorkPage { store_ok: true, unreadable_half: None, items: scan.items },
+        Err((SearchIndexWorkHalf::Index, message)) =>
+        {
+            eprintln!("search_index_work_page: {}", message);
+            SearchIndexWorkPage { store_ok: false, unreadable_half: Some("index".to_string()), items: Vec::new() }
+        }
+        Err((SearchIndexWorkHalf::Catalogue, message)) =>
+        {
+            eprintln!("search_index_work_page: {}", message);
+            SearchIndexWorkPage { store_ok: false, unreadable_half: Some("catalogue".to_string()), items: Vec::new() }
+        }
+    }
+}
+
+// --- The delete queue, its drain and the orphan sweep -------------------------
+
+fn pending_image_vector_delete_count_impl(conn: &Connection) -> Result<u64, String>
+{
+    conn.query_row("SELECT COUNT(*) FROM image_vector_pending_delete", [], |row| row.get::<_, i64>(0))
+        .map(|count| count.max(0) as u64)
+        .map_err(|error| format!("the pending image-vector count failed: {}", error))
+}
+
+fn pending_image_vector_delete_count_from_catalogue() -> Result<u64, String>
+{
+    let catalogue = lock_catalogue();
+    let conn = catalogue
+        .as_ref()
+        .ok_or_else(|| "the catalogue is not initialized".to_string())?;
+    pending_image_vector_delete_count_impl(conn)
+}
+
+fn pending_image_vector_delete_ids_from_catalogue() -> Result<Vec<i64>, String>
+{
+    const SITE: &str = "pending_image_vector_deletes";
+    let catalogue = lock_catalogue();
+    let conn = catalogue
+        .as_ref()
+        .ok_or_else(|| "the catalogue is not initialized".to_string())?;
+    let mut statement = conn
+        .prepare("SELECT image_id FROM image_vector_pending_delete ORDER BY image_id")
+        .map_err(|error| format!("the pending image-vector query could not be prepared: {}", error))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|error| format!("the pending image-vector query failed: {}", error))?;
+    let (ids, dropped) = collect_rows_counted(rows, SITE);
+    if dropped > 0
+    {
+        return Err(format!("{} pending image-vector id(s) could not be read", dropped));
+    }
+    Ok(ids)
+}
+
+/// Remove queue rows whose deletion was confirmed (or proved unnecessary).
+/// Returns the rows that were queued and are now gone — a TABLE read (S179).
+fn acknowledge_pending_image_vector_deletes_from_catalogue(ids: &[i64]) -> Result<u64, String>
+{
+    if ids.is_empty()
+    {
+        return Ok(0);
+    }
+    let catalogue = lock_catalogue();
+    let conn = catalogue
+        .as_ref()
+        .ok_or_else(|| "the catalogue is not initialized".to_string())?;
+    let csv = editor_saved_image_id_csv(ids);
+    let count_sql = format!("SELECT COUNT(*) FROM image_vector_pending_delete WHERE image_id IN ({})", csv);
+    let before = conn
+        .query_row(&count_sql, [], |row| row.get::<_, i64>(0))
+        .map_err(|error| format!("the image-vector acknowledgement could not be read: {}", error))?;
+    conn.execute_batch(&format!("DELETE FROM image_vector_pending_delete WHERE image_id IN ({});", csv))
+        .map_err(|error| format!("the image-vector acknowledgement failed: {}", error))?;
+    let after = conn
+        .query_row(&count_sql, [], |row| row.get::<_, i64>(0))
+        .map_err(|error| format!("the image-vector acknowledgement could not be re-read: {}", error))?;
+    Ok(before.saturating_sub(after).max(0) as u64)
+}
+
+fn image_vector_retry_result(
+    status: FaceVectorDeleteRetryStatus,
+    pending_count: u64,
+    acknowledged_count: u64,
+    remaining_count: u64,
+    message: String,
+) -> ImageVectorDeleteRetryResult
+{
+    ImageVectorDeleteRetryResult
+    {
+        status,
+        pending_count,
+        acknowledged_count,
+        remaining_count,
+        message,
+        orphans_enqueued: 0,
+        orphan_scan_ran: false,
+    }
+}
+
+/// The image queue drain. ⛔ Runs ONLY under `FACE_EMBEDDING_STORE_WRITE_LOCK`,
+/// taken by its one caller, `retry_pending_image_vector_deletes_probed`.
+///
+/// Every removed photo is queued, most of them with no vector, so the drain
+/// first reads the store's ids (one id-only projection) and issues a LanceDB
+/// delete — `image_id IN (…)`, 500 ids per commit — only for ids the store
+/// holds; an id the store does not hold is acknowledged without a commit.
+/// Under the write lock nothing can add a vector between that read and the
+/// acknowledgement, so "not in the store" is a proof, the same standing as a
+/// confirmed delete. Every store error leaves the ids queued.
+async fn drain_pending_image_vector_deletes() -> ImageVectorDeleteRetryResult
+{
+    let pending_ids = match pending_image_vector_delete_ids_from_catalogue()
+    {
+        Ok(ids) => ids,
+        Err(message) => return image_vector_retry_result(FaceVectorDeleteRetryStatus::Failed, 0, 0, 0, message),
+    };
+    let pending_count = pending_ids.len() as u64;
+    if pending_ids.is_empty()
+    {
+        return image_vector_retry_result(
+            FaceVectorDeleteRetryStatus::NoPendingDeletes,
+            0,
+            0,
+            0,
+            "No obsolete image vectors are waiting for deletion.".to_string(),
+        );
+    }
+    let remaining_after = |acknowledged: u64| -> u64
+    {
+        pending_image_vector_delete_count_from_catalogue()
+            .unwrap_or_else(|_| pending_count.saturating_sub(acknowledged))
+    };
+
+    let table = match open_image_vector_table_for_delete("retry_pending_image_vector_deletes").await
+    {
+        Ok(FaceVectorTableForDelete::Present(table)) => table,
+        Ok(FaceVectorTableForDelete::Absent) =>
+        {
+            return match acknowledge_pending_image_vector_deletes_from_catalogue(&pending_ids)
+            {
+                Ok(acknowledged) =>
+                {
+                    let remaining = remaining_after(acknowledged);
+                    image_vector_retry_result(
+                        if remaining == 0
+                        {
+                            FaceVectorDeleteRetryStatus::VectorTableAbsent
+                        }
+                        else
+                        {
+                            FaceVectorDeleteRetryStatus::Deferred
+                        },
+                        pending_count,
+                        acknowledged,
+                        remaining,
+                        "The image-vector table is absent; queued ids were safely acknowledged.".to_string(),
+                    )
+                }
+                Err(message) => image_vector_retry_result(
+                    FaceVectorDeleteRetryStatus::Deferred,
+                    pending_count,
+                    0,
+                    pending_count,
+                    message,
+                ),
+            };
+        }
+        Err(message) =>
+        {
+            return image_vector_retry_result(
+                FaceVectorDeleteRetryStatus::Deferred,
+                pending_count,
+                0,
+                pending_count,
+                message,
+            );
+        }
+    };
+
+    let stored = match stored_image_vector_ids(&table, None).await
+    {
+        Ok(stored) => stored,
+        Err(message) =>
+        {
+            return image_vector_retry_result(
+                FaceVectorDeleteRetryStatus::Deferred,
+                pending_count,
+                0,
+                pending_count,
+                format!("Image-vector deletion was deferred: {}", message),
+            );
+        }
+    };
+
+    let mut acknowledged = 0u64;
+    for chunk in pending_ids.chunks(IMAGE_VECTOR_CHUNK)
+    {
+        let present = chunk.iter().copied().filter(|id| stored.contains(id)).collect::<Vec<_>>();
+        if !present.is_empty()
+        {
+            let filter = format!("image_id IN ({})", editor_saved_image_id_csv(&present));
+            if let Err(error) = table.delete(&filter).await
+            {
+                return image_vector_retry_result(
+                    FaceVectorDeleteRetryStatus::Deferred,
+                    pending_count,
+                    acknowledged,
+                    remaining_after(acknowledged),
+                    format!("Image-vector deletion was deferred: {}", error),
+                );
+            }
+        }
+        match acknowledge_pending_image_vector_deletes_from_catalogue(chunk)
+        {
+            Ok(count) => acknowledged += count,
+            Err(message) =>
+            {
+                return image_vector_retry_result(
+                    FaceVectorDeleteRetryStatus::Deferred,
+                    pending_count,
+                    acknowledged,
+                    remaining_after(acknowledged),
+                    message,
+                );
+            }
+        }
+    }
+
+    let remaining = match pending_image_vector_delete_count_from_catalogue()
+    {
+        Ok(count) => count,
+        Err(message) =>
+        {
+            return image_vector_retry_result(
+                FaceVectorDeleteRetryStatus::Failed,
+                pending_count,
+                acknowledged,
+                pending_count.saturating_sub(acknowledged),
+                message,
+            );
+        }
+    };
+    image_vector_retry_result(
+        if remaining == 0
+        {
+            FaceVectorDeleteRetryStatus::Deleted
+        }
+        else
+        {
+            FaceVectorDeleteRetryStatus::Deferred
+        },
+        pending_count,
+        acknowledged,
+        remaining,
+        if remaining == 0
+        {
+            "Queued obsolete image vectors were deleted and acknowledged.".to_string()
+        }
+        else
+        {
+            "Some obsolete image-vector ids remain queued for a later retry.".to_string()
+        },
+    )
+}
+
+/// The image-vector orphan sweep: stored vectors whose `image_id` is no longer
+/// in `images` are queued (at most `cap` per run) for the next drain.
+///
+/// ⚠️ Deliberately WITHOUT the face sweep's count gate (`store > canonical`).
+/// For faces a vector-less observation is rare; for photos it is permanent —
+/// every catalogue holds photos with no thumbnail (S172 counted thousands of
+/// `openFail`) that never get a vector — so `store_count > images` would stay
+/// shut on nearly every real catalogue and the sweep would never run. The scan
+/// it skips is the `image_id` column alone (≈ 3.4 MB at 420,000 photos), and an
+/// empty store skips it.
+async fn reconcile_orphan_image_vectors(table: &lancedb::Table, cap: usize) -> OrphanSweep
+{
+    let skipped = |reason: String| OrphanSweep
+    {
+        ran: false,
+        enqueued: 0,
+        note: format!("Image orphan scan skipped: {}", reason),
+    };
+    let store_count = match table.count_rows(None).await
+    {
+        Ok(count) => count,
+        Err(error) => return skipped(format!("the store's row count failed: {}", error)),
+    };
+    if store_count == 0
+    {
+        return OrphanSweep
+        {
+            ran: false,
+            enqueued: 0,
+            note: "Image orphan scan not needed: the store holds no image vectors.".to_string(),
+        };
+    }
+    let store_ids = match stored_image_vector_ids(table, None).await
+    {
+        Ok(ids) => ids,
+        Err(reason) => return skipped(reason),
+    };
+    match enqueue_orphan_image_vectors_from_catalogue(&store_ids, cap)
+    {
+        Ok((found, enqueued)) => OrphanSweep
+        {
+            ran: true,
+            enqueued,
+            note: if found == 0
+            {
+                format!(
+                    "Image orphan scan: none of the store's {} photo(s) is missing from the catalogue.",
+                    store_ids.len()
+                )
+            }
+            else
+            {
+                format!(
+                    "Image orphan scan: {} stored photo id(s) are no longer catalogued; {} queued for deletion on the next retry (at most {} per run).",
+                    found, enqueued, cap
+                )
+            },
+        },
+        Err(failure) =>
+        {
+            eprintln!("reconcile_orphan_image_vectors: {}", failure.reason);
+            OrphanSweep
+            {
+                ran: true,
+                enqueued: 0,
+                note: if failure.nothing_queued
+                {
+                    format!("Image orphan scan abandoned, nothing was queued: {}", failure.reason)
+                }
+                else
+                {
+                    format!(
+                        "Image orphan scan abandoned; whether any orphan id stayed queued could not be confirmed: {}",
+                        failure.reason
+                    )
+                },
+            }
+        }
+    }
+}
+
+/// The live ids, the anti-join and the capped enqueue under ONE catalogue-lock
+/// acquisition. ALL OR NOTHING (the face sweep's review-F6 shape): the inserts
+/// run in one transaction with per-chunk verification on the table; any
+/// failure is rolled back and the rollback verified against the count read
+/// before BEGIN. ⛔ A live-id read that dropped rows ABANDONS the sweep — a
+/// short live set would queue LIVE vectors for deletion.
+fn enqueue_orphan_image_vectors_from_catalogue(
+    store_ids: &std::collections::HashSet<i64>,
+    cap: usize,
+) -> Result<(u64, u64), OrphanEnqueueFailure>
+{
+    const SITE: &str = "reconcile_orphan_image_vectors.live_ids";
+    let catalogue = lock_catalogue();
+    let conn = catalogue.as_ref().ok_or_else(|| {
+        OrphanEnqueueFailure::before_any_write("the catalogue is not initialized".to_string())
+    })?;
+
+    let mut statement = conn.prepare("SELECT id FROM images").map_err(|error| {
+        OrphanEnqueueFailure::before_any_write(format!("the photo id read could not be prepared: {}", error))
+    })?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|error| OrphanEnqueueFailure::before_any_write(format!("the photo id read failed: {}", error)))?;
+    let (live_ids, dropped) = collect_rows_counted(rows, SITE);
+    if dropped > 0
+    {
+        return Err(OrphanEnqueueFailure::before_any_write(format!(
+            "{} photo id(s) could not be read, so the live set is short and a live vector could be mistaken for an orphan",
+            dropped
+        )));
+    }
+    let live_ids = live_ids.into_iter().collect::<std::collections::HashSet<i64>>();
+    let mut orphans = store_ids
+        .iter()
+        .copied()
+        .filter(|id| !live_ids.contains(id))
+        .collect::<Vec<_>>();
+    orphans.sort_unstable();
+    let found = orphans.len() as u64;
+    orphans.truncate(cap);
+    if orphans.is_empty()
+    {
+        return Ok((found, 0));
+    }
+
+    let queue_before = pending_image_vector_delete_count_impl(conn).map_err(OrphanEnqueueFailure::before_any_write)?;
+    conn.execute_batch("BEGIN TRANSACTION;").map_err(|error| {
+        OrphanEnqueueFailure::before_any_write(format!("the image orphan enqueue could not begin: {}", error))
+    })?;
+    let enqueue_all = || -> Result<u64, String>
+    {
+        let mut enqueued = 0u64;
+        for chunk in orphans.chunks(IMAGE_VECTOR_CHUNK)
+        {
+            let csv = editor_saved_image_id_csv(chunk);
+            let values = chunk.iter().map(|id| format!("({})", id)).collect::<Vec<_>>().join(", ");
+            conn.execute_batch(&format!(
+                "INSERT OR IGNORE INTO image_vector_pending_delete (image_id) VALUES {};",
+                values
+            ))
+            .map_err(|error| format!("the image orphan enqueue failed: {}", error))?;
+            let confirmed = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM image_vector_pending_delete WHERE image_id IN ({})", csv),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| format!("the image orphan enqueue could not be verified: {}", error))?;
+            enqueued += confirmed.max(0) as u64;
+        }
+        conn.execute_batch("COMMIT;")
+            .map_err(|error| format!("the image orphan enqueue could not commit: {}", error))?;
+        Ok(enqueued)
+    };
+    match enqueue_all()
+    {
+        Ok(enqueued) => Ok((found, enqueued)),
+        Err(reason) =>
+        {
+            if let Err(error) = conn.execute_batch("ROLLBACK;")
+            {
+                return Err(OrphanEnqueueFailure
+                {
+                    reason: format!("{}; its ROLLBACK failed ({}), so what stayed queued cannot be confirmed", reason, error),
+                    nothing_queued: false,
+                });
+            }
+            Err(match pending_image_vector_delete_count_impl(conn)
+            {
+                Ok(queue_after) if queue_after == queue_before => OrphanEnqueueFailure
+                {
+                    reason: format!("{}; the pass was rolled back", reason),
+                    nothing_queued: true,
+                },
+                Ok(queue_after) => OrphanEnqueueFailure
+                {
+                    reason: format!(
+                        "{}; after the rollback the queue holds {} row(s) where it held {} before this pass",
+                        reason, queue_after, queue_before
+                    ),
+                    nothing_queued: false,
+                },
+                Err(error) => OrphanEnqueueFailure
+                {
+                    reason: format!(
+                        "{}; the pass was rolled back, but the queue could not be re-read to confirm it ({})",
+                        reason, error
+                    ),
+                    nothing_queued: false,
+                },
+            })
+        }
+    }
+}
+
+/// The image retry's one leaf: takes the store write lock ONCE and holds it
+/// across the drain AND the sweep (so no upsert can commit between the sweep's
+/// read of the store's ids and its read of the catalogue's). `sweep_cap` is
+/// `ORPHAN_VECTOR_SWEEP_CAP` in production; tests pass a smaller one.
+async fn retry_pending_image_vector_deletes_probed(
+    mode: OrphanSweepMode,
+    sweep_cap: usize,
+) -> ImageVectorDeleteRetryResult
+{
+    let _store_write = FACE_EMBEDDING_STORE_WRITE_LOCK.lock().await;
+    let drained = drain_pending_image_vector_deletes().await;
+    if mode == OrphanSweepMode::DrainOnly
+    {
+        return drained;
+    }
+    match drained.status
+    {
+        FaceVectorDeleteRetryStatus::NoPendingDeletes | FaceVectorDeleteRetryStatus::Deleted => {}
+        FaceVectorDeleteRetryStatus::VectorTableAbsent
+        | FaceVectorDeleteRetryStatus::Deferred
+        | FaceVectorDeleteRetryStatus::Failed => return drained,
+    }
+
+    let sweep = match open_image_vector_table_for_delete("reconcile_orphan_image_vectors").await
+    {
+        Ok(FaceVectorTableForDelete::Present(table)) => reconcile_orphan_image_vectors(&table, sweep_cap).await,
+        Ok(FaceVectorTableForDelete::Absent) => OrphanSweep
+        {
+            ran: false,
+            enqueued: 0,
+            note: "Image orphan scan: there is no image-vector table to reconcile.".to_string(),
+        },
+        Err(message) => OrphanSweep
+        {
+            ran: false,
+            enqueued: 0,
+            note: format!("Image orphan scan skipped: {}", message),
+        },
+    };
+    let remaining_count = if sweep.enqueued > 0
+    {
+        pending_image_vector_delete_count_from_catalogue().unwrap_or(drained.remaining_count + sweep.enqueued)
+    }
+    else
+    {
+        drained.remaining_count
+    };
+    ImageVectorDeleteRetryResult
+    {
+        status: drained.status,
+        pending_count: drained.pending_count,
+        acknowledged_count: drained.acknowledged_count,
+        remaining_count,
+        message: format!("{} {}", drained.message, sweep.note),
+        orphans_enqueued: sweep.enqueued,
+        orphan_scan_ran: sweep.ran,
+    }
+}
+
+/// A console line (never a user-facing text) for an image cleanup that left
+/// work behind.
+fn warn_on_unfinished_image_vector_cleanup(operation: &str, cleanup: &ImageVectorDeleteRetryResult)
+{
+    if cleanup.remaining_count > 0
+        || matches!(
+            cleanup.status,
+            FaceVectorDeleteRetryStatus::Deferred | FaceVectorDeleteRetryStatus::Failed
+        )
+    {
+        eprintln!(
+            "[WARN imageVectorCleanup] after {}: {:?} pending={} acknowledged={} remaining={} orphans_enqueued={} message={}",
+            operation,
+            cleanup.status,
+            cleanup.pending_count,
+            cleanup.acknowledged_count,
+            cleanup.remaining_count,
+            cleanup.orphans_enqueued,
+            cleanup.message
+        );
+    }
+}
+
+/// After a Remove from Catalogue COMMITS: delete the removed photos' image
+/// vectors through the durable queue's DRAIN ONLY (no sweep inside an action
+/// the user waits on — the face path's review-F3 rule), awaited inside the FFI
+/// call, on the embedding runtime and inside its own panic boundary (R-07).
+/// `removed_images` is the frozen photo census (a table read). Store errors are
+/// non-destructive: unconfirmed ids stay queued for the launch retry. The
+/// removal FFIs ignore the result; it is returned for tests.
+async fn retry_removal_image_vector_deletes(
+    removed_images: u64,
+    operation: &str,
+) -> Option<ImageVectorDeleteRetryResult>
+{
+    if removed_images == 0
+    {
+        return None;
+    }
+    let spawned = ffi_panic_boundary(
+        "retry_removal_image_vector_deletes.panic.query_failed",
+        ||
+        {
+            face_embedding_runtime(
+                "retry_removal_image_vector_deletes.face_runtime_unavailable.query_failed",
+            )
+            .map(|runtime|
+            {
+                runtime.spawn(retry_pending_image_vector_deletes_probed(
+                    OrphanSweepMode::DrainOnly,
+                    ORPHAN_VECTOR_SWEEP_CAP,
+                ))
+            })
+            .map_err(|message| format!("Image-vector cleanup could not start: {}", message))
+        },
+        |panic| Err(ffi_panic_report("clean up the removed photos' image vectors", &panic)),
+    );
+    let cleanup = match spawned
+    {
+        Ok(task) => match task.await
+        {
+            Ok(result) => result,
+            Err(error) => image_vector_retry_result(
+                FaceVectorDeleteRetryStatus::Failed,
+                0,
+                0,
+                0,
+                format!("Image-vector cleanup runtime failed: {}", error),
+            ),
+        },
+        Err(message) => image_vector_retry_result(FaceVectorDeleteRetryStatus::Failed, 0, 0, 0, message),
+    };
+    warn_on_unfinished_image_vector_cleanup(operation, &cleanup);
+    Some(cleanup)
 }
 
 fn assign_face_observations_to_person_impl(
@@ -26173,29 +28410,61 @@ pub async fn backup_manifest_counts() -> BackupCounts {
     // Slice F / R-25 — an unbuildable runtime (logged and censused by the
     // accessor), a failed task, or an unreadable store answers 0 for the
     // manifest's vector count — and, since slice P, says it is UNTAKEN.
-    let face_embedding_count = match face_embedding_runtime(
+    // ⭐ Semantic search slice 1 — the image-embedding count rides the SAME
+    // spawned task (one runtime touch, as before) and is `None` on every arm
+    // that could not take it.
+    let (face_embedding_count, image_embedding_count) = match face_embedding_runtime(
         "backup_manifest_counts.face_runtime_unavailable.query_failed",
     )
     {
         Ok(runtime) => match runtime
-            .spawn(face_embedding_total_count_checked())
+            .spawn(async
+            {
+                let face = face_embedding_total_count_checked().await;
+                // ⭐ Fix round 1 (review finding 1) — the image count is its
+                // OWN task: a panic or failure in it is `None` for the image
+                // count only, never an untaken FACE count.
+                let image = match tokio::spawn(image_embedding_total_count_checked()).await
+                {
+                    Ok(image) => image,
+                    Err(error) => Err(format!("image embedding count task failed: {}", error)),
+                };
+                (face, image)
+            })
             .await
         {
-            Ok(Ok(count)) => count,
-            Ok(Err(message)) => {
-                eprintln!("backup_manifest_counts: {}", message);
-                untaken_counts |= BACKUP_COUNT_UNTAKEN_FACE_EMBEDDING;
-                0
+            Ok((face, image)) =>
+            {
+                let face = match face
+                {
+                    Ok(count) => count,
+                    Err(message) =>
+                    {
+                        eprintln!("backup_manifest_counts: {}", message);
+                        untaken_counts |= BACKUP_COUNT_UNTAKEN_FACE_EMBEDDING;
+                        0
+                    }
+                };
+                let image = match image
+                {
+                    Ok(count) => Some(count),
+                    Err(message) =>
+                    {
+                        eprintln!("backup_manifest_counts: {}", message);
+                        None
+                    }
+                };
+                (face, image)
             }
             Err(error) => {
-                eprintln!("backup_manifest_counts: face embedding count task failed: {}", error);
+                eprintln!("backup_manifest_counts: embedding count task failed: {}", error);
                 untaken_counts |= BACKUP_COUNT_UNTAKEN_FACE_EMBEDDING;
-                0
+                (0, None)
             }
         },
         Err(_unavailable) => {
             untaken_counts |= BACKUP_COUNT_UNTAKEN_FACE_EMBEDDING;
-            0
+            (0, None)
         }
     };
     BackupCounts {
@@ -26206,6 +28475,7 @@ pub async fn backup_manifest_counts() -> BackupCounts {
         face_observation_count,
         face_embedding_count,
         untaken_counts,
+        image_embedding_count,
     }
 }
 
@@ -41553,6 +43823,7 @@ pub async fn remove_images_for_filters(path_prefix: String, date_prefix: String)
         Some(outcome) =>
         {
             retry_removal_face_vector_deletes(outcome.doomed_faces, "remove_images_for_filters", None).await;
+            retry_removal_image_vector_deletes(outcome.doomed_images, "remove_images_for_filters").await;
             outcome.deleted as i64
         }
         None => 0,
@@ -42434,6 +44705,7 @@ pub async fn remove_images_by_ids(ids: Vec<i64>) -> u64
         Some(outcome) =>
         {
             retry_removal_face_vector_deletes(outcome.doomed_faces, "remove_images_by_ids", None).await;
+            retry_removal_image_vector_deletes(outcome.doomed_images, "remove_images_by_ids").await;
             outcome.deleted
         }
         None => 0,
@@ -42498,6 +44770,11 @@ struct CatalogueRemovalOutcome
     /// change count: how many face observations this removal cascaded — and
     /// therefore whether it queued LanceDB vector deletes to retry.
     doomed_faces: u64,
+    /// ⭐ Semantic search slice 1 — a TABLE READ (`SELECT COUNT(*)` over the
+    /// frozen `pl_removal_doomed`): how many photos this removal queued into
+    /// `image_vector_pending_delete`, and therefore whether the image-vector
+    /// drain runs after commit.
+    doomed_images: u64,
 }
 
 /// The stages the test seam can fail at (B9's induced rollback).
@@ -42649,11 +44926,12 @@ fn remove_catalogue_rows(
     probe: RemovalProbeRef<'_>,
 ) -> Result<CatalogueRemovalOutcome, String>
 {
-    let result = removal_freeze_sets(conn, &selection).and_then(|doomed_faces| {
+    let result = removal_freeze_sets(conn, &selection).and_then(|(doomed_faces, doomed_images)| {
         removal_transaction(conn, probe).map(|deleted| CatalogueRemovalOutcome
         {
             deleted,
             doomed_faces,
+            doomed_images,
         })
     });
     removal_drop_temp_tables(conn);
@@ -42664,8 +44942,9 @@ fn remove_catalogue_rows(
 /// dependent set into temp tables. Placed here precisely so no DDL ever runs
 /// inside the removal transaction (S179: index DDL is refused inside a
 /// transaction with outstanding updates; temp-table DDL is not, but it has no
-/// reason to be there). Returns the frozen face count — a table read.
-fn removal_freeze_sets(conn: &Connection, selection: &RemovalSelection<'_>) -> Result<u64, String>
+/// reason to be there). Returns the frozen face count and the frozen photo count
+/// — both table reads.
+fn removal_freeze_sets(conn: &Connection, selection: &RemovalSelection<'_>) -> Result<(u64, u64), String>
 {
     const DOOMED_COLUMNS: &str =
         "id, file_path, file_size, capture_datetime, rating, flag, color_label, rotation";
@@ -42803,9 +45082,18 @@ fn removal_freeze_sets(conn: &Connection, selection: &RemovalSelection<'_>) -> R
     ))
     .map_err(|e| format!("freezing the waiting tombstones failed: {}", e))?;
 
-    conn.query_row("SELECT COUNT(*) FROM pl_removal_faces", [], |row| row.get::<_, i64>(0))
+    let faces = conn
+        .query_row("SELECT COUNT(*) FROM pl_removal_faces", [], |row| row.get::<_, i64>(0))
         .map(|count| count.max(0) as u64)
-        .map_err(|e| format!("reading the frozen face census failed: {}", e))
+        .map_err(|e| format!("reading the frozen face census failed: {}", e))?;
+    // ⭐ Semantic search slice 1 — the frozen photo count (a table read, never
+    // the DELETE's change count — S179) decides whether the image-vector drain
+    // runs after commit.
+    let images = conn
+        .query_row("SELECT COUNT(*) FROM pl_removal_doomed", [], |row| row.get::<_, i64>(0))
+        .map(|count| count.max(0) as u64)
+        .map_err(|e| format!("reading the frozen photo census failed: {}", e))?;
+    Ok((faces, images))
 }
 
 /// Steps 1–5: `BEGIN` → capture → cascade → delete → `COMMIT`, with `ROLLBACK`
@@ -42923,6 +45211,20 @@ fn removal_transaction_body(conn: &Connection, probe: RemovalProbeRef<'_>) -> Re
           WHERE id IN (SELECT id FROM pl_removal_faces);",
     )
     .map_err(|e| format!("queueing the face vectors for deletion failed: {}", e))?;
+
+    // 3a'. ⭐ Semantic search slice 1 (DESIGN-Semantic-Search.md §3.3) — the
+    //     same contract for IMAGE vectors, in the same transaction: every
+    //     removed photo's id is queued for its `image_embeddings` rows (deleted
+    //     after commit by `retry_removal_image_vector_deletes`), and its stale
+    //     marks go with it. Every doomed id is queued — whether a vector exists
+    //     is the store's to say, and the drain asks it.
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO image_vector_pending_delete (image_id) \
+         SELECT id FROM pl_removal_doomed; \
+         DELETE FROM image_vector_stale \
+          WHERE image_id IN (SELECT id FROM pl_removal_doomed);",
+    )
+    .map_err(|e| format!("queueing the image vectors for deletion failed: {}", e))?;
 
     // 3b. Assignments, then the observations — in that order. The two image
     //     limbs also sweep an assignment left dangling by an earlier writer.
@@ -43080,6 +45382,7 @@ async fn retry_removal_face_vector_deletes(
         message,
         orphans_enqueued: 0,
         orphan_scan_ran: false,
+        image_vector_cleanup: None,
     };
     let spawned = ffi_panic_boundary(
         "retry_removal_face_vector_deletes.panic.query_failed",
@@ -57027,10 +59330,14 @@ mod cross_store_tests
         let text = &product.squeezed;
         let acquisition = "FACE_EMBEDDING_STORE_WRITE_LOCK.lock().await";
         let sites = occurrences(text, acquisition);
+        // ⭐ Semantic search slice 1: the image store's two leaf writers share
+        // the ONE lock (the same `vectors.lancedb` directory).
         let writers = [
             "upsert_face_embeddings_impl",
             "retry_pending_face_vector_deletes_probed",
             "delete_face_vectors_by_observation_ids",
+            "upsert_image_embeddings_impl",
+            "retry_pending_image_vector_deletes_probed",
         ];
         let mut spans = Vec::new();
         for writer in writers
@@ -57045,7 +59352,11 @@ mod cross_store_tests
         }
         if sites.len() != writers.len()
         {
-            return Err(format!("P14/exactly-three-acquisitions: {} in product code", sites.len()));
+            return Err(format!(
+                "P14/exactly-one-acquisition-per-writer: {} in product code for {} writers",
+                sites.len(),
+                writers.len()
+            ));
         }
         if text.contains("FACE_VECTOR_DELETE_RETRY_LOCK")
         {
@@ -57056,10 +59367,13 @@ mod cross_store_tests
         let drain = body_span(&product, "drain_pending_face_vector_deletes")?;
         let delete = body_span(&product, "delete_face_vectors_by_observation_ids")?;
         let create = body_span(&product, "open_or_create_face_embedding_table")?;
+        let image_merge = body_span(&product, "upsert_image_embeddings_impl")?;
+        let image_drain = body_span(&product, "drain_pending_image_vector_deletes")?;
+        let image_create = body_span(&product, "open_or_create_image_embedding_table")?;
         for (needle, allowed) in [
-            (".merge_insert(", vec![merge]),
-            (".delete(&", vec![drain, delete]),
-            (".create_empty_table(", vec![create]),
+            (".merge_insert(", vec![merge, image_merge]),
+            (".delete(&", vec![drain, delete, image_drain]),
+            (".create_empty_table(", vec![create, image_create]),
         ]
         {
             for at in occurrences(text, needle)
@@ -57073,6 +59387,8 @@ mod cross_store_tests
         for (needle, expected, holder) in [
             ("drain_pending_face_vector_deletes()", 1usize, "retry_pending_face_vector_deletes_probed"),
             ("open_or_create_face_embedding_table(", 1usize, "upsert_face_embeddings_impl"),
+            ("drain_pending_image_vector_deletes()", 1usize, "retry_pending_image_vector_deletes_probed"),
+            ("open_or_create_image_embedding_table(", 1usize, "upsert_image_embeddings_impl"),
         ]
         {
             let holder_span = body_span(&product, holder)?;
@@ -65048,5 +67364,1308 @@ mod negative_roll_tests
         assert!(!plan.contains("Sequential Scan"), "no sequential scan for a small directory: {}", plan);
         drop(conn);
         cleanup(&path);
+    }
+}
+
+// ======================================================================
+// ⭐ Semantic search slice 1 — the `image_embeddings` store, the stale-vector
+// queue, the to-do list, the delete queue + orphan sweep and the manifest count
+// (Docs/DESIGN-Semantic-Search.md §3, §12's Rust row).
+//
+// Every fixture is a REAL temp-file catalogue opened through the production
+// `open_and_migrate_catalogue` and fenced (ENGINE TESTS NEVER FETCH), with a
+// REAL `vectors.lancedb` beside it — no mock. Tests that resolve the store from
+// the process-global CATALOGUE_PATH, or call an FFI entry point, serialise on
+// `swallowed_failure_tests::GLOBAL_CATALOGUE_LOCK`.
+// ======================================================================
+#[cfg(test)]
+mod image_embedding_store_tests
+{
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    const NAME: &str = "siglip2-test";
+    const MODEL: &str = "1.0-test";
+    const OTHER_MODEL: &str = "0.9-test";
+    const PREP: &str = "squash-test";
+    const DIM: usize = 8;
+
+    struct Fixture
+    {
+        dir: std::path::PathBuf,
+        catalogue: std::path::PathBuf,
+    }
+
+    impl Fixture
+    {
+        fn vectors(&self) -> std::path::PathBuf
+        {
+            self.dir.join("vectors.lancedb")
+        }
+
+        fn vectors_uri(&self) -> String
+        {
+            self.vectors().to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for Fixture
+    {
+        fn drop(&mut self)
+        {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn fixture_dir(tag: &str) -> std::path::PathBuf
+    {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("plcore-s1-search-{}-{}-{}", std::process::id(), n, tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        dir
+    }
+
+    fn fresh_catalogue(tag: &str) -> (Fixture, Connection)
+    {
+        let dir = fixture_dir(tag);
+        let catalogue = dir.join("catalogue.db");
+        let conn = open_and_migrate_catalogue(&catalogue).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH.
+        fence_connection_against_extension_fetches(&conn);
+        (Fixture { dir, catalogue }, conn)
+    }
+
+    fn second_connection(conn: &Connection) -> Connection
+    {
+        let other = conn.try_clone().expect("a second connection on the same instance");
+        fence_connection_against_extension_fetches(&other);
+        other
+    }
+
+    fn serial() -> std::sync::MutexGuard<'static, ()>
+    {
+        super::swallowed_failure_tests::GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct Installed;
+
+    impl Installed
+    {
+        fn new(fixture: &Fixture, conn: Connection) -> Self
+        {
+            *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(conn);
+            *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(fixture.catalogue.clone());
+            CATALOGUE.clear_poison();
+            CATALOGUE_PATH.clear_poison();
+            Installed
+        }
+    }
+
+    impl Drop for Installed
+    {
+        fn drop(&mut self)
+        {
+            *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
+
+    fn block<F: std::future::Future>(future: F) -> F::Output
+    {
+        FACE_EMBEDDING_RUNTIME.block_on(future)
+    }
+
+    fn insert_photo(conn: &Connection, file_path: &str, kind: &str, is_video: bool) -> i64
+    {
+        let file_name = file_path.rsplit('/').next().unwrap_or(file_path).to_string();
+        let stem = file_name.split('.').next().unwrap_or(&file_name).to_string();
+        let directory = file_path[..file_path.len() - file_name.len() - 1].to_string();
+        conn.query_row(
+            "INSERT INTO images (file_path, file_size, file_name, file_stem, image_kind, \
+             directory_path, created_timestamp, modified_timestamp, is_video) \
+             VALUES (?1, 10, ?2, ?3, ?4, ?5, 0, 0, ?6) RETURNING id",
+            params![file_path, file_name, stem, kind, directory, is_video],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("insert photo")
+    }
+
+    /// Catalogue photos with ids 1…`count` on a fresh catalogue (fix round 1:
+    /// the upsert stores vectors only for photos that are catalogued).
+    fn seed_photos(conn: &Connection, count: i64)
+    {
+        conn.execute_batch(&format!(
+            "INSERT INTO images (file_path, file_size, file_name, file_stem, image_kind, directory_path, \
+             created_timestamp, modified_timestamp, is_video) \
+             SELECT '/seed/p' || i || '.jpg', 10, 'p' || i || '.jpg', 'p' || i, 'jpeg', '/seed', 0, 0, FALSE \
+               FROM range({}) t(i);",
+            count
+        ))
+        .expect("seed photos");
+        let max = conn.query_row("SELECT MAX(id) FROM images", [], |row| row.get::<_, i64>(0)).expect("max id");
+        assert_eq!(max, count, "fixture: the seeded ids are 1…{}", count);
+    }
+
+    /// A deterministic, non-degenerate vector for `seed`.
+    fn values(seed: i64) -> Vec<f32>
+    {
+        (0..DIM).map(|i| ((seed as f32) * 0.37 + (i as f32) * 1.13).sin() + 0.05).collect()
+    }
+
+    fn record_with(id: i64, model: &str, prep: &str, vector: &[f32]) -> ImageEmbeddingRecord
+    {
+        ImageEmbeddingRecord
+        {
+            image_id: id,
+            model_name: NAME.to_string(),
+            model_version: model.to_string(),
+            preprocessing_version: prep.to_string(),
+            embedding_dimension: vector.len() as u32,
+            vector: vector.iter().flat_map(|value| value.to_le_bytes()).collect(),
+        }
+    }
+
+    fn record(id: i64, seed: i64) -> ImageEmbeddingRecord
+    {
+        record_with(id, MODEL, PREP, &values(seed))
+    }
+
+    fn normalized(vector: &[f32]) -> Vec<f32>
+    {
+        let norm = vector.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>().sqrt();
+        vector.iter().map(|v| (f64::from(*v) / norm) as f32).collect()
+    }
+
+    fn store(records: Vec<ImageEmbeddingRecord>, marks: Vec<ImageVectorStaleMark>) -> ImageEmbeddingStoreResult
+    {
+        block(upsert_image_embeddings_impl(records, marks))
+    }
+
+    /// Every stored row, read straight from the table: (id, model_version,
+    /// preprocessing_version) → the vector, read back as f32 from Float16.
+    fn stored_rows(uri: &str) -> BTreeMap<(i64, String, String), Vec<f32>>
+    {
+        block(async
+        {
+            let database = lancedb::connect(uri).execute().await.expect("connect");
+            let table = database.open_table(IMAGE_EMBEDDING_TABLE).execute().await.expect("open");
+            let count = table.count_rows(None).await.expect("count");
+            let mut rows = BTreeMap::new();
+            if count == 0
+            {
+                return rows;
+            }
+            let batches = table
+                .query()
+                .limit(count)
+                .execute()
+                .await
+                .expect("query")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect");
+            for batch in batches
+            {
+                let ids = batch.column_by_name("image_id").and_then(|a| a.as_any().downcast_ref::<Int64Array>().cloned()).expect("ids");
+                let models = batch.column_by_name("model_version").and_then(|a| a.as_any().downcast_ref::<StringArray>().cloned()).expect("models");
+                let preps = batch.column_by_name("preprocessing_version").and_then(|a| a.as_any().downcast_ref::<StringArray>().cloned()).expect("preps");
+                let vectors = batch.column_by_name("vector").and_then(|a| a.as_any().downcast_ref::<FixedSizeListArray>().cloned()).expect("vectors");
+                let halves = vectors
+                    .values()
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float16Array>()
+                    .cloned()
+                    .expect("S1-F16/readback: the stored child must read back as Float16");
+                let width = vectors.value_length() as usize;
+                for row in 0..batch.num_rows()
+                {
+                    let vector = (row * width..(row + 1) * width).map(|i| halves.value(i).to_f32()).collect();
+                    rows.insert((ids.value(row), models.value(row).to_string(), preps.value(row).to_string()), vector);
+                }
+            }
+            rows
+        })
+    }
+
+    fn stored_ids(uri: &str) -> BTreeSet<i64>
+    {
+        stored_rows(uri).keys().map(|(id, _, _)| *id).collect()
+    }
+
+    fn stale(conn: &Connection) -> BTreeMap<i64, i64>
+    {
+        let mut statement = conn.prepare("SELECT image_id, generation FROM image_vector_stale").expect("stale query");
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .expect("stale rows");
+        rows.map(|row| row.expect("stale row")).collect()
+    }
+
+    fn queued(conn: &Connection) -> BTreeSet<i64>
+    {
+        let mut statement = conn.prepare("SELECT image_id FROM image_vector_pending_delete").expect("queue query");
+        let rows = statement.query_map([], |row| row.get::<_, i64>(0)).expect("queue rows");
+        rows.map(|row| row.expect("queue row")).collect()
+    }
+
+    fn page(after: i64, limit: u32) -> SearchIndexWorkPage
+    {
+        futures::executor::block_on(search_index_work_page(MODEL.to_string(), PREP.to_string(), after, limit))
+    }
+
+    fn work_ids(page: &SearchIndexWorkPage) -> Vec<i64>
+    {
+        page.items.iter().map(|item| item.image_id).collect()
+    }
+
+    fn mark(ids: &[i64]) -> ImageVectorStaleMarkResult
+    {
+        futures::executor::block_on(mark_image_vectors_stale(ids.to_vec()))
+    }
+
+    // ------------------------------------------------------------------
+    // S1-F16 — Float16 storage and readback, and the ranking survives it.
+    // ------------------------------------------------------------------
+    #[test]
+    fn s1_float16_storage_round_trips_and_keeps_the_ranking()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("f16");
+        seed_photos(&conn, 24);
+        let _installed = Installed::new(&fixture, conn);
+
+        let originals = (1..=24).map(|id| (id, values(id * 7))).collect::<Vec<_>>();
+        let result = store(originals.iter().map(|(id, v)| record_with(*id, MODEL, PREP, v)).collect(), Vec::new());
+        assert_eq!(result.status, "stored", "S1-F16/store: {:?}", result.error);
+        assert_eq!(result.stored, 24);
+
+        // The table's own schema says Float16, nullable child (S98).
+        let schema = block(async
+        {
+            let database = lancedb::connect(&fixture.vectors_uri()).execute().await.expect("connect");
+            let table = database.open_table(IMAGE_EMBEDDING_TABLE).execute().await.expect("open");
+            table.schema().await.expect("schema")
+        });
+        match schema.field_with_name("vector").expect("vector field").data_type()
+        {
+            DataType::FixedSizeList(child, width) =>
+            {
+                assert_eq!(child.data_type(), &DataType::Float16, "S1-F16/schema: the stored child is Float16");
+                assert!(child.is_nullable(), "S1-F16/schema: the child is nullable (S98)");
+                assert_eq!(*width as usize, DIM, "S1-F16/schema: the list width is the dimension");
+            }
+            other => panic!("S1-F16/schema: vector is {:?}", other),
+        }
+
+        let rows = stored_rows(&fixture.vectors_uri());
+        assert_eq!(rows.len(), 24);
+        for (id, original) in &originals
+        {
+            let expected = normalized(original);
+            let back = rows.get(&(*id, MODEL.to_string(), PREP.to_string())).expect("row");
+            for (a, b) in expected.iter().zip(back.iter())
+            {
+                assert!((a - b).abs() <= 1e-3, "S1-F16/values: {} vs {} (image {})", a, b, id);
+            }
+            let norm = back.iter().map(|v| v * v).sum::<f32>().sqrt();
+            assert!((norm - 1.0).abs() <= 2e-3, "S1-F16/normalized: the stored norm is {} (image {})", norm, id);
+        }
+
+        // The ranking against a query survives the fp16 round trip (the §3.1
+        // condition, on a small fixture): the same top-10 SET, and any pair the
+        // two orders disagree on is a near-tie below fp16's resolution.
+        let query = normalized(&values(999));
+        let score = |v: &[f32]| v.iter().zip(query.iter()).map(|(a, b)| a * b).sum::<f32>();
+        let rank = |vectors: Vec<(i64, Vec<f32>)>| -> Vec<i64>
+        {
+            let mut scored = vectors.into_iter().map(|(id, v)| (id, score(&v))).collect::<Vec<_>>();
+            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+            scored.into_iter().take(10).map(|(id, _)| id).collect()
+        };
+        let fp32_scores = originals.iter().map(|(id, v)| (*id, score(&normalized(v)))).collect::<BTreeMap<_, _>>();
+        let fp32 = rank(originals.iter().map(|(id, v)| (*id, normalized(v))).collect());
+        let fp16 = rank(rows.iter().map(|((id, _, _), v)| (*id, v.clone())).collect());
+        assert_eq!(
+            fp16.iter().copied().collect::<BTreeSet<_>>(),
+            fp32.iter().copied().collect::<BTreeSet<_>>(),
+            "S1-F16/ranking: the top-10 set after the fp16 round trip"
+        );
+        for (i, x) in fp16.iter().enumerate()
+        {
+            for y in fp16.iter().skip(i + 1)
+            {
+                let flipped = fp32.iter().position(|id| id == x) > fp32.iter().position(|id| id == y);
+                if flipped
+                {
+                    let gap = (fp32_scores[x] - fp32_scores[y]).abs();
+                    assert!(gap < 2e-3, "S1-F16/ranking: {} and {} swapped across a {} gap", x, y, gap);
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // S1-MERGE — one merge_insert, idempotent, last wins, contracts isolated.
+    // ------------------------------------------------------------------
+    #[test]
+    fn s1_merge_insert_is_idempotent_last_wins_and_keyed_on_the_contract()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("merge");
+        seed_photos(&conn, 2);
+        let _installed = Installed::new(&fixture, conn);
+        let uri = fixture.vectors_uri();
+        let key = |id: i64, model: &str| (id, model.to_string(), PREP.to_string());
+
+        assert_eq!(store(vec![record(1, 1)], Vec::new()).status, "stored");
+        assert_eq!(store(vec![record(1, 1)], Vec::new()).status, "stored");
+        assert_eq!(stored_rows(&uri).len(), 1, "S1-MERGE/idempotent: the same record twice is one row");
+
+        assert_eq!(store(vec![record(1, 2)], Vec::new()).status, "stored");
+        let rows = stored_rows(&uri);
+        assert_eq!(rows.len(), 1, "S1-MERGE/replace: a new vector replaces, never adds");
+        assert!((rows[&key(1, MODEL)][0] - normalized(&values(2))[0]).abs() < 1e-3, "S1-MERGE/replace: the new vector");
+
+        let both = store(vec![record(2, 3), record(2, 4)], Vec::new());
+        assert_eq!(both.stored, 1, "S1-MERGE/last-wins: one row per image per call");
+        let rows = stored_rows(&uri);
+        assert!((rows[&key(2, MODEL)][0] - normalized(&values(4))[0]).abs() < 1e-3, "S1-MERGE/last-wins: the LAST record");
+        assert!((rows[&key(2, MODEL)][0] - normalized(&values(3))[0]).abs() > 1e-2, "fixture: seeds 3 and 4 differ");
+
+        // Another model version for the same photo is another row, never a replace.
+        assert_eq!(store(vec![record_with(1, OTHER_MODEL, PREP, &values(5))], Vec::new()).status, "stored");
+        let rows = stored_rows(&uri);
+        assert_eq!(rows.len(), 3, "S1-MERGE/contract: a second model version coexists");
+        assert!((rows[&key(1, MODEL)][0] - normalized(&values(2))[0]).abs() < 1e-3, "S1-MERGE/contract: untouched");
+
+        let count = futures::executor::block_on(image_embedding_count(MODEL.to_string(), PREP.to_string()));
+        assert!(count.store_ok);
+        assert_eq!(count.count, 2, "S1-MERGE/count-per-version");
+        let other = futures::executor::block_on(image_embedding_count(OTHER_MODEL.to_string(), PREP.to_string()));
+        assert_eq!((other.store_ok, other.count), (true, 1));
+    }
+
+    // ------------------------------------------------------------------
+    // S1-VALID — validation rejects, and only stored photos consume marks.
+    // ------------------------------------------------------------------
+    #[test]
+    fn s1_validation_rejects_bad_records_and_keeps_their_marks()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("valid");
+        let check = second_connection(&conn);
+        let a = insert_photo(&conn, "/v/a.jpg", "jpeg", false);
+        let b = insert_photo(&conn, "/v/b.jpg", "jpeg", false);
+        let _installed = Installed::new(&fixture, conn);
+
+        let mut short = record(a, 1);
+        short.vector.pop();
+        let short = store(vec![short], Vec::new());
+        assert_eq!(short.status, "invalid", "S1-VALID/length");
+        assert!(short.error.as_deref().unwrap_or("").contains("byte"), "S1-VALID/length names it: {:?}", short.error);
+
+        let mut nan = values(1);
+        nan[3] = f32::NAN;
+        let nan = store(vec![record_with(a, MODEL, PREP, &nan)], Vec::new());
+        assert_eq!(nan.status, "invalid", "S1-VALID/nan");
+        assert!(nan.error.as_deref().unwrap_or("").contains("value 3 is not finite"), "S1-VALID/nan names the value: {:?}", nan.error);
+        let mut inf = values(1);
+        inf[0] = f32::INFINITY;
+        assert_eq!(store(vec![record_with(a, MODEL, PREP, &inf)], Vec::new()).status, "invalid", "S1-VALID/infinity");
+
+        assert_eq!(store(vec![record_with(a, MODEL, PREP, &[0.0; DIM])], Vec::new()).status, "invalid", "S1-VALID/zero-norm");
+        assert_eq!(store(vec![record_with(a, MODEL, PREP, &[])], Vec::new()).status, "invalid", "S1-VALID/zero-dimension");
+        assert_eq!(store(Vec::new(), Vec::new()).status, "empty", "S1-VALID/empty");
+        assert!(!fixture.vectors().join("image_embeddings.lance").exists(), "S1-VALID/nothing-written");
+
+        // Mixed contracts: the first record's wins; the other is rejected and
+        // named, and its photo's mark is NOT consumed.
+        assert!(mark(&[a, b]).ok);
+        let marks = stale(&check);
+        let mixed = store(
+            vec![record(a, 1), record_with(b, OTHER_MODEL, PREP, &values(2))],
+            vec![
+                ImageVectorStaleMark { image_id: a, generation: marks[&a] },
+                ImageVectorStaleMark { image_id: b, generation: marks[&b] },
+            ],
+        );
+        assert_eq!(mixed.status, "stored", "S1-VALID/mixed: the conforming record is stored");
+        assert_eq!(mixed.stored, 1, "S1-VALID/mixed: one stored");
+        assert!(mixed.error.as_deref().unwrap_or("").contains(&format!("image {}", b)), "S1-VALID/mixed names the rejected record: {:?}", mixed.error);
+        assert_eq!(mixed.marks_consumed, 1, "S1-VALID/mixed: only the stored photo's mark");
+        assert_eq!(stale(&check).keys().copied().collect::<Vec<_>>(), vec![b], "S1-VALID/mixed: the rejected photo stays marked");
+        assert_eq!(stored_ids(&fixture.vectors_uri()), [a].into_iter().collect(), "S1-VALID/mixed: only a stored");
+    }
+
+    // ------------------------------------------------------------------
+    // S1-WORK — the to-do list: missing ∪ stale, the collapse rule, videos,
+    // paging, the version filter.
+    // ------------------------------------------------------------------
+    #[test]
+    fn s1_work_page_is_missing_union_stale_under_the_collapse_rule()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("work");
+        let check = second_connection(&conn);
+        let lone_jpeg = insert_photo(&conn, "/w/a.jpg", "jpeg", false);
+        let paired_raw = insert_photo(&conn, "/w/p.nef", "raw", false);
+        let paired_jpeg = insert_photo(&conn, "/w/p.jpg", "jpeg", false);
+        let lone_raw = insert_photo(&conn, "/w/l.arw", "raw", false);
+        let video = insert_photo(&conn, "/w/v.mov", "other", true);
+        let heif_raw = insert_photo(&conn, "/w/q.cr3", "raw", false);
+        let heif = insert_photo(&conn, "/w/q.heic", "heif", false);
+        let embedded = insert_photo(&conn, "/w/e.jpg", "jpeg", false);
+        let stale_one = insert_photo(&conn, "/w/s.jpg", "jpeg", false);
+        let other_version = insert_photo(&conn, "/w/o.jpg", "jpeg", false);
+        let _installed = Installed::new(&fixture, conn);
+
+        // Never built: every candidate is work, store_ok true.
+        let first = page(i64::MIN, 100);
+        assert!(first.store_ok && first.unreadable_half.is_none(), "S1-WORK/never-built is readable");
+        assert_eq!(first.items.len(), 8, "S1-WORK/never-built: every candidate");
+
+        assert_eq!(store(vec![record(embedded, 1), record(stale_one, 2)], Vec::new()).status, "stored");
+        assert_eq!(store(vec![record_with(other_version, OTHER_MODEL, PREP, &values(3))], Vec::new()).status, "stored");
+        assert!(mark(&[stale_one]).ok);
+        let generation = stale(&check)[&stale_one];
+
+        let expected = vec![lone_jpeg, paired_jpeg, lone_raw, video, heif, stale_one, other_version];
+        let all = page(i64::MIN, 10_000);
+        assert!(all.store_ok);
+        assert_eq!(work_ids(&all), expected, "S1-WORK/set: missing ∪ stale, ascending, collapse applied");
+        assert!(!work_ids(&all).contains(&paired_raw), "S1-WORK/collapse: a RAW with a JPEG twin is skipped");
+        assert!(!work_ids(&all).contains(&heif_raw), "S1-WORK/collapse: a RAW with a HEIF twin is skipped");
+        assert!(!work_ids(&all).contains(&embedded), "S1-WORK/embedded: a current vector is not work");
+        for item in &all.items
+        {
+            assert_eq!(item.stale_generation, if item.image_id == stale_one { Some(generation) } else { None }, "S1-WORK/generation");
+            assert_eq!(item.is_video, item.image_id == video, "S1-WORK/is_video");
+        }
+        assert_eq!(all.items.iter().find(|i| i.image_id == lone_raw).map(|i| i.file_path.as_str()), Some("/w/l.arw"));
+
+        let count = futures::executor::block_on(search_index_work_count(MODEL.to_string(), PREP.to_string()));
+        assert_eq!((count.store_ok, count.unreadable_half.clone(), count.remaining), (true, None, 7), "S1-WORK/count");
+
+        // Paging by after_image_id walks the same set, no gaps, no repeats.
+        let mut walked = Vec::new();
+        let mut cursor = i64::MIN;
+        loop
+        {
+            let next = page(cursor, 2);
+            assert!(next.store_ok);
+            assert!(next.items.len() <= 2, "S1-WORK/limit");
+            if next.items.is_empty()
+            {
+                break;
+            }
+            cursor = next.items.last().map(|i| i.image_id).unwrap_or(cursor);
+            walked.extend(work_ids(&next));
+        }
+        assert_eq!(walked, expected, "S1-WORK/paging");
+        assert_eq!(page(i64::MIN, 0).items.len(), 1, "S1-WORK/limit-0-clamps-to-1");
+        assert_eq!(work_ids(&page(heif, 100)), vec![stale_one, other_version], "S1-WORK/after");
+    }
+
+    // ------------------------------------------------------------------
+    // S1-UNREADABLE — a store that cannot be read is store_ok = false and an
+    // EMPTY answer, never "everything is missing"; a catalogue failure names
+    // the catalogue half.
+    // ------------------------------------------------------------------
+    #[test]
+    fn s1_an_unreadable_store_is_never_everything_missing()
+    {
+        let _serial = serial();
+
+        // (a) The store path is a FILE.
+        {
+            let (fixture, conn) = fresh_catalogue("unreadable-file");
+            insert_photo(&conn, "/u/a.jpg", "jpeg", false);
+            let _installed = Installed::new(&fixture, conn);
+            std::fs::write(fixture.vectors(), b"not a store").expect("a file where the store goes");
+            let count = futures::executor::block_on(image_embedding_count(MODEL.to_string(), PREP.to_string()));
+            assert!(!count.store_ok, "S1-UNREADABLE/count: a file is not an empty store");
+            let work = page(i64::MIN, 100);
+            assert!(!work.store_ok, "S1-UNREADABLE/page");
+            assert_eq!(work.unreadable_half.as_deref(), Some("index"), "S1-UNREADABLE/page-half");
+            assert!(work.items.is_empty(), "S1-UNREADABLE/page-empty: never everything");
+            let total = futures::executor::block_on(search_index_work_count(MODEL.to_string(), PREP.to_string()));
+            assert_eq!((total.store_ok, total.unreadable_half.as_deref(), total.remaining), (false, Some("index"), 0));
+        }
+
+        // (b) A real table whose manifests are corrupted. Two corruptions, two
+        // failure shapes, ONE honest answer:
+        //   · 7 bytes — `open_table` returns a Lance IO error ("does not have
+        //     sufficient data"), which the TYPED classifier must report, never
+        //     read as TableNotFound (M13);
+        //   · 22 bytes — in this DEBUG test build lance 8.0.0 PANICS inside the
+        //     spawned task (`dataset.rs:661`, "attempt to subtract with
+        //     overflow"); the JoinError arm must report it as unreadable.
+        for (tag, garbage) in [("short", &b"garbage"[..]), ("long", &b"corrupt manifest bytes"[..])]
+        {
+            let (fixture, conn) = fresh_catalogue(&format!("unreadable-manifest-{}", tag));
+            let a = insert_photo(&conn, "/u/a.jpg", "jpeg", false);
+            let check = second_connection(&conn);
+            let _installed = Installed::new(&fixture, conn);
+            assert_eq!(store(vec![record(a, 1)], Vec::new()).status, "stored");
+            let versions = fixture.vectors().join("image_embeddings.lance").join("_versions");
+            let mut corrupted = 0;
+            for entry in std::fs::read_dir(&versions).expect("versions dir")
+            {
+                let path = entry.expect("entry").path();
+                std::fs::write(&path, garbage).expect("corrupt");
+                corrupted += 1;
+            }
+            assert!(corrupted > 0, "fixture: a manifest to corrupt");
+            if tag == "short"
+            {
+                let opened = block(open_image_embedding_table_at_uri(&fixture.vectors_uri(), "s1"));
+                assert!(
+                    matches!(&opened, Err(message) if message.contains("image-embedding table open failed")),
+                    "S1-UNREADABLE/classifier: a corrupt manifest is a named open failure, never never-built"
+                );
+            }
+            let count = futures::executor::block_on(image_embedding_count(MODEL.to_string(), PREP.to_string()));
+            assert!(!count.store_ok, "S1-UNREADABLE/corrupt-count ({})", tag);
+            let work = page(i64::MIN, 100);
+            assert!(!work.store_ok && work.items.is_empty(), "S1-UNREADABLE/corrupt-page ({})", tag);
+            assert_eq!(work.unreadable_half.as_deref(), Some("index"));
+            let total = futures::executor::block_on(search_index_work_count(MODEL.to_string(), PREP.to_string()));
+            assert_eq!((total.store_ok, total.unreadable_half.as_deref()), (false, Some("index")), "S1-UNREADABLE/corrupt-total ({})", tag);
+            // Through the FFI: its spawned task turns even lance's panic into
+            // an answer, and nothing is recreated over the corrupt table.
+            // ⭐ Fix round 1 (finding 3a): a FAILED store write consumes no mark.
+            assert!(mark(&[a]).ok);
+            let marks_before = stale(&check);
+            let consumed = vec![ImageVectorStaleMark { image_id: a, generation: marks_before[&a] }];
+            let stored = futures::executor::block_on(upsert_image_embeddings(vec![record(a, 2)], consumed));
+            assert_eq!(stored.marks_consumed, 0, "S1-UNREADABLE/no-consume-on-failure ({})", tag);
+            assert_eq!(stale(&check), marks_before, "S1-UNREADABLE/marks-kept-on-failure ({})", tag);
+            assert!(
+                stored.status == "open_failed" || stored.status == "store_failed",
+                "S1-UNREADABLE/corrupt-write: never recreated over ({}): {} {:?}",
+                tag,
+                stored.status,
+                stored.error
+            );
+        }
+
+        // (c) The CATALOGUE half fails: the stale table is out of the way.
+        {
+            let (fixture, conn) = fresh_catalogue("unreadable-catalogue");
+            insert_photo(&conn, "/u/a.jpg", "jpeg", false);
+            let check = second_connection(&conn);
+            let _installed = Installed::new(&fixture, conn);
+            check.execute_batch("ALTER TABLE image_vector_stale RENAME TO image_vector_stale_aside;").expect("aside");
+            let work = page(i64::MIN, 100);
+            assert!(!work.store_ok && work.items.is_empty(), "S1-UNREADABLE/catalogue-page");
+            assert_eq!(work.unreadable_half.as_deref(), Some("catalogue"), "S1-UNREADABLE/catalogue-half");
+            check.execute_batch("ALTER TABLE image_vector_stale_aside RENAME TO image_vector_stale;").expect("back");
+            assert!(page(i64::MIN, 100).store_ok, "S1-UNREADABLE/catalogue-recovers");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // S1-MARK — every mark takes a FRESH generation; ids not catalogued are
+    // ignored; a failure rolls back and leaves the connection usable.
+    // ------------------------------------------------------------------
+    #[test]
+    fn s1_every_mark_takes_a_fresh_generation()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("mark");
+        let check = second_connection(&conn);
+        let a = insert_photo(&conn, "/m/a.jpg", "jpeg", false);
+        let b = insert_photo(&conn, "/m/b.jpg", "jpeg", false);
+        let _installed = Installed::new(&fixture, conn);
+
+        let empty = mark(&[]);
+        assert_eq!((empty.ok, empty.marked), (true, 0), "S1-MARK/empty");
+
+        let first = mark(&[a, b, a, 987_654]);
+        assert_eq!((first.ok, first.marked), (true, 2), "S1-MARK/first: duplicates folded, unknown ids ignored: {:?}", first.error);
+        let before = stale(&check);
+        assert_eq!(before.keys().copied().collect::<Vec<_>>(), vec![a, b]);
+        assert_ne!(before[&a], before[&b], "S1-MARK/distinct");
+
+        let again = mark(&[a]);
+        assert_eq!((again.ok, again.marked), (true, 1));
+        let after = stale(&check);
+        assert!(after[&a] > before[&a], "S1-MARK/fresh: a re-mark takes a NEWER generation ({} → {})", before[&a], after[&a]);
+        assert!(after[&a] > before[&b], "S1-MARK/fresh: newer than every earlier mark");
+        assert_eq!(after[&b], before[&b], "S1-MARK/untouched");
+
+        // ⭐ Fix round 1 (DuckDB #23645 precondition) — re-marking several
+        // marked ids gives EACH its own new generation (nextval per row, in
+        // place), and a later fresh mark is newer than all of them.
+        let c = insert_photo(&check, "/m/c.jpg", "jpeg", false);
+        let both = mark(&[a, b]);
+        assert_eq!((both.ok, both.marked), (true, 2));
+        let remarked = stale(&check);
+        assert_ne!(remarked[&a], remarked[&b], "S1-MARK/per-row: each re-marked row its OWN generation");
+        let prior_max = after.values().copied().max().unwrap_or(0);
+        assert!(remarked[&a] > prior_max && remarked[&b] > prior_max, "S1-MARK/per-row-fresh");
+        assert!(mark(&[c]).ok);
+        let latest = stale(&check);
+        assert!(latest[&c] > remarked[&a] && latest[&c] > remarked[&b], "S1-MARK/one-global-order: a later mark is newer");
+        assert_eq!((latest[&a], latest[&b]), (remarked[&a], remarked[&b]));
+        let after = latest;
+
+        // A failure inside the transaction rolls back (a's old mark stays) and
+        // leaves no transaction open (the next mark works).
+        check.execute_batch("DROP SEQUENCE image_vector_stale_generation_seq;").expect("drop the sequence");
+        let failed = mark(&[a, b]);
+        assert!(!failed.ok, "S1-MARK/failure-reported");
+        assert!(failed.error.is_some());
+        assert_eq!(stale(&check), after, "S1-MARK/rolled-back: the DELETE did not survive the failed INSERT");
+        check.execute_batch("CREATE SEQUENCE image_vector_stale_generation_seq START 1000000;").expect("restore the sequence");
+        let recovered = mark(&[b]);
+        assert_eq!((recovered.ok, recovered.marked), (true, 1), "S1-MARK/usable-after-failure: {:?}", recovered.error);
+        assert!(stale(&check)[&b] >= 1_000_000);
+    }
+
+    // ------------------------------------------------------------------
+    // S1-CONSUME — a consumed mark is deleted only on an EXACT generation; a
+    // re-mark between the read and the consume survives.
+    // ------------------------------------------------------------------
+    #[test]
+    fn s1_a_re_mark_during_a_pass_survives_its_consume()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("consume");
+        let check = second_connection(&conn);
+        let a = insert_photo(&conn, "/c/a.jpg", "jpeg", false);
+        let b = insert_photo(&conn, "/c/b.jpg", "jpeg", false);
+        let _installed = Installed::new(&fixture, conn);
+        assert_eq!(store(vec![record(a, 1), record(b, 2)], Vec::new()).status, "stored");
+        assert!(page(i64::MIN, 100).items.is_empty(), "fixture: nothing owed");
+
+        assert!(mark(&[a, b]).ok);
+        let read = page(i64::MIN, 100);
+        assert_eq!(work_ids(&read), vec![a, b], "S1-CONSUME/stale-is-work");
+        let read_marks = read
+            .items
+            .iter()
+            .map(|item| ImageVectorStaleMark { image_id: item.image_id, generation: item.stale_generation.expect("generation") })
+            .collect::<Vec<_>>();
+
+        // a is re-marked AFTER the pass read it (the pixels changed again).
+        assert!(mark(&[a]).ok);
+        let newer = stale(&check)[&a];
+
+        let consumed = store(vec![record(a, 3), record(b, 4)], read_marks);
+        assert_eq!(consumed.status, "stored");
+        assert_eq!(consumed.marks_consumed, 1, "S1-CONSUME/exact: only b's mark matched");
+        assert_eq!(consumed.error, None);
+        assert_eq!(stale(&check), [(a, newer)].into_iter().collect(), "S1-CONSUME/survives: the newer mark is kept");
+        assert_eq!(work_ids(&page(i64::MIN, 100)), vec![a], "S1-CONSUME/still-owed");
+
+        let second = store(vec![record(a, 5)], vec![ImageVectorStaleMark { image_id: a, generation: newer }]);
+        assert_eq!(second.marks_consumed, 1);
+        assert!(stale(&check).is_empty() && page(i64::MIN, 100).items.is_empty(), "S1-CONSUME/done");
+
+        // The FFI wrapper answers the same shape.
+        let ffi = futures::executor::block_on(upsert_image_embeddings(vec![record(b, 6)], Vec::new()));
+        assert_eq!((ffi.status.as_str(), ffi.stored, ffi.marks_consumed, ffi.error), ("stored", 1, 0, None));
+    }
+
+    // ------------------------------------------------------------------
+    // S1-REMOVE — Remove from Catalogue queues the photos' image vectors and
+    // clears their marks in its transaction; the drain deletes them.
+    // ------------------------------------------------------------------
+    #[test]
+    fn s1_removal_queues_drains_and_clears_marks()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("remove");
+        let check = second_connection(&conn);
+        let remover = second_connection(&conn);
+        let a = insert_photo(&conn, "/r/a.jpg", "jpeg", false);
+        let b = insert_photo(&conn, "/r/b.jpg", "jpeg", false);
+        let c = insert_photo(&conn, "/r/c.jpg", "jpeg", false);
+        let never_embedded = insert_photo(&conn, "/r/n.jpg", "jpeg", false);
+        let _installed = Installed::new(&fixture, conn);
+        let uri = fixture.vectors_uri();
+        assert_eq!(store(vec![record(a, 1), record(b, 2), record(c, 3)], Vec::new()).status, "stored");
+        assert!(mark(&[a, b]).ok);
+
+        let outcome = remove_images_by_ids_impl_with_probe(&remover, &[a, never_embedded], None).expect("removal");
+        assert_eq!(outcome.doomed_images, 2, "S1-REMOVE/census");
+        assert_eq!(queued(&check), [a, never_embedded].into_iter().collect(), "S1-REMOVE/queued-in-the-transaction");
+        assert_eq!(stale(&check).keys().copied().collect::<Vec<_>>(), vec![b], "S1-REMOVE/marks-cleared");
+        assert_eq!(stored_ids(&uri), [a, b, c].into_iter().collect(), "fixture: the store is untouched until the drain");
+
+        let cleanup = futures::executor::block_on(retry_removal_image_vector_deletes(outcome.doomed_images, "s1"))
+            .expect("the drain ran");
+        assert_eq!(cleanup.status, FaceVectorDeleteRetryStatus::Deleted, "S1-REMOVE/drained: {}", cleanup.message);
+        assert_eq!((cleanup.pending_count, cleanup.acknowledged_count, cleanup.remaining_count), (2, 2, 0));
+        assert!(!cleanup.orphan_scan_ran, "S1-REMOVE/drain-only");
+        assert!(queued(&check).is_empty(), "S1-REMOVE/acknowledged");
+        assert_eq!(stored_ids(&uri), [b, c].into_iter().collect(), "S1-REMOVE/deleted-from-the-store");
+        assert!(futures::executor::block_on(retry_removal_image_vector_deletes(0, "s1")).is_none(), "S1-REMOVE/nothing-removed");
+
+        // End to end through the FFI.
+        assert_eq!(futures::executor::block_on(remove_images_by_ids(vec![b])), 1);
+        assert!(queued(&check).is_empty(), "S1-REMOVE/ffi-drained");
+        assert!(stale(&check).is_empty(), "S1-REMOVE/ffi-marks-cleared");
+        assert_eq!(stored_ids(&uri), [c].into_iter().collect(), "S1-REMOVE/ffi-deleted");
+
+        // An unreadable store leaves the ids QUEUED — deferred, never lost.
+        std::fs::rename(fixture.vectors(), fixture.dir.join("aside.lancedb")).expect("store aside");
+        std::fs::write(fixture.vectors(), b"x").expect("unreadable store");
+        assert_eq!(futures::executor::block_on(remove_images_by_ids(vec![c])), 1);
+        assert_eq!(queued(&check), [c].into_iter().collect(), "S1-REMOVE/deferred-not-lost");
+    }
+
+    // ------------------------------------------------------------------
+    // S1-ORPHAN — the launch sweep queues stored vectors whose photo is gone,
+    // at most the cap per run, never a live one; the launch FFI reports it.
+    // ------------------------------------------------------------------
+    #[test]
+    fn s1_the_orphan_sweep_queues_only_orphans_capped_per_run()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("orphan");
+        let check = second_connection(&conn);
+        let a = insert_photo(&conn, "/o/a.jpg", "jpeg", false);
+        let b = insert_photo(&conn, "/o/b.jpg", "jpeg", false);
+        // The orphans: photos that were catalogued when their vectors were
+        // stored and have since lost their rows outside the queue (the
+        // historical leak shape — a bare DELETE).
+        let orphans = [
+            insert_photo(&conn, "/o/x.jpg", "jpeg", false),
+            insert_photo(&conn, "/o/y.jpg", "jpeg", false),
+            insert_photo(&conn, "/o/z.jpg", "jpeg", false),
+        ];
+        let _installed = Installed::new(&fixture, conn);
+        let uri = fixture.vectors_uri();
+        let mut records = vec![record(a, 1), record(b, 2)];
+        records.extend(orphans.iter().map(|id| record(*id, *id)));
+        assert_eq!(store(records, Vec::new()).status, "stored");
+        check
+            .execute_batch(&format!(
+                "DELETE FROM images WHERE id IN ({}, {}, {});",
+                orphans[0], orphans[1], orphans[2]
+            ))
+            .expect("simulate the historical leak");
+        // a second version of a live photo is not an orphan either
+        assert_eq!(store(vec![record_with(a, OTHER_MODEL, PREP, &values(9))], Vec::new()).status, "stored");
+
+        let first = block(retry_pending_image_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, 2));
+        assert!(first.orphan_scan_ran, "S1-ORPHAN/ran: {}", first.message);
+        assert_eq!(first.orphans_enqueued, 2, "S1-ORPHAN/cap");
+        assert_eq!(queued(&check), [orphans[0], orphans[1]].into_iter().collect(), "S1-ORPHAN/lowest-first, capped");
+        assert_eq!(first.remaining_count, 2, "S1-ORPHAN/remaining-includes-the-queued");
+
+        let second = block(retry_pending_image_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, 2));
+        assert_eq!(second.status, FaceVectorDeleteRetryStatus::Deleted, "S1-ORPHAN/drained: {}", second.message);
+        assert_eq!(queued(&check), [orphans[2]].into_iter().collect(), "S1-ORPHAN/next-run-finds-the-rest");
+
+        // Through the launch FFI: the face pass, then the image pass.
+        let launch = futures::executor::block_on(retry_pending_face_vector_deletes());
+        let images = launch.image_vector_cleanup.expect("S1-ORPHAN/launch: the image pass is reported");
+        assert_eq!(images.status, FaceVectorDeleteRetryStatus::Deleted, "S1-ORPHAN/launch: {}", images.message);
+        assert!(images.orphan_scan_ran);
+        assert_eq!(images.orphans_enqueued, 0, "S1-ORPHAN/launch: nothing left to find");
+        assert!(queued(&check).is_empty());
+        assert_eq!(stored_ids(&uri), [a, b].into_iter().collect(), "S1-ORPHAN/live-untouched, orphans gone");
+        assert_eq!(stored_rows(&uri).len(), 3, "S1-ORPHAN/both versions of a live photo kept");
+
+        // A drain-only pass never scans.
+        let drain_only = block(retry_pending_image_vector_deletes_probed(OrphanSweepMode::DrainOnly, 2));
+        assert!(!drain_only.orphan_scan_ran, "S1-ORPHAN/drain-only");
+    }
+
+    // ------------------------------------------------------------------
+    // S1-MANIFEST — backup_manifest_counts' image_embedding_count.
+    // ------------------------------------------------------------------
+    #[test]
+    fn s1_the_manifest_counts_image_vectors_or_says_it_could_not()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("manifest");
+        seed_photos(&conn, 2);
+        let _installed = Installed::new(&fixture, conn);
+        let counts = futures::executor::block_on(backup_manifest_counts());
+        assert_eq!(counts.image_embedding_count, Some(0), "S1-MANIFEST/never-built");
+        assert_eq!(store(vec![record(1, 1), record(2, 2)], Vec::new()).status, "stored");
+        assert_eq!(store(vec![record_with(1, OTHER_MODEL, PREP, &values(3))], Vec::new()).status, "stored");
+        let counts = futures::executor::block_on(backup_manifest_counts());
+        assert_eq!(counts.image_embedding_count, Some(3), "S1-MANIFEST/every-row");
+        assert_eq!(counts.untaken_counts & BACKUP_COUNT_UNTAKEN_FACE_EMBEDDING, 0);
+        std::fs::remove_dir_all(fixture.vectors()).expect("store away");
+        std::fs::write(fixture.vectors(), b"x").expect("unreadable store");
+        let counts = futures::executor::block_on(backup_manifest_counts());
+        assert_eq!(counts.image_embedding_count, None, "S1-MANIFEST/unreadable-is-omitted, never 0");
+    }
+
+    // ------------------------------------------------------------------
+    // S1-DDL — the tables and the sequence exist after a fresh open AND after
+    // reopening a catalogue written without them.
+    // ------------------------------------------------------------------
+    fn search_index_objects(conn: &Connection) -> (i64, i64)
+    {
+        let tables = conn
+            .query_row(
+                "SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = current_database() \
+                 AND table_name IN ('image_vector_stale', 'image_vector_pending_delete')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("table probe");
+        let sequences = conn
+            .query_row(
+                "SELECT COUNT(*) FROM duckdb_sequences() WHERE database_name = current_database() \
+                 AND sequence_name = 'image_vector_stale_generation_seq'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("sequence probe");
+        (tables, sequences)
+    }
+
+    #[test]
+    fn s1_the_search_index_tables_exist_after_a_fresh_open_and_after_an_upgrade()
+    {
+        let (fixture, conn) = fresh_catalogue("ddl");
+        assert_eq!(search_index_objects(&conn), (2, 1), "S1-DDL/fresh");
+        conn.execute_batch(
+            "DROP TABLE image_vector_stale; DROP TABLE image_vector_pending_delete; \
+             DROP SEQUENCE image_vector_stale_generation_seq; CHECKPOINT;",
+        )
+        .expect("drop them");
+        assert_eq!(search_index_objects(&conn), (0, 0));
+        drop(conn);
+        let reopened = open_and_migrate_catalogue(&fixture.catalogue).expect("reopen");
+        fence_connection_against_extension_fetches(&reopened);
+        assert_eq!(search_index_objects(&reopened), (2, 1), "S1-DDL/reopen");
+        drop(reopened);
+
+        // A REAL earlier schema state: the current identity-control fixture,
+        // which predates these tables.
+        let dir = fixture_dir("ddl-vintage");
+        let path = dir.join("catalogue.db");
+        {
+            let old = Connection::open(&path).expect("the vintage file");
+            // ⭐ ENGINE TESTS NEVER FETCH — a raw connection is fenced by hand.
+            fence_connection_against_extension_fetches(&old);
+            old.execute_batch(include_str!("schema_fixtures/sha256-633e6ae734f6.sql")).expect("the vintage batch replays");
+            assert_eq!(search_index_objects(&old), (0, 0), "fixture: the vintage has none");
+        }
+        let upgraded = open_and_migrate_catalogue(&path).expect("the production open upgrades it");
+        fence_connection_against_extension_fetches(&upgraded);
+        assert_eq!(search_index_objects(&upgraded), (2, 1), "S1-DDL/upgrade");
+        drop(upgraded);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // S1-PANIC — R-07: a panic inside each new FFI body (at its first probe
+    // point on this thread — the face-runtime accessor or the catalogue lock)
+    // is REPORTED through the function's own failure channel, never escapes,
+    // and leaves one census record under its site.
+    // ------------------------------------------------------------------
+    fn census(site: &str) -> u64
+    {
+        DROPPED_ROW_CENSUS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(site)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn caught<T>(site: &str, point: u32, call: impl FnOnce() -> T) -> T
+    {
+        let before = census(site);
+        FFI_PANIC_PROBE_COUNTDOWN.with(|countdown| countdown.set(point));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call));
+        let disarmed = FFI_PANIC_PROBE_COUNTDOWN.with(|countdown| countdown.replace(0));
+        let value = outcome.unwrap_or_else(|_| panic!("S1-PANIC `{}`: the panic ESCAPED the FFI boundary", site));
+        assert_eq!(disarmed, 0, "S1-PANIC `{}`: vacuity guard — the injected panic never fired", site);
+        assert_eq!(census(site) - before, 1, "S1-PANIC `{}`: one census record", site);
+        value
+    }
+
+    /// The catalogue half's panic, fired on a face-runtime WORKER (the next
+    /// `lock_catalogue()` there panics with the guard held).
+    fn caught_on_worker<T>(site: &str, call: impl FnOnce() -> T) -> T
+    {
+        let before = census(site);
+        FACE_WORKER_LOCK_PANIC_ARMED.store(true, Ordering::SeqCst);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call));
+        let still_armed = FACE_WORKER_LOCK_PANIC_ARMED.swap(false, Ordering::SeqCst);
+        let value = outcome.unwrap_or_else(|_| panic!("S1-PANIC `{}`: the panic ESCAPED", site));
+        assert!(!still_armed, "S1-PANIC `{}`: vacuity guard — no worker took the catalogue lock", site);
+        assert_eq!(census(site) - before, 1, "S1-PANIC `{}`: one census record", site);
+        value
+    }
+
+    #[test]
+    fn s1_every_new_ffi_reports_a_panic_instead_of_dying()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("panic");
+        insert_photo(&conn, "/x/a.jpg", "jpeg", false);
+        let _installed = Installed::new(&fixture, conn);
+        let injected = "an injected panic";
+
+        let r = caught("upsert_image_embeddings.panic.query_failed", 1, ||
+            futures::executor::block_on(upsert_image_embeddings(vec![record(1, 1)], Vec::new())));
+        assert_eq!(r.status, "store_failed");
+        assert!(r.error.as_deref().unwrap_or("").contains(injected), "{:?}", r.error);
+
+        let r = caught("image_embedding_count.panic.query_failed", 1, ||
+            futures::executor::block_on(image_embedding_count(MODEL.to_string(), PREP.to_string())));
+        assert!(!r.store_ok);
+
+        let r = caught("search_index_work_count.panic.query_failed", 1, ||
+            futures::executor::block_on(search_index_work_count(MODEL.to_string(), PREP.to_string())));
+        assert_eq!((r.store_ok, r.unreadable_half.as_deref(), r.remaining), (false, Some("index"), 0));
+        // ⭐ Fix round 1 (finding 2): the catalogue half runs on a face-runtime
+        // WORKER, inside its own boundary — a panic under the lock there is the
+        // catalogue half's failure.
+        let r = caught_on_worker("search_index_work_count.panic.query_failed", ||
+            futures::executor::block_on(search_index_work_count(MODEL.to_string(), PREP.to_string())));
+        assert_eq!((r.store_ok, r.unreadable_half.as_deref(), r.remaining), (false, Some("catalogue"), 0));
+
+        let r = caught("search_index_work_page.panic.query_failed", 1, ||
+            futures::executor::block_on(search_index_work_page(MODEL.to_string(), PREP.to_string(), 0, 10)));
+        assert!(!r.store_ok && r.items.is_empty() && r.unreadable_half.as_deref() == Some("index"));
+        let r = caught_on_worker("search_index_work_page.panic.query_failed", ||
+            futures::executor::block_on(search_index_work_page(MODEL.to_string(), PREP.to_string(), 0, 10)));
+        assert!(!r.store_ok && r.items.is_empty() && r.unreadable_half.as_deref() == Some("catalogue"));
+
+        let r = caught("mark_image_vectors_stale.panic.query_failed", 1, ||
+            futures::executor::block_on(mark_image_vectors_stale(vec![1])));
+        assert!(!r.ok && r.error.as_deref().unwrap_or("").contains(injected), "{:?}", r.error);
+
+        // After every caught panic the catalogue still answers.
+        assert!(mark(&[1]).ok, "S1-PANIC/the catalogue lock was healed");
+        assert!(page(i64::MIN, 10).store_ok);
+    }
+
+    // ------------------------------------------------------------------
+    // S1-REMARK (fix round 1, the #23645 precondition) — a mark never deletes
+    // and re-inserts a primary key: generation carries no index, the body
+    // holds no DELETE, and a failure AFTER the in-place UPDATE rolls it back.
+    // ------------------------------------------------------------------
+    #[test]
+    fn s1_marks_never_delete_and_reinsert_a_key()
+    {
+        let (_fixture, conn) = fresh_catalogue("remark");
+        let explicit_indexes = conn
+            .query_row(
+                "SELECT COUNT(*) FROM duckdb_indexes() WHERE table_name = 'image_vector_stale'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("index probe");
+        assert_eq!(explicit_indexes, 0, "S1-REMARK/no-index: nothing indexes generation");
+        let key = conn
+            .query_row(
+                "SELECT array_to_string(constraint_column_names, ',') FROM duckdb_constraints() \
+                 WHERE table_name = 'image_vector_stale' AND constraint_type = 'PRIMARY KEY'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("key probe");
+        assert_eq!(key, "image_id", "S1-REMARK/key: the only indexed column is image_id");
+
+        let source = include_str!("lib.rs");
+        let head = ["fn mark_image_vectors_stale_probed", "("].concat();
+        let start = source.find(&head).expect("S1-REMARK/source: the mark body");
+        let end = start + source[start..].find("\n}\n").expect("S1-REMARK/source: the body closes");
+        let body = &source[start..end];
+        assert!(body.contains("UPDATE image_vector_stale"), "S1-REMARK/source: the re-mark is an UPDATE");
+        assert!(!body.contains(&["DELETE", " FROM image_vector_stale"].concat()), "S1-REMARK/source: no DELETE of a mark");
+
+        let a = insert_photo(&conn, "/k/a.jpg", "jpeg", false);
+        let fresh = insert_photo(&conn, "/k/f.jpg", "jpeg", false);
+        assert_eq!(mark_image_vectors_stale_impl(&conn, &[a]), Ok(1));
+        let before = stale(&conn);
+        // The re-mark UPDATE succeeds, then the fresh-id INSERT fails with a
+        // catalog error (which does NOT abort the transaction): only a ROLLBACK
+        // undoes the UPDATE — a COMMIT would publish it (S187).
+        let failed = mark_image_vectors_stale_probed(&conn, &[a, fresh], Some("SELECT * FROM s1_injected_missing_table;"));
+        assert!(failed.is_err(), "S1-REMARK/failure-reported");
+        assert_eq!(stale(&conn), before, "S1-REMARK/rolled-back: the in-place re-mark did not survive");
+        assert_eq!(mark_image_vectors_stale_impl(&conn, &[a, fresh]), Ok(2), "S1-REMARK/usable-after-failure");
+        assert!(stale(&conn)[&a] > before[&a]);
+    }
+
+    // ------------------------------------------------------------------
+    // S1-TWIN (fix round 2) — marking follows the collapse rule: a hidden RAW
+    // marks its visible twin(s), never itself; a lone RAW marks itself.
+    // ------------------------------------------------------------------
+    #[test]
+    fn s1_a_mark_on_a_hidden_raw_marks_its_visible_twin()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("twin");
+        let check = second_connection(&conn);
+        let raw = insert_photo(&conn, "/t/p.nef", "raw", false);
+        let jpeg = insert_photo(&conn, "/t/p.jpg", "jpeg", false);
+        let both_raw = insert_photo(&conn, "/t/q.cr3", "raw", false);
+        let both_jpeg = insert_photo(&conn, "/t/q.jpg", "jpeg", false);
+        let both_heif = insert_photo(&conn, "/t/q.heic", "heif", false);
+        let lone_raw = insert_photo(&conn, "/t/l.arw", "raw", false);
+        let elsewhere = insert_photo(&conn, "/elsewhere/l.jpg", "jpeg", false);
+        let orphaned_raw = insert_photo(&conn, "/t/g.dng", "raw", false);
+        let gone_twin = insert_photo(&conn, "/t/g.jpg", "jpeg", false);
+        let _installed = Installed::new(&fixture, conn);
+        let marked_ids = |c: &Connection| stale(c).keys().copied().collect::<Vec<_>>();
+
+        let r = mark(&[raw]);
+        assert_eq!((r.ok, r.marked), (true, 1), "S1-TWIN/hidden: {:?}", r.error);
+        assert_eq!(marked_ids(&check), vec![jpeg], "S1-TWIN/hidden: the visible twin is marked, the RAW is not");
+
+        let r = mark(&[both_raw]);
+        assert_eq!(r.marked, 2, "S1-TWIN/two-twins");
+        assert_eq!(marked_ids(&check), vec![jpeg, both_jpeg, both_heif], "S1-TWIN/two-twins: JPEG and HEIF both marked");
+
+        let r = mark(&[lone_raw]);
+        assert_eq!(r.marked, 1, "S1-TWIN/lone");
+        assert!(stale(&check).contains_key(&lone_raw), "S1-TWIN/lone: a lone RAW is a candidate and is marked");
+        assert!(!stale(&check).contains_key(&elsewhere), "S1-TWIN/same-directory-only");
+
+        // A twin and its RAW in one call, plus an unknown id: one mark, fresh.
+        let before = stale(&check)[&jpeg];
+        let r = mark(&[raw, jpeg, 987_654]);
+        assert_eq!(r.marked, 1, "S1-TWIN/dedup: the RAW and its twin are one candidate");
+        assert!(stale(&check)[&jpeg] > before, "S1-TWIN/dedup: re-marked, fresh generation");
+        assert!(!stale(&check).contains_key(&raw) && !stale(&check).contains_key(&987_654));
+
+        // A RAW whose twin is gone is itself the candidate again.
+        check.execute_batch(&format!("DELETE FROM images WHERE id = {};", gone_twin)).expect("the twin goes");
+        assert_eq!(mark(&[orphaned_raw]).marked, 1);
+        assert!(stale(&check).contains_key(&orphaned_raw), "S1-TWIN/twin-gone: the RAW is marked");
+
+        // And the marks are exactly what the to-do list consumes: every marked
+        // id is a candidate.
+        let candidates = work_ids(&page(i64::MIN, 10_000)).into_iter().collect::<BTreeSet<_>>();
+        for id in stale(&check).keys()
+        {
+            assert!(candidates.contains(id), "S1-TWIN/marks-are-candidates: {} is marked but not a candidate", id);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // S1-ISOLATE (fix round 1, finding 1) — a damaged IMAGE table changes only
+    // the image fields: the face retry result and the face counts are
+    // byte-identical to a run without the image table.
+    // ------------------------------------------------------------------
+    fn face_part(result: &FaceVectorDeleteRetryResult) -> String
+    {
+        let mut face = result.clone();
+        face.image_vector_cleanup = None;
+        format!("{:?}", face)
+    }
+
+    fn face_counts(counts: &BackupCounts) -> String
+    {
+        let mut face = counts.clone();
+        face.image_embedding_count = None;
+        format!("{:?}", face)
+    }
+
+    #[test]
+    fn s1_a_damaged_image_table_never_touches_the_face_results()
+    {
+        let _serial = serial();
+        for (tag, garbage) in [("short", &b"garbage"[..]), ("long", &b"corrupt manifest bytes"[..])]
+        {
+            let (fixture, conn) = fresh_catalogue(&format!("isolate-{}", tag));
+            let a = insert_photo(&conn, "/i/a.jpg", "jpeg", false);
+            let _installed = Installed::new(&fixture, conn);
+
+            let baseline_retry = futures::executor::block_on(retry_pending_face_vector_deletes());
+            let baseline_counts = futures::executor::block_on(backup_manifest_counts());
+            assert_eq!(baseline_counts.image_embedding_count, Some(0));
+            assert_eq!(store(vec![record(a, 1)], Vec::new()).status, "stored");
+            let healthy = futures::executor::block_on(retry_pending_face_vector_deletes());
+            assert_eq!(face_part(&healthy), face_part(&baseline_retry), "fixture: an image table alone changes no face field");
+
+            // The reviewer's recipe: garbage over the image table's manifests.
+            let versions = fixture.vectors().join("image_embeddings.lance").join("_versions");
+            for entry in std::fs::read_dir(&versions).expect("versions dir")
+            {
+                std::fs::write(entry.expect("entry").path(), garbage).expect("corrupt");
+            }
+
+            let damaged = futures::executor::block_on(retry_pending_face_vector_deletes());
+            assert_eq!(face_part(&damaged), face_part(&baseline_retry), "S1-ISOLATE/retry-face-fields ({})", tag);
+            let images = damaged.image_vector_cleanup.expect("S1-ISOLATE/the image report is kept, never lost");
+            assert!(
+                images.orphan_scan_ran == false
+                    && (images.status == FaceVectorDeleteRetryStatus::Failed
+                        || images.message.contains("Image orphan scan skipped")),
+                "S1-ISOLATE/the image failure lands in the image field ({}): {:?} {}",
+                tag,
+                images.status,
+                images.message
+            );
+
+            let counts = futures::executor::block_on(backup_manifest_counts());
+            assert_eq!(face_counts(&counts), face_counts(&baseline_counts), "S1-ISOLATE/manifest-face-fields ({})", tag);
+            assert_eq!(counts.untaken_counts & BACKUP_COUNT_UNTAKEN_FACE_EMBEDDING, 0, "S1-ISOLATE/face-count-taken ({})", tag);
+            assert_eq!(counts.image_embedding_count, None, "S1-ISOLATE/image-count-untaken ({})", tag);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // S1-SCAN (fix round 1, finding 3b) — the short-scan guard: a scan that
+    // returns fewer ids than the store counted is a failure, never "missing".
+    // ------------------------------------------------------------------
+    #[test]
+    fn s1_a_short_id_scan_is_a_failure()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("short-scan");
+        seed_photos(&conn, 3);
+        let _installed = Installed::new(&fixture, conn);
+        assert_eq!(store(vec![record(1, 1), record(2, 2), record(3, 3)], Vec::new()).status, "stored");
+        let uri = fixture.vectors_uri();
+        let (full, short) = block(async
+        {
+            let table = match open_image_embedding_table_at_uri(&uri, "s1").await.expect("open")
+            {
+                ImageEmbeddingTableState::Present(table) => table,
+                ImageEmbeddingTableState::NeverBuilt => panic!("fixture: the table exists"),
+            };
+            (
+                stored_image_vector_ids_probed(&table, None, None).await,
+                stored_image_vector_ids_probed(&table, None, Some(&1)).await,
+            )
+        });
+        assert_eq!(full.expect("S1-SCAN/control").len(), 3);
+        let short = short.expect_err("S1-SCAN/guard: a capped scan must be an error");
+        assert!(short.contains("returned 1 row(s) where the store counted 3"), "S1-SCAN/names-it: {}", short);
+    }
+
+    // ------------------------------------------------------------------
+    // S1-CAP (fix round 1, finding 3c) — a page never exceeds 10,000 items,
+    // whatever `limit` asks for.
+    // ------------------------------------------------------------------
+    #[test]
+    fn s1_a_page_never_exceeds_ten_thousand_items()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("cap");
+        conn.execute_batch(
+            "INSERT INTO images (file_path, file_size, file_name, file_stem, image_kind, directory_path, \
+             created_timestamp, modified_timestamp, is_video) \
+             SELECT '/n/p' || i || '.jpg', 10, 'p' || i || '.jpg', 'p' || i, 'jpeg', '/n', 0, 0, FALSE \
+               FROM range(10050) t(i);",
+        )
+        .expect("10,050 photos");
+        let _installed = Installed::new(&fixture, conn);
+        let first = page(i64::MIN, 20_000);
+        assert!(first.store_ok);
+        assert_eq!(first.items.len(), 10_000, "S1-CAP/clamped");
+        let cursor = first.items.last().map(|item| item.image_id).expect("a last item");
+        assert_eq!(page(cursor, 20_000).items.len(), 50, "S1-CAP/the rest");
+        let count = futures::executor::block_on(search_index_work_count(MODEL.to_string(), PREP.to_string()));
+        assert_eq!(count.remaining, 10_050, "S1-CAP/the count is not capped");
+    }
+
+    // ------------------------------------------------------------------
+    // S1-REMOVED (fix round 1, finding 4) — under the store lock, a record
+    // whose photo is no longer catalogued is dropped, so a removal during a
+    // pass leaves no orphan.
+    // ------------------------------------------------------------------
+    #[test]
+    fn s1_a_photo_removed_mid_pass_gets_no_vector()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("removed");
+        let check = second_connection(&conn);
+        let a = insert_photo(&conn, "/d/a.jpg", "jpeg", false);
+        let b = insert_photo(&conn, "/d/b.jpg", "jpeg", false);
+        let _installed = Installed::new(&fixture, conn);
+        let uri = fixture.vectors_uri();
+
+        // Every record's photo gone: nothing written, no table created.
+        let nothing = store(vec![record(987_654, 1)], Vec::new());
+        assert_eq!((nothing.status.as_str(), nothing.stored, nothing.dropped_not_catalogued), ("stored", 0, 1), "S1-REMOVED/all-dropped");
+        assert!(!fixture.vectors().join("image_embeddings.lance").exists(), "S1-REMOVED/no-table-created");
+
+        // The pass reads its page, then the user removes a, then the pass writes.
+        assert!(mark(&[a, b]).ok);
+        let read = page(i64::MIN, 100);
+        assert_eq!(work_ids(&read), vec![a, b]);
+        assert_eq!(futures::executor::block_on(remove_images_by_ids(vec![a])), 1);
+        let marks = read
+            .items
+            .iter()
+            .map(|item| ImageVectorStaleMark { image_id: item.image_id, generation: item.stale_generation.expect("generation") })
+            .collect::<Vec<_>>();
+        let written = futures::executor::block_on(upsert_image_embeddings(vec![record(a, 1), record(b, 2)], marks));
+        assert_eq!(written.status, "stored", "{:?}", written.error);
+        assert_eq!((written.stored, written.dropped_not_catalogued, written.marks_consumed), (1, 1, 1), "S1-REMOVED/counts");
+        assert_eq!(written.error, None);
+        assert_eq!(stored_ids(&uri), [b].into_iter().collect(), "S1-REMOVED/no-orphan: the removed photo got no vector");
+        assert!(stale(&check).is_empty() && queued(&check).is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // S1-OFFMAIN (fix round 1, finding 2) — the work FFIs take no catalogue
+    // lock on the thread that polls them: no probe point fires there after
+    // the runtime touch.
+    // ------------------------------------------------------------------
+    #[test]
+    fn s1_the_work_scan_never_runs_on_the_polling_thread()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("offmain");
+        insert_photo(&conn, "/q/a.jpg", "jpeg", false);
+        let _installed = Installed::new(&fixture, conn);
+        for which in ["count", "page"]
+        {
+            // Point 1 is the runtime accessor; point 2 would be a catalogue
+            // lock on THIS thread.
+            FFI_PANIC_PROBE_COUNTDOWN.with(|countdown| countdown.set(2));
+            let ok = if which == "count"
+            {
+                futures::executor::block_on(search_index_work_count(MODEL.to_string(), PREP.to_string())).store_ok
+            }
+            else
+            {
+                page(i64::MIN, 10).store_ok
+            };
+            let left = FFI_PANIC_PROBE_COUNTDOWN.with(|countdown| countdown.replace(0));
+            assert_eq!(left, 1, "S1-OFFMAIN/{}: exactly one probe point (the runtime accessor) on the polling thread", which);
+            assert!(ok, "S1-OFFMAIN/{}: and the answer is a real one", which);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // S1-LOCK — the image writers wait on the ONE store write lock (P14's
+    // runtime twin for the second table).
+    // ------------------------------------------------------------------
+    #[test]
+    fn s1_the_image_writers_wait_on_the_store_write_lock()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("lock");
+        seed_photos(&conn, 2);
+        let _installed = Installed::new(&fixture, conn);
+        assert_eq!(store(vec![record(1, 1)], Vec::new()).status, "stored");
+        let runtime = &*FACE_EMBEDDING_RUNTIME;
+        let guard = runtime.block_on(FACE_EMBEDDING_STORE_WRITE_LOCK.lock());
+        let upsert = runtime.spawn(upsert_image_embeddings_impl(vec![record(2, 2)], Vec::new()));
+        let retry = runtime.spawn(retry_pending_image_vector_deletes_probed(OrphanSweepMode::DrainAndSweep, 10));
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        assert!(!upsert.is_finished(), "S1-LOCK/upsert entered the store while the lock was held");
+        assert!(!retry.is_finished(), "S1-LOCK/retry entered the store while the lock was held");
+        drop(guard);
+        assert_eq!(runtime.block_on(upsert).expect("upsert").status, "stored", "S1-LOCK/after-release");
+        runtime.block_on(retry).expect("retry");
     }
 }

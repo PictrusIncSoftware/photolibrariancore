@@ -1235,6 +1235,47 @@ namespace photolibrariancore {
     // the read could not be performed (UNKNOWN, never "no neighbors").
     [Async]
     NegativeRollFramePage negative_roll_frames_for_images(sequence<i64> seed_ids, f64 minimum_confidence, string detector_version);
+
+    // ⭐ Semantic search, slice 1 (Oct 24, 2026; Docs/DESIGN-Semantic-Search.md
+    // §3–§4). Image vectors live in LanceDB (`image_embeddings`, beside
+    // `face_embeddings` in vectors.lancedb), one per photo, keyed by
+    // (image_id, model_version, preprocessing_version); staleness lives in
+    // DuckDB (`image_vector_stale`).
+    //
+    // Store one batch: vector = little-endian f32 x embedding_dimension. One
+    // model / preprocessing / dimension per call (the first record's); a record
+    // that differs, is the wrong length, holds a non-finite value or has a zero
+    // norm is rejected (named in `error`) and the rest are stored, L2-normalized,
+    // as Float16, the last record per image_id winning, in ONE merge_insert.
+    // After that commit, `consumed_marks` whose image was stored are deleted only
+    // where (image_id, generation) still match exactly; a failure there is
+    // reported in `error` and never fails the upsert.
+    [Async]
+    ImageEmbeddingStoreResult upsert_image_embeddings(sequence<ImageEmbeddingRecord> records, sequence<ImageVectorStaleMark> consumed_marks);
+
+    // Vectors stored for one model/preprocessing pair. store_ok = false = the
+    // store could not be read (never 0-as-truth); never built = true, 0.
+    [Async]
+    ImageEmbeddingCount image_embedding_count(string model_version, string preprocessing_version);
+
+    // The search index's to-do list = (candidates with no vector for the
+    // version) + (candidates holding a stale mark). Candidates: every photo
+    // visible under the RAW+JPEG collapse rule, stills AND videos. On
+    // store_ok = false, unreadable_half names "index" or "catalogue" and the
+    // answer is empty — never "everything is missing".
+    [Async]
+    SearchIndexWorkCount search_index_work_count(string model_version, string preprocessing_version);
+
+    // One page: image_id > after_image_id, ascending, at most `limit`
+    // (clamped to 1…10000); each item carries its stale mark's generation.
+    [Async]
+    SearchIndexWorkPage search_index_work_page(string model_version, string preprocessing_version, i64 after_image_id, u32 limit);
+
+    // Mark photos whose thumbnail pixels changed: each id still catalogued gets
+    // a FRESH generation (a re-mark replaces the older one). One transaction;
+    // ids not in the catalogue are ignored; an empty list is ok, 0.
+    [Async]
+    ImageVectorStaleMarkResult mark_image_vectors_stale(sequence<i64> image_ids);
 };
 
 // Image classification categories for JPEG+RAW pair handling.
@@ -1434,6 +1475,10 @@ dictionary FaceVectorDeleteRetryResult {
     string message;
     u64 orphans_enqueued = 0;
     boolean orphan_scan_ran = false;
+    // ⭐ Semantic search slice 1 — the image-vector drain + orphan sweep the
+    // launch retry runs after the face pass. null = the image pass did not run.
+    // Appended LAST with a default (S65); the face fields above are unchanged.
+    ImageVectorDeleteRetryResult? image_vector_cleanup = null;
 };
 
 dictionary SimilarPhotoStackSummary {
@@ -2088,6 +2133,9 @@ dictionary BackupCounts {
     u64 face_observation_count;
     u64 face_embedding_count;
     u32 untaken_counts = 0;
+    // ⭐ Semantic search slice 1 — the image_embeddings row count; null = it
+    // could not be taken (the manifest omits the key). Appended LAST (S65).
+    u64? image_embedding_count = null;
 };
 
 // Pre-merge census for the additive restore's confirmation / batch prompt.
@@ -2329,4 +2377,77 @@ dictionary NegativeRollFramePage {
     sequence<NegativeRollFrame> frames;
     boolean query_ok = true;
     string? query_error = null;
+};
+
+// === Semantic search, slice 1 (Oct 24, 2026; Docs/DESIGN-Semantic-Search.md) ===
+
+// The image-vector twin of FaceVectorDeleteRetryResult, field for field;
+// `status` reuses FaceVectorDeleteRetryStatus (same five meanings).
+dictionary ImageVectorDeleteRetryResult {
+    FaceVectorDeleteRetryStatus status;
+    u64 pending_count;
+    u64 acknowledged_count;
+    u64 remaining_count;
+    string message;
+    u64 orphans_enqueued;
+    boolean orphan_scan_ran;
+};
+
+// One photo's embedding: vector = little-endian f32 x embedding_dimension
+// (bytes, never sequence<f32> — ruling W4-17).
+dictionary ImageEmbeddingRecord {
+    i64 image_id;
+    string model_name;
+    string model_version;
+    string preprocessing_version;
+    u32 embedding_dimension;
+    bytes vector;
+};
+
+// A stale mark as the work page read it.
+dictionary ImageVectorStaleMark {
+    i64 image_id;
+    i64 generation;
+};
+
+// status: empty / invalid / open_failed / batch_failed / store_failed / stored.
+// stored = records this call committed; marks_consumed = marks confirmed gone.
+dictionary ImageEmbeddingStoreResult {
+    string status;
+    u64 stored;
+    u64 marks_consumed;
+    string? error;
+    // Fix round 1: valid records not stored because their photo had been
+    // removed from the catalogue (checked under the store lock). Appended LAST.
+    u64 dropped_not_catalogued = 0;
+};
+
+dictionary ImageEmbeddingCount {
+    boolean store_ok;
+    u64 count;
+};
+
+dictionary SearchIndexWorkCount {
+    boolean store_ok;
+    string? unreadable_half;
+    u64 remaining;
+};
+
+dictionary SearchIndexWorkItem {
+    i64 image_id;
+    string file_path;
+    boolean is_video;
+    i64? stale_generation;
+};
+
+dictionary SearchIndexWorkPage {
+    boolean store_ok;
+    string? unreadable_half;
+    sequence<SearchIndexWorkItem> items;
+};
+
+dictionary ImageVectorStaleMarkResult {
+    boolean ok;
+    u64 marked;
+    string? error;
 };
