@@ -3149,6 +3149,60 @@ public func FfiConverterTypeImageEmbeddingRecord_lower(_ value: ImageEmbeddingRe
 }
 
 
+public struct ImageEmbeddingResetResult: Equatable, Hashable {
+    public var ok: Bool
+    public var error: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(ok: Bool, error: String?) {
+        self.ok = ok
+        self.error = error
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension ImageEmbeddingResetResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeImageEmbeddingResetResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ImageEmbeddingResetResult {
+        return
+            try ImageEmbeddingResetResult(
+                ok: FfiConverterBool.read(from: &buf), 
+                error: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ImageEmbeddingResetResult, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.ok, into: &buf)
+        FfiConverterOptionString.write(value.error, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImageEmbeddingResetResult_lift(_ buf: RustBuffer) throws -> ImageEmbeddingResetResult {
+    return try FfiConverterTypeImageEmbeddingResetResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeImageEmbeddingResetResult_lower(_ value: ImageEmbeddingResetResult) -> RustBuffer {
+    return FfiConverterTypeImageEmbeddingResetResult.lower(value)
+}
+
+
 public struct ImageEmbeddingStoreResult: Equatable, Hashable {
     public var status: String
     public var stored: UInt64
@@ -5971,6 +6025,286 @@ public func FfiConverterTypeSearchIndexWorkPage_lower(_ value: SearchIndexWorkPa
 }
 
 
+public struct SemanticPrepareResult: Equatable, Hashable {
+    public var missing: [UInt32]
+    public var ordersByScore: Bool
+    public var displayCapApplies: Bool
+    public var displayCap: UInt64
+    public var error: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(missing: [UInt32], ordersByScore: Bool, displayCapApplies: Bool, displayCap: UInt64, error: String?) {
+        self.missing = missing
+        self.ordersByScore = ordersByScore
+        self.displayCapApplies = displayCapApplies
+        self.displayCap = displayCap
+        self.error = error
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SemanticPrepareResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSemanticPrepareResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SemanticPrepareResult {
+        return
+            try SemanticPrepareResult(
+                missing: FfiConverterSequenceUInt32.read(from: &buf), 
+                ordersByScore: FfiConverterBool.read(from: &buf), 
+                displayCapApplies: FfiConverterBool.read(from: &buf), 
+                displayCap: FfiConverterUInt64.read(from: &buf), 
+                error: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SemanticPrepareResult, into buf: inout [UInt8]) {
+        FfiConverterSequenceUInt32.write(value.missing, into: &buf)
+        FfiConverterBool.write(value.ordersByScore, into: &buf)
+        FfiConverterBool.write(value.displayCapApplies, into: &buf)
+        FfiConverterUInt64.write(value.displayCap, into: &buf)
+        FfiConverterOptionString.write(value.error, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSemanticPrepareResult_lift(_ buf: RustBuffer) throws -> SemanticPrepareResult {
+    return try FfiConverterTypeSemanticPrepareResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSemanticPrepareResult_lower(_ value: SemanticPrepareResult) -> RustBuffer {
+    return FfiConverterTypeSemanticPrepareResult.lower(value)
+}
+
+
+public struct SemanticSearchRequest: Equatable, Hashable {
+    public var kind: String
+    public var value: String
+    public var breadth: String
+    public var queryVector: Data
+    public var modelName: String
+    public var modelVersion: String
+    public var preprocessingVersion: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(kind: String, value: String, breadth: String, queryVector: Data, modelName: String, modelVersion: String, preprocessingVersion: String) {
+        self.kind = kind
+        self.value = value
+        self.breadth = breadth
+        self.queryVector = queryVector
+        self.modelName = modelName
+        self.modelVersion = modelVersion
+        self.preprocessingVersion = preprocessingVersion
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SemanticSearchRequest: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSemanticSearchRequest: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SemanticSearchRequest {
+        return
+            try SemanticSearchRequest(
+                kind: FfiConverterString.read(from: &buf), 
+                value: FfiConverterString.read(from: &buf), 
+                breadth: FfiConverterString.read(from: &buf), 
+                queryVector: FfiConverterData.read(from: &buf), 
+                modelName: FfiConverterString.read(from: &buf), 
+                modelVersion: FfiConverterString.read(from: &buf), 
+                preprocessingVersion: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SemanticSearchRequest, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.kind, into: &buf)
+        FfiConverterString.write(value.value, into: &buf)
+        FfiConverterString.write(value.breadth, into: &buf)
+        FfiConverterData.write(value.queryVector, into: &buf)
+        FfiConverterString.write(value.modelName, into: &buf)
+        FfiConverterString.write(value.modelVersion, into: &buf)
+        FfiConverterString.write(value.preprocessingVersion, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSemanticSearchRequest_lift(_ buf: RustBuffer) throws -> SemanticSearchRequest {
+    return try FfiConverterTypeSemanticSearchRequest.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSemanticSearchRequest_lower(_ value: SemanticSearchRequest) -> RustBuffer {
+    return FfiConverterTypeSemanticSearchRequest.lower(value)
+}
+
+
+public struct SemanticSearchStart: Equatable, Hashable {
+    public var jobId: UInt64
+    public var accepted: Bool
+    public var error: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(jobId: UInt64, accepted: Bool, error: String?) {
+        self.jobId = jobId
+        self.accepted = accepted
+        self.error = error
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SemanticSearchStart: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSemanticSearchStart: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SemanticSearchStart {
+        return
+            try SemanticSearchStart(
+                jobId: FfiConverterUInt64.read(from: &buf), 
+                accepted: FfiConverterBool.read(from: &buf), 
+                error: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SemanticSearchStart, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.jobId, into: &buf)
+        FfiConverterBool.write(value.accepted, into: &buf)
+        FfiConverterOptionString.write(value.error, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSemanticSearchStart_lift(_ buf: RustBuffer) throws -> SemanticSearchStart {
+    return try FfiConverterTypeSemanticSearchStart.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSemanticSearchStart_lower(_ value: SemanticSearchStart) -> RustBuffer {
+    return FfiConverterTypeSemanticSearchStart.lower(value)
+}
+
+
+public struct SemanticSearchStatus: Equatable, Hashable {
+    public var phase: String
+    public var done: UInt64
+    public var total: UInt64
+    public var matched: UInt64
+    public var finished: Bool
+    public var storeOk: Bool
+    public var seedMissing: Bool
+    public var seedNotIndexed: Bool
+    public var error: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(phase: String, done: UInt64, total: UInt64, matched: UInt64, finished: Bool, storeOk: Bool, seedMissing: Bool, seedNotIndexed: Bool, error: String?) {
+        self.phase = phase
+        self.done = done
+        self.total = total
+        self.matched = matched
+        self.finished = finished
+        self.storeOk = storeOk
+        self.seedMissing = seedMissing
+        self.seedNotIndexed = seedNotIndexed
+        self.error = error
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SemanticSearchStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSemanticSearchStatus: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SemanticSearchStatus {
+        return
+            try SemanticSearchStatus(
+                phase: FfiConverterString.read(from: &buf), 
+                done: FfiConverterUInt64.read(from: &buf), 
+                total: FfiConverterUInt64.read(from: &buf), 
+                matched: FfiConverterUInt64.read(from: &buf), 
+                finished: FfiConverterBool.read(from: &buf), 
+                storeOk: FfiConverterBool.read(from: &buf), 
+                seedMissing: FfiConverterBool.read(from: &buf), 
+                seedNotIndexed: FfiConverterBool.read(from: &buf), 
+                error: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SemanticSearchStatus, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.phase, into: &buf)
+        FfiConverterUInt64.write(value.done, into: &buf)
+        FfiConverterUInt64.write(value.total, into: &buf)
+        FfiConverterUInt64.write(value.matched, into: &buf)
+        FfiConverterBool.write(value.finished, into: &buf)
+        FfiConverterBool.write(value.storeOk, into: &buf)
+        FfiConverterBool.write(value.seedMissing, into: &buf)
+        FfiConverterBool.write(value.seedNotIndexed, into: &buf)
+        FfiConverterOptionString.write(value.error, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSemanticSearchStatus_lift(_ buf: RustBuffer) throws -> SemanticSearchStatus {
+    return try FfiConverterTypeSemanticSearchStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSemanticSearchStatus_lower(_ value: SemanticSearchStatus) -> RustBuffer {
+    return FfiConverterTypeSemanticSearchStatus.lower(value)
+}
+
+
 public struct SimilarPhotoCandidate: Equatable, Hashable {
     public var id: Int64
     public var filePath: String
@@ -7508,6 +7842,31 @@ fileprivate struct FfiConverterOptionSequenceInt64: FfiConverterRustBuffer {
         case 1: return try FfiConverterSequenceInt64.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
+    typealias SwiftType = [UInt32]
+
+    public static func write(_ value: [UInt32], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterUInt32.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [UInt32] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [UInt32]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterUInt32.read(from: &buf))
+        }
+        return seq
     }
 }
 
@@ -10949,6 +11308,21 @@ public func requestCancelAnalysisJob(id: Int64)async  -> Bool  {
             
         )
 }
+public func resetImageEmbeddings()async  -> ImageEmbeddingResetResult  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_reset_image_embeddings(
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeImageEmbeddingResetResult_lift,
+            errorHandler: nil
+            
+        )
+}
 public func restoreKeywordForIds(ids: [Int64], path: String)async  -> UInt64  {
     return
         try!  await uniffiRustCallAsync(
@@ -11020,6 +11394,66 @@ public func searchIndexWorkPage(modelVersion: String, preprocessingVersion: Stri
             completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeSearchIndexWorkPage_lift,
+            errorHandler: nil
+            
+        )
+}
+public func semanticSearchCancel(jobId: UInt64)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_semantic_search_cancel(FfiConverterUInt64.lower(jobId)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_void,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_void,
+            freeFunc: ffi_photolibrariancore_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+public func semanticSearchPoll(jobId: UInt64)async  -> SemanticSearchStatus  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_semantic_search_poll(FfiConverterUInt64.lower(jobId)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeSemanticSearchStatus_lift,
+            errorHandler: nil
+            
+        )
+}
+public func semanticSearchPrepare(predicates: [QueryPredicate], connectors: [Connector])async  -> SemanticPrepareResult  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_semantic_search_prepare(FfiConverterSequenceTypeQueryPredicate.lower(predicates),FfiConverterSequenceTypeConnector.lower(connectors)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeSemanticPrepareResult_lift,
+            errorHandler: nil
+            
+        )
+}
+public func semanticSearchStart(request: SemanticSearchRequest)async  -> SemanticSearchStart  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_semantic_search_start(FfiConverterTypeSemanticSearchRequest_lower(request)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeSemanticSearchStart_lift,
             errorHandler: nil
             
         )
@@ -11820,6 +12254,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_request_cancel_analysis_job() != 55113) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_reset_image_embeddings() != 17800) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_restore_keyword_for_ids() != 5225) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -11833,6 +12270,18 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_search_index_work_page() != 36340) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_semantic_search_cancel() != 54692) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_semantic_search_poll() != 59820) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_semantic_search_prepare() != 46645) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_semantic_search_start() != 8014) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_similar_photo_candidates() != 1024) {

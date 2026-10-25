@@ -1301,6 +1301,40 @@ namespace photolibrariancore {
     // keyset-pages on next_after_image_id. query_ok = false = UNKNOWN.
     [Async]
     NegativeDetectionVectorCandidatePage negative_detection_vector_candidate_page(u32 limit, i64 after_image_id, string detector_version, string analysis_run_id, string model_name, string model_version, string preprocessing_version, sequence<i64>? scoped_ids);
+
+    // ⭐ Semantic search, slice 2 (Oct 25, 2026; Docs/DESIGN-Semantic-Search.md
+    // §5–§6, Docs/SemanticSearch-Slice2/PLAN.md §2.1) — searching.
+    //
+    // Start a search job on the core's private runtime; returns at once with a
+    // job id (accepted = false + error when the request is invalid or the
+    // runtime is unavailable). The job scores every stored vector for the
+    // current model, then saves the matches under the predicate's result key.
+    [Async]
+    SemanticSearchStart semantic_search_start(SemanticSearchRequest request);
+
+    // The job's phase and real counts. Takes only the job-registry mutex,
+    // never the catalogue lock. An unknown or expired id answers "unknown".
+    [Async]
+    SemanticSearchStatus semantic_search_poll(u64 job_id);
+
+    // Stop a job at its next batch boundary; nothing is written and the key's
+    // previous stored result stays. Takes only the job-registry mutex.
+    [Async]
+    void semantic_search_cancel(u64 job_id);
+
+    // The prepare chokepoint: which semantic predicates have no stored result
+    // (their indexes), touching last_used for the present ones; whether the
+    // query orders by match score; and whether the 10,000 display cap applies
+    // (the SAME rule the id projections apply). Never runs a search. error set
+    // = prepare could not answer (catalogue not open, temp tables absent).
+    [Async]
+    SemanticPrepareResult semantic_search_prepare(sequence<QueryPredicate> predicates, sequence<Connector> connectors);
+
+    // Rebuild Search Index: drop image_embeddings (a missing table is success)
+    // and clear image_vector_stale + image_vector_pending_delete. Never touches
+    // face_embeddings.
+    [Async]
+    ImageEmbeddingResetResult reset_image_embeddings();
 };
 
 // Image classification categories for JPEG+RAW pair handling.
@@ -2515,4 +2549,58 @@ dictionary NegativeDetectionVectorCandidatePage {
     boolean query_ok;
     string? query_error;
     i64 next_after_image_id;
+};
+
+// === Semantic search, slice 2 (Oct 25, 2026; Docs/SemanticSearch-Slice2/PLAN.md §2.1) ===
+
+// One search request. kind = "looks_like" | "similar_to"; value = the
+// normalized words, or the seed image id as text; breadth = "narrow" |
+// "medium" | "wide"; query_vector = 768 little-endian Float32, L2-normalized
+// (empty for similar_to); the three versions must equal the core's constants.
+dictionary SemanticSearchRequest {
+    string kind;
+    string value;
+    string breadth;
+    bytes query_vector;
+    string model_name;
+    string model_version;
+    string preprocessing_version;
+};
+
+dictionary SemanticSearchStart {
+    u64 job_id;
+    boolean accepted;
+    string? error;
+};
+
+// phase = "reading" | "saving" | "finished" | "failed" | "cancelled" |
+// "unknown". store_ok = false = the index could not be read (never "no
+// matches"). seed_missing = a similar_to seed no longer in the catalog;
+// seed_not_indexed = the seed (after RAW -> JPEG/HEIF twin mapping) has no
+// current vector.
+dictionary SemanticSearchStatus {
+    string phase;
+    u64 done;
+    u64 total;
+    u64 matched;
+    boolean finished;
+    boolean store_ok;
+    boolean seed_missing;
+    boolean seed_not_indexed;
+    string? error;
+};
+
+// missing = indexes into the predicate list whose stored result is absent.
+// display_cap_applies is computed by the same helper the id projections use.
+dictionary SemanticPrepareResult {
+    sequence<u32> missing;
+    boolean orders_by_score;
+    boolean display_cap_applies;
+    u64 display_cap;
+    string? error;
+};
+
+dictionary ImageEmbeddingResetResult {
+    boolean ok;
+    string? error;
 };

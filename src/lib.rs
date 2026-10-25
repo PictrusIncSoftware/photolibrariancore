@@ -2641,6 +2641,19 @@ pub async fn initialize_catalogue(catalogue_path: String) -> bool {
         None => return false,
     };
 
+    // ⭐ Semantic search, slice 2 (design §6.2): the search-result temporary
+    // tables, created ONCE here on the global connection — never inside
+    // `open_and_migrate_catalogue`, which also migrates a backup's catalogue.
+    // Autocommit. A failure is logged and the open continues: the prepare
+    // chokepoint then answers with `error` set (so no query that would fail
+    // to bind is run), and removal skips the semantic cleanup.
+    if let Err(message) = create_semantic_search_temp_tables(&conn) {
+        eprintln!(
+            "initialize_catalogue: {}; searching is unavailable until the next launch",
+            message
+        );
+    }
+
     // Store the connection in the global state
     // This connection will be reused by all subsequent catalogue operations
     // Mutex ensures thread-safe access when called from multiple Swift async tasks
@@ -9471,6 +9484,9 @@ fn predicate_to_sql(p: &QueryPredicate) -> String {
         "audio_absent" => "(has_audio = FALSE)".to_string(),
         "livephoto_yes" => "(is_video IS TRUE AND live_photo_id IS NOT NULL)".to_string(),
         "livephoto_no" => "(is_video IS TRUE AND live_photo_id IS NULL)".to_string(),
+        // ⭐ Semantic search, slice 2 (design §6.3): membership in the stored
+        // result of the predicate's key. No key → `(FALSE)`.
+        "looks_like" | "similar_to" => semantic_predicate_sql(p),
         other =>
         {
             eprintln!("Unknown query predicate kind '{}'", other);
@@ -9553,7 +9569,17 @@ const FOCUS_FILTER_ORDER_BY: &str =
 /// None of these three constants is a total order on its own. The tie-break
 /// (`, id ASC`) is appended at the ONE paged chokepoint,
 /// `build_image_record_query_sql` (slice E1, R-06) — never edit it in here.
-fn order_by_for_filter(predicates: &[QueryPredicate]) -> &'static str {
+///
+/// ⭐ Semantic search, slice 2 (design §6.3): if any `looks_like` /
+/// `similar_to` condition orders by match (`num` null or ≠ 0), the order is the
+/// LAST such condition's score, descending, NULLS LAST, then newest-first
+/// (`semantic_score_order_by`). Otherwise the rules above, byte-identical.
+/// Owned, because the semantic order embeds the condition's key. Like before,
+/// only the Find predicates are read, never a scope group.
+fn order_by_for_filter(predicates: &[QueryPredicate]) -> String {
+    if let Some((_, key)) = semantic_ordering_condition(predicates) {
+        return semantic_score_order_by(&key);
+    }
     match predicates.first() {
         Some(p) => match p.kind.as_str() {
             "rating" | "rating_unrated" => RATING_FILTER_ORDER_BY,
@@ -9562,6 +9588,7 @@ fn order_by_for_filter(predicates: &[QueryPredicate]) -> &'static str {
         },
         None => DEFAULT_FILTER_ORDER_BY,
     }
+    .to_string()
 }
 
 /// Filter / Query Builder — paginated records matching a structured filter.
@@ -9595,7 +9622,7 @@ pub async fn query_images(
     execute_image_record_query(
         conn,
         &where_clause,
-        order_by,
+        &order_by,
         limit as i64,
         offset as i64,
         apply_duplicate_filter,
@@ -9672,7 +9699,7 @@ pub async fn query_images_gallery(
     execute_image_record_query(
         conn,
         &where_clause,
-        order_by,
+        &order_by,
         limit as i64,
         offset as i64,
         apply_duplicate_filter,
@@ -9755,7 +9782,7 @@ pub async fn query_images_scoped(
     execute_image_record_query(
         conn,
         &where_clause,
-        order_by,
+        &order_by,
         limit as i64,
         offset as i64,
         apply_duplicate_filter,
@@ -9877,7 +9904,7 @@ fn query_images_scoped_gallery_impl(
     execute_image_record_query(
         conn,
         &where_clause,
-        order_by,
+        &order_by,
         limit as i64,
         offset as i64,
         apply_duplicate_filter,
@@ -10052,15 +10079,19 @@ fn query_image_ids_scoped_gallery_impl(
     );
     let order_by = order_by_for_filter(predicates);
 
+    // ⭐ Semantic search, slice 2 (design §6.3): Select All takes the first
+    // 10,000 ids in Best-match order when the cap rule applies — the SAME rule
+    // `semantic_search_prepare` reports, over the Find predicates only.
     execute_ordered_id_query(
         conn,
         &where_clause,
-        order_by,
+        &order_by,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
         apply_similar_photo_collapse,
         similar_algorithm_version,
         media_type,
+        semantic_id_projection_cap(predicates, connectors),
     )
 }
 
@@ -10068,6 +10099,9 @@ fn query_image_ids_scoped_gallery_impl(
 /// would return for the same arguments across all of its pages, in order.
 /// Prepare/query failures are an `Err` (the caller logs and censuses them); a
 /// row that fails to decode is counted by the dropped-row collector.
+/// ⭐ Semantic search, slice 2: `limit` appends a `LIMIT` after the total
+/// `ORDER BY` — the first `limit` ids of the same order (the display cap).
+/// `None` is the unlimited SQL, byte-identical to before.
 #[allow(clippy::too_many_arguments)]
 fn execute_ordered_id_query(
     conn: &Connection,
@@ -10078,9 +10112,10 @@ fn execute_ordered_id_query(
     apply_similar_photo_collapse: bool,
     similar_algorithm_version: &str,
     media_type: MediaType,
+    limit: Option<u64>,
 ) -> Result<Vec<i64>, String>
 {
-    let query_sql = build_ordered_image_id_query_sql(
+    let ordered_sql = build_ordered_image_id_query_sql(
         where_clause,
         order_by,
         apply_duplicate_filter,
@@ -10089,6 +10124,11 @@ fn execute_ordered_id_query(
         similar_algorithm_version,
         media_type,
     );
+    let query_sql = match limit
+    {
+        Some(limit) => format!("{} LIMIT {}", ordered_sql, limit),
+        None => ordered_sql,
+    };
 
     let mut stmt = conn
         .prepare(&query_sql)
@@ -10314,6 +10354,40 @@ pub async fn query_image_ids_gallery(
     };
 
     let where_clause = build_filter_predicate(&predicates, &connectors);
+
+    // ⭐ Semantic search, slice 2 (design §6.3): when a semantic condition
+    // orders the query, Select All must take the ids in Best-match order (and
+    // only the first 10,000 when the cap applies). ⚠️ Routed through
+    // `execute_ordered_id_query` — the record query's own builder — because
+    // `execute_id_projection_query`'s wrapped branch does not project
+    // `capture_datetime`, so an appended ORDER BY would fail to bind and
+    // Select All would come back empty. Without an ordering condition the
+    // path below is byte-identical.
+    if semantic_ordering_condition(&predicates).is_some()
+    {
+        let order_by = order_by_for_filter(&predicates);
+        return match execute_ordered_id_query(
+            conn,
+            &where_clause,
+            &order_by,
+            apply_duplicate_filter,
+            apply_raw_jpeg_collapse,
+            apply_similar_photo_collapse,
+            &similar_algorithm_version,
+            media_type,
+            semantic_id_projection_cap(&predicates, &connectors),
+        )
+        {
+            Ok(ids) => ids,
+            Err(message) =>
+            {
+                eprintln!("query_image_ids_gallery: {}", message);
+                record_dropped_rows("query_image_ids_gallery.query_failed", 1);
+                Vec::new()
+            }
+        };
+    }
+
     execute_id_projection_query(
         conn,
         &where_clause,
@@ -23974,6 +24048,1786 @@ pub async fn image_embedding_probe_scores(
             }
         },
         Err(message) => unreadable(message),
+    }
+}
+
+// ============================================================================
+// ⭐ Semantic search, slice 2 — searching (Oct 25, 2026;
+// Docs/DESIGN-Semantic-Search.md §5–§6, Docs/SemanticSearch-Slice2/PLAN.md §2.1)
+// ============================================================================
+
+/// One search request (PLAN §2.1). Rust constructs nothing here; Swift builds
+/// it on the main actor after the off-main encode.
+#[derive(Debug, Clone)]
+pub struct SemanticSearchRequest
+{
+    pub kind: String,
+    pub value: String,
+    pub breadth: String,
+    pub query_vector: Vec<u8>,
+    pub model_name: String,
+    pub model_version: String,
+    pub preprocessing_version: String,
+}
+
+/// The start call's answer: a fresh job id, or `accepted = false` + the reason.
+#[derive(Debug, Clone)]
+pub struct SemanticSearchStart
+{
+    pub job_id: u64,
+    pub accepted: bool,
+    pub error: Option<String>,
+}
+
+/// A job's phase and real counts. ⛔ `store_ok = false` = the index could not
+/// be read — never "no matches".
+#[derive(Debug, Clone)]
+pub struct SemanticSearchStatus
+{
+    pub phase: String,
+    pub done: u64,
+    pub total: u64,
+    pub matched: u64,
+    pub finished: bool,
+    pub store_ok: bool,
+    pub seed_missing: bool,
+    pub seed_not_indexed: bool,
+    pub error: Option<String>,
+}
+
+/// The prepare chokepoint's answer. `error` set = prepare could not answer.
+#[derive(Debug, Clone)]
+pub struct SemanticPrepareResult
+{
+    pub missing: Vec<u32>,
+    pub orders_by_score: bool,
+    pub display_cap_applies: bool,
+    pub display_cap: u64,
+    pub error: Option<String>,
+}
+
+/// Rebuild Search Index's answer.
+#[derive(Debug, Clone)]
+pub struct ImageEmbeddingResetResult
+{
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// The model identity a search scores against. ⭐ Equal to
+/// `SemanticSearchModelInfo` in the app's `SemanticSearchModels.swift`
+/// (PLAN §5 item 3: `predicate_to_sql` sees only the predicate, so the result
+/// key needs the versions on this side too; lane G's source lock keeps the two
+/// sets equal). The slice-1 upsert and probe paths keep taking their versions
+/// as arguments, unchanged.
+const SEMANTIC_MODEL_NAME: &str = "siglip2-base-patch16-256";
+const SEMANTIC_MODEL_VERSION: &str = "1.0-coreml-fp16";
+const SEMANTIC_PREPROCESSING_VERSION: &str = "squash256_bilinear_v1";
+
+/// The text and vision embedding width (SigLIP 2 base).
+const SEMANTIC_DIMENSION: usize = 768;
+
+/// The two Find kinds (design §5).
+const SEMANTIC_KIND_LOOKS_LIKE: &str = "looks_like";
+const SEMANTIC_KIND_SIMILAR_TO: &str = "similar_to";
+
+/// The result key's canonical-encoding version. A change to what the key
+/// covers bumps this, so no stored result can be read under a new meaning.
+const SEMANTIC_KEY_FORMAT_VERSION: u32 = 1;
+
+/// The display cap (design §6.3, open question 2 — ruled yes).
+const SEMANTIC_DISPLAY_CAP: u64 = 10_000;
+
+/// Stored match rows across every key before least-recently-used keys are
+/// evicted (design §6.2).
+const SEMANTIC_RESULT_ROW_BUDGET: i64 = 1_000_000;
+
+/// A key touched within this many seconds is never evicted: the prepare
+/// chokepoint's check and the page query take the catalogue lock separately,
+/// and another search's save must not evict a key between the two (§6.2).
+const SEMANTIC_EVICTION_EXEMPT_SECONDS: i64 = 60;
+
+/// Rows per record batch of the vector scan (the cancel granularity).
+const SEMANTIC_SCAN_BATCH_ROWS: u32 = 4_096;
+
+/// How far a `looks_like` query vector's L2 norm may stray from 1 (review
+/// LOW-5): Float32 normalization lands within ~1e-7, so 1e-3 only refuses a
+/// vector that was never normalized.
+const SEMANTIC_QUERY_NORM_TOLERANCE: f64 = 1e-3;
+
+/// Staged match rows per INSERT statement inside the save transaction.
+const SEMANTIC_STAGE_INSERT_CHUNK: usize = 2_000;
+
+/// The job registry's bound, and how long a finished job is kept for its
+/// final poll.
+const SEMANTIC_JOB_REGISTRY_MAX: usize = 64;
+const SEMANTIC_JOB_RETENTION_SECONDS: u64 = 120;
+
+/// ⚠️ PROVISIONAL until the calibration sitting (design §9). The floors are
+/// lane C's, read from
+/// `DebugTools/clip-spike/calibration/provisional-floors.json` (Oct 25, 2026):
+/// product arithmetic (Float16-stored normalized image vectors, dot product
+/// accumulated in Float64); looks_like from the 20 judged queries' rank-20
+/// scores, similar_to from ten seed photos' rank-20 scores; Narrow = the 75th
+/// percentile, Medium = the median, Wide = the 25th. A photo matches a breadth
+/// when its score is at or above the floor. The calibration sitting replaces
+/// these six numbers in a one-constant change.
+fn semantic_floor(kind: &str, breadth: &str) -> Option<f64>
+{
+    match (kind, breadth)
+    {
+        (SEMANTIC_KIND_LOOKS_LIKE, "narrow") => Some(0.118702),
+        (SEMANTIC_KIND_LOOKS_LIKE, "medium") => Some(0.106733),
+        (SEMANTIC_KIND_LOOKS_LIKE, "wide") => Some(0.098947),
+        (SEMANTIC_KIND_SIMILAR_TO, "narrow") => Some(0.879052),
+        (SEMANTIC_KIND_SIMILAR_TO, "medium") => Some(0.850348),
+        (SEMANTIC_KIND_SIMILAR_TO, "wide") => Some(0.781137),
+        _ => None,
+    }
+}
+
+fn is_semantic_kind(kind: &str) -> bool
+{
+    kind == SEMANTIC_KIND_LOOKS_LIKE || kind == SEMANTIC_KIND_SIMILAR_TO
+}
+
+// ---------------------------------------------------------------------------
+// The result key (PLAN §5 item 2)
+// ---------------------------------------------------------------------------
+
+/// SHA-256 of `data`, as 64 lowercase hex characters. Written here rather
+/// than taken from the `sha2` crate because `sha2` is a dev-dependency only
+/// and lane R does not own `Cargo.toml`; the cargo tests check it against
+/// `sha2` and the FIPS 180-2 vectors.
+fn semantic_sha256_hex(data: &[u8]) -> String
+{
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    let mut state: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+    let bit_length = (data.len() as u64).wrapping_mul(8);
+    let mut message = data.to_vec();
+    message.push(0x80);
+    while message.len() % 64 != 56
+    {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_length.to_be_bytes());
+    for block in message.chunks_exact(64)
+    {
+        let mut w = [0u32; 64];
+        for (t, word) in block.chunks_exact(4).enumerate()
+        {
+            w[t] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for t in 16..64
+        {
+            let s0 = w[t - 15].rotate_right(7) ^ w[t - 15].rotate_right(18) ^ (w[t - 15] >> 3);
+            let s1 = w[t - 2].rotate_right(17) ^ w[t - 2].rotate_right(19) ^ (w[t - 2] >> 10);
+            w[t] = w[t - 16].wrapping_add(s0).wrapping_add(w[t - 7]).wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for t in 0..64
+        {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choose = (e & f) ^ ((!e) & g);
+            let t1 = h.wrapping_add(s1).wrapping_add(choose).wrapping_add(K[t]).wrapping_add(w[t]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h])
+        {
+            *slot = slot.wrapping_add(value);
+        }
+    }
+    state.iter().map(|word| format!("{:08x}", word)).collect()
+}
+
+/// A `similar_to` value is the seed photo's `images.id` as text: a positive
+/// integer. Anything else has no key and no search.
+fn semantic_seed_id(value: &str) -> Option<i64>
+{
+    value.trim().parse::<i64>().ok().filter(|id| *id > 0)
+}
+
+/// ⭐ THE result key, the one function behind `predicate_to_sql`,
+/// `order_by_for_filter`, `semantic_search_prepare` and the job's save, so
+/// Swift never computes one.
+///
+/// Lowercase hex SHA-256 over an unambiguous byte encoding: a domain tag, the
+/// format version, then each field as (u64 big-endian byte length, bytes) —
+/// kind, value, breadth, and the three model constants. Length prefixes make
+/// every field boundary explicit, so no two tuples share an encoding.
+///
+/// ⛔ `num` is deliberately NOT part of the key: a filter-only copy of a
+/// condition (`num = 0`) matches exactly the photos the ordering copy does
+/// (the face refinement relies on this — REVIEW-PLAN-1 H3).
+///
+/// `None` (no key) for any other kind, a breadth outside narrow/medium/wide,
+/// an empty `looks_like` value, or a `similar_to` value that is not a positive
+/// id (canonicalized to its decimal form, so "042" and "42" are one search).
+/// ⭐ The output holds only `[0-9a-f]`: that, and nothing else, is what makes
+/// it safe to place in SQL text — the user's words never reach SQL.
+fn semantic_result_key(kind: &str, value: &str, breadth: &str) -> Option<String>
+{
+    semantic_floor(kind, breadth)?;
+    let canonical_value = match kind
+    {
+        SEMANTIC_KIND_LOOKS_LIKE =>
+        {
+            if value.trim().is_empty()
+            {
+                return None;
+            }
+            value.to_string()
+        }
+        SEMANTIC_KIND_SIMILAR_TO => semantic_seed_id(value)?.to_string(),
+        _ => return None,
+    };
+    let mut bytes = b"photolibrarian.semantic-result-key".to_vec();
+    bytes.extend_from_slice(&SEMANTIC_KEY_FORMAT_VERSION.to_be_bytes());
+    for field in [
+        kind,
+        canonical_value.as_str(),
+        breadth,
+        SEMANTIC_MODEL_NAME,
+        SEMANTIC_MODEL_VERSION,
+        SEMANTIC_PREPROCESSING_VERSION,
+    ]
+    {
+        bytes.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(field.as_bytes());
+    }
+    Some(semantic_sha256_hex(&bytes))
+}
+
+/// The key of a semantic predicate: `kind`, `value`, and the breadth in `op`
+/// (design §5's table). `None` for a non-semantic or malformed predicate.
+fn semantic_predicate_key(predicate: &QueryPredicate) -> Option<String>
+{
+    if !is_semantic_kind(&predicate.kind)
+    {
+        return None;
+    }
+    semantic_result_key(&predicate.kind, predicate.value.as_deref()?, predicate.op.as_deref()?)
+}
+
+/// ⭐ Belt and braces on the SQL-safety claim: a key is interpolated only
+/// after this check, so even a future change to the key function cannot put
+/// anything but 64 hex digits into SQL text.
+fn semantic_key_is_sql_safe(key: &str) -> bool
+{
+    key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+// ---------------------------------------------------------------------------
+// The SQL side (design §6.3)
+// ---------------------------------------------------------------------------
+
+/// `predicate_to_sql`'s arm for both kinds: membership in the key's stored
+/// result. ⭐ Bare `id`, never `images.id`: with duplicates hidden or stacks
+/// collapsed the outer statement has no `images` in scope, and bare `id`
+/// resolves in both shapes. No key → `(FALSE)`.
+fn semantic_predicate_sql(predicate: &QueryPredicate) -> String
+{
+    match semantic_predicate_key(predicate)
+    {
+        Some(key) if semantic_key_is_sql_safe(&key) => format!(
+            "(id IN (SELECT m.image_id FROM semantic_match m \
+             JOIN semantic_key k ON m.result_id = k.result_id WHERE k.key = '{}'))",
+            key
+        ),
+        _ => "(FALSE)".to_string(),
+    }
+}
+
+/// A semantic condition orders by match unless it says filter-only: `num` is
+/// null or 1 for Best match, 0 for filter only (design §5).
+fn semantic_orders_by_match(predicate: &QueryPredicate) -> bool
+{
+    predicate.num.map_or(true, |num| num != 0.0)
+}
+
+/// The ORDERING condition: the LAST semantic condition, in sentence order,
+/// that orders by match and has a key (design §6.3 — a condition appended
+/// later, such as a right-click "like this one", sorts the results). Its
+/// index and key. `None` when no semantic condition orders.
+fn semantic_ordering_condition(predicates: &[QueryPredicate]) -> Option<(usize, String)>
+{
+    predicates.iter().enumerate().rev().find_map(|(index, predicate)|
+    {
+        if is_semantic_kind(&predicate.kind) && semantic_orders_by_match(predicate)
+        {
+            semantic_predicate_key(predicate)
+                .filter(|key| semantic_key_is_sql_safe(key))
+                .map(|key| (index, key))
+        }
+        else
+        {
+            None
+        }
+    })
+}
+
+/// The Best-match order: the ordering condition's score, descending, NULLS
+/// LAST (under OR, keyword-only rows have no score and sort after the scored
+/// ones), then the default newest-first. `MAX` makes the correlated subquery
+/// single-row by construction, on top of `UNIQUE (result_id, image_id)`.
+/// Correlated on bare `id`, for the same reason as the predicate. The `id ASC`
+/// tie-break is still appended at the one paged chokepoint.
+fn semantic_score_order_by(key: &str) -> String
+{
+    format!(
+        "(SELECT MAX(m.score) FROM semantic_match m JOIN semantic_key k ON m.result_id = k.result_id \
+         WHERE k.key = '{}' AND m.image_id = id) DESC NULLS LAST, {}",
+        key, DEFAULT_FILTER_ORDER_BY
+    )
+}
+
+/// ⭐ THE display-cap rule (design §6.3), ONE function with two callers — the
+/// prepare chokepoint (which tells Swift to clamp its count and paging) and
+/// the id projections (which cut Select All) — so the two can never disagree.
+///
+/// The cap applies iff a semantic condition orders the query (Best match) AND
+/// that ordering condition is the LAST condition of the sentence AND it is
+/// joined to the rest by AND. Then every result carries a score, and "the
+/// best 10,000" is literally true. Exact readings:
+///   · a one-condition query whose condition orders by match: the cap applies
+///     (it is the last condition, and nothing is joined to it);
+///   · an ordering condition that is the FIRST of several: no cap, even when
+///     every connector is AND (the rule names the last condition; this is the
+///     conservative reading — no false "best 10,000" claim);
+///   · a missing connector counts as AND, exactly as `build_filter_predicate`
+///     folds it;
+///   · every semantic condition `num = 0`: no ordering condition, no cap.
+/// Only the Find predicates count, never a scope group (like the ordering).
+fn semantic_display_cap_applies(predicates: &[QueryPredicate], connectors: &[Connector]) -> bool
+{
+    match semantic_ordering_condition(predicates)
+    {
+        Some((index, _)) if index + 1 == predicates.len() =>
+        {
+            index == 0 || connectors.get(index - 1).map_or(true, |connector| *connector == Connector::And)
+        }
+        _ => false,
+    }
+}
+
+/// The id projections' cap: `Some(10,000)` exactly when the rule applies.
+fn semantic_id_projection_cap(predicates: &[QueryPredicate], connectors: &[Connector]) -> Option<u64>
+{
+    if semantic_display_cap_applies(predicates, connectors)
+    {
+        Some(SEMANTIC_DISPLAY_CAP)
+    }
+    else
+    {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The temporary tables (design §6.2, PLAN §5 item 7)
+// ---------------------------------------------------------------------------
+
+/// Created once, in `initialize_catalogue` right after
+/// `open_and_migrate_catalogue` returns (never inside it — it also migrates
+/// the backup connection), in autocommit. Temporary objects live in memory on
+/// THIS connection only: they never touch the catalogue file or its WAL, a
+/// checkpoint ignores them, and reset and full restore relaunch the app, so
+/// they start empty.
+///
+/// · `semantic_key` — one row per stored search. `key` is UNIQUE; `result_id`
+///   (the current result GENERATION), `rows` and `last_used` are unindexed and
+///   updated in place (S179: an UPDATE of an unindexed column is the in-place
+///   branch, never delete+insert).
+/// · `semantic_match` — one row per (generation, photo). A save writes a NEW
+///   generation and deletes the old one afterwards, so nothing is ever deleted
+///   and re-inserted under the same indexed key in one transaction (DuckDB
+///   #23645's precondition). `UNIQUE (result_id, image_id)` keeps the
+///   ordering's scalar subquery single-row (the S124 error would blank a page).
+/// · `semantic_stage` — the save's staging rows, empty outside a save.
+const SEMANTIC_TEMP_DDL: [&str; 4] = [
+    "CREATE TEMP SEQUENCE IF NOT EXISTS semantic_seq START 1;",
+    "CREATE TEMP TABLE IF NOT EXISTS semantic_key ( \
+         key_id INTEGER PRIMARY KEY DEFAULT nextval('semantic_seq'), \
+         key TEXT UNIQUE, \
+         result_id BIGINT, \
+         rows BIGINT, \
+         last_used TIMESTAMP);",
+    "CREATE TEMP TABLE IF NOT EXISTS semantic_match ( \
+         result_id BIGINT, \
+         image_id BIGINT, \
+         score DOUBLE, \
+         UNIQUE (result_id, image_id));",
+    "CREATE TEMP TABLE IF NOT EXISTS semantic_stage ( \
+         image_id BIGINT, \
+         score DOUBLE);",
+];
+
+/// Create the temporary objects (idempotent). Each statement on its own, so a
+/// failure names the one that failed.
+fn create_semantic_search_temp_tables(conn: &Connection) -> Result<(), String>
+{
+    for statement in SEMANTIC_TEMP_DDL
+    {
+        conn.execute_batch(statement)
+            .map_err(|error| format!("creating the semantic-search tables failed ({}): {}", statement, error))?;
+    }
+    Ok(())
+}
+
+/// Whether all four temporary objects exist on this connection. A failed
+/// census is an `Err` (never "absent" or "present" by guess).
+fn semantic_temp_tables_present(conn: &Connection) -> Result<bool, String>
+{
+    let tables = conn
+        .query_row(
+            "SELECT COUNT(*) FROM duckdb_tables() WHERE temporary \
+             AND table_name IN ('semantic_key', 'semantic_match', 'semantic_stage')",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("the semantic-search table census failed: {}", error))?;
+    let sequences = conn
+        .query_row(
+            "SELECT COUNT(*) FROM duckdb_sequences() WHERE temporary AND sequence_name = 'semantic_seq'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("the semantic-search sequence census failed: {}", error))?;
+    Ok(tables == 3 && sequences == 1)
+}
+
+/// The honest reason a search cannot run when the tables are missing.
+const SEMANTIC_TABLES_MISSING_MESSAGE: &str =
+    "The search results table could not be created when the catalog opened, so searching is \
+     unavailable until PhotoLibrarian is relaunched.";
+
+/// "now" for `last_used`, as TIMESTAMP text, from Rust's clock (no SQL time
+/// function, so no ICU — the S127/E0 rule).
+fn semantic_timestamp_text(at: chrono::NaiveDateTime) -> String
+{
+    at.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+}
+
+fn semantic_now() -> chrono::NaiveDateTime
+{
+    chrono::Utc::now().naive_utc()
+}
+
+// ---------------------------------------------------------------------------
+// The prepare chokepoint (PLAN §2.1, BRIEF-R item 7)
+// ---------------------------------------------------------------------------
+
+/// The prepare body, on a borrowed connection: one short read and one
+/// in-place touch. Never runs a search.
+fn semantic_search_prepare_impl(
+    conn: &Connection,
+    predicates: &[QueryPredicate],
+    connectors: &[Connector],
+    now: &str,
+) -> SemanticPrepareResult
+{
+    let mut keyed: Vec<(u32, String)> = Vec::new();
+    for (index, predicate) in predicates.iter().enumerate()
+    {
+        if !is_semantic_kind(&predicate.kind)
+        {
+            continue;
+        }
+        match semantic_predicate_key(predicate)
+        {
+            Some(key) => keyed.push((index as u32, key)),
+            None =>
+            {
+                return semantic_prepare_failure(format!(
+                    "Condition {} is not a complete search (kind {}, breadth {}, value {}).",
+                    index + 1,
+                    predicate.kind,
+                    predicate.op.as_deref().unwrap_or("none"),
+                    if predicate.value.as_deref().map_or(true, |value| value.trim().is_empty())
+                    {
+                        "empty"
+                    }
+                    else
+                    {
+                        "present"
+                    }
+                ));
+            }
+        }
+    }
+    let answer = |missing: Vec<u32>| SemanticPrepareResult
+    {
+        missing,
+        orders_by_score: semantic_ordering_condition(predicates).is_some(),
+        display_cap_applies: semantic_display_cap_applies(predicates, connectors),
+        display_cap: SEMANTIC_DISPLAY_CAP,
+        error: None,
+    };
+    if keyed.is_empty()
+    {
+        return answer(Vec::new());
+    }
+    match semantic_temp_tables_present(conn)
+    {
+        Ok(true) => {}
+        Ok(false) => return semantic_prepare_failure(SEMANTIC_TABLES_MISSING_MESSAGE.to_string()),
+        Err(message) => return semantic_prepare_failure(message),
+    }
+    let mut distinct = keyed.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
+    distinct.sort();
+    distinct.dedup();
+    if !distinct.iter().all(|key| semantic_key_is_sql_safe(key))
+    {
+        return semantic_prepare_failure("a search key was not 64 hex digits".to_string());
+    }
+    let list = distinct.iter().map(|key| format!("'{}'", key)).collect::<Vec<_>>().join(", ");
+    let present = match conn.prepare(&format!("SELECT key FROM semantic_key WHERE key IN ({})", list))
+    {
+        Ok(mut statement) => match statement.query_map([], |row| row.get::<_, String>(0))
+        {
+            Ok(rows) =>
+            {
+                let (keys, dropped) = collect_rows_counted(rows, "semantic_search_prepare.query_failed");
+                if dropped > 0
+                {
+                    return semantic_prepare_failure(format!("{} stored search key(s) could not be read", dropped));
+                }
+                keys.into_iter().collect::<std::collections::HashSet<String>>()
+            }
+            Err(error) => return semantic_prepare_failure(format!("the stored searches could not be read: {}", error)),
+        },
+        Err(error) => return semantic_prepare_failure(format!("the stored searches could not be read: {}", error)),
+    };
+    if !present.is_empty()
+    {
+        let mut touched = present.iter().cloned().collect::<Vec<_>>();
+        touched.sort();
+        let touched = touched.iter().map(|key| format!("'{}'", key)).collect::<Vec<_>>().join(", ");
+        if let Err(error) = conn.execute(
+            &format!("UPDATE semantic_key SET last_used = CAST(? AS TIMESTAMP) WHERE key IN ({})", touched),
+            params![now],
+        )
+        {
+            return semantic_prepare_failure(format!("the stored searches could not be marked in use: {}", error));
+        }
+    }
+    answer(
+        keyed
+            .into_iter()
+            .filter(|(_, key)| !present.contains(key))
+            .map(|(index, _)| index)
+            .collect(),
+    )
+}
+
+/// ⭐ The prepare chokepoint (design §6.3): which semantic predicates have no
+/// stored result (their indexes into `predicates`), touching `last_used` for
+/// the present ones; whether the query orders by match; whether the 10,000
+/// cap applies — computed by `semantic_display_cap_applies`, the SAME function
+/// the id projections call. One short catalogue-lock hold. Never runs a
+/// search. `error` set = prepare could not answer: the catalogue is not open,
+/// the temp tables are absent, a condition is malformed, or a read failed.
+pub async fn semantic_search_prepare(
+    predicates: Vec<QueryPredicate>,
+    connectors: Vec<Connector>,
+) -> SemanticPrepareResult
+{
+    ffi_panic_boundary(
+        "semantic_search_prepare.panic.query_failed",
+        ||
+        {
+            let now = semantic_timestamp_text(semantic_now());
+            let catalogue = lock_catalogue();
+            match catalogue.as_ref()
+            {
+                Some(conn) => semantic_search_prepare_impl(conn, &predicates, &connectors, &now),
+                None => semantic_prepare_failure("The catalog is not open.".to_string()),
+            }
+        },
+        |panic| semantic_prepare_failure(ffi_panic_report("prepare the search", &panic)),
+    )
+}
+
+/// A prepare that could not answer.
+fn semantic_prepare_failure(message: String) -> SemanticPrepareResult
+{
+    SemanticPrepareResult
+    {
+        missing: Vec::new(),
+        orders_by_score: false,
+        display_cap_applies: false,
+        display_cap: SEMANTIC_DISPLAY_CAP,
+        error: Some(message),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The job (design §6.1–§6.2)
+// ---------------------------------------------------------------------------
+
+/// One job's live state: a cancel flag and the status `poll` reads. Neither
+/// is ever held across an `await`.
+struct SemanticJob
+{
+    cancel: std::sync::atomic::AtomicBool,
+    cell: std::sync::Mutex<SemanticJobCell>,
+}
+
+struct SemanticJobCell
+{
+    status: SemanticSearchStatus,
+    finished_at: Option<std::time::Instant>,
+}
+
+impl SemanticJob
+{
+    fn new() -> Self
+    {
+        SemanticJob
+        {
+            cancel: std::sync::atomic::AtomicBool::new(false),
+            cell: std::sync::Mutex::new(SemanticJobCell
+            {
+                status: SemanticSearchStatus
+                {
+                    phase: "reading".to_string(),
+                    done: 0,
+                    total: 0,
+                    matched: 0,
+                    finished: false,
+                    store_ok: true,
+                    seed_missing: false,
+                    seed_not_indexed: false,
+                    error: None,
+                },
+                finished_at: None,
+            }),
+        }
+    }
+
+    /// Poison-safe: a panic while the cell was held left a whole status
+    /// struct behind (every write replaces fields of an owned value).
+    fn with_cell<T>(&self, body: impl FnOnce(&mut SemanticJobCell) -> T) -> T
+    {
+        let mut cell = self.cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        body(&mut cell)
+    }
+
+    fn update(&self, body: impl FnOnce(&mut SemanticSearchStatus))
+    {
+        self.with_cell(|cell| body(&mut cell.status));
+    }
+
+    /// The terminal write: `finished = true` plus the phase-specific fields.
+    fn finish(&self, body: impl FnOnce(&mut SemanticSearchStatus))
+    {
+        self.with_cell(|cell|
+        {
+            body(&mut cell.status);
+            cell.status.finished = true;
+            cell.finished_at = Some(std::time::Instant::now());
+        });
+    }
+
+    fn snapshot(&self) -> SemanticSearchStatus
+    {
+        self.with_cell(|cell| cell.status.clone())
+    }
+
+    fn is_cancelled(&self) -> bool
+    {
+        self.cancel.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn finished_at(&self) -> Option<std::time::Instant>
+    {
+        self.with_cell(|cell| cell.finished_at)
+    }
+}
+
+/// The job registry, behind its OWN mutex: `poll` and `cancel` take only
+/// this, never `lock_catalogue()`.
+struct SemanticJobRegistry
+{
+    next_id: u64,
+    jobs: std::collections::HashMap<u64, Arc<SemanticJob>>,
+}
+
+static SEMANTIC_JOBS: once_cell::sync::Lazy<std::sync::Mutex<SemanticJobRegistry>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(SemanticJobRegistry
+    {
+        next_id: 0,
+        jobs: std::collections::HashMap::new(),
+    }));
+
+/// Poison-safe: the registry is a map of `Arc`s and a counter; a panic under
+/// it cannot leave either half-written.
+fn lock_semantic_jobs() -> std::sync::MutexGuard<'static, SemanticJobRegistry>
+{
+    SEMANTIC_JOBS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Register a job under a fresh id (never 0). Finished jobs older than the
+/// retention are dropped first; at the bound, the oldest finished job goes;
+/// a registry full of RUNNING jobs refuses.
+fn semantic_register_job(job: Arc<SemanticJob>) -> Result<u64, String>
+{
+    let mut registry = lock_semantic_jobs();
+    let retention = std::time::Duration::from_secs(SEMANTIC_JOB_RETENTION_SECONDS);
+    registry.jobs.retain(|_, entry| entry.finished_at().map_or(true, |at| at.elapsed() < retention));
+    if registry.jobs.len() >= SEMANTIC_JOB_REGISTRY_MAX
+    {
+        let oldest_finished = registry
+            .jobs
+            .iter()
+            .filter_map(|(id, entry)| entry.finished_at().map(|at| (at, *id)))
+            .min()
+            .map(|(_, id)| id);
+        match oldest_finished
+        {
+            Some(id) =>
+            {
+                registry.jobs.remove(&id);
+            }
+            None =>
+            {
+                return Err(format!(
+                    "{} searches are already running; wait for one to finish.",
+                    registry.jobs.len()
+                ));
+            }
+        }
+    }
+    registry.next_id = registry.next_id.wrapping_add(1).max(1);
+    let id = registry.next_id;
+    registry.jobs.insert(id, job);
+    Ok(id)
+}
+
+/// What a validated request asks for.
+#[derive(Debug, Clone)]
+enum SemanticQuery
+{
+    Vector(Vec<f32>),
+    Seed(i64),
+}
+
+#[derive(Debug, Clone)]
+struct SemanticJobSpec
+{
+    key: String,
+    floor: f64,
+    query: SemanticQuery,
+}
+
+/// Validate a request: the kind, the breadth, the model versions equal to the
+/// constants (PLAN §5 item 3), exactly 768 finite little-endian floats for
+/// `looks_like` (and a non-empty value), a positive seed id and no vector for
+/// `similar_to`. The message is the user-facing reason.
+fn semantic_validate_request(request: &SemanticSearchRequest) -> Result<SemanticJobSpec, String>
+{
+    if !is_semantic_kind(&request.kind)
+    {
+        return Err(format!("\"{}\" is not a kind of search.", request.kind));
+    }
+    let floor = semantic_floor(&request.kind, &request.breadth)
+        .ok_or_else(|| format!("\"{}\" is not a search breadth (narrow, medium or wide).", request.breadth))?;
+    if request.model_name != SEMANTIC_MODEL_NAME
+        || request.model_version != SEMANTIC_MODEL_VERSION
+        || request.preprocessing_version != SEMANTIC_PREPROCESSING_VERSION
+    {
+        return Err(format!(
+            "The search model ({} {} {}) does not match the search index ({} {} {}).",
+            request.model_name,
+            request.model_version,
+            request.preprocessing_version,
+            SEMANTIC_MODEL_NAME,
+            SEMANTIC_MODEL_VERSION,
+            SEMANTIC_PREPROCESSING_VERSION
+        ));
+    }
+    let query = if request.kind == SEMANTIC_KIND_LOOKS_LIKE
+    {
+        if request.value.trim().is_empty()
+        {
+            return Err("The description is empty.".to_string());
+        }
+        if request.query_vector.len() != SEMANTIC_DIMENSION * 4
+        {
+            return Err(format!(
+                "The description's vector holds {} bytes, not {} ({} floats).",
+                request.query_vector.len(),
+                SEMANTIC_DIMENSION * 4,
+                SEMANTIC_DIMENSION
+            ));
+        }
+        let vector = request
+            .query_vector
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect::<Vec<f32>>();
+        if !vector.iter().all(|value| value.is_finite())
+        {
+            return Err("The description's vector holds a value that is not a number.".to_string());
+        }
+        // Review LOW-5: the floors assume an L2-normalized query (PLAN §2.1);
+        // an unnormalized one would shift every score silently.
+        let norm = vector.iter().map(|value| f64::from(*value) * f64::from(*value)).sum::<f64>().sqrt();
+        if (norm - 1.0).abs() > SEMANTIC_QUERY_NORM_TOLERANCE
+        {
+            return Err(format!("The description's vector is not normalized (its length is {:.4}, not 1).", norm));
+        }
+        SemanticQuery::Vector(vector)
+    }
+    else
+    {
+        let seed = semantic_seed_id(&request.value)
+            .ok_or_else(|| format!("\"{}\" is not a photo id.", request.value))?;
+        if !request.query_vector.is_empty()
+        {
+            return Err("A \"similar to\" search carries no vector; the seed photo's is read.".to_string());
+        }
+        SemanticQuery::Seed(seed)
+    };
+    let key = semantic_result_key(&request.kind, &request.value, &request.breadth)
+        .ok_or_else(|| "The search could not be keyed.".to_string())?;
+    Ok(SemanticJobSpec { key, floor, query })
+}
+
+/// Test-only seam (the S179 `FocusApplyProbe` discipline: private,
+/// parameter-threaded, no statics; outside `cfg(test)` the type is
+/// UNINHABITED, so production provably passes `None`).
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct SemanticJobProbe
+{
+    /// Rows per scan batch instead of `SEMANTIC_SCAN_BATCH_ROWS`.
+    batch_rows: Option<u32>,
+    /// After this many batches the job waits until it is cancelled (bounded).
+    hold_after_batch: Option<u64>,
+    /// After this many batches the job panics.
+    panic_after_batch: Option<u64>,
+    /// SQL that REPLACES the match INSERT inside the save transaction — a
+    /// statement that fails after earlier writes succeeded, so the ROLLBACK
+    /// is observable on the table.
+    save_insert_sql: Option<String>,
+    /// The eviction budget instead of `SEMANTIC_RESULT_ROW_BUDGET`.
+    row_budget: Option<i64>,
+}
+
+#[cfg(test)]
+type SemanticJobProbeArg = Option<Arc<SemanticJobProbe>>;
+
+#[cfg(not(test))]
+type SemanticJobProbeArg = Option<std::convert::Infallible>;
+
+#[cfg(test)]
+fn semantic_scan_batch_rows(probe: &SemanticJobProbeArg) -> u32
+{
+    probe.as_ref().and_then(|probe| probe.batch_rows).unwrap_or(SEMANTIC_SCAN_BATCH_ROWS).max(1)
+}
+
+#[cfg(not(test))]
+fn semantic_scan_batch_rows(_probe: &SemanticJobProbeArg) -> u32
+{
+    SEMANTIC_SCAN_BATCH_ROWS
+}
+
+#[cfg(test)]
+async fn semantic_probe_after_batch(probe: &SemanticJobProbeArg, job: &SemanticJob, batches: u64)
+{
+    let Some(probe) = probe.as_ref() else { return };
+    if probe.panic_after_batch == Some(batches)
+    {
+        panic!("semantic search test: an injected panic after batch {}", batches);
+    }
+    if probe.hold_after_batch == Some(batches)
+    {
+        for _ in 0..4_000
+        {
+            if job.is_cancelled()
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+}
+
+#[cfg(not(test))]
+async fn semantic_probe_after_batch(_probe: &SemanticJobProbeArg, _job: &SemanticJob, _batches: u64) {}
+
+#[cfg(test)]
+fn semantic_match_insert_sql(probe: &SemanticJobProbeArg, real: String) -> String
+{
+    probe.as_ref().and_then(|probe| probe.save_insert_sql.clone()).unwrap_or(real)
+}
+
+#[cfg(not(test))]
+fn semantic_match_insert_sql(_probe: &SemanticJobProbeArg, real: String) -> String
+{
+    real
+}
+
+#[cfg(test)]
+fn semantic_row_budget(probe: &SemanticJobProbeArg) -> i64
+{
+    probe.as_ref().and_then(|probe| probe.row_budget).unwrap_or(SEMANTIC_RESULT_ROW_BUDGET)
+}
+
+#[cfg(not(test))]
+fn semantic_row_budget(_probe: &SemanticJobProbeArg) -> i64
+{
+    SEMANTIC_RESULT_ROW_BUDGET
+}
+
+/// A `similar_to` seed, resolved against the catalogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticSeed
+{
+    /// The seed photo is no longer in `images`.
+    Missing,
+    /// The photo whose vector stands for the seed holds a stale mark.
+    NotIndexed,
+    /// The id whose vector stands for the seed.
+    Indexed(i64),
+}
+
+/// Resolve a seed: missing → `Missing`. A RAW with a JPEG/HEIF twin in the
+/// same directory with the same stem maps to that twin — the photo the index
+/// holds (the collapse rule `mark_image_vectors_stale` uses) — and a RAW with
+/// BOTH maps to the JPEG (the S126 visible-representative rule; then the lower
+/// id). A stale mark on the mapped photo → `NotIndexed` (its vector, if any,
+/// no longer describes it).
+fn semantic_resolve_seed(conn: &Connection, seed: i64) -> Result<SemanticSeed, String>
+{
+    let row = conn.query_row(
+        "SELECT image_kind, file_stem, directory_path FROM images WHERE id = ?1",
+        params![seed],
+        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?)),
+    );
+    let (kind, stem, directory) = match row
+    {
+        Ok(row) => row,
+        Err(duckdb::Error::QueryReturnedNoRows) => return Ok(SemanticSeed::Missing),
+        Err(error) => return Err(format!("the seed photo could not be read: {}", error)),
+    };
+    let mut mapped = seed;
+    if kind.as_deref() == Some("raw")
+    {
+        if let (Some(stem), Some(directory)) = (stem, directory)
+        {
+            let twin = conn.query_row(
+                "SELECT id FROM images \
+                  WHERE directory_path = ?1 AND file_stem = ?2 AND image_kind IN ('jpeg', 'heif') \
+                  ORDER BY CASE WHEN image_kind = 'jpeg' THEN 0 ELSE 1 END, id \
+                  LIMIT 1",
+                params![directory, stem],
+                |row| row.get::<_, i64>(0),
+            );
+            match twin
+            {
+                Ok(twin) => mapped = twin,
+                Err(duckdb::Error::QueryReturnedNoRows) => {}
+                Err(error) => return Err(format!("the seed photo's twin could not be read: {}", error)),
+            }
+        }
+    }
+    let stale = conn
+        .query_row("SELECT COUNT(*) FROM image_vector_stale WHERE image_id = ?1", params![mapped], |row| row.get::<_, i64>(0))
+        .map_err(|error| format!("the seed photo's index state could not be read: {}", error))?;
+    if stale > 0
+    {
+        Ok(SemanticSeed::NotIndexed)
+    }
+    else
+    {
+        Ok(SemanticSeed::Indexed(mapped))
+    }
+}
+
+/// The identity filter every search read uses: the current model, version
+/// and preprocessing. ⭐ Stale-marked vectors ARE scored (PLAN §5 item 8): a
+/// stale vector still describes the photo closely.
+fn semantic_identity_filter() -> String
+{
+    image_embedding_identity_filter(SEMANTIC_MODEL_NAME, SEMANTIC_MODEL_VERSION, SEMANTIC_PREPROCESSING_VERSION)
+}
+
+/// The seed's stored vector (Float16 read back as f32), or `None` when the
+/// store holds none for the current model. Count-then-limit, the id scan's
+/// shape. A vector of the wrong width is a store failure.
+async fn semantic_seed_vector(table: &lancedb::Table, image_id: i64) -> Result<Option<Vec<f32>>, String>
+{
+    let filter = format!("{} AND image_id = {}", semantic_identity_filter(), image_id);
+    let matching = table
+        .count_rows(Some(filter.clone()))
+        .await
+        .map_err(|error| format!("the seed photo's vector could not be counted: {}", error))?;
+    if matching == 0
+    {
+        return Ok(None);
+    }
+    let batches = table
+        .query()
+        .select(lancedb::query::Select::columns(&["image_id", "vector"]))
+        .only_if(filter)
+        .limit(matching)
+        .execute()
+        .await
+        .map_err(|error| format!("the seed photo's vector could not be read: {}", error))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|error| format!("the seed photo's vector could not be read: {}", error))?;
+    for batch in batches
+    {
+        if let Some((_, vector)) = image_embedding_vectors_from_batch(&batch)?.into_iter().next()
+        {
+            if vector.len() != SEMANTIC_DIMENSION
+            {
+                return Err(format!(
+                    "the seed photo's stored vector holds {} values, not {}",
+                    vector.len(),
+                    SEMANTIC_DIMENSION
+                ));
+            }
+            return Ok(Some(vector.into_iter().map(|value| value as f32).collect()));
+        }
+    }
+    Ok(None)
+}
+
+/// ⭐ THE scoring: the dot product of the query (L2-normalized Float32) with a
+/// stored vector (Float16, L2-normalized at write, so the dot product IS the
+/// cosine), accumulated in Float64. `None` when the stored slice is out of
+/// range (a malformed batch never panics).
+fn semantic_dot_f16(query: &[f32], values: &[Float16Native], start: usize) -> Option<f64>
+{
+    let stored = values.get(start..start.checked_add(query.len())?)?;
+    let mut sum = 0.0f64;
+    for (q, v) in query.iter().zip(stored.iter())
+    {
+        sum += f64::from(*q) * f64::from(v.to_f32());
+    }
+    Some(sum)
+}
+
+/// The Float32 twin, for a store written under the documented fallback (§3.1).
+fn semantic_dot_f32(query: &[f32], values: &[f32], start: usize) -> Option<f64>
+{
+    let stored = values.get(start..start.checked_add(query.len())?)?;
+    let mut sum = 0.0f64;
+    for (q, v) in query.iter().zip(stored.iter())
+    {
+        sum += f64::from(*q) * f64::from(*v);
+    }
+    Some(sum)
+}
+
+/// Score one record batch into `best` (image id → best score at or above the
+/// floor; duplicate rows for one photo collapse to the best). Returns the
+/// rows read. A stored width other than the query's is a store failure.
+fn semantic_score_batch(
+    batch: &RecordBatch,
+    query: &[f32],
+    floor: f64,
+    best: &mut std::collections::HashMap<i64, f64>,
+) -> Result<u64, String>
+{
+    let ids = batch
+        .column_by_name("image_id")
+        .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+        .ok_or_else(|| "the search read returned no Int64 image_id column".to_string())?;
+    let vectors = batch
+        .column_by_name("vector")
+        .and_then(|array| array.as_any().downcast_ref::<FixedSizeListArray>())
+        .ok_or_else(|| "the search read returned no fixed-size vector column".to_string())?;
+    let width = vectors.value_length() as usize;
+    if width != query.len()
+    {
+        return Err(format!("the search index holds {}-wide vectors; the query is {}-wide", width, query.len()));
+    }
+    let child = vectors.values();
+    let halves = child.as_any().downcast_ref::<arrow_array::Float16Array>();
+    let singles = child.as_any().downcast_ref::<arrow_array::Float32Array>();
+    if halves.is_none() && singles.is_none()
+    {
+        return Err(format!("the search index holds an unexpected vector type: {:?}", child.data_type()));
+    }
+    for row in 0..batch.num_rows()
+    {
+        if ids.is_null(row)
+        {
+            return Err("the search read returned a NULL image_id".to_string());
+        }
+        if vectors.is_null(row)
+        {
+            continue;
+        }
+        let start = vectors.value_offset(row) as usize;
+        let score = match (halves, singles)
+        {
+            (Some(halves), _) => semantic_dot_f16(query, halves.values(), start),
+            (None, Some(singles)) => semantic_dot_f32(query, singles.values(), start),
+            (None, None) => None,
+        };
+        if let Some(score) = score
+        {
+            if score.is_finite() && score >= floor
+            {
+                let entry = best.entry(ids.value(row)).or_insert(score);
+                if score > *entry
+                {
+                    *entry = score;
+                }
+            }
+        }
+    }
+    Ok(batch.num_rows() as u64)
+}
+
+/// What a scan found.
+struct SemanticScan
+{
+    /// (image id, best score) — every photo at or above the floor.
+    matches: Vec<(i64, f64)>,
+    total: u64,
+    scanned: u64,
+    cancelled: bool,
+}
+
+/// ⭐ The reading phase: stream the vector column in record batches filtered
+/// to the current model — never the whole table at once — scoring each batch
+/// and keeping every match at or above `floor`. `total` comes from a cheap
+/// count first; `done` advances per batch. Cancel is honoured at every batch
+/// boundary (nothing is kept). The scan must deliver every row the count
+/// promised, or it is a store failure (a short scan would read as "fewer
+/// matches").
+async fn semantic_scan_table(
+    table: &lancedb::Table,
+    query: &[f32],
+    floor: f64,
+    job: &SemanticJob,
+    probe: &SemanticJobProbeArg,
+) -> Result<SemanticScan, String>
+{
+    let filter = semantic_identity_filter();
+    // ⭐ Pin ONE table version for the count and the scan: an index pass may
+    // commit a batch between the two, and a scan of a newer version under
+    // `.limit(total)` would silently drop an arbitrary subset of vectors. On
+    // the pinned version the count is exact, so `scanned != total` stays a
+    // true short-scan alarm (never a false one during a running pass).
+    let version = table
+        .version()
+        .await
+        .map_err(|error| format!("the search index version could not be read: {}", error))?;
+    table
+        .checkout(version)
+        .await
+        .map_err(|error| format!("the search index version could not be pinned: {}", error))?;
+    let total = table
+        .count_rows(Some(filter.clone()))
+        .await
+        .map_err(|error| format!("the search index could not be counted: {}", error))? as u64;
+    job.update(|status| status.total = total);
+    let mut best: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
+    let mut scanned = 0u64;
+    if total > 0
+    {
+        let mut options = lancedb::query::QueryExecutionOptions::default();
+        options.max_batch_length = semantic_scan_batch_rows(probe);
+        let mut stream = table
+            .query()
+            .select(lancedb::query::Select::columns(&["image_id", "vector"]))
+            .only_if(filter)
+            .limit(total as usize)
+            .execute_with_options(options)
+            .await
+            .map_err(|error| format!("the search index could not be read: {}", error))?;
+        let mut batches = 0u64;
+        loop
+        {
+            if job.is_cancelled()
+            {
+                return Ok(SemanticScan { matches: Vec::new(), total, scanned, cancelled: true });
+            }
+            let next = stream
+                .try_next()
+                .await
+                .map_err(|error| format!("the search index could not be read: {}", error))?;
+            let Some(batch) = next else { break };
+            scanned += semantic_score_batch(&batch, query, floor, &mut best)?;
+            batches += 1;
+            job.update(|status| status.done = scanned);
+            semantic_probe_after_batch(probe, job, batches).await;
+        }
+        if scanned != total
+        {
+            return Err(format!(
+                "the search index returned {} vector(s) where it counted {}",
+                scanned, total
+            ));
+        }
+    }
+    if job.is_cancelled()
+    {
+        return Ok(SemanticScan { matches: Vec::new(), total, scanned, cancelled: true });
+    }
+    let mut matches = best.into_iter().collect::<Vec<_>>();
+    matches.sort_unstable_by_key(|(image_id, _)| *image_id);
+    Ok(SemanticScan { matches, total, scanned, cancelled: false })
+}
+
+/// The design §6.2 twin expansion, set-based: the scored photos plus every
+/// match's RAW twin (same directory, same stem, `image_kind = 'raw'`, the
+/// scored photo a JPEG/HEIF) — exactly the pair definition
+/// `RAW_JPEG_COLLAPSE_PREDICATE` uses (stored lowercase `image_kind`,
+/// `file_stem`, `directory_path`, confirmed against it), so a same-named PSD
+/// or TIFF never inherits a score. `GROUP BY image_id … MAX(score)` writes ONE
+/// row per photo: a RAW with both a JPEG and a HEIF twin, or a RAW that has
+/// its own vector, still gets one row. ⭐ Only photos still in `images` are
+/// written (slice 1 review finding 4: an orphan vector of a removed photo must
+/// never surface).
+fn semantic_match_insert_real(result_id: i64) -> String
+{
+    format!(
+        "INSERT INTO semantic_match (result_id, image_id, score) \
+         SELECT {result_id}, u.image_id, MAX(u.score) FROM ( \
+             SELECT image_id, score FROM semantic_stage \
+             UNION ALL \
+             SELECT twin.id AS image_id, s.score FROM semantic_stage s \
+               JOIN images a    ON a.id = s.image_id \
+               JOIN images twin ON twin.directory_path = a.directory_path \
+                               AND twin.file_stem      = a.file_stem \
+                               AND twin.id <> a.id \
+                               AND twin.image_kind = 'raw' \
+              WHERE a.image_kind IN ('jpeg', 'heif') \
+         ) u \
+         WHERE u.image_id IN (SELECT id FROM images) \
+         GROUP BY u.image_id;",
+        result_id = result_id
+    )
+}
+
+/// ⭐ The saving phase: ONE transaction, the result-generation shape (PLAN §5
+/// item 7), under the caller's catalogue lock:
+///   1. stage the matches; 2. allocate a FRESH `result_id`; 3. write one row
+///   per photo under it (with the twin expansion); 4. insert the key row if
+///   new, or update its `result_id` / `rows` / `last_used` IN PLACE (all
+///   unindexed); 5. delete the previous generation's rows; 6. evict LRU keys
+///   past the row budget, except keys touched since `exempt_after`.
+/// ⛔ Nothing is ever deleted and re-inserted under the same indexed key in one
+/// transaction (DuckDB #23645). ⛔ Any error → ROLLBACK, never COMMIT (S187,
+/// via `search_index_transaction`). Counts are TABLE READS, never a
+/// statement's change count (S179). Returns the rows stored under the key.
+fn semantic_save_result(
+    conn: &Connection,
+    key: &str,
+    matches: &[(i64, f64)],
+    now: &str,
+    exempt_after: &str,
+    probe: &SemanticJobProbeArg,
+) -> Result<u64, String>
+{
+    if !semantic_key_is_sql_safe(key)
+    {
+        return Err("the search key was not 64 hex digits".to_string());
+    }
+    search_index_transaction(conn, ||
+    {
+        conn.execute_batch("DELETE FROM semantic_stage;")
+            .map_err(|error| format!("clearing the search staging failed: {}", error))?;
+        for chunk in matches.chunks(SEMANTIC_STAGE_INSERT_CHUNK)
+        {
+            let values = chunk
+                .iter()
+                .filter(|(_, score)| score.is_finite())
+                .map(|(image_id, score)| format!("({}, {:e})", image_id, score))
+                .collect::<Vec<_>>();
+            if values.is_empty()
+            {
+                continue;
+            }
+            conn.execute_batch(&format!(
+                "INSERT INTO semantic_stage (image_id, score) VALUES {};",
+                values.join(", ")
+            ))
+            .map_err(|error| format!("staging the matches failed: {}", error))?;
+        }
+        let result_id = conn
+            .query_row("SELECT nextval('semantic_seq')", [], |row| row.get::<_, i64>(0))
+            .map_err(|error| format!("allocating a result generation failed: {}", error))?;
+        conn.execute_batch(&semantic_match_insert_sql(probe, semantic_match_insert_real(result_id)))
+            .map_err(|error| format!("writing the matches failed: {}", error))?;
+        let stored = conn
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_match WHERE result_id = ?1",
+                params![result_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("counting the stored matches failed: {}", error))?;
+        let previous = match conn.query_row(
+            "SELECT result_id FROM semantic_key WHERE key = ?1",
+            params![key],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        {
+            Ok(previous) => Some(previous),
+            Err(duckdb::Error::QueryReturnedNoRows) => None,
+            Err(error) => return Err(format!("reading the stored search failed: {}", error)),
+        };
+        match previous
+        {
+            Some(_) => conn
+                .execute(
+                    "UPDATE semantic_key SET result_id = ?1, rows = ?2, last_used = CAST(?3 AS TIMESTAMP) \
+                     WHERE key = ?4",
+                    params![result_id, stored, now, key],
+                )
+                .map_err(|error| format!("updating the stored search failed: {}", error))?,
+            None => conn
+                .execute(
+                    "INSERT INTO semantic_key (key, result_id, rows, last_used) \
+                     VALUES (?1, ?2, ?3, CAST(?4 AS TIMESTAMP))",
+                    params![key, result_id, stored, now],
+                )
+                .map_err(|error| format!("recording the stored search failed: {}", error))?,
+        };
+        if let Some(Some(old)) = previous
+        {
+            conn.execute("DELETE FROM semantic_match WHERE result_id = ?1", params![old])
+                .map_err(|error| format!("removing the previous result failed: {}", error))?;
+        }
+        conn.execute_batch("DELETE FROM semantic_stage;")
+            .map_err(|error| format!("clearing the search staging failed: {}", error))?;
+        semantic_evict(conn, key, exempt_after, semantic_row_budget(probe))?;
+        Ok(stored.max(0) as u64)
+    })
+}
+
+/// LRU eviction, inside the save transaction: while the stored rows (a table
+/// read) exceed `budget`, delete the least-recently-used key — never `key`
+/// (the one just saved) and never one touched since `exempt_after` — its
+/// generation's rows first, then its key row. Stops when nothing is evictable
+/// (a budget overrun of exempt keys is accepted, never forced).
+fn semantic_evict(conn: &Connection, key: &str, exempt_after: &str, budget: i64) -> Result<(), String>
+{
+    loop
+    {
+        let total = conn
+            .query_row("SELECT COUNT(*) FROM semantic_match", [], |row| row.get::<_, i64>(0))
+            .map_err(|error| format!("counting the stored matches failed: {}", error))?;
+        if total <= budget
+        {
+            return Ok(());
+        }
+        let victim = conn.query_row(
+            "SELECT key_id, result_id FROM semantic_key \
+              WHERE key <> ?1 AND last_used < CAST(?2 AS TIMESTAMP) \
+              ORDER BY last_used ASC, key_id ASC LIMIT 1",
+            params![key, exempt_after],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+        );
+        let (key_id, result_id) = match victim
+        {
+            Ok(victim) => victim,
+            Err(duckdb::Error::QueryReturnedNoRows) => return Ok(()),
+            Err(error) => return Err(format!("choosing a stored search to evict failed: {}", error)),
+        };
+        if let Some(result_id) = result_id
+        {
+            conn.execute("DELETE FROM semantic_match WHERE result_id = ?1", params![result_id])
+                .map_err(|error| format!("evicting a stored result failed: {}", error))?;
+        }
+        conn.execute("DELETE FROM semantic_key WHERE key_id = ?1", params![key_id])
+            .map_err(|error| format!("evicting a stored search failed: {}", error))?;
+    }
+}
+
+/// How a job ended.
+enum SemanticJobEnd
+{
+    Finished(u64),
+    Cancelled,
+    SeedMissing,
+    SeedNotIndexed,
+    StoreUnreadable(String),
+    Failed(String),
+}
+
+/// The job's work. Every catalogue-lock hold is a synchronous block with no
+/// `await` inside it.
+async fn semantic_search_job_body(job: &SemanticJob, spec: &SemanticJobSpec, probe: &SemanticJobProbeArg) -> SemanticJobEnd
+{
+    // similar_to: the seed is resolved against the catalogue BEFORE the store
+    // is opened, so a removed seed is reported without touching Lance.
+    let seed = match spec.query
+    {
+        SemanticQuery::Seed(seed) =>
+        {
+            let resolved = {
+                let catalogue = lock_catalogue();
+                match catalogue.as_ref()
+                {
+                    Some(conn) => semantic_resolve_seed(conn, seed),
+                    None => Err("The catalog is not open.".to_string()),
+                }
+            };
+            match resolved
+            {
+                Ok(SemanticSeed::Missing) => return SemanticJobEnd::SeedMissing,
+                Ok(SemanticSeed::NotIndexed) => return SemanticJobEnd::SeedNotIndexed,
+                Ok(SemanticSeed::Indexed(mapped)) => Some(mapped),
+                Err(message) => return SemanticJobEnd::Failed(message),
+            }
+        }
+        SemanticQuery::Vector(_) => None,
+    };
+    let table = match open_image_embedding_table_for_read("semantic_search").await
+    {
+        Ok(ImageEmbeddingTableState::Present(table)) => Some(table),
+        Ok(ImageEmbeddingTableState::NeverBuilt) => None,
+        Err(message) => return SemanticJobEnd::StoreUnreadable(message),
+    };
+    let query = match (&spec.query, seed, table.as_ref())
+    {
+        (SemanticQuery::Vector(vector), _, _) => vector.clone(),
+        (SemanticQuery::Seed(_), Some(mapped), Some(table)) => match semantic_seed_vector(table, mapped).await
+        {
+            Ok(Some(vector)) => vector,
+            Ok(None) => return SemanticJobEnd::SeedNotIndexed,
+            Err(message) => return SemanticJobEnd::StoreUnreadable(message),
+        },
+        // A seed with no store at all has no vector.
+        (SemanticQuery::Seed(_), _, _) => return SemanticJobEnd::SeedNotIndexed,
+    };
+    // A never-built store answers an honest empty result: nothing is indexed,
+    // so nothing matches (the header's "not indexed yet" note says why).
+    let scan = match table.as_ref()
+    {
+        Some(table) => match semantic_scan_table(table, &query, spec.floor, job, probe).await
+        {
+            Ok(scan) => scan,
+            Err(message) => return SemanticJobEnd::StoreUnreadable(message),
+        },
+        None => SemanticScan { matches: Vec::new(), total: 0, scanned: 0, cancelled: job.is_cancelled() },
+    };
+    if scan.cancelled || job.is_cancelled()
+    {
+        return SemanticJobEnd::Cancelled;
+    }
+    job.update(|status|
+    {
+        status.phase = "saving".to_string();
+        status.done = scan.scanned;
+        status.total = scan.total;
+    });
+    let now = semantic_now();
+    let exempt_after = now - chrono::Duration::seconds(SEMANTIC_EVICTION_EXEMPT_SECONDS);
+    let saved = {
+        let catalogue = lock_catalogue();
+        if job.is_cancelled()
+        {
+            return SemanticJobEnd::Cancelled;
+        }
+        match catalogue.as_ref()
+        {
+            Some(conn) => semantic_save_result(
+                conn,
+                &spec.key,
+                &scan.matches,
+                &semantic_timestamp_text(now),
+                &semantic_timestamp_text(exempt_after),
+                probe,
+            ),
+            None => Err("The catalog is not open.".to_string()),
+        }
+    };
+    match saved
+    {
+        Ok(stored) => SemanticJobEnd::Finished(stored),
+        Err(message) => SemanticJobEnd::Failed(format!("The search results could not be saved: {}", message)),
+    }
+}
+
+/// The job, with its ending written to the status.
+async fn semantic_search_job(job: Arc<SemanticJob>, spec: SemanticJobSpec, probe: SemanticJobProbeArg)
+{
+    let end = semantic_search_job_body(&job, &spec, &probe).await;
+    job.finish(|status| match end
+    {
+        SemanticJobEnd::Finished(stored) =>
+        {
+            status.phase = "finished".to_string();
+            status.matched = stored;
+        }
+        SemanticJobEnd::Cancelled => status.phase = "cancelled".to_string(),
+        SemanticJobEnd::SeedMissing =>
+        {
+            status.phase = "finished".to_string();
+            status.seed_missing = true;
+        }
+        SemanticJobEnd::SeedNotIndexed =>
+        {
+            status.phase = "finished".to_string();
+            status.seed_not_indexed = true;
+        }
+        SemanticJobEnd::StoreUnreadable(message) =>
+        {
+            eprintln!("semantic_search: the index could not be read: {}", message);
+            status.phase = "failed".to_string();
+            status.store_ok = false;
+            status.error = Some(message);
+        }
+        SemanticJobEnd::Failed(message) =>
+        {
+            eprintln!("semantic_search: {}", message);
+            status.phase = "failed".to_string();
+            status.error = Some(message);
+        }
+    });
+}
+
+/// ⭐ The job's own panic capture: work inside the spawned task is outside
+/// the FFI boundary, so a panic there becomes `phase: "failed"` with the
+/// panic's text — never a crash, never a job that polls "reading" forever.
+async fn semantic_search_job_guarded(job: Arc<SemanticJob>, spec: SemanticJobSpec, probe: SemanticJobProbeArg)
+{
+    use futures::FutureExt;
+    let outcome = std::panic::AssertUnwindSafe(semantic_search_job(job.clone(), spec, probe))
+        .catch_unwind()
+        .await;
+    if let Err(payload) = outcome
+    {
+        let message = panic_payload_text(payload.as_ref());
+        eprintln!("semantic_search: a panic inside the job was caught: {}", message);
+        record_dropped_rows("semantic_search_job.panic.query_failed", 1);
+        job.finish(|status|
+        {
+            status.phase = "failed".to_string();
+            status.error = Some(ffi_panic_report("finish the search", &message));
+        });
+    }
+}
+
+/// A start that was refused.
+fn semantic_start_refused(message: String) -> SemanticSearchStart
+{
+    SemanticSearchStart { job_id: 0, accepted: false, error: Some(message) }
+}
+
+/// The start body: validate, then (with the runtime the FFI acquired
+/// fallibly) register and spawn. Returns at once; Lance is never opened on
+/// the calling thread.
+fn semantic_search_start_impl(
+    request: SemanticSearchRequest,
+    runtime: Result<&'static tokio::runtime::Runtime, String>,
+    probe: SemanticJobProbeArg,
+) -> SemanticSearchStart
+{
+    let spec = match semantic_validate_request(&request)
+    {
+        Ok(spec) => spec,
+        Err(message) => return semantic_start_refused(message),
+    };
+    let runtime = match runtime
+    {
+        Ok(runtime) => runtime,
+        Err(message) => return semantic_start_refused(format!("The search could not start: {}", message)),
+    };
+    let job = Arc::new(SemanticJob::new());
+    let job_id = match semantic_register_job(job.clone())
+    {
+        Ok(job_id) => job_id,
+        Err(message) => return semantic_start_refused(message),
+    };
+    runtime.spawn(semantic_search_job_guarded(job, spec, probe));
+    SemanticSearchStart { job_id, accepted: true, error: None }
+}
+
+/// ⭐ Start a search (design §6.1): validates the request and spawns the job
+/// on the core's private runtime (`face_embedding_runtime`, ruling 79 — the
+/// Rust work leaves the polling thread), returning at once with a job id.
+/// `accepted = false` + the reason for an invalid request, a model-version
+/// mismatch, an unavailable runtime, or a full registry.
+pub async fn semantic_search_start(request: SemanticSearchRequest) -> SemanticSearchStart
+{
+    ffi_panic_boundary(
+        "semantic_search_start.panic.query_failed",
+        ||
+        {
+            let runtime = face_embedding_runtime("semantic_search_start.face_runtime_unavailable.query_failed");
+            semantic_search_start_impl(request, runtime, None)
+        },
+        |panic| semantic_start_refused(ffi_panic_report("start the search", &panic)),
+    )
+}
+
+/// A job's phase and real counts. Takes only the registry mutex. An unknown
+/// (or expired) id answers `phase: "unknown"`.
+pub async fn semantic_search_poll(job_id: u64) -> SemanticSearchStatus
+{
+    ffi_panic_boundary(
+        "semantic_search_poll.panic.query_failed",
+        ||
+        {
+            let job = lock_semantic_jobs().jobs.get(&job_id).cloned();
+            match job
+            {
+                Some(job) => job.snapshot(),
+                None => semantic_search_status_unknown(None),
+            }
+        },
+        |panic| semantic_search_status_unknown(Some(ffi_panic_report("check on the search", &panic))),
+    )
+}
+
+/// Stop a job at its next batch boundary: nothing is written, and the key's
+/// previous stored result stays. A save already under way finishes (it is
+/// one transaction). An unknown id is a no-op. Takes only the registry mutex.
+pub async fn semantic_search_cancel(job_id: u64)
+{
+    ffi_panic_boundary(
+        "semantic_search_cancel.panic.query_failed",
+        ||
+        {
+            let job = lock_semantic_jobs().jobs.get(&job_id).cloned();
+            if let Some(job) = job
+            {
+                job.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        },
+        |_panic| (),
+    )
+}
+
+/// The status of a job id the registry does not hold.
+fn semantic_search_status_unknown(error: Option<String>) -> SemanticSearchStatus
+{
+    SemanticSearchStatus
+    {
+        phase: "unknown".to_string(),
+        done: 0,
+        total: 0,
+        matched: 0,
+        finished: true,
+        store_ok: true,
+        seed_missing: false,
+        seed_not_indexed: false,
+        error,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rebuild Search Index (slice 1 review finding 5)
+// ---------------------------------------------------------------------------
+
+/// Drop `image_embeddings` and clear the two image-vector queues, under the
+/// ONE store write lock (P14). A missing store or table is success. The
+/// queues are cleared only after the drop succeeded: then every photo is owed
+/// again (nothing is stale) and nothing is left to delete. Never touches
+/// `face_embeddings`. Lock order store → catalogue, the slice-1 upsert's.
+async fn reset_image_embeddings_impl() -> Result<(), String>
+{
+    const OPERATION: &str = "reset_image_embeddings";
+    let _store_write = FACE_EMBEDDING_STORE_WRITE_LOCK.lock().await;
+    let uri = face_embedding_store_uri()
+        .ok_or_else(|| format!("{}: catalogue path is not initialized", OPERATION))?;
+    let store_exists = match std::fs::metadata(&uri)
+    {
+        Ok(metadata) if metadata.is_dir() => true,
+        Ok(_) => return Err(format!("{}: vector store path is not a directory: {}", OPERATION, uri)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(format!("{}: vector store metadata failed for {}: {}", OPERATION, uri, error)),
+    };
+    if store_exists
+    {
+        let database = lancedb::connect(&uri)
+            .execute()
+            .await
+            .map_err(|error| format!("{}: vector store connect failed: {}", OPERATION, error))?;
+        let table_names = database
+            .table_names()
+            .execute()
+            .await
+            .map_err(|error| format!("{}: vector table census failed: {}", OPERATION, error))?;
+        if table_names.iter().any(|name| name == IMAGE_EMBEDDING_TABLE)
+        {
+            match database.drop_table(IMAGE_EMBEDDING_TABLE, &[]).await
+            {
+                Ok(()) | Err(lancedb::Error::TableNotFound { .. }) => {}
+                Err(error) => return Err(format!("{}: the search index could not be removed: {}", OPERATION, error)),
+            }
+        }
+    }
+    let catalogue = lock_catalogue();
+    let conn = catalogue
+        .as_ref()
+        .ok_or_else(|| format!("{}: the catalog is not open", OPERATION))?;
+    search_index_transaction(conn, ||
+    {
+        conn.execute_batch("DELETE FROM image_vector_stale; DELETE FROM image_vector_pending_delete;")
+            .map_err(|error| format!("{}: clearing the search-index queues failed: {}", OPERATION, error))
+    })
+}
+
+/// ⭐ Rebuild Search Index's reset: drop the image-vector table and clear its
+/// queues, on the core's private runtime. Swift decides when it may run.
+pub async fn reset_image_embeddings() -> ImageEmbeddingResetResult
+{
+    let failed = |message: String| ImageEmbeddingResetResult { ok: false, error: Some(message) };
+    let spawned = ffi_panic_boundary(
+        "reset_image_embeddings.panic.query_failed",
+        ||
+        {
+            face_embedding_runtime("reset_image_embeddings.face_runtime_unavailable.query_failed")
+                .map(|runtime| runtime.spawn(reset_image_embeddings_impl()))
+        },
+        |panic| Err(ffi_panic_report("reset the search index", &panic)),
+    );
+    match spawned
+    {
+        Ok(task) => match task.await
+        {
+            Ok(Ok(())) => ImageEmbeddingResetResult { ok: true, error: None },
+            Ok(Err(message)) =>
+            {
+                eprintln!("{}", message);
+                failed(message)
+            }
+            Err(error) =>
+            {
+                let message = format!("reset_image_embeddings: the reset task failed: {}", error);
+                eprintln!("{}", message);
+                failed(message)
+            }
+        },
+        Err(message) => failed(message),
     }
 }
 
@@ -45816,7 +47670,11 @@ fn remove_catalogue_rows(
 ) -> Result<CatalogueRemovalOutcome, String>
 {
     let result = removal_freeze_sets(conn, &selection).and_then(|(doomed_faces, doomed_images)| {
-        removal_transaction(conn, probe).map(|deleted| CatalogueRemovalOutcome
+        // ⭐ Semantic search, slice 2: asked ONCE, in the autocommit window,
+        // whether the search-result temp table exists — a missing temp table
+        // must never roll back a removal (slice 1 review deviation 1).
+        let semantic_matches = removal_semantic_matches_present(conn);
+        removal_transaction(conn, probe, semantic_matches).map(|deleted| CatalogueRemovalOutcome
         {
             deleted,
             doomed_faces,
@@ -45988,11 +47846,15 @@ fn removal_freeze_sets(conn: &Connection, selection: &RemovalSelection<'_>) -> R
 /// Steps 1–5: `BEGIN` → capture → cascade → delete → `COMMIT`, with `ROLLBACK`
 /// on ANY error. Returns the `images` DELETE's reported count (return value
 /// only — S179).
-fn removal_transaction(conn: &Connection, probe: RemovalProbeRef<'_>) -> Result<u64, String>
+fn removal_transaction(
+    conn: &Connection,
+    probe: RemovalProbeRef<'_>,
+    semantic_matches: bool,
+) -> Result<u64, String>
 {
     conn.execute_batch("BEGIN TRANSACTION;")
         .map_err(|e| format!("BEGIN failed: {}", e))?;
-    match removal_transaction_body(conn, probe)
+    match removal_transaction_body(conn, probe, semantic_matches)
     {
         Ok(deleted) => match conn.execute_batch("COMMIT;")
         {
@@ -46011,7 +47873,32 @@ fn removal_transaction(conn: &Connection, probe: RemovalProbeRef<'_>) -> Result<
     }
 }
 
-fn removal_transaction_body(conn: &Connection, probe: RemovalProbeRef<'_>) -> Result<u64, String>
+/// ⭐ Semantic search, slice 2 — whether this connection holds the
+/// `semantic_match` temp table (`duckdb_tables()`, `temporary`). A failed
+/// census answers `false` with a log line: the removal then skips the
+/// semantic cleanup rather than risk rolling back on a table it cannot see.
+fn removal_semantic_matches_present(conn: &Connection) -> bool
+{
+    match conn.query_row(
+        "SELECT COUNT(*) FROM duckdb_tables() WHERE temporary AND table_name = 'semantic_match'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    {
+        Ok(count) => count > 0,
+        Err(e) =>
+        {
+            eprintln!("[removal] the semantic-search table census failed ({}); its cleanup is skipped", e);
+            false
+        }
+    }
+}
+
+fn removal_transaction_body(
+    conn: &Connection,
+    probe: RemovalProbeRef<'_>,
+    semantic_matches: bool,
+) -> Result<u64, String>
 {
     // --- 2. CAPTURE, before the `images` DELETE (step 4). ⚠️ The order that is
     // --- LOAD-BEARING here is 2c before 2d: the keyword rows are captured by
@@ -46114,6 +48001,17 @@ fn removal_transaction_body(conn: &Connection, probe: RemovalProbeRef<'_>) -> Re
           WHERE image_id IN (SELECT id FROM pl_removal_doomed);",
     )
     .map_err(|e| format!("queueing the image vectors for deletion failed: {}", e))?;
+
+    // 3a''. ⭐ Semantic search slice 2 (design §8): a removed photo leaves the
+    //     stored search results in the same transaction as its row — only
+    //     when the temp table exists (asked in the autocommit window).
+    if semantic_matches
+    {
+        conn.execute_batch(
+            "DELETE FROM semantic_match WHERE image_id IN (SELECT id FROM pl_removal_doomed);",
+        )
+        .map_err(|e| format!("removing the photos from stored search results failed: {}", e))?;
+    }
 
     // 3b. Assignments, then the observations — in that order. The two image
     //     limbs also sweep an assignment left dangling by an earlier writer.
@@ -60228,6 +62126,8 @@ mod cross_store_tests
             "delete_face_vectors_by_observation_ids",
             "upsert_image_embeddings_impl",
             "retry_pending_image_vector_deletes_probed",
+            // ⭐ Semantic search slice 2: Rebuild Search Index's drop.
+            "reset_image_embeddings_impl",
         ];
         let mut spans = Vec::new();
         for writer in writers
@@ -60260,10 +62160,12 @@ mod cross_store_tests
         let image_merge = body_span(&product, "upsert_image_embeddings_impl")?;
         let image_drain = body_span(&product, "drain_pending_image_vector_deletes")?;
         let image_create = body_span(&product, "open_or_create_image_embedding_table")?;
+        let reset = body_span(&product, "reset_image_embeddings_impl")?;
         for (needle, allowed) in [
             (".merge_insert(", vec![merge, image_merge]),
             (".delete(&", vec![drain, delete, image_drain]),
             (".create_empty_table(", vec![create, image_create]),
+            (".drop_table(", vec![reset]),
         ]
         {
             for at in occurrences(text, needle)
@@ -60324,6 +62226,23 @@ mod cross_store_tests
             assert!(store_write_lock_census(&mutated).is_err(), "P14/probe-decoy {}", decoy);
         }
         assert!(store_write_lock_census("").is_err(), "P14/probe-empty");
+
+        // ⭐ Semantic search slice 2 — a SECOND, unlocked `.drop_table(` in
+        // product code (here, a rogue helper beside the real one) fails P14:
+        // the only store drop is Rebuild Search Index's, under the lock.
+        let anchor = "/// The v3 queue walked from the catalogue";
+        let at = source.find(anchor).expect("a product anchor for the rogue drop");
+        let mut rogue = source.to_string();
+        rogue.insert_str(
+            at,
+            "async fn rogue_drop(d: &lancedb::Connection) { let _ = d.drop_table(\"image_embeddings\", &[]).await; }\n",
+        );
+        let verdict = store_write_lock_census(&rogue);
+        assert!(
+            verdict.as_ref().err().map_or(false, |reason| reason.contains(".drop_table(")),
+            "P14/probe-rogue-drop: {:?}",
+            verdict
+        );
     }
 
     /// P14's RUNTIME TWIN, its own test so a mutation that fails the source
@@ -67830,12 +69749,13 @@ mod scoped_gallery_id_projection_tests
                 let flat_ids = execute_ordered_id_query(
                     conn,
                     &build_filter_predicate(&flat, &flat_conns),
-                    order_by_for_filter(find),
+                    &order_by_for_filter(find),
                     false,
                     false,
                     false,
                     "",
                     MediaType::Both,
+                    None,
                 )
                 .expect("flat fold");
                 let scoped = query_image_ids_scoped_gallery_impl(
@@ -70206,5 +72126,1267 @@ mod negative_detection_v3_tests
         }
         *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+// ============================================================================
+// ⭐ Semantic search, slice 2 — the cargo tests (BRIEF-R "Tests"; design §12's
+// Rust row as it falls to slice 2). Every catalogue is a fresh file under the
+// temp directory, fenced against extension fetches; every test that touches
+// the process-global catalogue or calls an FFI entry point serialises on
+// `swallowed_failure_tests::GLOBAL_CATALOGUE_LOCK`.
+// ============================================================================
+#[cfg(test)]
+mod semantic_search_tests
+{
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    const ALGO: &str = "similar-test-v1";
+
+    struct Fixture
+    {
+        dir: std::path::PathBuf,
+        catalogue: std::path::PathBuf,
+    }
+
+    impl Fixture
+    {
+        fn vectors(&self) -> std::path::PathBuf
+        {
+            self.dir.join("vectors.lancedb")
+        }
+    }
+
+    impl Drop for Fixture
+    {
+        fn drop(&mut self)
+        {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A fresh, fenced catalogue WITH the temp tables (as `initialize_catalogue`
+    /// leaves the global connection).
+    fn fresh(tag: &str) -> (Fixture, Connection)
+    {
+        let (fixture, conn) = fresh_without_temp_tables(tag);
+        create_semantic_search_temp_tables(&conn).expect("temp tables");
+        (fixture, conn)
+    }
+
+    fn fresh_without_temp_tables(tag: &str) -> (Fixture, Connection)
+    {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("plcore-s2-search-{}-{}-{}", std::process::id(), n, tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        let catalogue = dir.join("catalogue.db");
+        let conn = open_and_migrate_catalogue(&catalogue).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH.
+        fence_connection_against_extension_fetches(&conn);
+        (Fixture { dir, catalogue }, conn)
+    }
+
+    fn serial() -> std::sync::MutexGuard<'static, ()>
+    {
+        super::swallowed_failure_tests::GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct Installed;
+
+    impl Installed
+    {
+        fn new(fixture: &Fixture, conn: Connection) -> Self
+        {
+            *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(conn);
+            *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fixture.catalogue.clone());
+            CATALOGUE.clear_poison();
+            CATALOGUE_PATH.clear_poison();
+            Installed
+        }
+    }
+
+    impl Drop for Installed
+    {
+        fn drop(&mut self)
+        {
+            *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
+
+    fn block<F: std::future::Future>(future: F) -> F::Output
+    {
+        FACE_EMBEDDING_RUNTIME.block_on(future)
+    }
+
+    /// Run `body` against the installed global connection.
+    fn with_global<T>(body: impl FnOnce(&Connection) -> T) -> T
+    {
+        let catalogue = lock_catalogue();
+        body(catalogue.as_ref().expect("installed catalogue"))
+    }
+
+    fn insert(conn: &Connection, path: &str, kind: &str, capture: &str) -> i64
+    {
+        let file_name = path.rsplit('/').next().unwrap_or(path).to_string();
+        let stem = file_name.split('.').next().unwrap_or(&file_name).to_string();
+        let directory = path[..path.len() - file_name.len() - 1].to_string();
+        conn.query_row(
+            "INSERT INTO images (file_path, file_size, file_name, file_stem, image_kind, directory_path, \
+             created_timestamp, modified_timestamp, is_video, capture_datetime, camera_model, pixel_width, pixel_height) \
+             VALUES (?1, 10, ?2, ?3, ?4, ?5, 0, 0, FALSE, ?6, 'cam', 100, 100) RETURNING id",
+            params![path, file_name, stem, kind, directory, capture],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("insert photo")
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64
+    {
+        conn.query_row(sql, [], |row| row.get::<_, i64>(0)).expect(sql)
+    }
+
+    /// A unit vector whose dot product with `axis(0)` is `cos`.
+    fn at(cos: f32) -> Vec<f32>
+    {
+        let mut vector = vec![0.0f32; SEMANTIC_DIMENSION];
+        vector[0] = cos;
+        vector[1] = (1.0 - cos * cos).max(0.0).sqrt();
+        vector
+    }
+
+    fn axis(index: usize) -> Vec<f32>
+    {
+        let mut vector = vec![0.0f32; SEMANTIC_DIMENSION];
+        vector[index] = 1.0;
+        vector
+    }
+
+    fn bytes(vector: &[f32]) -> Vec<u8>
+    {
+        vector.iter().flat_map(|value| value.to_le_bytes()).collect()
+    }
+
+    fn embedding(image_id: i64, vector: &[f32]) -> ImageEmbeddingRecord
+    {
+        ImageEmbeddingRecord
+        {
+            image_id,
+            model_name: SEMANTIC_MODEL_NAME.to_string(),
+            model_version: SEMANTIC_MODEL_VERSION.to_string(),
+            preprocessing_version: SEMANTIC_PREPROCESSING_VERSION.to_string(),
+            embedding_dimension: SEMANTIC_DIMENSION as u32,
+            vector: bytes(vector),
+        }
+    }
+
+    fn store(records: Vec<ImageEmbeddingRecord>)
+    {
+        let result = block(upsert_image_embeddings_impl(records, Vec::new()));
+        assert_eq!(result.status, "stored", "{:?}", result.error);
+    }
+
+    fn predicate(kind: &str, value: &str, breadth: &str, num: Option<f64>) -> QueryPredicate
+    {
+        QueryPredicate
+        {
+            kind: kind.to_string(),
+            day: None,
+            day_end: None,
+            op: Some(breadth.to_string()),
+            stars: None,
+            value: Some(value.to_string()),
+            num,
+            num_end: None,
+        }
+    }
+
+    fn looks(words: &str, num: Option<f64>) -> QueryPredicate
+    {
+        predicate(SEMANTIC_KIND_LOOKS_LIKE, words, "medium", num)
+    }
+
+    fn keyword(label: &str) -> QueryPredicate
+    {
+        QueryPredicate
+        {
+            kind: "filename_contains".to_string(),
+            day: None,
+            day_end: None,
+            op: None,
+            stars: None,
+            value: Some(label.to_string()),
+            num: None,
+            num_end: None,
+        }
+    }
+
+    fn request(kind: &str, value: &str, breadth: &str, vector: &[f32]) -> SemanticSearchRequest
+    {
+        SemanticSearchRequest
+        {
+            kind: kind.to_string(),
+            value: value.to_string(),
+            breadth: breadth.to_string(),
+            query_vector: bytes(vector),
+            model_name: SEMANTIC_MODEL_NAME.to_string(),
+            model_version: SEMANTIC_MODEL_VERSION.to_string(),
+            preprocessing_version: SEMANTIC_PREPROCESSING_VERSION.to_string(),
+        }
+    }
+
+    fn wait(job_id: u64) -> SemanticSearchStatus
+    {
+        for _ in 0..6_000
+        {
+            let status = block(semantic_search_poll(job_id));
+            if status.finished
+            {
+                return status;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("job {} never finished", job_id);
+    }
+
+    fn run(request: SemanticSearchRequest, probe: SemanticJobProbeArg) -> SemanticSearchStatus
+    {
+        let start = semantic_search_start_impl(request, face_embedding_runtime("semantic_search_tests"), probe);
+        assert!(start.accepted, "{:?}", start.error);
+        wait(start.job_id)
+    }
+
+    fn now_text() -> String
+    {
+        semantic_timestamp_text(semantic_now())
+    }
+
+    fn save(conn: &Connection, key: &str, matches: &[(i64, f64)]) -> Result<u64, String>
+    {
+        save_with(conn, key, matches, None)
+    }
+
+    fn save_with(conn: &Connection, key: &str, matches: &[(i64, f64)], probe: SemanticJobProbeArg) -> Result<u64, String>
+    {
+        let now = semantic_now();
+        let exempt = now - chrono::Duration::seconds(SEMANTIC_EVICTION_EXEMPT_SECONDS);
+        semantic_save_result(conn, key, matches, &semantic_timestamp_text(now), &semantic_timestamp_text(exempt), &probe)
+    }
+
+    fn stored_ids(conn: &Connection, key: &str) -> Vec<(i64, f64)>
+    {
+        let mut statement = conn
+            .prepare(
+                "SELECT m.image_id, m.score FROM semantic_match m JOIN semantic_key k ON m.result_id = k.result_id \
+                 WHERE k.key = ?1 ORDER BY m.image_id",
+            )
+            .expect("prepare");
+        let rows = statement.query_map(params![key], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))).expect("query");
+        rows.map(|row| row.expect("row")).collect()
+    }
+
+    fn generations(conn: &Connection) -> i64
+    {
+        count(conn, "SELECT COUNT(DISTINCT result_id) FROM semantic_match")
+    }
+
+    fn key_of(p: &QueryPredicate) -> String
+    {
+        semantic_predicate_key(p).expect("a key")
+    }
+
+    fn page_ids(conn: &Connection, predicates: &[QueryPredicate], connectors: &[Connector], limit: u32, offset: u32, dup: bool, similar: bool) -> Vec<i64>
+    {
+        query_images_scoped_gallery_impl(
+            conn, predicates, connectors, &[], &[], limit, offset, dup, true, similar, ALGO, MediaType::Both,
+        )
+        .iter()
+        .map(|record| record.id)
+        .collect()
+    }
+
+    // ------------------------------------------------------------------
+    // The key
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_sha256_matches_the_reference_vectors_and_the_sha2_crate()
+    {
+        use sha2::Digest;
+        assert_eq!(semantic_sha256_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(semantic_sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(
+            semantic_sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        for length in [0usize, 1, 55, 56, 63, 64, 65, 119, 120, 1000]
+        {
+            let data = (0..length).map(|i| (i * 31 % 251) as u8).collect::<Vec<u8>>();
+            let reference = sha2::Sha256::digest(&data).iter().map(|byte| format!("{:02x}", byte)).collect::<String>();
+            assert_eq!(semantic_sha256_hex(&data), reference, "length {}", length);
+        }
+    }
+
+    #[test]
+    fn the_key_is_64_hex_digits_for_hostile_words()
+    {
+        for words in [
+            "a dog",
+            "it's \"quoted\"",
+            "back\\slash \\' \\\"",
+            "'); DROP TABLE images; --",
+            "x' OR '1'='1",
+            "日本の桜 🌸",
+            "\n\t\0",
+        ]
+        {
+            let key = semantic_result_key(SEMANTIC_KIND_LOOKS_LIKE, words, "medium").expect("a key");
+            assert_eq!(key.len(), 64, "{:?}", words);
+            assert!(key.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "{:?} → {}", words, key);
+            assert!(semantic_key_is_sql_safe(&key));
+
+            let sql = semantic_predicate_sql(&looks(words, None));
+            assert_eq!(
+                sql,
+                format!(
+                    "(id IN (SELECT m.image_id FROM semantic_match m \
+                     JOIN semantic_key k ON m.result_id = k.result_id WHERE k.key = '{}'))",
+                    key
+                ),
+                "the SQL is the template plus the hex key — the words never reach it"
+            );
+        }
+        // ⭐ Review LOW-1: the second layer, pinned on its own.
+        let real = semantic_result_key(SEMANTIC_KIND_LOOKS_LIKE, "a dog", "medium").expect("a key");
+        assert!(semantic_key_is_sql_safe(&real), "a real key passes");
+        assert!(!semantic_key_is_sql_safe("'"), "a quote is refused");
+        assert!(!semantic_key_is_sql_safe(&real[..63]), "63 hex digits are refused");
+        assert!(!semantic_key_is_sql_safe(&format!("{}a", real)), "65 hex digits are refused");
+        assert!(!semantic_key_is_sql_safe(&real.to_uppercase()), "uppercase hex is refused");
+        assert!(!semantic_key_is_sql_safe(&format!("{}'", &real[..63])), "a quote in the 64th place is refused");
+        assert!(!semantic_key_is_sql_safe(""), "empty is refused");
+    }
+
+    #[test]
+    fn the_key_ignores_num_and_separates_everything_else()
+    {
+        let ordered = key_of(&looks("a dog", Some(1.0)));
+        assert_eq!(ordered, key_of(&looks("a dog", Some(0.0))), "num = 0 and num = 1 share the key");
+        assert_eq!(ordered, key_of(&looks("a dog", None)), "num = null shares the key");
+        assert_ne!(ordered, key_of(&predicate(SEMANTIC_KIND_LOOKS_LIKE, "a dog", "wide", None)), "breadth");
+        assert_ne!(ordered, key_of(&looks("a cat", None)), "value");
+        assert_ne!(
+            key_of(&predicate(SEMANTIC_KIND_SIMILAR_TO, "12", "medium", None)),
+            key_of(&predicate(SEMANTIC_KIND_LOOKS_LIKE, "12", "medium", None)),
+            "kind"
+        );
+        // Length prefixes: moving a byte across a field boundary changes the key.
+        assert_ne!(
+            semantic_result_key(SEMANTIC_KIND_LOOKS_LIKE, "ab", "medium"),
+            semantic_result_key(SEMANTIC_KIND_LOOKS_LIKE, "a", "bmedium")
+        );
+        // similar_to canonicalizes the id.
+        assert_eq!(
+            semantic_result_key(SEMANTIC_KIND_SIMILAR_TO, "042", "narrow"),
+            semantic_result_key(SEMANTIC_KIND_SIMILAR_TO, "42", "narrow")
+        );
+        // No key: another kind, another breadth, an empty description, a bad id.
+        assert!(semantic_result_key("keyword_has", "x", "medium").is_none());
+        assert!(semantic_result_key(SEMANTIC_KIND_LOOKS_LIKE, "x", "Medium").is_none());
+        assert!(semantic_result_key(SEMANTIC_KIND_LOOKS_LIKE, "   ", "medium").is_none());
+        assert!(semantic_result_key(SEMANTIC_KIND_SIMILAR_TO, "-3", "medium").is_none());
+        assert!(semantic_result_key(SEMANTIC_KIND_SIMILAR_TO, "abc", "medium").is_none());
+        assert_eq!(semantic_predicate_sql(&predicate(SEMANTIC_KIND_LOOKS_LIKE, "x", "huge", None)), "(FALSE)");
+    }
+
+    #[test]
+    fn the_model_constants_equal_the_swift_constants()
+    {
+        let swift = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../PhotoLibrarian/PhotoLibrarian/SemanticSearchModels.swift"),
+        );
+        let Ok(swift) = swift else
+        {
+            println!("SKIPPED: SemanticSearchModels.swift is not beside the core (lane G's source lock owns this)");
+            return;
+        };
+        for (name, value) in [
+            ("modelName", SEMANTIC_MODEL_NAME),
+            ("modelVersion", SEMANTIC_MODEL_VERSION),
+            ("preprocessingVersion", SEMANTIC_PREPROCESSING_VERSION),
+        ]
+        {
+            assert!(swift.contains(&format!("static let {} = \"{}\"", name, value)), "{} = {}", name, value);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Ordering and the cap rule (pure)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ordering_follows_the_last_ordering_condition_and_num_zero_falls_through()
+    {
+        let a = looks("a", None);
+        let b = looks("b", Some(1.0));
+        let filter_only = looks("c", Some(0.0));
+        assert_eq!(order_by_for_filter(&[a.clone(), b.clone()]), semantic_score_order_by(&key_of(&b)));
+        assert_eq!(order_by_for_filter(&[b.clone(), filter_only.clone()]), semantic_score_order_by(&key_of(&b)), "a later num = 0 does not order");
+        assert_eq!(order_by_for_filter(&[filter_only.clone()]), DEFAULT_FILTER_ORDER_BY, "num = 0 → the existing rules");
+        assert_eq!(order_by_for_filter(&[keyword("x")]), DEFAULT_FILTER_ORDER_BY, "byte-identical without a semantic condition");
+        assert!(semantic_score_order_by("k").contains("DESC NULLS LAST, capture_datetime DESC NULLS LAST"));
+    }
+
+    #[test]
+    fn the_cap_rule_reads_the_last_condition_joined_by_and()
+    {
+        let ordered = looks("a", None);
+        let filter_only = looks("a", Some(0.0));
+        let k = keyword("x");
+        assert!(semantic_display_cap_applies(&[ordered.clone()], &[]), "one ordering condition: cap");
+        assert!(semantic_display_cap_applies(&[k.clone(), ordered.clone()], &[Connector::And]), "last, joined by AND: cap");
+        assert!(semantic_display_cap_applies(&[k.clone(), ordered.clone()], &[]), "a missing connector folds as AND");
+        assert!(!semantic_display_cap_applies(&[k.clone(), ordered.clone()], &[Connector::Or]), "under OR: no cap");
+        assert!(!semantic_display_cap_applies(&[k.clone(), ordered.clone()], &[Connector::Xor]), "under XOR: no cap");
+        assert!(!semantic_display_cap_applies(&[ordered.clone(), k.clone()], &[Connector::And]), "first of several: no cap");
+        assert!(!semantic_display_cap_applies(&[filter_only.clone()], &[]), "num = 0: never capped");
+        assert!(!semantic_display_cap_applies(&[k.clone(), filter_only], &[Connector::And]));
+        assert!(!semantic_display_cap_applies(&[k], &[]), "no semantic condition: no cap");
+        assert_eq!(semantic_id_projection_cap(&[ordered], &[]), Some(10_000));
+    }
+
+    // ------------------------------------------------------------------
+    // Temp tables, prepare
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn the_temp_tables_exist_right_after_catalogue_open_so_a_condition_binds_before_any_search()
+    {
+        let _serial = serial();
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("plcore-s2-init-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&dir);
+        let catalogue = dir.join("catalogue.db");
+        assert!(block(initialize_catalogue(catalogue.to_string_lossy().into_owned())));
+        let fixture = Fixture { dir, catalogue };
+        let taken = CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take().expect("opened");
+        fence_connection_against_extension_fetches(&taken);
+        let _installed = Installed::new(&fixture, taken);
+        with_global(|conn|
+        {
+            assert!(semantic_temp_tables_present(conn).expect("census"), "all four objects exist");
+            insert(conn, "/a/p1.jpg", "jpeg", "2026:01:01 10:00:00");
+        });
+        let predicates = vec![looks("a dog", None)];
+        let records = block(query_images_gallery(predicates.clone(), vec![], 50, 0, true, true, true, ALGO.to_string(), MediaType::Both));
+        assert!(records.is_empty(), "binds and matches nothing before any search");
+        let total = block(count_query_images_gallery(predicates.clone(), vec![], true, true, true, ALGO.to_string(), MediaType::Both));
+        assert_eq!(total, 0);
+        let prepared = block(semantic_search_prepare(predicates, vec![]));
+        assert_eq!(prepared.error, None);
+        assert_eq!(prepared.missing, vec![0]);
+        assert!(prepared.orders_by_score && prepared.display_cap_applies);
+        assert_eq!(prepared.display_cap, 10_000);
+    }
+
+    #[test]
+    fn prepare_reports_missing_keys_touches_present_ones_and_never_runs_a_search()
+    {
+        let (_fixture, conn) = fresh("prepare");
+        let a = looks("a", None);
+        let b = predicate(SEMANTIC_KIND_SIMILAR_TO, "7", "wide", Some(0.0));
+        save(&conn, &key_of(&a), &[]).expect("save a");
+        conn.execute("UPDATE semantic_key SET last_used = CAST('2001-01-01 00:00:00' AS TIMESTAMP)", []).expect("age");
+        let now = now_text();
+        let prepared = semantic_search_prepare_impl(&conn, &[keyword("x"), a.clone(), b.clone()], &[Connector::And, Connector::Or], &now);
+        assert_eq!(prepared.error, None);
+        assert_eq!(prepared.missing, vec![2], "only the unstored key is missing, by its index");
+        assert!(prepared.orders_by_score, "a orders");
+        assert!(!prepared.display_cap_applies, "the ordering condition is not last");
+        let touched = conn
+            .query_row("SELECT CAST(last_used AS VARCHAR) FROM semantic_key", [], |row| row.get::<_, String>(0))
+            .expect("touched");
+        assert!(!touched.starts_with("2001"), "the present key was touched: {}", touched);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM semantic_key"), 1, "no search ran");
+        // No semantic condition: nothing missing, no error.
+        let plain = semantic_search_prepare_impl(&conn, &[keyword("x")], &[], &now);
+        assert_eq!(plain.error, None);
+        assert!(plain.missing.is_empty() && !plain.orders_by_score);
+        // A malformed condition is an error, never a silent (FALSE).
+        let bad = semantic_search_prepare_impl(&conn, &[predicate(SEMANTIC_KIND_LOOKS_LIKE, "", "medium", None)], &[], &now);
+        assert!(bad.error.is_some());
+    }
+
+    #[test]
+    fn prepare_answers_error_when_the_temp_tables_are_absent()
+    {
+        let (_fixture, conn) = fresh_without_temp_tables("absent");
+        let prepared = semantic_search_prepare_impl(&conn, &[looks("a", None)], &[], &now_text());
+        assert_eq!(prepared.error.as_deref(), Some(SEMANTIC_TABLES_MISSING_MESSAGE));
+        assert!(prepared.missing.is_empty());
+        // …and with the catalogue closed, the FFI answers error too.
+        let _serial = serial();
+        let prepared = block(semantic_search_prepare(vec![looks("a", None)], vec![]));
+        assert_eq!(prepared.error.as_deref(), Some("The catalog is not open."));
+    }
+
+    // ------------------------------------------------------------------
+    // The save
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn resaving_a_key_leaves_exactly_one_result_generation_even_after_a_rollback()
+    {
+        let (_fixture, conn) = fresh("resave");
+        let p1 = insert(&conn, "/a/p1.jpg", "jpeg", "2026:01:01 10:00:00");
+        let p2 = insert(&conn, "/a/p2.jpg", "jpeg", "2026:01:01 10:00:01");
+        let key = key_of(&looks("a", None));
+        assert_eq!(save(&conn, &key, &[(p1, 0.5)]).expect("first"), 1);
+        assert_eq!(save(&conn, &key, &[(p1, 0.4), (p2, 0.3)]).expect("second"), 2);
+        assert_eq!(generations(&conn), 1);
+        assert_eq!(stored_ids(&conn, &key), vec![(p1, 0.4), (p2, 0.3)]);
+        // An injected failure after the staging writes: ROLLBACK, the previous
+        // result stays, nothing staged survives.
+        let failing = Some(Arc::new(SemanticJobProbe { save_insert_sql: Some("INSERT INTO no_such_table VALUES (1);".to_string()), ..Default::default() }));
+        let error = save_with(&conn, &key, &[(p2, 0.9)], failing).expect_err("the injected failure");
+        assert!(error.contains("rolled back"), "{}", error);
+        assert_eq!(stored_ids(&conn, &key), vec![(p1, 0.4), (p2, 0.3)], "the previous result stays");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM semantic_stage"), 0, "the staging was rolled back");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM semantic_key"), 1);
+        assert_eq!(save(&conn, &key, &[(p2, 0.8)]).expect("after the rollback"), 1);
+        assert_eq!(generations(&conn), 1);
+        assert_eq!(stored_ids(&conn, &key), vec![(p2, 0.8)]);
+        let rows = conn.query_row("SELECT rows FROM semantic_key", [], |row| row.get::<_, i64>(0)).expect("rows");
+        assert_eq!(rows, 1, "rows is a table read");
+    }
+
+    #[test]
+    fn eviction_drops_the_least_recently_used_key_but_never_one_touched_in_the_last_60_seconds()
+    {
+        let (_fixture, conn) = fresh("evict");
+        let ids = (0..6).map(|i| insert(&conn, &format!("/e/p{}.jpg", i), "jpeg", "2026:01:01 10:00:00")).collect::<Vec<_>>();
+        let old = key_of(&looks("old", None));
+        let older = key_of(&looks("older", None));
+        let recent = key_of(&looks("recent", None));
+        let current = key_of(&looks("current", None));
+        save(&conn, &older, &[(ids[0], 0.5), (ids[1], 0.5)]).expect("older");
+        save(&conn, &old, &[(ids[2], 0.5), (ids[3], 0.5)]).expect("old");
+        save(&conn, &recent, &[(ids[4], 0.5)]).expect("recent");
+        conn.execute("UPDATE semantic_key SET last_used = CAST('2001-01-01 00:00:00' AS TIMESTAMP) WHERE key = ?1", params![older]).expect("age");
+        conn.execute("UPDATE semantic_key SET last_used = CAST('2001-01-02 00:00:00' AS TIMESTAMP) WHERE key = ?1", params![old]).expect("age");
+        // Budget 4: 5 rows stored + 1 new = 6 → evict the LRU (older), then 4 ≤ 4.
+        let budget = Some(Arc::new(SemanticJobProbe { row_budget: Some(4), ..Default::default() }));
+        save_with(&conn, &current, &[(ids[5], 0.5)], budget.clone()).expect("current");
+        assert!(stored_ids(&conn, &older).is_empty(), "the LRU key went");
+        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM semantic_key WHERE key = '{}'", older)), 0);
+        assert_eq!(stored_ids(&conn, &old).len(), 2, "the next-oldest stays (the budget is met)");
+        // Budget 1: old is evictable; recent (touched now) and current are exempt.
+        save_with(&conn, &current, &[(ids[5], 0.5)], Some(Arc::new(SemanticJobProbe { row_budget: Some(1), ..Default::default() }))).expect("again");
+        assert!(stored_ids(&conn, &old).is_empty(), "the old key went");
+        assert_eq!(stored_ids(&conn, &recent).len(), 1, "⭐ a key touched in the last 60 s is exempt");
+        assert_eq!(stored_ids(&conn, &current).len(), 1, "the key just saved is never evicted");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM semantic_match"), 2, "over budget is accepted when only exempt keys remain");
+    }
+
+    #[test]
+    fn twin_expansion_matches_only_raw_jpeg_heif_pairs_with_one_row_per_image()
+    {
+        let (_fixture, conn) = fresh("twins");
+        let jpeg = insert(&conn, "/t/A.jpg", "jpeg", "2026:01:01 10:00:00");
+        let raw = insert(&conn, "/t/A.nef", "raw", "2026:01:01 10:00:00");
+        let psd = insert(&conn, "/t/A.psd", "psd", "2026:01:01 10:00:00");
+        let lone_raw = insert(&conn, "/t/C.nef", "raw", "2026:01:01 10:00:00");
+        // B: a RAW with BOTH a JPEG and a HEIF twin.
+        let b_jpeg = insert(&conn, "/t/B.jpg", "jpeg", "2026:01:01 10:00:00");
+        let b_heif = insert(&conn, "/t/B.hif", "heif", "2026:01:01 10:00:00");
+        let b_raw = insert(&conn, "/t/B.nef", "raw", "2026:01:01 10:00:00");
+        // D: a RAW with its OWN vector and a JPEG twin.
+        let d_jpeg = insert(&conn, "/t/D.jpg", "jpeg", "2026:01:01 10:00:00");
+        let d_raw = insert(&conn, "/t/D.nef", "raw", "2026:01:01 10:00:00");
+        // E / F (review MED-1): a SCORED non-JPEG/HEIF photo with a same-stem
+        // RAW sibling and no JPEG — the RAW stays visible under the collapse,
+        // so it must never inherit another file's score.
+        let e_psd = insert(&conn, "/t/E.psd", "psd", "2026:01:01 10:00:00");
+        let e_raw = insert(&conn, "/t/E.nef", "raw", "2026:01:01 10:00:00");
+        let f_tif = insert(&conn, "/t/F.tif", "tiff", "2026:01:01 10:00:00");
+        let f_raw = insert(&conn, "/t/F.nef", "raw", "2026:01:01 10:00:00");
+        let gone = 999_999; // an orphan vector's id: not in images
+        let key = key_of(&looks("twins", None));
+        save(
+            &conn,
+            &key,
+            &[(jpeg, 0.5), (b_jpeg, 0.4), (b_heif, 0.6), (d_jpeg, 0.3), (d_raw, 0.7), (gone, 0.9), (lone_raw, 0.2), (e_psd, 0.9), (f_tif, 0.8)],
+        )
+        .expect("save");
+        let stored = stored_ids(&conn, &key).into_iter().collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(stored.get(&raw), Some(&0.5), "the RAW inherits its JPEG's score");
+        assert!(!stored.contains_key(&psd), "⭐ a same-named PSD gets no score");
+        assert_eq!(stored.get(&b_raw), Some(&0.6), "a RAW with JPEG + HEIF twins: one row, the best score");
+        assert_eq!(stored.get(&d_raw), Some(&0.7), "a RAW with its own vector: one row, the best score");
+        assert_eq!(stored.get(&lone_raw), Some(&0.2));
+        assert!(!stored.contains_key(&gone), "an orphan vector never surfaces (finding 4)");
+        assert_eq!(stored.get(&e_psd), Some(&0.9), "the scored PSD keeps its own score");
+        assert!(!stored.contains_key(&e_raw), "⭐ MED-1: a RAW beside a scored PSD inherits nothing");
+        assert_eq!(stored.get(&f_tif), Some(&0.8));
+        assert!(!stored.contains_key(&f_raw), "⭐ MED-1: a RAW beside a scored TIFF inherits nothing");
+        assert_eq!(stored.len(), 10, "A.jpg, A.nef, B.jpg, B.hif, B.nef, D.jpg, D.nef, C.nef, E.psd, F.tif");
+        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM semantic_match WHERE image_id = {}", b_raw)), 1);
+        // A Best-match page holding such RAWs binds and runs (no "more than one row").
+        let page = page_ids(&conn, &[looks("twins", None)], &[], 50, 0, false, false);
+        assert!(!page.is_empty());
+        let all = query_images_scoped_gallery_impl(&conn, &[looks("twins", None)], &[], &[], &[], 50, 0, false, false, false, "", MediaType::Both);
+        assert_eq!(all.len(), 10);
+        assert_eq!(all[0].id, e_psd, "best score first (E.psd at 0.9)");
+        assert_eq!(all[1].id, f_tif, "then F.tif at 0.8");
+        assert_eq!(all[2].id, d_raw, "then D's RAW at 0.7");
+    }
+
+    // ------------------------------------------------------------------
+    // Queries with a stored result
+    // ------------------------------------------------------------------
+
+    /// 30 photos in three directories; 10 duplicate pairs (same capture,
+    /// camera, size, kind, stem) and two similar stacks; a stored result for
+    /// `looks("q")` scoring every even photo.
+    fn query_scene(tag: &str) -> (Fixture, Connection, Vec<i64>)
+    {
+        let (fixture, conn) = fresh(tag);
+        let mut ids = Vec::new();
+        for i in 0..30
+        {
+            let capture = format!("2026:01:{:02} 10:00:00", 1 + i % 20);
+            ids.push(insert(&conn, &format!("/d{}/p{}.jpg", i % 3, i % 20), "jpeg", &capture));
+        }
+        for (rep, member) in [(ids[0], ids[2]), (ids[4], ids[6])]
+        {
+            for (image, rank) in [(rep, 0), (member, 1)]
+            {
+                conn.execute(
+                    "INSERT INTO similar_photo_group_member (image_id, group_id, representative_id, member_rank, algorithm_version, threshold) \
+                     VALUES (?1, ?2, ?2, ?3, ?4, 1.0)",
+                    params![image, rep, rank, ALGO],
+                )
+                .expect("stack");
+            }
+        }
+        let key = key_of(&looks("q", None));
+        let matches = ids.iter().enumerate().filter(|(i, _)| i % 2 == 0).map(|(i, id)| (*id, 0.2 + i as f64 / 100.0)).collect::<Vec<_>>();
+        save(&conn, &key, &matches).expect("save");
+        (fixture, conn, ids)
+    }
+
+    #[test]
+    fn the_condition_and_the_ordering_bind_with_duplicates_hidden_and_stacks_collapsed_across_pages()
+    {
+        let (_fixture, conn, _ids) = query_scene("pages");
+        let predicates = vec![looks("q", None)];
+        for (dup, similar) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let total = count_query_images_scoped_gallery_impl(&conn, &predicates, &[], &[], &[], dup, true, similar, ALGO, MediaType::Both);
+            assert!(total > 0, "dup {} similar {}", dup, similar);
+            let mut paged = Vec::new();
+            for page in 0..10
+            {
+                paged.extend(page_ids(&conn, &predicates, &[], 4, page * 4, dup, similar));
+            }
+            assert_eq!(paged.len() as u64, total, "count/page parity (dup {} similar {})", dup, similar);
+            let unique = paged.iter().collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(unique.len(), paged.len(), "no photo twice across pages");
+            let ids = query_image_ids_scoped_gallery_impl(&conn, &predicates, &[], &[], &[], dup, true, similar, ALGO, MediaType::Both).expect("ids");
+            assert_eq!(ids, paged, "the ordered id projection = the pages, in order (dup {} similar {})", dup, similar);
+            // Best match: the scores read back descend.
+            let key = key_of(&predicates[0]);
+            let scores = paged
+                .iter()
+                .map(|id| conn.query_row(
+                    &format!("SELECT MAX(m.score) FROM semantic_match m JOIN semantic_key k ON m.result_id = k.result_id WHERE k.key = '{}' AND m.image_id = {}", key, id),
+                    [],
+                    |row| row.get::<_, f64>(0),
+                ).expect("score"))
+                .collect::<Vec<_>>();
+            assert!(scores.windows(2).all(|pair| pair[0] >= pair[1]), "best first: {:?}", scores);
+        }
+    }
+
+    #[test]
+    fn nulls_last_under_or_and_num_zero_orders_newest_first()
+    {
+        let (_fixture, conn, ids) = query_scene("nulls");
+        // p1 (odd → unscored) OR looks: the scored rows first, then the rest.
+        let predicates = vec![keyword("p1"), looks("q", None)];
+        let page = page_ids(&conn, &predicates, &[Connector::Or], 100, 0, false, false);
+        let key = key_of(&predicates[1]);
+        let scored = stored_ids(&conn, &key).into_iter().map(|(id, _)| id).collect::<std::collections::BTreeSet<_>>();
+        let first_unscored = page.iter().position(|id| !scored.contains(id)).expect("unscored rows exist");
+        assert!(page[first_unscored..].iter().all(|id| !scored.contains(id)), "⭐ NULLS LAST: no scored row after an unscored one");
+        assert!(first_unscored > 0);
+        // num = 0: the same photos, newest first.
+        let filter_only = vec![looks("q", Some(0.0))];
+        let newest = page_ids(&conn, &filter_only, &[], 100, 0, false, false);
+        let best = page_ids(&conn, &[looks("q", None)], &[], 100, 0, false, false);
+        assert_eq!(newest.iter().collect::<std::collections::BTreeSet<_>>(), best.iter().collect::<std::collections::BTreeSet<_>>(), "same membership");
+        assert_ne!(newest, best, "different order");
+        let captures = newest
+            .iter()
+            .map(|id| conn.query_row("SELECT capture_datetime FROM images WHERE id = ?1", params![id], |row| row.get::<_, String>(0)).expect("capture"))
+            .collect::<Vec<_>>();
+        assert!(captures.windows(2).all(|pair| pair[0] >= pair[1]), "newest first");
+        let _ = ids;
+    }
+
+    #[test]
+    fn the_ordered_id_projections_take_the_first_10000_in_best_match_order_only_when_the_cap_applies()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh("cap");
+        conn.execute_batch(
+            "INSERT INTO images (file_path, file_size, file_name, file_stem, image_kind, directory_path, \
+             created_timestamp, modified_timestamp, is_video, capture_datetime) \
+             SELECT '/cap/p' || i || '.jpg', 10, 'p' || i || '.jpg', 'p' || i, 'jpeg', '/cap', 0, 0, FALSE, '2026:01:01 10:00:00' \
+               FROM range(10050) t(i);",
+        )
+        .expect("seed");
+        let key = key_of(&looks("q", None));
+        let matches = (1..=10_050i64).map(|id| (id, id as f64 / 100_000.0)).collect::<Vec<_>>();
+        save(&conn, &key, &matches).expect("save");
+        let _installed = Installed::new(&fixture, conn);
+        let gallery = |predicates: Vec<QueryPredicate>, connectors: Vec<Connector>|
+            block(query_image_ids_gallery(predicates, connectors, true, true, true, ALGO.to_string(), MediaType::Both));
+        let capped = gallery(vec![looks("q", None)], vec![]);
+        assert_eq!(capped.len(), 10_000, "Best match: the cap");
+        assert_eq!(capped[0], 10_050, "best first");
+        assert_eq!(*capped.last().expect("last"), 51, "exactly the best 10,000");
+        let scoped = with_global(|conn| query_image_ids_scoped_gallery_impl(conn, &[looks("q", None)], &[], &[keyword("p")], &[], true, true, true, ALGO, MediaType::Both).expect("scoped"));
+        assert_eq!(scoped, capped, "the scoped projection honours the same cap");
+        assert_eq!(gallery(vec![looks("q", Some(0.0))], vec![]).len(), 10_050, "⭐ num = 0: never capped");
+        assert_eq!(gallery(vec![keyword("zzz"), looks("q", None)], vec![Connector::Or]).len(), 10_050, "under OR: no cap");
+        assert_eq!(gallery(vec![looks("q", None), keyword("p")], vec![Connector::And]).len(), 10_050, "not the last condition: no cap");
+        let prepared = block(semantic_search_prepare(vec![looks("q", None)], vec![]));
+        assert!(prepared.display_cap_applies, "prepare and the projection agree");
+    }
+
+    #[test]
+    fn saved_queries_round_trip_both_kinds()
+    {
+        let (_fixture, conn) = fresh("saved");
+        let predicates = vec![
+            predicate(SEMANTIC_KIND_LOOKS_LIKE, "a red-roofed town", "narrow", Some(1.0)),
+            predicate(SEMANTIC_KIND_SIMILAR_TO, "1234", "wide", Some(0.0)),
+        ];
+        let connectors = vec![Connector::And];
+        let info = save_query_impl(&conn, "towns", &predicates, &connectors).expect("saved");
+        let payload = load_saved_query_impl(&conn, info.id).expect("loaded");
+        assert_eq!(payload.predicates, predicates);
+        assert_eq!(payload.connectors, connectors);
+        assert_eq!(key_of(&payload.predicates[0]), key_of(&predicates[0]), "the loaded condition has the same key");
+    }
+
+    // ------------------------------------------------------------------
+    // The job
+    // ------------------------------------------------------------------
+
+    struct JobScene
+    {
+        _installed: Installed,
+        _fixture: Fixture,
+        ids: Vec<i64>,
+    }
+
+    /// Photos at cosines 0.9, 0.5, 0.2, 0.05 to `axis(0)`; a fourth (0.95) is
+    /// marked STALE; a fifth (0.8) is removed after its vector was stored.
+    fn job_scene(tag: &str) -> JobScene
+    {
+        let (fixture, conn) = fresh(tag);
+        let ids = (0..6).map(|i| insert(&conn, &format!("/j/p{}.jpg", i), "jpeg", &format!("2026:01:0{} 10:00:00", i + 1))).collect::<Vec<_>>();
+        let installed = Installed::new(&fixture, conn);
+        store(
+            [0.9f32, 0.5, 0.2, 0.05, 0.95, 0.8]
+                .iter()
+                .zip(ids.iter())
+                .map(|(cos, id)| embedding(*id, &at(*cos)))
+                .collect(),
+        );
+        with_global(|conn|
+        {
+            mark_image_vectors_stale_impl(conn, &[ids[4]]).expect("stale");
+            conn.execute("DELETE FROM images WHERE id = ?1", params![ids[5]]).expect("orphan the vector");
+        });
+        JobScene { _installed: installed, _fixture: fixture, ids }
+    }
+
+    #[test]
+    fn a_looks_like_job_scores_every_current_vector_and_saves_the_matches()
+    {
+        let _serial = serial();
+        let scene = job_scene("looks");
+        let status = run(request(SEMANTIC_KIND_LOOKS_LIKE, "a thing", "medium", &axis(0)), None);
+        assert_eq!(status.phase, "finished", "{:?}", status.error);
+        assert!(status.store_ok && !status.seed_missing && !status.seed_not_indexed);
+        assert_eq!(status.total, 6, "a real count");
+        assert_eq!(status.done, 6, "every vector scored");
+        assert_eq!(status.matched, 4, "0.9, 0.5, 0.2 and the STALE 0.95 clear 0.1067; the orphan never surfaces");
+        let key = key_of(&looks("a thing", None));
+        let stored = with_global(|conn| stored_ids(conn, &key)).into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+        let ids = &scene.ids;
+        assert_eq!(stored, vec![ids[0], ids[1], ids[2], ids[4]]);
+        let prepared = block(semantic_search_prepare(vec![looks("a thing", None)], vec![]));
+        assert!(prepared.missing.is_empty(), "the key is now stored");
+        let page = block(query_images_gallery(vec![looks("a thing", None)], vec![], 50, 0, true, true, true, ALGO.to_string(), MediaType::Both));
+        assert_eq!(page.iter().map(|r| r.id).collect::<Vec<_>>(), vec![ids[4], ids[0], ids[1], ids[2]], "best match first");
+        // Narrow (0.1187): the same four clear it.
+        let narrow = run(request(SEMANTIC_KIND_LOOKS_LIKE, "a thing", "narrow", &axis(0)), None);
+        assert_eq!(narrow.matched, 4);
+        let none = run(request(SEMANTIC_KIND_LOOKS_LIKE, "nothing", "medium", &axis(7)), None);
+        assert_eq!(none.phase, "finished");
+        assert_eq!(none.matched, 0, "an orthogonal query matches nothing — and that is stored as an answer");
+    }
+
+    #[test]
+    fn a_stale_job_id_answers_unknown_and_a_bad_request_is_refused()
+    {
+        let _serial = serial();
+        let status = block(semantic_search_poll(u64::MAX));
+        assert_eq!(status.phase, "unknown");
+        assert!(status.finished);
+        block(semantic_search_cancel(u64::MAX)); // a no-op, never a crash
+        for (bad, why) in [
+            (request("keyword_has", "x", "medium", &axis(0)), "kind"),
+            (request(SEMANTIC_KIND_LOOKS_LIKE, "x", "huge", &axis(0)), "breadth"),
+            (request(SEMANTIC_KIND_LOOKS_LIKE, "", "medium", &axis(0)), "empty words"),
+            (request(SEMANTIC_KIND_LOOKS_LIKE, "x", "medium", &[1.0; 767]), "767 floats"),
+            (request(SEMANTIC_KIND_LOOKS_LIKE, "x", "medium", &{ let mut v = axis(0); v[3] = f32::NAN; v }), "a NaN"),
+            (request(SEMANTIC_KIND_LOOKS_LIKE, "x", "medium", &{ let mut v = axis(0); v[0] = 2.0; v }), "an unnormalized vector (norm 2)"),
+            (request(SEMANTIC_KIND_LOOKS_LIKE, "x", "medium", &at(0.0).iter().map(|v| v * 1.0011).collect::<Vec<f32>>()), "norm 1.0011"),
+            (request(SEMANTIC_KIND_LOOKS_LIKE, "x", "medium", &[0.0; 768]), "a zero vector"),
+            (request(SEMANTIC_KIND_SIMILAR_TO, "abc", "medium", &[]), "a bad seed id"),
+            (request(SEMANTIC_KIND_SIMILAR_TO, "12", "medium", &axis(0)), "a vector on similar_to"),
+            (SemanticSearchRequest { model_version: "2.0".to_string(), ..request(SEMANTIC_KIND_LOOKS_LIKE, "x", "medium", &axis(0)) }, "the model version"),
+        ]
+        {
+            let start = block(semantic_search_start(bad));
+            if why.starts_with("an unnormalized") || why.starts_with("norm ") || why.starts_with("a zero")
+            {
+                assert!(start.error.as_deref().unwrap_or("").contains("not normalized"), "{}: {:?}", why, start.error);
+            }
+            assert!(!start.accepted, "{}", why);
+            assert_eq!(start.job_id, 0, "{}", why);
+            assert!(start.error.is_some(), "{}", why);
+        }
+        // Within the tolerance (norm 1.0009) the request validates.
+        let near = request(SEMANTIC_KIND_LOOKS_LIKE, "x", "medium", &at(0.0).iter().map(|v| v * 1.0009).collect::<Vec<f32>>());
+        assert!(semantic_validate_request(&near).is_ok(), "a norm within 1e-3 of 1 is accepted");
+    }
+
+    #[test]
+    fn two_jobs_for_one_key_both_finish_and_leave_one_result_generation()
+    {
+        let _serial = serial();
+        let _scene = job_scene("double");
+        let first = semantic_search_start_impl(request(SEMANTIC_KIND_LOOKS_LIKE, "twice", "medium", &axis(0)), face_embedding_runtime("semantic_search_tests"), None);
+        let second = semantic_search_start_impl(request(SEMANTIC_KIND_LOOKS_LIKE, "twice", "medium", &axis(0)), face_embedding_runtime("semantic_search_tests"), None);
+        assert!(first.accepted && second.accepted);
+        assert_ne!(first.job_id, second.job_id);
+        assert_eq!(wait(first.job_id).phase, "finished");
+        assert_eq!(wait(second.job_id).phase, "finished");
+        with_global(|conn|
+        {
+            assert_eq!(generations(conn), 1, "their saves serialised; one generation remains");
+            assert_eq!(count(conn, "SELECT COUNT(*) FROM semantic_key"), 1);
+        });
+    }
+
+    #[test]
+    fn cancel_mid_scan_writes_nothing_and_keeps_the_previous_result()
+    {
+        let _serial = serial();
+        let scene = job_scene("cancel");
+        let key = key_of(&looks("cancel me", None));
+        with_global(|conn| save(conn, &key, &[(scene.ids[3], 0.05)]).expect("a previous result"));
+        let probe = Some(Arc::new(SemanticJobProbe { batch_rows: Some(2), hold_after_batch: Some(1), ..Default::default() }));
+        let start = semantic_search_start_impl(request(SEMANTIC_KIND_LOOKS_LIKE, "cancel me", "medium", &axis(0)), face_embedding_runtime("semantic_search_tests"), probe);
+        assert!(start.accepted);
+        for _ in 0..2_000
+        {
+            if block(semantic_search_poll(start.job_id)).done == 2
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mid = block(semantic_search_poll(start.job_id));
+        assert_eq!((mid.phase.as_str(), mid.done, mid.total, mid.finished), ("reading", 2, 6, false), "held after the first batch");
+        block(semantic_search_cancel(start.job_id));
+        let end = wait(start.job_id);
+        assert_eq!(end.phase, "cancelled");
+        assert_eq!(end.done, 2, "it stopped at the next batch boundary");
+        with_global(|conn| assert_eq!(stored_ids(conn, &key), vec![(scene.ids[3], 0.05)], "the previous result stays"));
+    }
+
+    #[test]
+    fn a_panic_inside_the_job_becomes_failed_and_the_next_job_runs()
+    {
+        let _serial = serial();
+        let _scene = job_scene("panic");
+        let probe = Some(Arc::new(SemanticJobProbe { batch_rows: Some(2), panic_after_batch: Some(2), ..Default::default() }));
+        let status = run(request(SEMANTIC_KIND_LOOKS_LIKE, "boom", "medium", &axis(0)), probe);
+        assert_eq!(status.phase, "failed");
+        assert!(status.finished);
+        assert!(status.error.as_deref().unwrap_or("").contains("internal error"), "{:?}", status.error);
+        let next = run(request(SEMANTIC_KIND_LOOKS_LIKE, "boom", "medium", &axis(0)), None);
+        assert_eq!(next.phase, "finished");
+    }
+
+    #[test]
+    fn an_unreadable_store_is_store_ok_false_never_no_matches()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh("unreadable");
+        insert(&conn, "/u/p.jpg", "jpeg", "2026:01:01 10:00:00");
+        std::fs::write(fixture.vectors(), b"not a directory").expect("a file where the store goes");
+        let _installed = Installed::new(&fixture, conn);
+        let status = run(request(SEMANTIC_KIND_LOOKS_LIKE, "x", "medium", &axis(0)), None);
+        assert_eq!(status.phase, "failed");
+        assert!(!status.store_ok, "⭐ store_ok = false");
+        assert!(status.error.is_some());
+        with_global(|conn| assert_eq!(count(conn, "SELECT COUNT(*) FROM semantic_key"), 0, "nothing stored as 'no matches'"));
+    }
+
+    #[test]
+    fn a_never_built_store_answers_an_honest_empty_result()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh("never");
+        let _installed = Installed::new(&fixture, conn);
+        let status = run(request(SEMANTIC_KIND_LOOKS_LIKE, "x", "medium", &axis(0)), None);
+        assert_eq!((status.phase.as_str(), status.store_ok, status.matched, status.total), ("finished", true, 0, 0));
+        let seed = run(request(SEMANTIC_KIND_SIMILAR_TO, "1", "medium", &[]), None);
+        assert!(seed.seed_missing || seed.seed_not_indexed);
+    }
+
+    #[test]
+    fn similar_to_maps_a_raw_seed_to_its_twin_and_tells_missing_from_not_indexed()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh("similar");
+        let jpeg = insert(&conn, "/s/A.jpg", "jpeg", "2026:01:01 10:00:00");
+        let raw = insert(&conn, "/s/A.nef", "raw", "2026:01:01 10:00:00");
+        let b_heif = insert(&conn, "/s/B.hif", "heif", "2026:01:01 10:00:00");
+        let b_jpeg = insert(&conn, "/s/B.jpg", "jpeg", "2026:01:01 10:00:00");
+        let b_raw = insert(&conn, "/s/B.nef", "raw", "2026:01:01 10:00:00");
+        let near = insert(&conn, "/s/N.jpg", "jpeg", "2026:01:01 10:00:00");
+        let mid = insert(&conn, "/s/M.jpg", "jpeg", "2026:01:01 10:00:00");
+        let far = insert(&conn, "/s/F.jpg", "jpeg", "2026:01:01 10:00:00");
+        let unindexed = insert(&conn, "/s/U.jpg", "jpeg", "2026:01:01 10:00:00");
+        let stale = insert(&conn, "/s/S.jpg", "jpeg", "2026:01:01 10:00:00");
+        let _installed = Installed::new(&fixture, conn);
+        store(vec![
+            embedding(jpeg, &at(1.0)),
+            embedding(b_jpeg, &at(1.0)),
+            embedding(b_heif, &axis(5)),
+            embedding(near, &at(0.95)),
+            embedding(mid, &at(0.83)),
+            embedding(far, &at(0.5)),
+            embedding(stale, &at(1.0)),
+        ]);
+        with_global(|conn| mark_image_vectors_stale_impl(conn, &[stale]).expect("stale"));
+        let narrow = run(request(SEMANTIC_KIND_SIMILAR_TO, &raw.to_string(), "narrow", &[]), None);
+        assert_eq!(narrow.phase, "finished", "{:?}", narrow.error);
+        let key = semantic_result_key(SEMANTIC_KIND_SIMILAR_TO, &raw.to_string(), "narrow").expect("key");
+        let found = with_global(|conn| stored_ids(conn, &key)).into_iter().map(|(id, _)| id).collect::<std::collections::BTreeSet<_>>();
+        for id in [jpeg, raw, b_jpeg, b_raw, near, stale]
+        {
+            assert!(found.contains(&id), "narrow from the RAW seed (via its JPEG twin) finds {}", id);
+        }
+        assert!(!found.contains(&mid) && !found.contains(&far) && !found.contains(&b_heif));
+        let wide = run(request(SEMANTIC_KIND_SIMILAR_TO, &raw.to_string(), "wide", &[]), None);
+        assert!(wide.matched > narrow.matched, "wide reaches 0.83");
+        // ⭐ A RAW with BOTH twins maps to the JPEG (axis 0), not the HEIF (axis 5).
+        let both = run(request(SEMANTIC_KIND_SIMILAR_TO, &b_raw.to_string(), "narrow", &[]), None);
+        let both_key = semantic_result_key(SEMANTIC_KIND_SIMILAR_TO, &b_raw.to_string(), "narrow").expect("key");
+        let both_found = with_global(|conn| stored_ids(conn, &both_key)).into_iter().map(|(id, _)| id).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(both.phase, "finished");
+        assert!(both_found.contains(&near) && !both_found.contains(&b_heif), "the JPEG's vector was the seed");
+        // Missing vs not indexed.
+        let missing = run(request(SEMANTIC_KIND_SIMILAR_TO, "987654", "medium", &[]), None);
+        assert_eq!((missing.phase.as_str(), missing.seed_missing, missing.seed_not_indexed), ("finished", true, false));
+        let no_vector = run(request(SEMANTIC_KIND_SIMILAR_TO, &unindexed.to_string(), "medium", &[]), None);
+        assert_eq!((no_vector.seed_missing, no_vector.seed_not_indexed), (false, true), "present, never embedded");
+        let stale_seed = run(request(SEMANTIC_KIND_SIMILAR_TO, &stale.to_string(), "medium", &[]), None);
+        assert_eq!((stale_seed.seed_missing, stale_seed.seed_not_indexed), (false, true), "present, stale vector");
+        with_global(|conn|
+        {
+            for seed in [987654i64, unindexed, stale]
+            {
+                let key = semantic_result_key(SEMANTIC_KIND_SIMILAR_TO, &seed.to_string(), "medium").expect("key");
+                assert_eq!(count(conn, &format!("SELECT COUNT(*) FROM semantic_key WHERE key = '{}'", key)), 0, "no result is written");
+            }
+        });
+    }
+
+    #[test]
+    fn duplicate_rows_for_one_photo_collapse_to_the_best_score()
+    {
+        let schema = image_embedding_schema(4);
+        let values = [1.0f32, 0.0, 0.0, 0.0, 0.6, 0.8, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0]
+            .iter()
+            .map(|value| Float16Native::from_f32(*value))
+            .collect::<Vec<_>>();
+        let vectors = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float16, true)),
+            4,
+            Arc::new(arrow_array::Float16Array::from(values)),
+            None,
+        )
+        .expect("vectors");
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![7, 7, 9])),
+                Arc::new(StringArray::from(vec!["m"; 3])),
+                Arc::new(StringArray::from(vec!["v"; 3])),
+                Arc::new(StringArray::from(vec!["p"; 3])),
+                Arc::new(UInt32Array::from(vec![4u32; 3])),
+                Arc::new(vectors),
+            ],
+        )
+        .expect("batch");
+        let mut best = std::collections::HashMap::new();
+        assert_eq!(semantic_score_batch(&batch, &[1.0, 0.0, 0.0, 0.0], 0.5, &mut best).expect("scored"), 3);
+        assert_eq!(best.len(), 1, "photo 9 (0.3) is below the floor");
+        assert!((best[&7] - 1.0).abs() < 1e-3, "two rows for photo 7 collapse to the best");
+        assert!(semantic_score_batch(&batch, &[1.0, 0.0, 0.0], 0.5, &mut best).is_err(), "a width mismatch is a failure");
+    }
+
+    // ------------------------------------------------------------------
+    // Removal and reset
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn removal_takes_the_photo_out_of_stored_results_and_succeeds_without_the_temp_tables()
+    {
+        let (_fixture, conn) = fresh("removal");
+        let a = insert(&conn, "/r/a.jpg", "jpeg", "2026:01:01 10:00:00");
+        let b = insert(&conn, "/r/b.jpg", "jpeg", "2026:01:01 10:00:00");
+        let key = key_of(&looks("r", None));
+        save(&conn, &key, &[(a, 0.5), (b, 0.4)]).expect("save");
+        assert_eq!(remove_images_by_ids_impl(&conn, &[a]), 1);
+        assert_eq!(stored_ids(&conn, &key), vec![(b, 0.4)], "the removed photo left the results in the same transaction");
+        let (_fixture2, bare) = fresh_without_temp_tables("removal-bare");
+        let c = insert(&bare, "/r/c.jpg", "jpeg", "2026:01:01 10:00:00");
+        assert!(!removal_semantic_matches_present(&bare));
+        assert_eq!(remove_images_by_ids_impl(&bare, &[c]), 1, "⭐ a missing temp table never rolls back a removal");
+        assert_eq!(count(&bare, "SELECT COUNT(*) FROM images"), 0);
+    }
+
+    #[test]
+    fn reset_drops_the_index_clears_both_queues_leaves_faces_and_succeeds_twice()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh("reset");
+        let ids = (0..3).map(|i| insert(&conn, &format!("/x/p{}.jpg", i), "jpeg", "2026:01:01 10:00:00")).collect::<Vec<_>>();
+        let _installed = Installed::new(&fixture, conn);
+        store(ids.iter().map(|id| embedding(*id, &at(0.5))).collect());
+        let face = FaceEmbeddingVectorRecord
+        {
+            face_observation_id: 1,
+            image_id: ids[0],
+            analyzed_image_id: ids[0],
+            face_index: 0,
+            model_name: "face".to_string(),
+            model_version: "1".to_string(),
+            preprocessing_version: "p".to_string(),
+            input_size: 112,
+            color_order: "RGB".to_string(),
+            normalization: "n".to_string(),
+            embedding_dimension: 4,
+            embedding_l2_norm: 1.0,
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+        };
+        assert_eq!(block(upsert_face_embeddings_impl(vec![face])).status, "stored");
+        with_global(|conn|
+        {
+            mark_image_vectors_stale_impl(conn, &[ids[1]]).expect("stale");
+            conn.execute("INSERT INTO image_vector_pending_delete (image_id) VALUES (424242)", []).expect("queued");
+        });
+        let result = block(reset_image_embeddings());
+        assert!(result.ok, "{:?}", result.error);
+        let uri = fixture.vectors().to_string_lossy().into_owned();
+        let names = block(async { lancedb::connect(&uri).execute().await.expect("connect").table_names().execute().await.expect("names") });
+        assert!(!names.iter().any(|name| name == IMAGE_EMBEDDING_TABLE), "the image index is gone");
+        assert!(names.iter().any(|name| name == "face_embeddings"), "faces are untouched");
+        with_global(|conn|
+        {
+            assert_eq!(count(conn, "SELECT COUNT(*) FROM image_vector_stale"), 0);
+            assert_eq!(count(conn, "SELECT COUNT(*) FROM image_vector_pending_delete"), 0);
+        });
+        let again = block(reset_image_embeddings());
+        assert!(again.ok, "a second reset (no table) succeeds: {:?}", again.error);
+        let count_after = block(image_embedding_count_checked(SEMANTIC_MODEL_VERSION.to_string(), SEMANTIC_PREPROCESSING_VERSION.to_string()));
+        assert_eq!(count_after, Ok(0), "the index reads as never built");
+    }
+
+    // ------------------------------------------------------------------
+    // The FFI panic boundary (FfiPanicBoundaryGate's runtime twin)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn every_new_ffi_reports_a_panic_instead_of_dying()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh("ffi-panic");
+        let _installed = Installed::new(&fixture, conn);
+        let arm = |n: u32| FFI_PANIC_PROBE_COUNTDOWN.with(|countdown| countdown.set(n));
+        arm(1); // the first probe point: lock_catalogue
+        let prepared = block(semantic_search_prepare(vec![looks("a", None)], vec![]));
+        assert!(prepared.error.as_deref().unwrap_or("").contains("internal error"), "{:?}", prepared.error);
+        arm(1); // the first probe point: face_embedding_runtime
+        let start = block(semantic_search_start(request(SEMANTIC_KIND_LOOKS_LIKE, "a", "medium", &axis(0))));
+        assert!(!start.accepted && start.error.as_deref().unwrap_or("").contains("internal error"), "{:?}", start.error);
+        arm(1);
+        let reset = block(reset_image_embeddings());
+        assert!(!reset.ok && reset.error.as_deref().unwrap_or("").contains("internal error"), "{:?}", reset.error);
+        arm(0);
+        // poll and cancel answer after the panics.
+        assert_eq!(block(semantic_search_poll(1_000_000)).phase, "unknown");
+        block(semantic_search_cancel(1_000_000));
+        assert!(block(semantic_search_prepare(vec![looks("a", None)], vec![])).error.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // The spike fixture: fp16 round trip + the search-quality lock
+    // ------------------------------------------------------------------
+
+    fn spike_root() -> std::path::PathBuf
+    {
+        std::env::var_os("PLCORE_CLIP_SPIKE_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../DebugTools/clip-spike"))
+    }
+
+    /// A little-endian float32, C-order `.npy` (the spike's format).
+    fn read_npy_f32(path: &std::path::Path) -> (Vec<usize>, Vec<f32>)
+    {
+        let data = std::fs::read(path).expect("npy");
+        assert_eq!(&data[..6], b"\x93NUMPY", "{:?} is a .npy file", path);
+        let (header_len, header_start) = if data[6] == 1
+        {
+            (u16::from_le_bytes([data[8], data[9]]) as usize, 10)
+        }
+        else
+        {
+            (u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize, 12)
+        };
+        let header = std::str::from_utf8(&data[header_start..header_start + header_len]).expect("header");
+        assert!(header.contains("'descr': '<f4'") && header.contains("'fortran_order': False"), "{}", header);
+        let shape_text = header.split("'shape': (").nth(1).expect("shape").split(')').next().expect("shape");
+        let shape = shape_text.split(',').filter_map(|part| part.trim().parse::<usize>().ok()).collect::<Vec<_>>();
+        let body = &data[header_start + header_len..];
+        let values = body.chunks_exact(4).map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])).collect::<Vec<_>>();
+        assert_eq!(values.len(), shape.iter().product::<usize>());
+        (shape, values)
+    }
+
+    fn normalize(vector: &[f32]) -> Vec<f32>
+    {
+        let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+        vector.iter().map(|v| v / norm).collect()
+    }
+
+    fn top20(scores: &[(usize, f64)]) -> std::collections::BTreeSet<usize>
+    {
+        let mut sorted = scores.to_vec();
+        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).expect("finite").then(a.0.cmp(&b.0)));
+        sorted.iter().take(20).map(|(row, _)| *row).collect()
+    }
+
+    #[test]
+    fn the_spike_fixture_survives_the_fp16_round_trip_and_returns_the_judged_top_20()
+    {
+        let root = spike_root();
+        let embeddings = root.join("work/embeddings/siglip2");
+        let judged_path = root.join("calibration/judged-top20.json");
+        for needed in [embeddings.join("sample20k.npy"), embeddings.join("texts.npy"), embeddings.join("texts.json"), judged_path.clone(), root.join("scripts/common.py")]
+        {
+            if !needed.exists()
+            {
+                println!("SKIPPED: the spike fixture is absent ({}); set PLCORE_CLIP_SPIKE_DIR", needed.display());
+                return;
+            }
+        }
+        // The 20 judged queries are the first 20 of texts.json = common.QUERIES.
+        let texts: Vec<String> = serde_json::from_str(&std::fs::read_to_string(embeddings.join("texts.json")).expect("texts")).expect("json");
+        let common = std::fs::read_to_string(root.join("scripts/common.py")).expect("common.py");
+        let block_text = common.split("QUERIES = [").nth(1).expect("QUERIES").split(']').next().expect("end");
+        let queries = block_text.split('"').skip(1).step_by(2).map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(queries.len(), 20);
+        assert_eq!(&texts[..20], &queries[..], "the judged queries = common.QUERIES");
+        let judged: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&judged_path).expect("judged")).expect("json");
+        let judged = judged["queries"].as_array().expect("queries");
+        assert_eq!(judged.len(), 20);
+
+        let (image_shape, image_values) = read_npy_f32(&embeddings.join("sample20k.npy"));
+        let (text_shape, text_values) = read_npy_f32(&embeddings.join("texts.npy"));
+        assert_eq!(image_shape[1], SEMANTIC_DIMENSION);
+        assert_eq!(text_shape, vec![34, SEMANTIC_DIMENSION]);
+        let rows = image_shape[0];
+        // The product's write order: normalize, THEN round to Float16.
+        let normalized = (0..rows).map(|row| normalize(&image_values[row * SEMANTIC_DIMENSION..(row + 1) * SEMANTIC_DIMENSION])).collect::<Vec<_>>();
+        let halves = normalized.iter().flatten().map(|v| Float16Native::from_f32(*v)).collect::<Vec<_>>();
+        // A real Lance table holding them, so the lock goes through the job's
+        // streaming scan (`semantic_scan_table`) — the product's scoring code.
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("plcore-s2-spike-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&dir);
+        let uri = dir.join("vectors.lancedb").to_string_lossy().into_owned();
+        let table = block(async
+        {
+            let database = lancedb::connect(&uri).execute().await.expect("connect");
+            let table = database.create_empty_table(IMAGE_EMBEDDING_TABLE, image_embedding_schema(SEMANTIC_DIMENSION as u32)).execute().await.expect("create");
+            for start in (0..rows).step_by(5_000)
+            {
+                let end = (start + 5_000).min(rows);
+                let records = (start..end)
+                    .map(|row| ValidImageEmbedding
+                    {
+                        image_id: row as i64,
+                        model_name: SEMANTIC_MODEL_NAME.to_string(),
+                        model_version: SEMANTIC_MODEL_VERSION.to_string(),
+                        preprocessing_version: SEMANTIC_PREPROCESSING_VERSION.to_string(),
+                        vector: normalized[row].clone(),
+                    })
+                    .collect::<Vec<_>>();
+                table.add(image_embedding_batch(&records, SEMANTIC_DIMENSION as u32).expect("batch")).execute().await.expect("add");
+            }
+            table
+        });
+        let job = SemanticJob::new();
+        for (index, query) in judged.iter().enumerate()
+        {
+            let text = normalize(&text_values[index * SEMANTIC_DIMENSION..(index + 1) * SEMANTIC_DIMENSION]);
+            assert_eq!(query["text"].as_str(), Some(texts[index].as_str()));
+            let scan = block(semantic_scan_table(&table, &text, -2.0, &job, &None)).expect("scan");
+            assert_eq!(scan.total as usize, rows);
+            assert_eq!(scan.matches.len(), rows, "floor -2 keeps every photo");
+            let product = scan.matches.iter().map(|(row, score)| (*row as usize, *score)).collect::<Vec<_>>();
+            // fp16 round trip: top-20 from Float16 storage = top-20 from Float32.
+            let float32 = (0..rows)
+                .map(|row| (row, normalized[row].iter().zip(text.iter()).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum::<f64>()))
+                .collect::<Vec<_>>();
+            assert_eq!(top20(&product), top20(&float32), "fp16 round trip, query {} ({})", index + 1, texts[index]);
+            // The search-quality lock: the spike's top-20 set, Jaccard 1.0.
+            let judged_rows = query["rows"].as_array().expect("rows").iter().map(|row| row.as_u64().expect("row") as usize).collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(top20(&product), judged_rows, "⭐ quality lock, query {} ({})", index + 1, texts[index]);
+            // The scan really used Float16 values (the half-precision dot, not f32).
+            let row0 = product.iter().find(|(row, _)| *row == 0).expect("row 0").1;
+            let direct = semantic_dot_f16(&text, &halves, 0).expect("row 0 dot");
+            assert_eq!(row0, direct, "the scan's score is the Float16 dot product");
+        }
+        drop(table);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
