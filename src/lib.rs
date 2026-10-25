@@ -1760,6 +1760,55 @@ pub struct NegativeDetectionCandidatePage
     pub query_error: Option<String>,
 }
 
+/// ⭐ SigLIP slice N (Oct 24, 2026; Docs/DESIGN-Semantic-Search.md §4b.2) —
+/// the linear probe's score for each requested photo, `scores[i]` for
+/// `image_ids[i]`. `None` = no usable vector for that photo under the
+/// model/preprocessing pair (never stored, or a stored vector that cannot be
+/// scored — named in `error`). ⛔ `store_ok = false` = the store or the
+/// request could not be read: `scores` is EMPTY then, never "no vectors".
+#[derive(Debug, Clone)]
+pub struct ImageEmbeddingProbeScores
+{
+    pub store_ok: bool,
+    pub scores: Vec<Option<f64>>,
+    pub error: Option<String>,
+}
+
+/// ⭐ SigLIP slice N (§4b.3) — the `film-negative-v3` queue's size, split by
+/// whether the photo has a CURRENT vector (stored for the pair and holding no
+/// stale mark). `with_vector` is the pass's work; `without_vector` stays at
+/// its earlier verdict (`without_vector_unchecked` of them have none: never
+/// checked, or last left unreadable/failed). ⛔ `query_ok = false` = UNKNOWN,
+/// never zero.
+#[derive(Debug, Clone)]
+pub struct NegativeDetectionVectorWorkCount
+{
+    pub query_ok: bool,
+    pub query_error: Option<String>,
+    pub with_vector: u64,
+    pub without_vector: u64,
+    pub without_vector_unchecked: u64,
+    /// Fix round 1: of `without_vector`, the photos whose stored vector is
+    /// stale — waiting to be re-indexed after a change.
+    pub without_vector_stale: u64,
+}
+
+/// ⭐ SigLIP slice N (§4b.3) — one page of the `film-negative-v3` queue: ONLY
+/// photos with a current vector, `id > after_image_id`, ascending. The pass
+/// keyset-pages on `next_after_image_id` (the last id this page covered), so a
+/// photo it chose not to write is never offered twice in one run.
+/// `dropped_rows` counts candidate rows the catalogue could not decode (each
+/// counted once: the cursor moves past them). ⛔ `query_ok = false` = UNKNOWN.
+#[derive(Debug, Clone)]
+pub struct NegativeDetectionVectorCandidatePage
+{
+    pub candidates: Vec<NegativeDetectionCandidate>,
+    pub dropped_rows: u64,
+    pub query_ok: bool,
+    pub query_error: Option<String>,
+    pub next_after_image_id: i64,
+}
+
 /// One detector verdict for one image (S196). `status` is `complete`,
 /// `unreadable` or `failed`; anything else is quarantined to `failed`.
 /// `auto_keywords` may carry ONLY the managed labels
@@ -1776,6 +1825,15 @@ pub struct NegativeDetectionResult
     pub negative_kind: Option<String>,
     pub signals_json: Option<String>,
     pub auto_keywords: Vec<String>,
+    /// ⭐ SigLIP slice N, fix round 1: the verdict was computed from the
+    /// photo's search-index vector (`film-negative-v3`). If that photo holds
+    /// an `image_vector_stale` mark when the chunk is written — its thumbnail
+    /// changed (an editor save, a rotation, Folder Sync) after the vector was
+    /// read — the result is NOT written: it is reported in
+    /// `skipped_stale_ids`, and the photo re-enters the v3 queue once the
+    /// search index has re-embedded it. Appended LAST, `.udl` default false
+    /// (S65), so every older caller writes exactly as before.
+    pub requires_current_vector: bool,
 }
 
 /// Receipt for one film-negative writeback chunk.
@@ -1803,6 +1861,11 @@ pub struct NegativeDetectionWritebackResult
     pub warnings: Vec<String>,
     pub failure_stage: Option<String>,
     pub failed_reason: Option<String>,
+    /// ⭐ SigLIP slice N, fix round 1: results with `requires_current_vector`
+    /// whose photo held a stale vector mark at write time, NOT written (each
+    /// also named in a `negative_writeback_vector_stale` warning). Appended
+    /// LAST, `.udl` default `[]` (S65).
+    pub skipped_stale_ids: Vec<i64>,
 }
 
 /// One detected human face from the Vision enrichment pass.
@@ -15275,6 +15338,8 @@ const NEGATIVE_WRITEBACK_WARNING_CHUNK_RETRIED: &str = "negative_writeback_chunk
 const NEGATIVE_WRITEBACK_WARNING_LABEL_DROPPED: &str = "negative_writeback_label_dropped";
 const NEGATIVE_WRITEBACK_WARNING_VALUE_DROPPED: &str = "negative_writeback_value_dropped";
 const NEGATIVE_WRITEBACK_WARNING_QUARANTINED: &str = "negative_writeback_result_quarantined";
+/// SigLIP slice N, fix round 1: a v3 verdict whose vector went stale since.
+const NEGATIVE_WRITEBACK_WARNING_VECTOR_STALE: &str = "negative_writeback_vector_stale";
 
 /// Every `images` column `update_negative_detection_target` assigns. An index
 /// on ANY of them would put that UPDATE on DuckDB's DELETE + INSERT branch
@@ -15767,6 +15832,7 @@ impl NegativeDetectionWritebackFailure
             warnings,
             failure_stage: Some(self.stage.to_string()),
             failed_reason: Some(self.reason),
+            skipped_stale_ids: Vec::new(),
         }
     }
 }
@@ -16702,7 +16768,48 @@ fn successful_negative_detection_writeback(
         warnings,
         failure_stage: None,
         failed_reason: None,
+        skipped_stale_ids: Vec::new(),
     }
+}
+
+/// ⭐ SigLIP slice N, fix round 1 — the results computed from a search-index
+/// vector (`requires_current_vector`) whose photo now holds a stale vector
+/// mark: the vector the verdict came from no longer describes the photo's
+/// pixels (an editor save also reset its negative columns), so writing it
+/// would stamp `film-negative-v3` from the old pixels and the photo would
+/// never be re-queued. Read under the catalogue lock the whole writeback holds
+/// — `mark_image_vectors_stale` takes the same lock — so no mark can land
+/// between this read and the write. ⛔ A read that fails is an error, never
+/// "nothing is stale".
+fn negative_detection_stale_source_ids(
+    conn: &Connection,
+    results: &[NegativeDetectionResult],
+) -> Result<std::collections::HashSet<i64>, String>
+{
+    let ids: Vec<i64> = results
+        .iter()
+        .filter(|result| result.requires_current_vector)
+        .map(|result| result.id)
+        .collect();
+    let mut stale = std::collections::HashSet::new();
+    for chunk in ids.chunks(IMAGE_VECTOR_CHUNK)
+    {
+        let csv = chunk.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+        let sql = format!("SELECT image_id FROM image_vector_stale WHERE image_id IN ({})", csv);
+        let mut statement = conn
+            .prepare(&sql)
+            .map_err(|error| format!("the stale-vector marks could not be prepared: {}", error))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(|error| format!("the stale-vector marks could not be read: {}", error))?;
+        let (batch, dropped) = collect_rows_counted(rows, "negative_detection_stale_source_ids");
+        if dropped > 0
+        {
+            return Err(format!("{} stale-vector mark(s) could not be read", dropped));
+        }
+        stale.extend(batch);
+    }
+    Ok(stale)
 }
 
 fn update_negative_detection_results_impl(
@@ -16723,12 +16830,56 @@ fn update_negative_detection_results_impl(
         .into_iter()
         .map(|result| sanitized_negative_detection_result(result, &mut warnings))
         .collect::<Vec<_>>();
+
+    // ⭐ SigLIP slice N, fix round 1: a verdict computed from a vector that
+    // went stale since is dropped here — before planning, under the lock.
+    let stale = match negative_detection_stale_source_ids(conn, &results)
+    {
+        Ok(stale) => stale,
+        Err(message) =>
+        {
+            let failure = NegativeDetectionWritebackFailure::new(
+                FOCUS_WRITEBACK_STAGE_PLANNING,
+                format!("update_negative_detection_results: {}", message),
+            );
+            eprintln!("{}", failure.reason);
+            return failure.into_result(warnings);
+        }
+    };
+    let mut skipped_stale_ids: Vec<i64> = Vec::new();
+    let results = results
+        .into_iter()
+        .filter(|result|
+        {
+            if result.requires_current_vector && stale.contains(&result.id)
+            {
+                warnings.push(format!(
+                    "{}: source_image_id={}: its search-index vector went stale after it was scored; not written, re-checked once re-indexed",
+                    NEGATIVE_WRITEBACK_WARNING_VECTOR_STALE, result.id
+                ));
+                skipped_stale_ids.push(result.id);
+                return false;
+            }
+            true
+        })
+        .collect::<Vec<_>>();
+    if results.is_empty()
+    {
+        let mut receipt = successful_negative_detection_writeback(NegativeDetectionWritebackCounts::default(), warnings);
+        receipt.skipped_stale_ids = skipped_stale_ids;
+        return receipt;
+    }
     let retry_results = results.clone();
 
     let (first_failure, rolled_back) =
         match negative_detection_writeback_attempt(conn, results, probe, &mut warnings)
         {
-            Ok(counts) => return successful_negative_detection_writeback(counts, warnings),
+            Ok(counts) =>
+            {
+                let mut receipt = successful_negative_detection_writeback(counts, warnings);
+                receipt.skipped_stale_ids = skipped_stale_ids;
+                return receipt;
+            }
             Err(failure) => failure,
         };
 
@@ -16751,7 +16902,12 @@ fn update_negative_detection_results_impl(
 
     match negative_detection_writeback_attempt(conn, retry_results, probe, &mut warnings)
     {
-        Ok(counts) => successful_negative_detection_writeback(counts, warnings),
+        Ok(counts) =>
+        {
+            let mut receipt = successful_negative_detection_writeback(counts, warnings);
+            receipt.skipped_stale_ids = skipped_stale_ids;
+            receipt
+        }
         Err((mut failure, _)) =>
         {
             failure.reason = format!(
@@ -23472,6 +23628,739 @@ pub async fn search_index_work_page(
         {
             eprintln!("search_index_work_page: {}", message);
             SearchIndexWorkPage { store_ok: false, unreadable_half: Some("catalogue".to_string()), items: Vec::new() }
+        }
+    }
+}
+
+// --- SigLIP slice N: the combined film-negative detector's reads ------------
+//
+// ⭐ Docs/DESIGN-Semantic-Search.md §4b (Oct 24, 2026; Richard: "That's the
+// whole point of this exercise"). `film-negative-v3` combines the shipped
+// detector's logit with a linear probe on the photo's SigLIP 2 vector. The
+// probe's 768 weights live in Swift (`NegativeDetector.CombinedV3`, frozen
+// from `DebugTools/clip-spike/n-refit/constants.json`) and are passed in; Rust
+// only reads the requested vectors and returns one number per photo, so the
+// payload is tiny in both directions and every vector read runs on the core's
+// private runtime, never on the thread that polls the FFI (ruling 79).
+//
+// The v3 QUEUE covers only photos with a CURRENT vector — stored for the
+// probe's model/preprocessing pair and holding no stale mark (§4b.3: "A photo
+// with no vector keeps its v2 verdict"; a stale vector describes pixels the
+// photo no longer has, so it is not current either). Hidden RAW twins: the
+// queue is the film-negative queue (`RAW_JPEG_COLLAPSE_PREDICATE`), whose
+// candidates are exactly the search index's candidates, so a vector is
+// looked up on the visible photo and the writeback copies the verdict to the
+// RAW behind it, as it always has. A hidden RAW's own id has no vector.
+
+/// The filter for ONE stored vector identity: the model's NAME as well as its
+/// version and preprocessing (fix round 1) — the row carries all three.
+fn image_embedding_identity_filter(model_name: &str, model_version: &str, preprocessing_version: &str) -> String
+{
+    format!(
+        "model_name = {} AND {}",
+        sql_string_literal(model_name),
+        face_embedding_version_filter(model_version, preprocessing_version)
+    )
+}
+
+/// The ids stored for one model identity (name, version, preprocessing) —
+/// an id-only projection, never the vectors. Never built ⇒ empty.
+async fn stored_image_embedding_ids_for_identity(
+    model_name: &str,
+    model_version: &str,
+    preprocessing_version: &str,
+) -> Result<std::collections::HashSet<i64>, String>
+{
+    match open_image_embedding_table_for_read("negative_detection_vector_queue").await?
+    {
+        ImageEmbeddingTableState::Present(table) =>
+        {
+            stored_image_vector_ids(
+                &table,
+                Some(image_embedding_identity_filter(model_name, model_version, preprocessing_version)),
+            )
+            .await
+        }
+        ImageEmbeddingTableState::NeverBuilt => Ok(std::collections::HashSet::new()),
+    }
+}
+
+/// The probe score for ONE stored vector: `w · (v / ‖v‖) + bias`, in f64 (the
+/// refit normalized in float64; the store keeps a Float16 copy of an
+/// already-normalized vector, so this re-normalization only removes the
+/// half-precision rounding of the norm). `None` when the vector cannot be
+/// scored: the wrong width, a non-finite value, or a zero norm.
+fn image_embedding_probe_score(vector: &[f64], weights: &[f64], bias: f64) -> Option<f64>
+{
+    if vector.len() != weights.len() || vector.is_empty()
+    {
+        return None;
+    }
+    let mut squared = 0.0f64;
+    for value in vector
+    {
+        if !value.is_finite()
+        {
+            return None;
+        }
+        squared += value * value;
+    }
+    let norm = squared.sqrt();
+    if !(norm > 0.0) || !norm.is_finite()
+    {
+        return None;
+    }
+    let mut dot = 0.0f64;
+    for (value, weight) in vector.iter().zip(weights.iter())
+    {
+        dot += (value / norm) * weight;
+    }
+    let score = dot + bias;
+    if score.is_finite()
+    {
+        Some(score)
+    }
+    else
+    {
+        None
+    }
+}
+
+/// The stored vectors of one batch, as f64 rows keyed by `image_id`. Reads the
+/// `vector` column as Float16 (the table's type) or Float32 (the documented
+/// fallback, §3.1).
+fn image_embedding_vectors_from_batch(
+    batch: &RecordBatch,
+) -> Result<Vec<(i64, Vec<f64>)>, String>
+{
+    let ids = batch
+        .column_by_name("image_id")
+        .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+        .ok_or_else(|| "the image-vector read returned no Int64 image_id column".to_string())?;
+    let vectors = batch
+        .column_by_name("vector")
+        .and_then(|array| array.as_any().downcast_ref::<FixedSizeListArray>())
+        .ok_or_else(|| "the image-vector read returned no fixed-size vector column".to_string())?;
+    let width = vectors.value_length() as usize;
+    let child = vectors.values();
+    let mut rows = Vec::with_capacity(batch.num_rows());
+    if let Some(halves) = child.as_any().downcast_ref::<arrow_array::Float16Array>()
+    {
+        for row in 0..batch.num_rows()
+        {
+            if ids.is_null(row)
+            {
+                return Err("the image-vector read returned a NULL image_id".to_string());
+            }
+            let start = vectors.value_offset(row) as usize;
+            let values = (start..start + width).map(|i| f64::from(halves.value(i).to_f32())).collect();
+            rows.push((ids.value(row), values));
+        }
+        return Ok(rows);
+    }
+    if let Some(singles) = child.as_any().downcast_ref::<arrow_array::Float32Array>()
+    {
+        for row in 0..batch.num_rows()
+        {
+            if ids.is_null(row)
+            {
+                return Err("the image-vector read returned a NULL image_id".to_string());
+            }
+            let start = vectors.value_offset(row) as usize;
+            let values = (start..start + width).map(|i| f64::from(singles.value(i))).collect();
+            rows.push((ids.value(row), values));
+        }
+        return Ok(rows);
+    }
+    Err(format!("the image-vector read returned an unexpected vector type: {:?}", child.data_type()))
+}
+
+/// ⚠️ The probe scores, read from an open table. Ids are read in chunks of
+/// `IMAGE_VECTOR_CHUNK`, each by count-then-limit (the id scan's shape) and
+/// checked against that count. A vector that cannot be scored, and an id the
+/// store holds twice with DIFFERENT scores, answer `None` for that photo and
+/// are named in the second half of the result; neither fails the call.
+async fn image_embedding_probe_scores_from_table(
+    table: &lancedb::Table,
+    image_ids: &[i64],
+    model_name: &str,
+    model_version: &str,
+    preprocessing_version: &str,
+    weights: &[f64],
+    bias: f64,
+) -> Result<(Vec<Option<f64>>, Option<String>), String>
+{
+    let mut unique: Vec<i64> = image_ids.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    let version_filter = image_embedding_identity_filter(model_name, model_version, preprocessing_version);
+    let mut scored: std::collections::HashMap<i64, Option<f64>> = std::collections::HashMap::new();
+    let mut problems: Vec<String> = Vec::new();
+    for chunk in unique.chunks(IMAGE_VECTOR_CHUNK)
+    {
+        let csv = chunk.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+        let filter = format!("{} AND image_id IN ({})", version_filter, csv);
+        let matching = table
+            .count_rows(Some(filter.clone()))
+            .await
+            .map_err(|error| format!("the image-vector count failed: {}", error))?;
+        if matching == 0
+        {
+            continue;
+        }
+        let batches = table
+            .query()
+            .select(lancedb::query::Select::columns(&["image_id", "vector"]))
+            .only_if(filter)
+            .limit(matching)
+            .execute()
+            .await
+            .map_err(|error| format!("the image-vector read failed: {}", error))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|error| format!("the image-vector read failed: {}", error))?;
+        let mut rows = 0usize;
+        for batch in batches
+        {
+            for (image_id, vector) in image_embedding_vectors_from_batch(&batch)?
+            {
+                rows += 1;
+                let score = image_embedding_probe_score(&vector, weights, bias);
+                if score.is_none()
+                {
+                    problems.push(format!(
+                        "image {}: its stored vector ({} values) cannot be scored by a {}-weight probe",
+                        image_id,
+                        vector.len(),
+                        weights.len()
+                    ));
+                }
+                match scored.get(&image_id)
+                {
+                    None =>
+                    {
+                        scored.insert(image_id, score);
+                    }
+                    // merge_insert keeps one row per key; a second row that
+                    // agrees is harmless, one that disagrees is not trusted.
+                    Some(existing) if *existing == score => {}
+                    Some(_) =>
+                    {
+                        problems.push(format!("image {}: the store holds two different vectors", image_id));
+                        scored.insert(image_id, None);
+                    }
+                }
+            }
+        }
+        if rows != matching
+        {
+            return Err(format!(
+                "the image-vector read returned {} row(s) where the store counted {}",
+                rows, matching
+            ));
+        }
+    }
+    let scores = image_ids.iter().map(|id| scored.get(id).copied().flatten()).collect();
+    let note = if problems.is_empty()
+    {
+        None
+    }
+    else
+    {
+        let first = problems.iter().take(3).cloned().collect::<Vec<_>>().join("; ");
+        Some(format!("{} stored vector(s) could not be scored: {}", problems.len(), first))
+    };
+    Ok((scores, note))
+}
+
+/// The whole read, on the embedding runtime: request validation, the store
+/// open (never built ⇒ every score `None`), then the chunked read.
+async fn image_embedding_probe_scores_checked(
+    image_ids: Vec<i64>,
+    model_name: String,
+    model_version: String,
+    preprocessing_version: String,
+    weights: Vec<f64>,
+    bias: f64,
+) -> Result<(Vec<Option<f64>>, Option<String>), String>
+{
+    if weights.is_empty() || weights.iter().any(|weight| !weight.is_finite()) || !bias.is_finite()
+    {
+        return Err("image_embedding_probe_scores: the probe weights and bias must be finite and non-empty".to_string());
+    }
+    if image_ids.is_empty()
+    {
+        return Ok((Vec::new(), None));
+    }
+    match open_image_embedding_table_for_read("image_embedding_probe_scores").await?
+    {
+        ImageEmbeddingTableState::Present(table) =>
+        {
+            image_embedding_probe_scores_from_table(
+                &table,
+                &image_ids,
+                &model_name,
+                &model_version,
+                &preprocessing_version,
+                &weights,
+                bias,
+            )
+            .await
+        }
+        ImageEmbeddingTableState::NeverBuilt => Ok((vec![None; image_ids.len()], None)),
+    }
+}
+
+/// ⭐ SigLIP slice N (§4b.2) — the linear probe's score for each photo, read
+/// from `image_embeddings` for one model/preprocessing pair: `scores[i]` for
+/// `image_ids[i]` (`None` = no usable vector). Runs on the core's private
+/// runtime; the FFI future only awaits the handle. ⛔ `store_ok = false` = the
+/// store (or a malformed request) could not be read — never "no vectors".
+pub async fn image_embedding_probe_scores(
+    image_ids: Vec<i64>,
+    model_name: String,
+    model_version: String,
+    preprocessing_version: String,
+    weights: Vec<f64>,
+    bias: f64,
+) -> ImageEmbeddingProbeScores
+{
+    let unreadable = |message: String| ImageEmbeddingProbeScores
+    {
+        store_ok: false,
+        scores: Vec::new(),
+        error: Some(message),
+    };
+    let spawned = ffi_panic_boundary(
+        "image_embedding_probe_scores.panic.query_failed",
+        ||
+        {
+            face_embedding_runtime("image_embedding_probe_scores.face_runtime_unavailable.query_failed").map(|runtime|
+            {
+                runtime.spawn(image_embedding_probe_scores_checked(
+                    image_ids,
+                    model_name,
+                    model_version,
+                    preprocessing_version,
+                    weights,
+                    bias,
+                ))
+            })
+        },
+        |panic| Err(ffi_panic_report("read the search index", &panic)),
+    );
+    match spawned
+    {
+        Ok(task) => match task.await
+        {
+            Ok(Ok((scores, note))) =>
+            {
+                if let Some(note) = note.as_deref()
+                {
+                    eprintln!("image_embedding_probe_scores: {}", note);
+                }
+                ImageEmbeddingProbeScores { store_ok: true, scores, error: note }
+            }
+            Ok(Err(message)) =>
+            {
+                eprintln!("image_embedding_probe_scores: {}", message);
+                unreadable(message)
+            }
+            Err(error) =>
+            {
+                let message = format!("image_embedding_probe_scores: the read task failed: {}", error);
+                eprintln!("{}", message);
+                unreadable(message)
+            }
+        },
+        Err(message) => unreadable(message),
+    }
+}
+
+/// The v3 queue walked from the catalogue: candidate ids that hold a CURRENT
+/// vector (up to `page_limit` of them, `id > after_image_id`), plus the whole
+/// queue's split when counting.
+struct NegativeDetectionVectorScan
+{
+    candidate_ids: Vec<i64>,
+    next_after_image_id: i64,
+    with_vector: u64,
+    without_vector: u64,
+    without_vector_unchecked: u64,
+    without_vector_stale: u64,
+}
+
+/// Rows per keyset batch of the v3 queue walk (ids and one flag only).
+const NEGATIVE_DETECTION_VECTOR_SCAN_BATCH: usize = 10_000;
+
+/// Walks the film-negative queue (`negative_detection_queue_where_clause`, so
+/// stills only, the RAW/JPEG collapse applied, pending under
+/// `detector_version`) by id, splitting it on the CURRENT-vector set
+/// (`stored` minus every stale-marked id). `page_limit = None` counts the
+/// whole queue; `Some(n)` stops after `n` candidates with a current vector,
+/// and `next_after_image_id` is the last id the page covered. ⛔ A row the
+/// walk cannot read is an error, never skipped (the cursor would pass it).
+fn negative_detection_vector_scan(
+    conn: &Connection,
+    stored: &std::collections::HashSet<i64>,
+    detector_version: &str,
+    analysis_run_id: &str,
+    scope_filter: Option<&str>,
+    after_image_id: i64,
+    page_limit: Option<usize>,
+) -> Result<NegativeDetectionVectorScan, String>
+{
+    const STALE_SITE: &str = "negative_detection_vector_scan.stale";
+    const SCAN_SITE: &str = "negative_detection_vector_scan.candidates";
+
+    let mut stale_statement = conn
+        .prepare("SELECT image_id FROM image_vector_stale")
+        .map_err(|error| format!("the stale-vector marks could not be prepared: {}", error))?;
+    let stale_rows = stale_statement
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|error| format!("the stale-vector marks could not be read: {}", error))?;
+    let (stale_ids, stale_dropped) = collect_rows_counted(stale_rows, STALE_SITE);
+    if stale_dropped > 0
+    {
+        return Err(format!("{} stale-vector mark(s) could not be read", stale_dropped));
+    }
+    let stale: std::collections::HashSet<i64> = stale_ids.into_iter().collect();
+
+    let id_predicate = match scope_filter
+    {
+        Some(filter) => format!("({}) AND id > ?3", filter),
+        None => "id > ?3".to_string(),
+    };
+    let where_clause = negative_detection_queue_where_clause(Some(&id_predicate));
+    let sql = format!(
+        "SELECT id, COALESCE(negative_detection_status = 'complete', FALSE) \
+           FROM images {} \
+          ORDER BY id \
+          LIMIT {}",
+        where_clause, NEGATIVE_DETECTION_VECTOR_SCAN_BATCH
+    );
+    let mut statement = conn
+        .prepare(&sql)
+        .map_err(|error| format!("the film-negative queue could not be prepared: {}", error))?;
+
+    let mut scan = NegativeDetectionVectorScan
+    {
+        candidate_ids: Vec::new(),
+        next_after_image_id: after_image_id,
+        with_vector: 0,
+        without_vector: 0,
+        without_vector_unchecked: 0,
+        without_vector_stale: 0,
+    };
+    let mut cursor = after_image_id;
+    loop
+    {
+        let rows = statement
+            .query_map(params![detector_version, analysis_run_id, cursor], |row|
+            {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?))
+            })
+            .map_err(|error| format!("the film-negative queue could not be read: {}", error))?;
+        let (batch, dropped) = collect_rows_counted(rows, SCAN_SITE);
+        if dropped > 0
+        {
+            return Err(format!("{} film-negative queue row(s) could not be read", dropped));
+        }
+        let batch_len = batch.len();
+        for (image_id, has_complete_verdict) in batch
+        {
+            cursor = image_id;
+            scan.next_after_image_id = image_id;
+            if stored.contains(&image_id) && !stale.contains(&image_id)
+            {
+                scan.with_vector += 1;
+                if let Some(limit) = page_limit
+                {
+                    scan.candidate_ids.push(image_id);
+                    if scan.candidate_ids.len() >= limit
+                    {
+                        return Ok(scan);
+                    }
+                }
+            }
+            else
+            {
+                scan.without_vector += 1;
+                if stored.contains(&image_id)
+                {
+                    scan.without_vector_stale += 1;
+                }
+                if !has_complete_verdict
+                {
+                    scan.without_vector_unchecked += 1;
+                }
+            }
+        }
+        if batch_len < NEGATIVE_DETECTION_VECTOR_SCAN_BATCH
+        {
+            return Ok(scan);
+        }
+    }
+}
+
+/// The page's candidate rows, by id. Rows the catalogue cannot decode are
+/// counted, and the page's cursor already covers them, so each is counted once.
+fn negative_detection_vector_candidates(
+    conn: &Connection,
+    ids: &[i64],
+) -> Result<(Vec<NegativeDetectionCandidate>, u64), String>
+{
+    let mut candidates = Vec::with_capacity(ids.len());
+    let mut dropped_rows = 0u64;
+    for chunk in ids.chunks(IMAGE_VECTOR_CHUNK)
+    {
+        let csv = chunk.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT id, file_path, file_size, camera_make, camera_model \
+               FROM images WHERE id IN ({}) ORDER BY id",
+            csv
+        );
+        let mut statement = conn
+            .prepare(&sql)
+            .map_err(|error| format!("the film-negative candidates could not be prepared: {}", error))?;
+        let rows = statement
+            .query_map([], |row|
+            {
+                Ok(NegativeDetectionCandidate
+                {
+                    id: row.get(0)?,
+                    file_path: row.get(1)?,
+                    file_size: row.get::<_, i64>(2)?.max(0) as u64,
+                    camera_make: row.get(3)?,
+                    camera_model: row.get(4)?,
+                })
+            })
+            .map_err(|error| format!("the film-negative candidates could not be read: {}", error))?;
+        let (batch, dropped) = collect_rows_counted(rows, "negative_detection_vector_candidates");
+        candidates.extend(batch);
+        dropped_rows += dropped;
+    }
+    Ok((candidates, dropped_rows))
+}
+
+/// What the v3 queue read produced: the walk, and (for a page) its rows.
+struct NegativeDetectionVectorWork
+{
+    scan: NegativeDetectionVectorScan,
+    candidates: Vec<NegativeDetectionCandidate>,
+    dropped_rows: u64,
+}
+
+/// ⭐ BOTH halves of the v3 queue, as ONE task on the embedding runtime (the
+/// search index's `search_index_work_in_background` shape — ruling 79): the
+/// stored ids first (an id-only projection, never the vectors), then the
+/// catalogue lock, briefly and inside a panic boundary, for the walk. The
+/// error names the half that could not be read.
+async fn negative_detection_vector_work_in_background(
+    detector_version: String,
+    analysis_run_id: String,
+    model_name: String,
+    model_version: String,
+    preprocessing_version: String,
+    scoped_ids: Option<Vec<i64>>,
+    after_image_id: i64,
+    page_limit: Option<usize>,
+    panic_site: &'static str,
+) -> Result<NegativeDetectionVectorWork, String>
+{
+    let stored = stored_image_embedding_ids_for_identity(&model_name, &model_version, &preprocessing_version)
+        .await
+        .map_err(|message| format!("the search index could not be read: {}", message))?;
+    ffi_panic_boundary(
+        panic_site,
+        || -> Result<NegativeDetectionVectorWork, String>
+        {
+            let scope_filter = match scoped_ids.as_deref()
+            {
+                Some(ids) => match focus_analysis_scope_predicate(ids)
+                {
+                    Some(filter) => Some(filter),
+                    // An EMPTY explicit selection is an empty queue, not a failure.
+                    None =>
+                    {
+                        return Ok(NegativeDetectionVectorWork
+                        {
+                            scan: NegativeDetectionVectorScan
+                            {
+                                candidate_ids: Vec::new(),
+                                next_after_image_id: after_image_id,
+                                with_vector: 0,
+                                without_vector: 0,
+                                without_vector_unchecked: 0,
+                                without_vector_stale: 0,
+                            },
+                            candidates: Vec::new(),
+                            dropped_rows: 0,
+                        });
+                    }
+                },
+                None => None,
+            };
+            let catalogue = lock_catalogue();
+            let conn = catalogue
+                .as_ref()
+                .ok_or_else(|| "the catalog is not initialized".to_string())?;
+            let scan = negative_detection_vector_scan(
+                conn,
+                &stored,
+                &detector_version,
+                &analysis_run_id,
+                scope_filter.as_deref(),
+                after_image_id,
+                page_limit,
+            )?;
+            let (candidates, dropped_rows) = if page_limit.is_some()
+            {
+                negative_detection_vector_candidates(conn, &scan.candidate_ids)?
+            }
+            else
+            {
+                (Vec::new(), 0)
+            };
+            Ok(NegativeDetectionVectorWork { scan, candidates, dropped_rows })
+        },
+        |panic| Err(ffi_panic_report("read the list of photos to check for film negatives", &panic)),
+    )
+    .map_err(|message| format!("the catalog could not be read: {}", message))
+}
+
+async fn negative_detection_vector_work_outcome(
+    spawned: Result<tokio::task::JoinHandle<Result<NegativeDetectionVectorWork, String>>, String>,
+) -> Result<NegativeDetectionVectorWork, String>
+{
+    match spawned
+    {
+        Ok(task) => task
+            .await
+            .unwrap_or_else(|error| Err(format!("the film-negative queue task failed: {}", error))),
+        Err(message) => Err(message),
+    }
+}
+
+/// ⭐ SigLIP slice N (§4b.3) — the size of the `film-negative-v3` queue, split
+/// by whether each photo has a current vector for the probe's pair.
+/// `scoped_ids` = a selection (culling's sibling expansion); `None` = the
+/// whole catalog. ⛔ A read failure is `query_ok = false`, never zero.
+pub async fn negative_detection_vector_candidate_count(
+    detector_version: String,
+    analysis_run_id: String,
+    model_name: String,
+    model_version: String,
+    preprocessing_version: String,
+    scoped_ids: Option<Vec<i64>>,
+) -> NegativeDetectionVectorWorkCount
+{
+    let spawned = ffi_panic_boundary(
+        "negative_detection_vector_candidate_count.panic.query_failed",
+        ||
+        {
+            face_embedding_runtime("negative_detection_vector_candidate_count.face_runtime_unavailable.query_failed").map(|runtime|
+            {
+                runtime.spawn(negative_detection_vector_work_in_background(
+                    detector_version,
+                    analysis_run_id,
+                    model_name,
+                    model_version,
+                    preprocessing_version,
+                    scoped_ids,
+                    i64::MIN,
+                    None,
+                    "negative_detection_vector_candidate_count.panic.query_failed",
+                ))
+            })
+        },
+        |panic| Err(ffi_panic_report("read the list of photos to check for film negatives", &panic)),
+    );
+    match negative_detection_vector_work_outcome(spawned).await
+    {
+        Ok(work) => NegativeDetectionVectorWorkCount
+        {
+            query_ok: true,
+            query_error: None,
+            with_vector: work.scan.with_vector,
+            without_vector: work.scan.without_vector,
+            without_vector_unchecked: work.scan.without_vector_unchecked,
+            without_vector_stale: work.scan.without_vector_stale,
+        },
+        Err(message) =>
+        {
+            eprintln!("negative_detection_vector_candidate_count: {}", message);
+            NegativeDetectionVectorWorkCount
+            {
+                query_ok: false,
+                query_error: Some(message),
+                with_vector: 0,
+                without_vector: 0,
+                without_vector_unchecked: 0,
+                without_vector_stale: 0,
+            }
+        }
+    }
+}
+
+/// ⭐ SigLIP slice N (§4b.3) — one page of the `film-negative-v3` queue: at
+/// most `limit` (clamped 1…5000) photos with a current vector, `id >
+/// after_image_id`, ascending. ⛔ A read failure is `query_ok = false` with
+/// no candidates — never "nothing to do".
+pub async fn negative_detection_vector_candidate_page(
+    limit: u32,
+    after_image_id: i64,
+    detector_version: String,
+    analysis_run_id: String,
+    model_name: String,
+    model_version: String,
+    preprocessing_version: String,
+    scoped_ids: Option<Vec<i64>>,
+) -> NegativeDetectionVectorCandidatePage
+{
+    let limit = limit.clamp(1, 5000) as usize;
+    let spawned = ffi_panic_boundary(
+        "negative_detection_vector_candidate_page.panic.query_failed",
+        ||
+        {
+            face_embedding_runtime("negative_detection_vector_candidate_page.face_runtime_unavailable.query_failed").map(|runtime|
+            {
+                runtime.spawn(negative_detection_vector_work_in_background(
+                    detector_version,
+                    analysis_run_id,
+                    model_name,
+                    model_version,
+                    preprocessing_version,
+                    scoped_ids,
+                    after_image_id,
+                    Some(limit),
+                    "negative_detection_vector_candidate_page.panic.query_failed",
+                ))
+            })
+        },
+        |panic| Err(ffi_panic_report("read the list of photos to check for film negatives", &panic)),
+    );
+    match negative_detection_vector_work_outcome(spawned).await
+    {
+        Ok(work) => NegativeDetectionVectorCandidatePage
+        {
+            candidates: work.candidates,
+            dropped_rows: work.dropped_rows,
+            query_ok: true,
+            query_error: None,
+            next_after_image_id: work.scan.next_after_image_id,
+        },
+        Err(message) =>
+        {
+            eprintln!("negative_detection_vector_candidate_page: {}", message);
+            NegativeDetectionVectorCandidatePage
+            {
+                candidates: Vec::new(),
+                dropped_rows: 0,
+                query_ok: false,
+                query_error: Some(message),
+                next_after_image_id: after_image_id,
+            }
         }
     }
 }
@@ -56204,6 +57093,7 @@ mod panic_boundary_tests
                 negative_kind: None,
                 signals_json: None,
                 auto_keywords: Vec::new(),
+                requires_current_vector: false,
             }])));
         assert_eq!((r.updated, r.keywords_added, r.keywords_retracted), (0, 0, 0));
         assert_eq!(r.failure_stage.as_deref(), Some("catalogue"), "an EXISTING stage token");
@@ -64962,6 +65852,7 @@ mod negative_detection_tests
             negative_kind: kind.map(|kind| kind.to_string()),
             signals_json: Some("{\"bright_border\":0.9}".to_string()),
             auto_keywords: labels.iter().map(|label| label.to_string()).collect(),
+            requires_current_vector: false,
         }
     }
 
@@ -65321,6 +66212,7 @@ mod negative_detection_tests
                 warnings: Vec::new(),
                 failure_stage: None,
                 failed_reason: None,
+                skipped_stale_ids: Vec::new(),
             }
         );
         let expected: Columns = (
@@ -65544,6 +66436,7 @@ mod negative_detection_tests
                 warnings: Vec::new(),
                 failure_stage: None,
                 failed_reason: None,
+                skipped_stale_ids: Vec::new(),
             }
         );
     }
@@ -66117,6 +67010,7 @@ mod twin_lookup_tests
                 negative_kind: None,
                 signals_json: None,
                 auto_keywords: Vec::new(),
+                requires_current_vector: false,
             })
             .collect::<Vec<_>>();
         let t = std::time::Instant::now();
@@ -66348,6 +67242,7 @@ mod writeback_plan_evidence
                     negative_kind: Some("color".to_string()),
                     signals_json: Some("{}".to_string()),
                     auto_keywords: vec!["film negative".to_string(), "color negative".to_string()],
+                    requires_current_vector: false,
                 })
                 .collect::<Vec<_>>();
             let mut retract = add.clone();
@@ -68667,5 +69562,649 @@ mod image_embedding_store_tests
         drop(guard);
         assert_eq!(runtime.block_on(upsert).expect("upsert").status, "stored", "S1-LOCK/after-release");
         runtime.block_on(retry).expect("retry");
+    }
+}
+
+// =============================================================================
+// ⭐ SigLIP slice N (Oct 24, 2026; Docs/DESIGN-Semantic-Search.md §4b) — the
+// combined film-negative detector's two reads: the probe scores and the v3
+// queue that covers only photos with a CURRENT vector.
+// =============================================================================
+#[cfg(test)]
+mod negative_detection_v3_tests
+{
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    const NAME: &str = "siglip2-test";
+    const MODEL: &str = "1.0-test";
+    const OTHER_MODEL: &str = "0.9-test";
+    const PREP: &str = "squash-test";
+    const DIM: usize = 8;
+    const V3: &str = "film-negative-v3";
+    const RUN: &str = "run-n";
+
+    struct Fixture
+    {
+        dir: std::path::PathBuf,
+        catalogue: std::path::PathBuf,
+    }
+
+    impl Drop for Fixture
+    {
+        fn drop(&mut self)
+        {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn fresh_catalogue(tag: &str) -> (Fixture, Connection)
+    {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("plcore-n-v3-{}-{}-{}", std::process::id(), n, tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture directory");
+        let catalogue = dir.join("catalogue.db");
+        let conn = open_and_migrate_catalogue(&catalogue).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH.
+        fence_connection_against_extension_fetches(&conn);
+        (Fixture { dir, catalogue }, conn)
+    }
+
+    fn serial() -> std::sync::MutexGuard<'static, ()>
+    {
+        super::swallowed_failure_tests::GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct Installed;
+
+    impl Installed
+    {
+        fn new(fixture: &Fixture, conn: Connection) -> Self
+        {
+            *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(conn);
+            *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(fixture.catalogue.clone());
+            CATALOGUE.clear_poison();
+            CATALOGUE_PATH.clear_poison();
+            Installed
+        }
+    }
+
+    impl Drop for Installed
+    {
+        fn drop(&mut self)
+        {
+            *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
+
+    fn block<F: std::future::Future>(future: F) -> F::Output
+    {
+        FACE_EMBEDDING_RUNTIME.block_on(future)
+    }
+
+    fn insert_photo(conn: &Connection, file_path: &str, kind: &str, is_video: bool) -> i64
+    {
+        let file_name = file_path.rsplit('/').next().unwrap_or(file_path).to_string();
+        let stem = file_name.split('.').next().unwrap_or(&file_name).to_string();
+        let directory = file_path[..file_path.len() - file_name.len() - 1].to_string();
+        conn.query_row(
+            "INSERT INTO images (file_path, file_size, file_name, file_stem, image_kind, \
+             directory_path, created_timestamp, modified_timestamp, is_video, camera_make) \
+             VALUES (?1, 10, ?2, ?3, ?4, ?5, 0, 0, ?6, 'TestCam') RETURNING id",
+            params![file_path, file_name, stem, kind, directory, is_video],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("insert photo")
+    }
+
+    fn values(seed: i64) -> Vec<f32>
+    {
+        (0..DIM).map(|i| ((seed as f32) * 0.71 + (i as f32) * 0.93).cos() * 3.0 + 0.2).collect()
+    }
+
+    fn record_with(id: i64, model: &str, vector: &[f32]) -> ImageEmbeddingRecord
+    {
+        record_named(id, NAME, model, vector)
+    }
+
+    fn record_named(id: i64, name: &str, model: &str, vector: &[f32]) -> ImageEmbeddingRecord
+    {
+        ImageEmbeddingRecord
+        {
+            image_id: id,
+            model_name: name.to_string(),
+            model_version: model.to_string(),
+            preprocessing_version: PREP.to_string(),
+            embedding_dimension: vector.len() as u32,
+            vector: vector.iter().flat_map(|value| value.to_le_bytes()).collect(),
+        }
+    }
+
+    fn store(records: Vec<ImageEmbeddingRecord>)
+    {
+        let result = block(upsert_image_embeddings_impl(records, Vec::new()));
+        assert_eq!(result.status, "stored", "fixture: vectors stored ({:?})", result.error);
+    }
+
+    fn weights() -> Vec<f64>
+    {
+        (0..DIM).map(|i| (i as f64) * 0.5 - 1.75).collect()
+    }
+
+    /// Every stored (model, id) → its Float16 values, read straight from the table.
+    fn stored_vectors(uri: &str) -> BTreeMap<(String, i64), Vec<f64>>
+    {
+        block(async
+        {
+            let database = lancedb::connect(uri).execute().await.expect("connect");
+            let table = database.open_table(IMAGE_EMBEDDING_TABLE).execute().await.expect("open");
+            let count = table.count_rows(None).await.expect("count");
+            let batches = table
+                .query()
+                .limit(count)
+                .execute()
+                .await
+                .expect("query")
+                .try_collect::<Vec<_>>()
+                .await
+                .expect("collect");
+            let mut rows = BTreeMap::new();
+            for batch in batches
+            {
+                let models = batch
+                    .column_by_name("model_version")
+                    .and_then(|a| a.as_any().downcast_ref::<StringArray>().cloned())
+                    .expect("models");
+                let vectors = image_embedding_vectors_from_batch(&batch).expect("vectors");
+                for (row, (id, vector)) in vectors.into_iter().enumerate()
+                {
+                    rows.insert((models.value(row).to_string(), id), vector);
+                }
+            }
+            rows
+        })
+    }
+
+    fn probe(ids: &[i64], model: &str, weights: Vec<f64>, bias: f64) -> ImageEmbeddingProbeScores
+    {
+        futures::executor::block_on(image_embedding_probe_scores(
+            ids.to_vec(),
+            NAME.to_string(),
+            model.to_string(),
+            PREP.to_string(),
+            weights,
+            bias,
+        ))
+    }
+
+    fn count(scope: Option<Vec<i64>>) -> NegativeDetectionVectorWorkCount
+    {
+        futures::executor::block_on(negative_detection_vector_candidate_count(
+            V3.to_string(),
+            RUN.to_string(),
+            NAME.to_string(),
+            MODEL.to_string(),
+            PREP.to_string(),
+            scope,
+        ))
+    }
+
+    fn page(after: i64, limit: u32, scope: Option<Vec<i64>>) -> NegativeDetectionVectorCandidatePage
+    {
+        futures::executor::block_on(negative_detection_vector_candidate_page(
+            limit,
+            after,
+            V3.to_string(),
+            RUN.to_string(),
+            NAME.to_string(),
+            MODEL.to_string(),
+            PREP.to_string(),
+            scope,
+        ))
+    }
+
+    fn ids(page: &NegativeDetectionVectorCandidatePage) -> Vec<i64>
+    {
+        page.candidates.iter().map(|candidate| candidate.id).collect()
+    }
+
+    // ------------------------------------------------------------------
+    // N-PROBE/pure — the score is w · (v / |v|) + bias, in f64; a vector
+    // of the wrong width, with a non-finite value, or of zero norm has none.
+    // ------------------------------------------------------------------
+    #[test]
+    fn n_probe_score_is_the_normalized_dot_plus_bias()
+    {
+        let score = image_embedding_probe_score(&[3.0, 4.0], &[1.0, 2.0], 0.5).expect("a score");
+        assert!((score - 2.7).abs() < 1e-12, "N-PROBE/pure: 0.6·1 + 0.8·2 + 0.5 = 2.7, got {}", score);
+        let scaled = image_embedding_probe_score(&[30.0, 40.0], &[1.0, 2.0], 0.5).expect("a score");
+        assert!((scaled - score).abs() < 1e-12, "N-PROBE/pure: the vector is normalized first");
+        assert_eq!(image_embedding_probe_score(&[3.0, 4.0, 0.0], &[1.0, 2.0], 0.5), None, "N-PROBE/width");
+        assert_eq!(image_embedding_probe_score(&[0.0, 0.0], &[1.0, 2.0], 0.5), None, "N-PROBE/zero-norm");
+        assert_eq!(image_embedding_probe_score(&[f64::NAN, 1.0], &[1.0, 2.0], 0.5), None, "N-PROBE/nan");
+        assert_eq!(image_embedding_probe_score(&[], &[], 0.5), None, "N-PROBE/empty");
+    }
+
+    // ------------------------------------------------------------------
+    // N-PROBE/read — one score per requested id, in request order, from the
+    // requested pair's stored (Float16) vector; an unstored id, another
+    // model's vector and an id asked twice answer as they should.
+    // ------------------------------------------------------------------
+    #[test]
+    fn n_probe_scores_read_only_the_requested_vectors_in_request_order()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("probe");
+        for i in 1..=6
+        {
+            insert_photo(&conn, &format!("/probe/p{}.jpg", i), "jpeg", false);
+        }
+        let other_name = insert_photo(&conn, "/probe/p7.jpg", "jpeg", false);
+        let uri = fixture.dir.join("vectors.lancedb").to_string_lossy().into_owned();
+        let _installed = Installed::new(&fixture, conn);
+
+        // Never built: every score is None, and the store is readable.
+        let never = probe(&[1, 2], MODEL, weights(), 0.25);
+        assert!(never.store_ok, "N-PROBE/never-built is readable");
+        assert_eq!(never.scores, vec![None, None], "N-PROBE/never-built: no vectors");
+
+        store((1..=5).map(|id| record_with(id, MODEL, &values(id))).collect());
+        store(vec![record_with(6, OTHER_MODEL, &values(6))]);
+        // Fix round 1: same version and preprocessing, another model NAME.
+        store(vec![record_named(other_name, "another-model", MODEL, &values(other_name))]);
+        let stored = stored_vectors(&uri);
+        let named = probe(&[other_name, 1], MODEL, weights(), 0.25);
+        assert_eq!(named.scores[0], None, "N-PROBE/name: another model's name is not this identity");
+        assert!(named.scores[1].is_some(), "N-PROBE/name: this identity still scores");
+
+        let answer = probe(&[4, 2, 99, 6, 4], MODEL, weights(), 0.25);
+        assert!(answer.store_ok, "N-PROBE/read: store_ok ({:?})", answer.error);
+        assert_eq!(answer.scores.len(), 5, "N-PROBE/read: one score per requested id");
+        let expected = |id: i64| image_embedding_probe_score(&stored[&(MODEL.to_string(), id)], &weights(), 0.25);
+        assert_eq!(answer.scores[0], expected(4), "N-PROBE/read: id 4, first");
+        assert_eq!(answer.scores[1], expected(2), "N-PROBE/read: id 2, second");
+        assert_eq!(answer.scores[2], None, "N-PROBE/read: an unstored id has no score");
+        assert_eq!(answer.scores[3], None, "N-PROBE/read: another model's vector is not this pair's");
+        assert_eq!(answer.scores[4], answer.scores[0], "N-PROBE/read: an id asked twice answers twice");
+        assert!(answer.scores[0].is_some(), "N-PROBE/read: a stored vector is scored");
+
+        // The score really is the normalized dot product of what was STORED:
+        // re-derive it by hand from the f16 values.
+        let v = &stored[&(MODEL.to_string(), 4)];
+        let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let by_hand = v.iter().zip(weights()).map(|(x, w)| x / norm * w).sum::<f64>() + 0.25;
+        assert!((answer.scores[0].unwrap() - by_hand).abs() < 1e-12, "N-PROBE/read: w·(v/|v|)+b");
+        // …and close to the score of the f32 vector before Float16 storage.
+        let original: Vec<f64> = values(4).iter().map(|x| f64::from(*x)).collect();
+        let before = image_embedding_probe_score(&original, &weights(), 0.25).unwrap();
+        assert!((answer.scores[0].unwrap() - before).abs() < 1e-2, "N-PROBE/read: f16 storage moves the score only slightly");
+
+        // A probe of the wrong width scores nothing and SAYS so; the store is fine.
+        let narrow = probe(&[1, 2], MODEL, vec![1.0; DIM - 1], 0.0);
+        assert!(narrow.store_ok, "N-PROBE/width: the store is readable");
+        assert_eq!(narrow.scores, vec![None, None], "N-PROBE/width: no score from a mismatched probe");
+        assert!(narrow.error.as_deref().unwrap_or("").contains("cannot be scored"), "N-PROBE/width: named");
+
+        // A malformed request is a failure, never "no vectors".
+        let bad = probe(&[1], MODEL, vec![f64::NAN; DIM], 0.0);
+        assert!(!bad.store_ok && bad.scores.is_empty(), "N-PROBE/request: non-finite weights refused");
+        let empty = probe(&[], MODEL, weights(), 0.0);
+        assert!(empty.store_ok && empty.scores.is_empty(), "N-PROBE/request: an empty request is empty");
+    }
+
+    // ------------------------------------------------------------------
+    // N-PROBE/unreadable — a store that cannot be read is store_ok = false,
+    // never "every photo has no vector".
+    // ------------------------------------------------------------------
+    #[test]
+    fn n_an_unreadable_store_is_never_no_vectors()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("unreadable");
+        let id = insert_photo(&conn, "/u/a.jpg", "jpeg", false);
+        std::fs::write(fixture.dir.join("vectors.lancedb"), b"not a directory").expect("poison the store path");
+        let _installed = Installed::new(&fixture, conn);
+
+        let answer = probe(&[id], MODEL, weights(), 0.0);
+        assert!(!answer.store_ok, "N-PROBE/unreadable: store_ok = false");
+        assert!(answer.scores.is_empty(), "N-PROBE/unreadable: no scores");
+        let counted = count(None);
+        assert!(!counted.query_ok, "N-QUEUE/unreadable: the count is UNKNOWN, not zero");
+        assert!(counted.query_error.as_deref().unwrap_or("").contains("search index"), "N-QUEUE/unreadable: names the index");
+        let paged = page(i64::MIN, 10, None);
+        assert!(!paged.query_ok && paged.candidates.is_empty(), "N-QUEUE/unreadable: the page is UNKNOWN");
+    }
+
+    // ------------------------------------------------------------------
+    // N-QUEUE — the v3 queue covers ONLY photos with a current vector: the
+    // film-negative pending rule, stills only, the RAW/JPEG collapse (the
+    // vector lives on the visible twin), no stale mark; everything else is
+    // counted as staying at its earlier verdict.
+    // ------------------------------------------------------------------
+    #[test]
+    fn n_the_v3_queue_covers_only_photos_with_a_current_vector()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("queue");
+        let with_vector = insert_photo(&conn, "/q/a.jpg", "jpeg", false); // 1: in
+        let no_vector = insert_photo(&conn, "/q/b.jpg", "jpeg", false); // 2: never checked, no vector
+        let stale = insert_photo(&conn, "/q/c.jpg", "jpeg", false); // 3: vector, but stale
+        let hidden_raw = insert_photo(&conn, "/q/d.nef", "raw", false); // 4: hidden behind 5
+        let visible_twin = insert_photo(&conn, "/q/d.jpg", "jpeg", false); // 5: in (the vector's photo)
+        let video = insert_photo(&conn, "/q/e.mov", "jpeg", true); // 6: a video, never
+        let done = insert_photo(&conn, "/q/f.jpg", "jpeg", false); // 7: already v3
+        let kept_v2 = insert_photo(&conn, "/q/g.jpg", "jpeg", false); // 8: v2 verdict, no vector
+        let lone_raw = insert_photo(&conn, "/q/h.nef", "raw", false); // 9: in
+        conn.execute_batch(&format!(
+            "UPDATE images SET negative_detection_status = 'complete', negative_detection_version = '{v3}', \
+                    negative_detection_run_id = 'older' WHERE id = {done}; \
+             UPDATE images SET negative_detection_status = 'complete', negative_detection_version = 'film-negative-v2', \
+                    negative_detection_run_id = 'older' WHERE id = {kept}; \
+             INSERT INTO image_vector_stale VALUES ({stale}, 1);",
+            v3 = V3,
+            done = done,
+            kept = kept_v2,
+            stale = stale
+        ))
+        .expect("fixture rows");
+        let _installed = Installed::new(&fixture, conn);
+
+        // Never built: nothing has a vector.
+        let never = count(None);
+        assert!(never.query_ok, "N-QUEUE/never-built is readable");
+        assert_eq!((never.with_vector, never.without_vector), (0, 6), "N-QUEUE/never-built: every pending photo (1, 2, 3, 5, 8, 9) stays");
+        assert!(page(i64::MIN, 10, None).candidates.is_empty(), "N-QUEUE/never-built: nothing to score");
+
+        store(
+            [with_vector, stale, visible_twin, video, done, lone_raw]
+                .iter()
+                .map(|id| record_with(*id, MODEL, &values(*id)))
+                .collect(),
+        );
+        // Another model's vector does not count for this pair.
+        store(vec![record_with(no_vector, OTHER_MODEL, &values(no_vector))]);
+
+        let counted = count(None);
+        assert!(counted.query_ok, "N-QUEUE/count: readable ({:?})", counted.query_error);
+        assert_eq!(counted.with_vector, 3, "N-QUEUE/count: 1, 5 and 9 have a current vector");
+        assert_eq!(counted.without_vector, 3, "N-QUEUE/count: 2, 3 (stale) and 8 stay at their verdict");
+        assert_eq!(counted.without_vector_unchecked, 2, "N-QUEUE/count: 2 and 3 have no verdict yet; 8 keeps v2's");
+        assert_eq!(counted.without_vector_stale, 1, "N-QUEUE/count: 3 waits to be re-indexed; 2 and 8 are not indexed");
+
+        let first = page(i64::MIN, 2, None);
+        assert!(first.query_ok, "N-QUEUE/page: readable");
+        assert_eq!(ids(&first), vec![with_vector, visible_twin], "N-QUEUE/page: current vectors only, ascending");
+        assert_eq!(first.next_after_image_id, visible_twin, "N-QUEUE/page: the cursor is the last id covered");
+        assert_eq!(first.candidates[0].file_path, "/q/a.jpg", "N-QUEUE/page: the candidate row");
+        assert_eq!(first.candidates[0].camera_make.as_deref(), Some("TestCam"), "N-QUEUE/page: metadata carried");
+        let second = page(first.next_after_image_id, 2, None);
+        assert_eq!(ids(&second), vec![lone_raw], "N-QUEUE/page: a lone RAW is its own candidate");
+        let third = page(second.next_after_image_id, 2, None);
+        assert!(third.query_ok && third.candidates.is_empty(), "N-QUEUE/page: exhausted");
+        assert!(!ids(&first).contains(&hidden_raw) && !ids(&second).contains(&hidden_raw), "N-QUEUE/twin: the hidden RAW is never a candidate");
+        assert!(!ids(&first).contains(&video), "N-QUEUE/video: never");
+
+        // A selection reaches the visible twin through its hidden RAW.
+        let selected = page(i64::MIN, 10, Some(vec![hidden_raw]));
+        assert_eq!(ids(&selected), vec![visible_twin], "N-QUEUE/scope: the RAW's visible twin");
+        let selected_count = count(Some(vec![hidden_raw]));
+        assert_eq!((selected_count.with_vector, selected_count.without_vector), (1, 0), "N-QUEUE/scope count");
+        let empty = page(i64::MIN, 10, Some(Vec::new()));
+        assert!(empty.query_ok && empty.candidates.is_empty(), "N-QUEUE/scope: an empty selection is empty");
+
+        // The stale photo joins once its mark is consumed (re-embedded).
+        {
+            let catalogue = lock_catalogue();
+            catalogue
+                .as_ref()
+                .expect("installed")
+                .execute_batch(&format!("DELETE FROM image_vector_stale WHERE image_id = {};", stale))
+                .expect("consume the mark");
+        }
+        let after_reembed = page(i64::MIN, 10, None);
+        assert_eq!(ids(&after_reembed), vec![with_vector, stale, visible_twin, lone_raw], "N-QUEUE/stale: current again");
+
+        // A photo stamped v3 by THIS run leaves the queue; the pending rule is
+        // the film-negative queue's own.
+        {
+            let catalogue = lock_catalogue();
+            catalogue
+                .as_ref()
+                .expect("installed")
+                .execute_batch(&format!(
+                    "UPDATE images SET negative_detection_status = 'complete', negative_detection_version = '{}', \
+                     negative_detection_run_id = '{}' WHERE id = {};",
+                    V3, RUN, with_vector
+                ))
+                .expect("stamp");
+        }
+        assert_eq!(ids(&page(i64::MIN, 10, None)), vec![stale, visible_twin, lone_raw], "N-QUEUE/stamped: gone");
+    }
+    // ------------------------------------------------------------------
+    // N-STALE (fix round 1) — a v3 verdict (`requires_current_vector`) is NOT
+    // written for a photo whose vector went stale after it was scored: the
+    // photo keeps its columns, is reported in `skipped_stale_ids` with a
+    // `negative_writeback_vector_stale` warning, and is back in the v3 queue
+    // once its mark is consumed. A verdict that does not require a vector
+    // writes exactly as before.
+    // ------------------------------------------------------------------
+    #[test]
+    fn n_a_verdict_from_a_vector_that_went_stale_is_not_written()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("stale-writeback");
+        let reset = insert_photo(&conn, "/w/a.jpg", "jpeg", false);
+        let current = insert_photo(&conn, "/w/b.jpg", "jpeg", false);
+        let legacy = insert_photo(&conn, "/w/c.jpg", "jpeg", false);
+        let verdict = |id: i64, requires: bool| NegativeDetectionResult
+        {
+            id,
+            detector_version: V3.to_string(),
+            analysis_run_id: RUN.to_string(),
+            status: "complete".to_string(),
+            negative_confidence: Some(0.9),
+            negative_kind: Some("black and white".to_string()),
+            signals_json: Some("{}".to_string()),
+            auto_keywords: vec!["film negative".to_string(), "negative".to_string()],
+            requires_current_vector: requires,
+        };
+        // The editor save that happened mid-page: the columns reset, the mark set.
+        conn.execute_batch(&format!(
+            "INSERT INTO image_vector_stale VALUES ({reset}, 7), ({legacy}, 8);",
+            reset = reset,
+            legacy = legacy
+        ))
+        .expect("marks");
+
+        let receipt = update_negative_detection_results_impl(
+            &conn,
+            vec![verdict(reset, true), verdict(current, true), verdict(legacy, false)],
+            None,
+        );
+        assert_eq!(receipt.failure_stage, None, "N-STALE: the chunk commits ({:?})", receipt.failed_reason);
+        assert_eq!(receipt.skipped_stale_ids, vec![reset], "N-STALE: only the v3 verdict on a stale photo is skipped");
+        assert!(
+            receipt.warnings.iter().any(|w| w.starts_with("negative_writeback_vector_stale:") && w.contains(&format!("source_image_id={}", reset))),
+            "N-STALE: named in a warning ({:?})",
+            receipt.warnings
+        );
+        let version = |id: i64| -> Option<String>
+        {
+            conn.query_row("SELECT negative_detection_version FROM images WHERE id = ?1", params![id], |row| row.get(0))
+                .expect("version")
+        };
+        assert_eq!(version(reset), None, "N-STALE: the reset photo keeps its reset columns");
+        assert_eq!(version(current).as_deref(), Some(V3), "N-STALE: a current photo is written");
+        assert_eq!(version(legacy).as_deref(), Some(V3), "N-STALE: a verdict that needs no vector writes as before");
+        let keywords: i64 = conn
+            .query_row("SELECT COUNT(*) FROM keyword WHERE image_id = ?1 AND status = 1", params![reset], |row| row.get(0))
+            .expect("keywords");
+        assert_eq!(keywords, 0, "N-STALE: no keyword written for the skipped photo");
+
+        // A chunk whose every verdict is skipped is a success that wrote nothing.
+        let only = update_negative_detection_results_impl(&conn, vec![verdict(reset, true)], None);
+        assert_eq!((only.updated, only.failure_stage.clone(), only.skipped_stale_ids.clone()), (0, None, vec![reset]), "N-STALE: all skipped");
+
+        // Once re-indexed (mark consumed) it is in the v3 queue again.
+        store_after_install(&fixture, conn, reset);
+    }
+
+    /// Installs the catalogue, stores a vector for `id`, and checks the v3
+    /// queue now offers it (its mark is gone).
+    fn store_after_install(fixture: &Fixture, conn: Connection, id: i64)
+    {
+        conn.execute_batch(&format!("DELETE FROM image_vector_stale WHERE image_id = {};", id)).expect("consume");
+        let _installed = Installed::new(fixture, conn);
+        store(vec![record_with(id, MODEL, &values(id))]);
+        let queued = page(i64::MIN, 10, None);
+        assert!(ids(&queued).contains(&id), "N-STALE: re-queued once re-indexed ({:?})", ids(&queued));
+    }
+
+    // ------------------------------------------------------------------
+    // N-PANIC (fix round 1) — R-07: a panic inside each of the three new FFI
+    // bodies (at the first probe point on this thread — the face-runtime
+    // accessor — or, for the queue's catalogue half, under the catalogue lock
+    // on a face-runtime worker) is REPORTED through the function's own
+    // failure channel, never escapes, and leaves one census record.
+    // ------------------------------------------------------------------
+    fn census(site: &str) -> u64
+    {
+        DROPPED_ROW_CENSUS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(site)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn caught<T>(site: &str, call: impl FnOnce() -> T) -> T
+    {
+        let before = census(site);
+        FFI_PANIC_PROBE_COUNTDOWN.with(|countdown| countdown.set(1));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call));
+        let disarmed = FFI_PANIC_PROBE_COUNTDOWN.with(|countdown| countdown.replace(0));
+        let value = outcome.unwrap_or_else(|_| panic!("N-PANIC `{}`: the panic ESCAPED the FFI boundary", site));
+        assert_eq!(disarmed, 0, "N-PANIC `{}`: vacuity guard — the injected panic never fired", site);
+        assert_eq!(census(site) - before, 1, "N-PANIC `{}`: one census record", site);
+        value
+    }
+
+    fn caught_on_worker<T>(site: &str, call: impl FnOnce() -> T) -> T
+    {
+        let before = census(site);
+        FACE_WORKER_LOCK_PANIC_ARMED.store(true, Ordering::SeqCst);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call));
+        let still_armed = FACE_WORKER_LOCK_PANIC_ARMED.swap(false, Ordering::SeqCst);
+        let value = outcome.unwrap_or_else(|_| panic!("N-PANIC `{}`: the panic ESCAPED", site));
+        assert!(!still_armed, "N-PANIC `{}`: vacuity guard — no worker took the catalogue lock", site);
+        assert_eq!(census(site) - before, 1, "N-PANIC `{}`: one census record", site);
+        value
+    }
+
+    #[test]
+    fn n_every_new_ffi_reports_a_panic_instead_of_dying()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh_catalogue("panic");
+        let id = insert_photo(&conn, "/x/a.jpg", "jpeg", false);
+        let _installed = Installed::new(&fixture, conn);
+        store(vec![record_with(id, MODEL, &values(id))]);
+
+        let r = caught("image_embedding_probe_scores.panic.query_failed", || probe(&[id], MODEL, weights(), 0.0));
+        assert!(!r.store_ok && r.scores.is_empty(), "N-PANIC/probe: reported");
+        assert!(r.error.as_deref().unwrap_or("").contains("internal error"), "N-PANIC/probe: says so ({:?})", r.error);
+
+        let r = caught("negative_detection_vector_candidate_count.panic.query_failed", || count(None));
+        assert!(!r.query_ok && r.with_vector == 0, "N-PANIC/count: reported");
+        let r = caught_on_worker("negative_detection_vector_candidate_count.panic.query_failed", || count(None));
+        assert!(!r.query_ok && r.query_error.as_deref().unwrap_or("").contains("catalog"), "N-PANIC/count: the catalogue half");
+
+        let r = caught("negative_detection_vector_candidate_page.panic.query_failed", || page(i64::MIN, 10, None));
+        assert!(!r.query_ok && r.candidates.is_empty(), "N-PANIC/page: reported");
+        let r = caught_on_worker("negative_detection_vector_candidate_page.panic.query_failed", || page(i64::MIN, 10, None));
+        assert!(!r.query_ok && r.candidates.is_empty(), "N-PANIC/page: the catalogue half");
+
+        // After every caught panic the catalogue still answers.
+        assert!(page(i64::MIN, 10, None).query_ok, "N-PANIC: the catalogue lock was healed");
+    }
+
+    // ------------------------------------------------------------------
+    // N-LIVE (ignored; an instrument, not a gate) — times the v3 queue and
+    // the probe read on a COPY of a real catalogue + vectors.lancedb:
+    //   PLDIAG_N_CATALOGUE=/copy/catalogue.db cargo test --release --lib \
+    //     negative_detection_v3_tests::n_live -- --ignored --nocapture
+    // Never point it at the live catalogue (the open migrates the file).
+    // ------------------------------------------------------------------
+    #[test]
+    #[ignore]
+    fn n_live_queue_and_probe_timing()
+    {
+        let Ok(path) = std::env::var("PLDIAG_N_CATALOGUE") else
+        {
+            eprintln!("N-LIVE: PLDIAG_N_CATALOGUE is not set; skipped");
+            return;
+        };
+        let _serial = serial();
+        let catalogue = std::path::PathBuf::from(&path);
+        let conn = open_and_migrate_catalogue(&catalogue).expect("the catalogue copy opens");
+        fence_connection_against_extension_fetches(&conn);
+        *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(conn);
+        *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(catalogue.clone());
+        let model = "1.0-coreml-fp16".to_string();
+        let prep = "squash256_bilinear_v1".to_string();
+        let started = std::time::Instant::now();
+        let name = "siglip2-base-patch16-256".to_string();
+        let counted = futures::executor::block_on(negative_detection_vector_candidate_count(
+            V3.to_string(), RUN.to_string(), name.clone(), model.clone(), prep.clone(), None));
+        eprintln!(
+            "N-LIVE count: ok={} with={} without={} unchecked={} in {:.3}s",
+            counted.query_ok, counted.with_vector, counted.without_vector, counted.without_vector_unchecked,
+            started.elapsed().as_secs_f64()
+        );
+        let weights: Vec<f64> = (0..768).map(|i| ((i as f64) * 0.37).sin()).collect();
+        for limit in [200u32, 1000]
+        {
+            let mut cursor = i64::MIN;
+            let mut pages = 0;
+            let mut photos = 0usize;
+            let mut page_seconds = 0.0;
+            let mut probe_seconds = 0.0;
+            while pages < 5
+            {
+                let t = std::time::Instant::now();
+                let page = futures::executor::block_on(negative_detection_vector_candidate_page(
+                    limit, cursor, V3.to_string(), RUN.to_string(), name.clone(), model.clone(), prep.clone(), None));
+                page_seconds += t.elapsed().as_secs_f64();
+                assert!(page.query_ok, "N-LIVE page: {:?}", page.query_error);
+                if page.candidates.is_empty()
+                {
+                    break;
+                }
+                cursor = page.next_after_image_id;
+                let ids: Vec<i64> = page.candidates.iter().map(|c| c.id).collect();
+                let t = std::time::Instant::now();
+                let probe = futures::executor::block_on(image_embedding_probe_scores(
+                    ids.clone(), name.clone(), model.clone(), prep.clone(), weights.clone(), 0.0));
+                probe_seconds += t.elapsed().as_secs_f64();
+                assert!(probe.store_ok, "N-LIVE probe: {:?}", probe.error);
+                assert!(probe.scores.iter().all(|s| s.is_some()), "N-LIVE: every queued photo has a scorable vector");
+                photos += ids.len();
+                pages += 1;
+            }
+            eprintln!(
+                "N-LIVE limit {}: {} page(s), {} photo(s): page {:.3}s/page, probe {:.3}s/page",
+                limit, pages, photos, page_seconds / pages.max(1) as f64, probe_seconds / pages.max(1) as f64
+            );
+        }
+        *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 }

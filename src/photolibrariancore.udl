@@ -1276,6 +1276,31 @@ namespace photolibrariancore {
     // ids not in the catalogue are ignored; an empty list is ok, 0.
     [Async]
     ImageVectorStaleMarkResult mark_image_vectors_stale(sequence<i64> image_ids);
+
+    // ⭐ SigLIP slice N (Oct 24, 2026; Docs/DESIGN-Semantic-Search.md §4b) —
+    // the combined film-negative detector, film-negative-v3.
+    //
+    // The linear probe's score for each photo: scores[i] = w · (v / |v|) + bias
+    // for image_ids[i], v = its stored vector for (model_name, model_version,
+    // preprocessing_version); null = no usable vector. Computed on the core's
+    // private runtime; only the requested vectors are read. store_ok = false =
+    // the store or the request could not be read (scores EMPTY, never "no
+    // vectors"); error also names any stored vector that could not be scored.
+    [Async]
+    ImageEmbeddingProbeScores image_embedding_probe_scores(sequence<i64> image_ids, string model_name, string model_version, string preprocessing_version, sequence<f64> weights, f64 bias);
+
+    // The film-negative queue under detector_version (the same pending rule,
+    // stills only, the RAW/JPEG collapse applied), split by whether each photo
+    // has a CURRENT vector for the pair (stored, and no stale mark).
+    // scoped_ids = a selection (sibling-expanded); null = the whole catalog.
+    [Async]
+    NegativeDetectionVectorWorkCount negative_detection_vector_candidate_count(string detector_version, string analysis_run_id, string model_name, string model_version, string preprocessing_version, sequence<i64>? scoped_ids);
+
+    // One page of that queue holding ONLY photos with a current vector:
+    // id > after_image_id, ascending, at most limit (clamped 1…5000). The pass
+    // keyset-pages on next_after_image_id. query_ok = false = UNKNOWN.
+    [Async]
+    NegativeDetectionVectorCandidatePage negative_detection_vector_candidate_page(u32 limit, i64 after_image_id, string detector_version, string analysis_run_id, string model_name, string model_version, string preprocessing_version, sequence<i64>? scoped_ids);
 };
 
 // Image classification categories for JPEG+RAW pair handling.
@@ -2340,6 +2365,10 @@ dictionary NegativeDetectionResult {
     string? negative_kind = null;
     string? signals_json = null;
     sequence<string> auto_keywords;
+    // ⭐ SigLIP slice N, fix round 1: computed from the photo's search-index
+    // vector — not written if the photo holds a stale vector mark at write
+    // time (reported in skipped_stale_ids). Appended LAST (S65).
+    boolean requires_current_vector = false;
 };
 
 // updated counts rows stamped (a RAW twin included); keywords_added /
@@ -2357,6 +2386,9 @@ dictionary NegativeDetectionWritebackResult {
     sequence<string> warnings;
     string? failure_stage = null;
     string? failed_reason = null;
+    // ⭐ SigLIP slice N, fix round 1: requires_current_vector results whose
+    // photo held a stale vector mark, not written. Appended LAST (S65).
+    sequence<i64> skipped_stale_ids = [];
 };
 
 // ⭐ Round 2 (Oct 23, 2026) — one row the film-negative roll cue reads. Rust
@@ -2450,4 +2482,37 @@ dictionary ImageVectorStaleMarkResult {
     boolean ok;
     u64 marked;
     string? error;
+};
+
+// === SigLIP slice N (Oct 24, 2026; Docs/DESIGN-Semantic-Search.md §4b) ===
+
+// The probe scores, one per requested id (null = no usable vector).
+dictionary ImageEmbeddingProbeScores {
+    boolean store_ok;
+    sequence<f64?> scores;
+    string? error;
+};
+
+// The film-negative-v3 queue's size. with_vector = the pass's work;
+// without_vector keeps its earlier verdict (without_vector_unchecked of them
+// have none yet). query_ok = false = UNKNOWN, never zero.
+dictionary NegativeDetectionVectorWorkCount {
+    boolean query_ok;
+    string? query_error;
+    u64 with_vector;
+    u64 without_vector;
+    u64 without_vector_unchecked;
+    // Fix round 1: of without_vector, the photos whose stored vector is
+    // stale (waiting to be re-indexed after a change); the rest are not in
+    // the search index yet.
+    u64 without_vector_stale;
+};
+
+// One page of the film-negative-v3 queue (photos with a current vector only).
+dictionary NegativeDetectionVectorCandidatePage {
+    sequence<NegativeDetectionCandidate> candidates;
+    u64 dropped_rows;
+    boolean query_ok;
+    string? query_error;
+    i64 next_after_image_id;
 };
