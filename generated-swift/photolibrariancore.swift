@@ -6025,6 +6025,118 @@ public func FfiConverterTypeSearchIndexWorkPage_lower(_ value: SearchIndexWorkPa
 }
 
 
+public struct SemanticMatchScore: Equatable, Hashable {
+    public var imageId: Int64
+    public var score: Double
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(imageId: Int64, score: Double) {
+        self.imageId = imageId
+        self.score = score
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SemanticMatchScore: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSemanticMatchScore: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SemanticMatchScore {
+        return
+            try SemanticMatchScore(
+                imageId: FfiConverterInt64.read(from: &buf), 
+                score: FfiConverterDouble.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SemanticMatchScore, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.imageId, into: &buf)
+        FfiConverterDouble.write(value.score, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSemanticMatchScore_lift(_ buf: RustBuffer) throws -> SemanticMatchScore {
+    return try FfiConverterTypeSemanticMatchScore.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSemanticMatchScore_lower(_ value: SemanticMatchScore) -> RustBuffer {
+    return FfiConverterTypeSemanticMatchScore.lower(value)
+}
+
+
+public struct SemanticMatchScoresResult: Equatable, Hashable {
+    public var keyPresent: Bool
+    public var scores: [SemanticMatchScore]
+    public var error: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(keyPresent: Bool, scores: [SemanticMatchScore], error: String?) {
+        self.keyPresent = keyPresent
+        self.scores = scores
+        self.error = error
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SemanticMatchScoresResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSemanticMatchScoresResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SemanticMatchScoresResult {
+        return
+            try SemanticMatchScoresResult(
+                keyPresent: FfiConverterBool.read(from: &buf), 
+                scores: FfiConverterSequenceTypeSemanticMatchScore.read(from: &buf), 
+                error: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SemanticMatchScoresResult, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.keyPresent, into: &buf)
+        FfiConverterSequenceTypeSemanticMatchScore.write(value.scores, into: &buf)
+        FfiConverterOptionString.write(value.error, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSemanticMatchScoresResult_lift(_ buf: RustBuffer) throws -> SemanticMatchScoresResult {
+    return try FfiConverterTypeSemanticMatchScoresResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSemanticMatchScoresResult_lower(_ value: SemanticMatchScoresResult) -> RustBuffer {
+    return FfiConverterTypeSemanticMatchScoresResult.lower(value)
+}
+
+
 public struct SemanticPrepareResult: Equatable, Hashable {
     public var missing: [UInt32]
     public var ordersByScore: Bool
@@ -6302,6 +6414,126 @@ public func FfiConverterTypeSemanticSearchStatus_lift(_ buf: RustBuffer) throws 
 #endif
 public func FfiConverterTypeSemanticSearchStatus_lower(_ value: SemanticSearchStatus) -> RustBuffer {
     return FfiConverterTypeSemanticSearchStatus.lower(value)
+}
+
+
+public struct SemanticVectorPresence: Equatable, Hashable {
+    public var imageId: Int64
+    public var resolvedId: Int64
+    public var state: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(imageId: Int64, resolvedId: Int64, state: String) {
+        self.imageId = imageId
+        self.resolvedId = resolvedId
+        self.state = state
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SemanticVectorPresence: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSemanticVectorPresence: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SemanticVectorPresence {
+        return
+            try SemanticVectorPresence(
+                imageId: FfiConverterInt64.read(from: &buf), 
+                resolvedId: FfiConverterInt64.read(from: &buf), 
+                state: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SemanticVectorPresence, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.imageId, into: &buf)
+        FfiConverterInt64.write(value.resolvedId, into: &buf)
+        FfiConverterString.write(value.state, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSemanticVectorPresence_lift(_ buf: RustBuffer) throws -> SemanticVectorPresence {
+    return try FfiConverterTypeSemanticVectorPresence.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSemanticVectorPresence_lower(_ value: SemanticVectorPresence) -> RustBuffer {
+    return FfiConverterTypeSemanticVectorPresence.lower(value)
+}
+
+
+public struct SemanticVectorPresenceResult: Equatable, Hashable {
+    public var storeOk: Bool
+    public var storeCount: UInt64
+    public var items: [SemanticVectorPresence]
+    public var error: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(storeOk: Bool, storeCount: UInt64, items: [SemanticVectorPresence], error: String?) {
+        self.storeOk = storeOk
+        self.storeCount = storeCount
+        self.items = items
+        self.error = error
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SemanticVectorPresenceResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSemanticVectorPresenceResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SemanticVectorPresenceResult {
+        return
+            try SemanticVectorPresenceResult(
+                storeOk: FfiConverterBool.read(from: &buf), 
+                storeCount: FfiConverterUInt64.read(from: &buf), 
+                items: FfiConverterSequenceTypeSemanticVectorPresence.read(from: &buf), 
+                error: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SemanticVectorPresenceResult, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.storeOk, into: &buf)
+        FfiConverterUInt64.write(value.storeCount, into: &buf)
+        FfiConverterSequenceTypeSemanticVectorPresence.write(value.items, into: &buf)
+        FfiConverterOptionString.write(value.error, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSemanticVectorPresenceResult_lift(_ buf: RustBuffer) throws -> SemanticVectorPresenceResult {
+    return try FfiConverterTypeSemanticVectorPresenceResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSemanticVectorPresenceResult_lower(_ value: SemanticVectorPresenceResult) -> RustBuffer {
+    return FfiConverterTypeSemanticVectorPresenceResult.lower(value)
 }
 
 
@@ -8923,6 +9155,56 @@ fileprivate struct FfiConverterSequenceTypeSearchIndexWorkItem: FfiConverterRust
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeSemanticMatchScore: FfiConverterRustBuffer {
+    typealias SwiftType = [SemanticMatchScore]
+
+    public static func write(_ value: [SemanticMatchScore], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSemanticMatchScore.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SemanticMatchScore] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SemanticMatchScore]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSemanticMatchScore.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSemanticVectorPresence: FfiConverterRustBuffer {
+    typealias SwiftType = [SemanticVectorPresence]
+
+    public static func write(_ value: [SemanticVectorPresence], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSemanticVectorPresence.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SemanticVectorPresence] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SemanticVectorPresence]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSemanticVectorPresence.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeSimilarPhotoCandidate: FfiConverterRustBuffer {
     typealias SwiftType = [SimilarPhotoCandidate]
 
@@ -11398,6 +11680,21 @@ public func searchIndexWorkPage(modelVersion: String, preprocessingVersion: Stri
             
         )
 }
+public func semanticMatchScores(predicate: QueryPredicate, imageIds: [Int64])async  -> SemanticMatchScoresResult  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_semantic_match_scores(FfiConverterTypeQueryPredicate_lower(predicate),FfiConverterSequenceInt64.lower(imageIds)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeSemanticMatchScoresResult_lift,
+            errorHandler: nil
+            
+        )
+}
 public func semanticSearchCancel(jobId: UInt64)async   {
     return
         try!  await uniffiRustCallAsync(
@@ -11454,6 +11751,21 @@ public func semanticSearchStart(request: SemanticSearchRequest)async  -> Semanti
             completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeSemanticSearchStart_lift,
+            errorHandler: nil
+            
+        )
+}
+public func semanticVectorPresence(imageIds: [Int64])async  -> SemanticVectorPresenceResult  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_semantic_vector_presence(FfiConverterSequenceInt64.lower(imageIds)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeSemanticVectorPresenceResult_lift,
             errorHandler: nil
             
         )
@@ -12272,6 +12584,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_search_index_work_page() != 36340) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_photolibrariancore_checksum_func_semantic_match_scores() != 56042) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_photolibrariancore_checksum_func_semantic_search_cancel() != 54692) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -12282,6 +12597,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_semantic_search_start() != 8014) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_semantic_vector_presence() != 57007) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_similar_photo_candidates() != 1024) {

@@ -25018,46 +25018,61 @@ enum SemanticSeed
     Indexed(i64),
 }
 
-/// Resolve a seed: missing → `Missing`. A RAW with a JPEG/HEIF twin in the
-/// same directory with the same stem maps to that twin — the photo the index
-/// holds (the collapse rule `mark_image_vectors_stale` uses) — and a RAW with
-/// BOTH maps to the JPEG (the S126 visible-representative rule; then the lower
-/// id). A stale mark on the mapped photo → `NotIndexed` (its vector, if any,
-/// no longer describes it).
+/// ⭐ THE seed-twin rule, ONE SQL fragment with two callers (slice 3, PLAN
+/// §2.1: "one rule, two callers") — the job's single-id `semantic_resolve_seed`
+/// and the menu's set-based `semantic_vector_presence`. For every catalogued
+/// id in `id_list` it answers one row `(image_id, resolved_id)`: a RAW with a
+/// non-NULL stem and directory maps to its same-directory, same-stem JPEG
+/// twin, else its HEIF twin, the LOWEST id within the kind (the S126
+/// visible-representative rule — the photo the index holds, the collapse rule
+/// `mark_image_vectors_stale` uses); every other id maps to itself. An id not
+/// in `images` has no row. A NULL stem or directory never equals anything, so
+/// such a RAW keeps its own id.
+///
+/// ⚠️ The ON clause carries only the twin's own conditions: a left-side-only
+/// predicate there (`a.image_kind = 'raw'`) stops DuckDB 1.5.5 from building a
+/// hash join (a blockwise nested-loop join, ≈4× the lock hold at 541k rows —
+/// REVIEW-RUST-1 LOW-1). The `CASE` gates the answer; a non-RAW `a`'s joined
+/// rows collapse in the `GROUP BY` and answer `ELSE a.id`.
+///
+/// `id_list` is SQL text: `?1` (one bound parameter) or a comma-separated
+/// list of formatted `i64`s — never user text.
+fn semantic_twin_resolution_sql(id_list: &str) -> String
+{
+    format!(
+        "SELECT a.id AS image_id, \
+                CASE WHEN a.image_kind = 'raw' \
+                     THEN COALESCE(MIN(t.id) FILTER (WHERE t.image_kind = 'jpeg'), \
+                                   MIN(t.id) FILTER (WHERE t.image_kind = 'heif'), \
+                                   a.id) \
+                     ELSE a.id END AS resolved_id \
+           FROM images a \
+           LEFT JOIN images t ON t.directory_path = a.directory_path \
+                             AND t.file_stem = a.file_stem \
+                             AND t.image_kind IN ('jpeg', 'heif') \
+          WHERE a.id IN ({}) \
+          GROUP BY a.id, a.image_kind",
+        id_list
+    )
+}
+
+/// Resolve a seed: missing → `Missing`. The twin rule is
+/// `semantic_twin_resolution_sql`'s (RAW → JPEG twin, else HEIF twin, lowest
+/// id within the kind; anything else → itself). A stale mark on the mapped
+/// photo → `NotIndexed` (its vector, if any, no longer describes it).
 fn semantic_resolve_seed(conn: &Connection, seed: i64) -> Result<SemanticSeed, String>
 {
-    let row = conn.query_row(
-        "SELECT image_kind, file_stem, directory_path FROM images WHERE id = ?1",
+    let resolved = conn.query_row(
+        &semantic_twin_resolution_sql("?1"),
         params![seed],
-        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?)),
+        |row| row.get::<_, i64>(1),
     );
-    let (kind, stem, directory) = match row
+    let mapped = match resolved
     {
-        Ok(row) => row,
+        Ok(mapped) => mapped,
         Err(duckdb::Error::QueryReturnedNoRows) => return Ok(SemanticSeed::Missing),
         Err(error) => return Err(format!("the seed photo could not be read: {}", error)),
     };
-    let mut mapped = seed;
-    if kind.as_deref() == Some("raw")
-    {
-        if let (Some(stem), Some(directory)) = (stem, directory)
-        {
-            let twin = conn.query_row(
-                "SELECT id FROM images \
-                  WHERE directory_path = ?1 AND file_stem = ?2 AND image_kind IN ('jpeg', 'heif') \
-                  ORDER BY CASE WHEN image_kind = 'jpeg' THEN 0 ELSE 1 END, id \
-                  LIMIT 1",
-                params![directory, stem],
-                |row| row.get::<_, i64>(0),
-            );
-            match twin
-            {
-                Ok(twin) => mapped = twin,
-                Err(duckdb::Error::QueryReturnedNoRows) => {}
-                Err(error) => return Err(format!("the seed photo's twin could not be read: {}", error)),
-            }
-        }
-    }
     let stale = conn
         .query_row("SELECT COUNT(*) FROM image_vector_stale WHERE image_id = ?1", params![mapped], |row| row.get::<_, i64>(0))
         .map_err(|error| format!("the seed photo's index state could not be read: {}", error))?;
@@ -25829,6 +25844,436 @@ pub async fn reset_image_embeddings() -> ImageEmbeddingResetResult
         },
         Err(message) => failed(message),
     }
+}
+
+// ============================================================================
+// ⭐ Semantic search, slice 3 — the surfaces' two reads (Oct 25, 2026;
+// Docs/SemanticSearch-Slice3/PLAN.md §2.1)
+// ============================================================================
+
+/// One requested id's index state (PLAN §2.1). `state` is "indexed",
+/// "not_indexed" or "missing".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticVectorPresence
+{
+    pub image_id: i64,
+    pub resolved_id: i64,
+    pub state: String,
+}
+
+/// The menu's presence answer. ⛔ `store_ok = false` = the lookup could not
+/// answer (then `items` is empty and `error` says why: a catalog failure is
+/// prefixed "catalog:", anything else is the index, the request or the task).
+#[derive(Debug, Clone)]
+pub struct SemanticVectorPresenceResult
+{
+    pub store_ok: bool,
+    pub store_count: u64,
+    pub items: Vec<SemanticVectorPresence>,
+    pub error: Option<String>,
+}
+
+/// One stored match score.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticMatchScore
+{
+    pub image_id: i64,
+    pub score: f64,
+}
+
+/// Browse's Match column answer. `key_present = false` = no stored result for
+/// the predicate's key; `error` set = the read could not answer.
+#[derive(Debug, Clone)]
+pub struct SemanticMatchScoresResult
+{
+    pub key_present: bool,
+    pub scores: Vec<SemanticMatchScore>,
+    pub error: Option<String>,
+}
+
+/// The most ids one presence call answers (Swift asks by page).
+const SEMANTIC_PRESENCE_MAX_IDS: usize = 500;
+
+/// The most ids one scores call answers (Browse's page size).
+const SEMANTIC_MATCH_SCORES_MAX_IDS: usize = 1_500;
+
+const SEMANTIC_PRESENCE_INDEXED: &str = "indexed";
+const SEMANTIC_PRESENCE_NOT_INDEXED: &str = "not_indexed";
+const SEMANTIC_PRESENCE_MISSING: &str = "missing";
+
+/// A presence call that could not answer.
+fn semantic_presence_failure(message: String) -> SemanticVectorPresenceResult
+{
+    SemanticVectorPresenceResult
+    {
+        store_ok: false,
+        store_count: 0,
+        items: Vec::new(),
+        error: Some(message),
+    }
+}
+
+/// Test-only seam for the presence lookup's statement count (REVIEW-RUST-1
+/// MED-2; the `FocusApplyProbe` discipline: private, parameter-threaded, no
+/// statics). Outside `cfg(test)` the type is UNINHABITED, so production
+/// provably passes `None`.
+#[cfg(test)]
+type PresenceStatementProbeRef<'a> = Option<&'a std::cell::Cell<u32>>;
+
+#[cfg(not(test))]
+type PresenceStatementProbeRef<'a> = Option<&'a std::convert::Infallible>;
+
+#[cfg(test)]
+fn semantic_presence_note_statement(probe: PresenceStatementProbeRef<'_>)
+{
+    if let Some(count) = probe
+    {
+        count.set(count.get() + 1);
+    }
+}
+
+#[cfg(not(test))]
+fn semantic_presence_note_statement(_probe: PresenceStatementProbeRef<'_>) {}
+
+/// Every statement the presence lookup's catalogue half prepares goes through
+/// here, so the test seam counts real statements, not source text.
+fn semantic_presence_prepare<'c>(
+    conn: &'c Connection,
+    sql: &str,
+    probe: PresenceStatementProbeRef<'_>,
+) -> duckdb::Result<duckdb::Statement<'c>>
+{
+    semantic_presence_note_statement(probe);
+    conn.prepare(sql)
+}
+
+/// The presence lookup's catalogue half, on a borrowed connection: EXACTLY
+/// two statements, whatever the number of ids (R-171 / ruling 99 — never a
+/// per-id loop through the catalogue): the twin rule over the distinct
+/// requested ids (`semantic_twin_resolution_sql`, the job's own rule), then
+/// ONE `image_vector_stale` membership read for the distinct resolved ids.
+/// Returns the `(image_id, resolved_id)` rows (catalogued ids only) and the
+/// stale-marked resolved ids.
+fn semantic_presence_catalogue_read(
+    conn: &Connection,
+    image_ids: &[i64],
+    probe: PresenceStatementProbeRef<'_>,
+) -> Result<(Vec<(i64, i64)>, Vec<i64>), String>
+{
+    const TWIN_SITE: &str = "semantic_vector_presence.twins.query_failed";
+    const STALE_SITE: &str = "semantic_vector_presence.stale.query_failed";
+    let mut requested = image_ids.to_vec();
+    requested.sort_unstable();
+    requested.dedup();
+    if requested.is_empty()
+    {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let requested_csv = requested.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+    let mut twin_statement = semantic_presence_prepare(conn, &semantic_twin_resolution_sql(&requested_csv), probe)
+        .map_err(|error| format!("the photos could not be looked up: {}", error))?;
+    let twin_rows = twin_statement
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+        .map_err(|error| format!("the photos could not be looked up: {}", error))?;
+    let (resolved, twin_dropped) = collect_rows_counted(twin_rows, TWIN_SITE);
+    if twin_dropped > 0
+    {
+        return Err(format!("{} photo row(s) could not be read", twin_dropped));
+    }
+    let mut targets = resolved.iter().map(|(_, target)| *target).collect::<Vec<_>>();
+    targets.sort_unstable();
+    targets.dedup();
+    if targets.is_empty()
+    {
+        return Ok((resolved, Vec::new()));
+    }
+    let targets_csv = targets.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+    let mut stale_statement = semantic_presence_prepare(
+        conn,
+        &format!("SELECT DISTINCT image_id FROM image_vector_stale WHERE image_id IN ({})", targets_csv),
+        probe,
+    )
+        .map_err(|error| format!("the index marks could not be read: {}", error))?;
+    let stale_rows = stale_statement
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|error| format!("the index marks could not be read: {}", error))?;
+    let (stale, stale_dropped) = collect_rows_counted(stale_rows, STALE_SITE);
+    if stale_dropped > 0
+    {
+        return Err(format!("{} index mark(s) could not be read", stale_dropped));
+    }
+    Ok((resolved, stale))
+}
+
+/// The presence lookup's index half: the vectors stored for the CURRENT model
+/// (`store_count`, an identity-filtered row count) and which of `candidates`
+/// hold one — an `image_id`-only projection (`stored_image_vector_ids`),
+/// ⛔ never a vector. One table version is pinned for both reads, so an index
+/// pass committing between them cannot shorten the projection. Never built ⇒
+/// `(0, ∅)`.
+async fn semantic_presence_index_read(
+    candidates: &[i64],
+) -> Result<(u64, std::collections::HashSet<i64>), String>
+{
+    let table = match open_image_embedding_table_for_read("semantic_vector_presence").await?
+    {
+        ImageEmbeddingTableState::Present(table) => table,
+        ImageEmbeddingTableState::NeverBuilt => return Ok((0, std::collections::HashSet::new())),
+    };
+    let version = table
+        .version()
+        .await
+        .map_err(|error| format!("the search index version could not be read: {}", error))?;
+    table
+        .checkout(version)
+        .await
+        .map_err(|error| format!("the search index version could not be pinned: {}", error))?;
+    let identity = semantic_identity_filter();
+    let store_count = table
+        .count_rows(Some(identity.clone()))
+        .await
+        .map_err(|error| format!("the search index could not be counted: {}", error))? as u64;
+    let mut stored = std::collections::HashSet::new();
+    if store_count == 0
+    {
+        return Ok((0, stored));
+    }
+    for chunk in candidates.chunks(IMAGE_VECTOR_CHUNK)
+    {
+        let csv = chunk.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+        stored.extend(stored_image_vector_ids(&table, Some(format!("{} AND image_id IN ({})", identity, csv))).await?);
+    }
+    Ok((store_count, stored))
+}
+
+/// The whole presence lookup, on the core's private runtime: the request
+/// bound, the catalogue half in ONE lock hold — a block whose guard is
+/// dropped before any await (a std guard is not `Send`, and Lance must never
+/// run under the catalogue lock) — then the index half, then the answer in
+/// request order (a duplicate id gets its own item).
+async fn semantic_vector_presence_checked(image_ids: Vec<i64>) -> SemanticVectorPresenceResult
+{
+    if image_ids.len() > SEMANTIC_PRESENCE_MAX_IDS
+    {
+        return semantic_presence_failure(format!(
+            "request: {} ids asked for; at most {} per call",
+            image_ids.len(),
+            SEMANTIC_PRESENCE_MAX_IDS
+        ));
+    }
+    let catalogue_read = {
+        let catalogue = lock_catalogue();
+        match catalogue.as_ref()
+        {
+            Some(conn) => semantic_presence_catalogue_read(conn, &image_ids, None),
+            None => Err("the catalog is not open".to_string()),
+        }
+    };
+    let (resolved_rows, stale_rows) = match catalogue_read
+    {
+        Ok(read) => read,
+        Err(message) =>
+        {
+            let message = format!("catalog: {}", message);
+            eprintln!("semantic_vector_presence: {}", message);
+            return semantic_presence_failure(message);
+        }
+    };
+    let resolved: std::collections::HashMap<i64, i64> = resolved_rows.into_iter().collect();
+    let stale: std::collections::HashSet<i64> = stale_rows.into_iter().collect();
+    let mut candidates = resolved.values().copied().filter(|target| !stale.contains(target)).collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates.dedup();
+    let (store_count, stored) = match semantic_presence_index_read(&candidates).await
+    {
+        Ok(read) => read,
+        Err(message) =>
+        {
+            let message = format!("index: {}", message);
+            eprintln!("semantic_vector_presence: {}", message);
+            return semantic_presence_failure(message);
+        }
+    };
+    let items = image_ids
+        .iter()
+        .map(|image_id| match resolved.get(image_id)
+        {
+            Some(target) => SemanticVectorPresence
+            {
+                image_id: *image_id,
+                resolved_id: *target,
+                state: if !stale.contains(target) && stored.contains(target)
+                {
+                    SEMANTIC_PRESENCE_INDEXED.to_string()
+                }
+                else
+                {
+                    SEMANTIC_PRESENCE_NOT_INDEXED.to_string()
+                },
+            },
+            None => SemanticVectorPresence
+            {
+                image_id: *image_id,
+                resolved_id: *image_id,
+                state: SEMANTIC_PRESENCE_MISSING.to_string(),
+            },
+        })
+        .collect();
+    SemanticVectorPresenceResult { store_ok: true, store_count, items, error: None }
+}
+
+/// ⭐ Slice 3 (PLAN §2.1) — whether each photo can seed "Find Photos Like This
+/// One": "indexed" = its RAW → JPEG/HEIF resolution (the job's own rule) holds
+/// a vector for the current model AND no stale mark; "not_indexed" otherwise;
+/// "missing" = not in the catalog. ⛔ All of the work runs in a task spawned
+/// on the core's private runtime; this future only awaits the handle (ruling
+/// 79). An unavailable runtime, a panic in the task (`JoinError`) or a failed
+/// read answers `store_ok: false` + `error`. At most 500 ids per call.
+pub async fn semantic_vector_presence(image_ids: Vec<i64>) -> SemanticVectorPresenceResult
+{
+    let spawned = ffi_panic_boundary(
+        "semantic_vector_presence.panic.query_failed",
+        ||
+        {
+            face_embedding_runtime("semantic_vector_presence.face_runtime_unavailable.query_failed")
+                .map(|runtime| runtime.spawn(semantic_vector_presence_checked(image_ids)))
+        },
+        |panic| Err(ffi_panic_report("read the search index", &panic)),
+    );
+    match spawned
+    {
+        Ok(task) => match task.await
+        {
+            Ok(result) => result,
+            Err(error) =>
+            {
+                let message = format!("presence: the lookup task failed: {}", error);
+                eprintln!("semantic_vector_presence: {}", message);
+                semantic_presence_failure(message)
+            }
+        },
+        Err(message) => semantic_presence_failure(message),
+    }
+}
+
+/// A scores call that could not answer.
+fn semantic_match_scores_failure(message: String) -> SemanticMatchScoresResult
+{
+    SemanticMatchScoresResult { key_present: false, scores: Vec::new(), error: Some(message) }
+}
+
+/// The scores read on a borrowed connection: the key from the predicate
+/// (`semantic_predicate_key`, never from Swift), then its stored generation,
+/// then `semantic_match ⨝ semantic_key` for the requested ids. Twin rows were
+/// written with the score at save time, so a RAW answers for itself. One score
+/// per distinct id that has a stored row, in first-request order.
+fn semantic_match_scores_impl(
+    conn: &Connection,
+    predicate: &QueryPredicate,
+    image_ids: &[i64],
+) -> SemanticMatchScoresResult
+{
+    if image_ids.len() > SEMANTIC_MATCH_SCORES_MAX_IDS
+    {
+        return semantic_match_scores_failure(format!(
+            "{} ids asked for; at most {} per call",
+            image_ids.len(),
+            SEMANTIC_MATCH_SCORES_MAX_IDS
+        ));
+    }
+    let key = match semantic_predicate_key(predicate)
+    {
+        Some(key) if semantic_key_is_sql_safe(&key) => key,
+        _ => return semantic_match_scores_failure(format!(
+            "the condition is not a complete search (kind {}, breadth {})",
+            predicate.kind,
+            predicate.op.as_deref().unwrap_or("none")
+        )),
+    };
+    match semantic_temp_tables_present(conn)
+    {
+        Ok(true) => {}
+        Ok(false) => return semantic_match_scores_failure(SEMANTIC_TABLES_MISSING_MESSAGE.to_string()),
+        Err(message) => return semantic_match_scores_failure(message),
+    }
+    let generation = match conn.query_row(
+        "SELECT result_id FROM semantic_key WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    {
+        Ok(generation) => generation,
+        Err(duckdb::Error::QueryReturnedNoRows) => None,
+        Err(error) => return semantic_match_scores_failure(format!("the stored search could not be read: {}", error)),
+    };
+    if generation.is_none()
+    {
+        return SemanticMatchScoresResult { key_present: false, scores: Vec::new(), error: None };
+    }
+    let mut order: Vec<i64> = Vec::with_capacity(image_ids.len());
+    let mut seen = std::collections::HashSet::new();
+    for image_id in image_ids
+    {
+        if seen.insert(*image_id)
+        {
+            order.push(*image_id);
+        }
+    }
+    if order.is_empty()
+    {
+        return SemanticMatchScoresResult { key_present: true, scores: Vec::new(), error: None };
+    }
+    let csv = order.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+    let rows = match conn.prepare(&format!(
+        "SELECT m.image_id, m.score FROM semantic_match m \
+           JOIN semantic_key k ON m.result_id = k.result_id \
+          WHERE k.key = '{}' AND m.image_id IN ({})",
+        key, csv
+    ))
+    {
+        Ok(mut statement) => match statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)))
+        {
+            Ok(rows) =>
+            {
+                let (rows, dropped) = collect_rows_counted(rows, "semantic_match_scores.query_failed");
+                if dropped > 0
+                {
+                    return semantic_match_scores_failure(format!("{} stored score(s) could not be read", dropped));
+                }
+                rows
+            }
+            Err(error) => return semantic_match_scores_failure(format!("the stored scores could not be read: {}", error)),
+        },
+        Err(error) => return semantic_match_scores_failure(format!("the stored scores could not be read: {}", error)),
+    };
+    let found: std::collections::HashMap<i64, f64> = rows.into_iter().collect();
+    let scores = order
+        .iter()
+        .filter_map(|image_id| found.get(image_id).map(|score| SemanticMatchScore { image_id: *image_id, score: *score }))
+        .collect();
+    SemanticMatchScoresResult { key_present: true, scores, error: None }
+}
+
+/// ⭐ Slice 3 (PLAN §2.1) — Browse's Match column: the stored score of each
+/// requested photo under the predicate's result key (computed here from the
+/// predicate, never by Swift). Pure DuckDB under one catalogue-lock hold, like
+/// the other query reads. `key_present = false` = nothing stored for the key;
+/// `error` = the read could not answer (a panic included). At most 1,500 ids.
+pub async fn semantic_match_scores(predicate: QueryPredicate, image_ids: Vec<i64>) -> SemanticMatchScoresResult
+{
+    ffi_panic_boundary(
+        "semantic_match_scores.panic.query_failed",
+        ||
+        {
+            let catalogue = lock_catalogue();
+            match catalogue.as_ref()
+            {
+                Some(conn) => semantic_match_scores_impl(conn, &predicate, &image_ids),
+                None => semantic_match_scores_failure("The catalog is not open.".to_string()),
+            }
+        },
+        |panic| semantic_match_scores_failure(ffi_panic_report("read the match scores", &panic)),
+    )
 }
 
 /// The v3 queue walked from the catalogue: candidate ids that hold a CURRENT
@@ -73255,6 +73700,712 @@ mod semantic_search_tests
         assert_eq!(block(semantic_search_poll(1_000_000)).phase, "unknown");
         block(semantic_search_cancel(1_000_000));
         assert!(block(semantic_search_prepare(vec![looks("a", None)], vec![])).error.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Slice 3 (Docs/SemanticSearch-Slice3/PLAN.md §2.1): the presence lookup
+    // and the match scores
+    // ------------------------------------------------------------------
+
+    fn presence(ids: &[i64]) -> SemanticVectorPresenceResult
+    {
+        block(semantic_vector_presence(ids.to_vec()))
+    }
+
+    fn states(result: &SemanticVectorPresenceResult) -> Vec<(i64, i64, String)>
+    {
+        result.items.iter().map(|item| (item.image_id, item.resolved_id, item.state.clone())).collect()
+    }
+
+    fn s3_census(site: &str) -> u64
+    {
+        DROPPED_ROW_CENSUS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(site)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// A top-level product function's body, read from this file.
+    fn s3_product_body(name: &str) -> String
+    {
+        let source = include_str!("lib.rs");
+        let head = [name, "("].concat();
+        let start = source.find(&head).unwrap_or_else(|| panic!("S3-SOURCE: `{}` is gone", name));
+        let end = start + source[start..].find("\n}\n").unwrap_or_else(|| panic!("S3-SOURCE: `{}` never closes", name));
+        source[start..end].to_string()
+    }
+
+    /// `text` with every comment removed and every string, raw-string and
+    /// char literal's CONTENT blanked (the quotes kept), so a source lock
+    /// counts only code: a `//`, `/* */` or literal decoy can neither satisfy
+    /// a lock nor hide a real site from it.
+    fn s3_code_only(text: &str) -> String
+    {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0usize;
+        while i < chars.len()
+        {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            if c == '/' && next == Some('/')
+            {
+                while i < chars.len() && chars[i] != '\n'
+                {
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '/' && next == Some('*')
+            {
+                let mut depth = 0usize;
+                while i < chars.len()
+                {
+                    if chars[i] == '/' && chars.get(i + 1) == Some(&'*')
+                    {
+                        depth += 1;
+                        i += 2;
+                    }
+                    else if chars[i] == '*' && chars.get(i + 1) == Some(&'/')
+                    {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0
+                        {
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        i += 1;
+                    }
+                }
+                out.push(' ');
+                continue;
+            }
+            if c == 'r' && (next == Some('"') || next == Some('#')) && !chars.get(i.wrapping_sub(1)).map_or(false, |p| p.is_alphanumeric() || *p == '_')
+            {
+                let mut j = i + 1;
+                let mut hashes = 0usize;
+                while chars.get(j) == Some(&'#')
+                {
+                    hashes += 1;
+                    j += 1;
+                }
+                if chars.get(j) == Some(&'"')
+                {
+                    j += 1;
+                    loop
+                    {
+                        if j >= chars.len()
+                        {
+                            break;
+                        }
+                        if chars[j] == '"' && (0..hashes).all(|k| chars.get(j + 1 + k) == Some(&'#'))
+                        {
+                            j += 1 + hashes;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    out.push_str("\"\"");
+                    i = j;
+                    continue;
+                }
+            }
+            if c == '"'
+            {
+                let mut j = i + 1;
+                while j < chars.len() && chars[j] != '"'
+                {
+                    if chars[j] == '\\'
+                    {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                out.push_str("\"\"");
+                i = j + 1;
+                continue;
+            }
+            if c == '\''
+            {
+                // A char literal ('x', '\n', '\''); anything else is a lifetime.
+                let close = if next == Some('\\') { chars.iter().skip(i + 2).position(|ch| *ch == '\'').map(|p| i + 2 + p) } else if chars.get(i + 2) == Some(&'\'') { Some(i + 2) } else { None };
+                if let Some(close) = close
+                {
+                    out.push_str("''");
+                    i = close + 1;
+                    continue;
+                }
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn s3_the_source_lock_stripper_sees_only_code()
+    {
+        let decoys = "a(); // lock_catalogue()\n/* lock_catalogue() /* nested */ still */ b(\"lock_catalogue()\"); c(r#\"lock_catalogue()\"#); d('\"'); e('\\''); fn f<'a>(x: &'a str) { lock_catalogue() }";
+        let code = s3_code_only(decoys);
+        assert_eq!(code.matches("lock_catalogue()").count(), 1, "only the real call survives: {}", code);
+        assert!(code.contains("fn f<'a>(x: &'a str)"), "a lifetime is not a literal: {}", code);
+        assert!(s3_code_only("let s = \"a // b\"; x.prepare(y)").contains("x.prepare(y)"), "a // inside a string is not a comment");
+    }
+
+    #[test]
+    fn s3_presence_answers_every_state_and_both_twin_kinds_with_the_jobs_own_rule()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh("s3-presence");
+        let plain = insert(&conn, "/p/P.jpg", "jpeg", "2026:01:01 10:00:00");
+        let stale = insert(&conn, "/p/S.jpg", "jpeg", "2026:01:01 10:00:00");
+        let unembedded = insert(&conn, "/p/U.jpg", "jpeg", "2026:01:01 10:00:00");
+        let a_jpeg = insert(&conn, "/p/A.jpg", "jpeg", "2026:01:01 10:00:00");
+        let a_raw = insert(&conn, "/p/A.nef", "raw", "2026:01:01 10:00:00");
+        let h_heif = insert(&conn, "/p/H.hif", "heif", "2026:01:01 10:00:00");
+        let h_raw = insert(&conn, "/p/H.nef", "raw", "2026:01:01 10:00:00");
+        // B: JPEG AND HEIF twins, only the HEIF embedded — the rule picks the
+        // JPEG, so B's RAW is NOT indexed (JPEG before HEIF, never "any twin").
+        let b_jpeg = insert(&conn, "/p/B.jpg", "jpeg", "2026:01:01 10:00:00");
+        let b_heif = insert(&conn, "/p/B.hif", "heif", "2026:01:01 10:00:00");
+        let b_raw = insert(&conn, "/p/B.nef", "raw", "2026:01:01 10:00:00");
+        // C: TWO JPEG twins (A.JPG beside A.jpg) — the lowest id wins.
+        let c_jpeg_low = insert(&conn, "/p/C.jpg", "jpeg", "2026:01:01 10:00:00");
+        let c_jpeg_high = insert(&conn, "/p/C.JPG", "jpeg", "2026:01:01 10:00:00");
+        let c_raw = insert(&conn, "/p/C.nef", "raw", "2026:01:01 10:00:00");
+        // D: a RAW whose JPEG twin is stale-marked.
+        let d_jpeg = insert(&conn, "/p/D.jpg", "jpeg", "2026:01:01 10:00:00");
+        let d_raw = insert(&conn, "/p/D.nef", "raw", "2026:01:01 10:00:00");
+        // L: a lone RAW with its own vector; Q: a PSD beside a RAW (not a twin).
+        let l_raw = insert(&conn, "/p/L.nef", "raw", "2026:01:01 10:00:00");
+        let q_psd = insert(&conn, "/p/Q.psd", "psd", "2026:01:01 10:00:00");
+        let q_raw = insert(&conn, "/p/Q.nef", "raw", "2026:01:01 10:00:00");
+        // O: embedded only under an OLD model version (identity filter).
+        let old = insert(&conn, "/p/O.jpg", "jpeg", "2026:01:01 10:00:00");
+        let gone = 987_654i64;
+        let _installed = Installed::new(&fixture, conn);
+        store(
+            [plain, stale, a_jpeg, h_heif, b_heif, c_jpeg_low, d_jpeg, l_raw, q_psd]
+                .iter()
+                .map(|id| embedding(*id, &at(0.5)))
+                .collect(),
+        );
+        // A separate batch: one upsert carries one model identity.
+        store(vec![ImageEmbeddingRecord { model_version: "0.9-old".to_string(), ..embedding(old, &at(0.5)) }]);
+        assert_eq!(
+            block(image_embedding_count_checked("0.9-old".to_string(), SEMANTIC_PREPROCESSING_VERSION.to_string())),
+            Ok(1),
+            "fixture: O's old-model vector is really in the store"
+        );
+        with_global(|conn| mark_image_vectors_stale_impl(conn, &[stale, d_jpeg]).expect("stale"));
+
+        let asked = [plain, stale, unembedded, gone, a_raw, h_raw, b_raw, c_raw, d_raw, l_raw, q_raw, old, c_jpeg_high, b_heif, plain];
+        let result = presence(&asked);
+        assert!(result.store_ok, "{:?}", result.error);
+        assert!(result.error.is_none());
+        assert_eq!(result.store_count, 9, "store_count counts the CURRENT model's vectors only (O's old one is not)");
+        let i = SEMANTIC_PRESENCE_INDEXED.to_string();
+        let n = SEMANTIC_PRESENCE_NOT_INDEXED.to_string();
+        let m = SEMANTIC_PRESENCE_MISSING.to_string();
+        assert_eq!(
+            states(&result),
+            vec![
+                (plain, plain, i.clone()),
+                (stale, stale, n.clone()),
+                (unembedded, unembedded, n.clone()),
+                (gone, gone, m.clone()),
+                (a_raw, a_jpeg, i.clone()),
+                (h_raw, h_heif, i.clone()),
+                (b_raw, b_jpeg, n.clone()),
+                (c_raw, c_jpeg_low, i.clone()),
+                (d_raw, d_jpeg, n.clone()),
+                (l_raw, l_raw, i.clone()),
+                (q_raw, q_raw, n.clone()),
+                (old, old, n.clone()),
+                (c_jpeg_high, c_jpeg_high, n.clone()),
+                (b_heif, b_heif, i.clone()),
+                (plain, plain, i.clone()),
+            ],
+            "one item per requested id, same order, duplicates included; a JPEG or HEIF is never remapped"
+        );
+        // ⭐ One rule, two callers: the job's single-id resolution agrees with
+        // the set-based one on every id.
+        with_global(|conn|
+        {
+            for item in &result.items
+            {
+                let seed = semantic_resolve_seed(conn, item.image_id).expect("seed");
+                match seed
+                {
+                    SemanticSeed::Missing => assert_eq!(item.state, m, "id {}", item.image_id),
+                    SemanticSeed::NotIndexed => assert_eq!(item.state, n, "a stale resolution, id {}", item.image_id),
+                    SemanticSeed::Indexed(mapped) => assert_eq!(mapped, item.resolved_id, "id {}", item.image_id),
+                }
+            }
+        });
+    }
+
+    /// A photo row with an explicit (possibly NULL) stem and directory.
+    fn s3_insert_shaped(conn: &Connection, path: &str, stem: Option<&str>, kind: &str, directory: Option<&str>) -> i64
+    {
+        let file_name = path.rsplit('/').next().unwrap_or(path).to_string();
+        conn.query_row(
+            "INSERT INTO images (file_path, file_size, file_name, file_stem, image_kind, directory_path, \
+             created_timestamp, modified_timestamp, is_video, capture_datetime, camera_model, pixel_width, pixel_height) \
+             VALUES (?1, 10, ?2, ?3, ?4, ?5, 0, 0, FALSE, '2026:01:01 10:00:00', 'cam', 100, 100) RETURNING id",
+            params![path, file_name, stem, kind, directory],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("insert shaped photo")
+    }
+
+    /// The pre-slice-3 single-id rule, verbatim from `9696ea0`'s
+    /// `semantic_resolve_seed` (minus its stale step) — an independent oracle
+    /// for the shared fragment (REVIEW-RUST-1 MED-1).
+    fn s3_pre_slice_rule(conn: &Connection, seed: i64) -> Option<i64>
+    {
+        let row = conn.query_row(
+            "SELECT image_kind, file_stem, directory_path FROM images WHERE id = ?1",
+            params![seed],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?)),
+        );
+        let (kind, stem, directory) = match row
+        {
+            Ok(row) => row,
+            Err(_) => return None,
+        };
+        let mut mapped = seed;
+        if kind.as_deref() == Some("raw")
+        {
+            if let (Some(stem), Some(directory)) = (stem, directory)
+            {
+                if let Ok(twin) = conn.query_row(
+                    "SELECT id FROM images \
+                      WHERE directory_path = ?1 AND file_stem = ?2 AND image_kind IN ('jpeg', 'heif') \
+                      ORDER BY CASE WHEN image_kind = 'jpeg' THEN 0 ELSE 1 END, id \
+                      LIMIT 1",
+                    params![directory, stem],
+                    |row| row.get::<_, i64>(0),
+                )
+                {
+                    mapped = twin;
+                }
+            }
+        }
+        Some(mapped)
+    }
+
+    #[test]
+    fn s3_the_shared_rule_holds_the_same_directory_and_null_shapes()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh("s3-edge-shapes");
+        // Each (asked id, the id it must resolve to).
+        let mut expected: Vec<(i64, i64)> = Vec::new();
+        // ⭐ Same stem, DIFFERENT directory: never a twin.
+        let far_raw = s3_insert_shaped(&conn, "/d1/X.nef", Some("X"), "raw", Some("/d1"));
+        let far_jpeg = s3_insert_shaped(&conn, "/d2/X.jpg", Some("X"), "jpeg", Some("/d2"));
+        expected.push((far_raw, far_raw));
+        expected.push((far_jpeg, far_jpeg));
+        // ⭐ NULL stem RAW beside a NULL stem JPEG, one directory: NULL equals nothing.
+        let null_stem_raw = s3_insert_shaped(&conn, "/n/ns.nef", None, "raw", Some("/n"));
+        let null_stem_jpeg = s3_insert_shaped(&conn, "/n/ns.jpg", None, "jpeg", Some("/n"));
+        expected.push((null_stem_raw, null_stem_raw));
+        expected.push((null_stem_jpeg, null_stem_jpeg));
+        // ⭐ NULL directory RAW beside a NULL directory JPEG, same stem.
+        let null_dir_raw = s3_insert_shaped(&conn, "/x/nd.nef", Some("nd"), "raw", None);
+        let null_dir_jpeg = s3_insert_shaped(&conn, "/x/nd.jpg", Some("nd"), "jpeg", None);
+        expected.push((null_dir_raw, null_dir_raw));
+        expected.push((null_dir_jpeg, null_dir_jpeg));
+        // Case-variant stem: stems compare exactly.
+        let case_raw = s3_insert_shaped(&conn, "/c/Y.nef", Some("Y"), "raw", Some("/c"));
+        let case_jpeg = s3_insert_shaped(&conn, "/c/y.jpg", Some("y"), "jpeg", Some("/c"));
+        expected.push((case_raw, case_raw));
+        expected.push((case_jpeg, case_jpeg));
+        // A HEIF with a LOWER id than the JPEG: JPEG still wins.
+        let z_heif = s3_insert_shaped(&conn, "/h/Z.hif", Some("Z"), "heif", Some("/h"));
+        let z_jpeg = s3_insert_shaped(&conn, "/h/Z.jpg", Some("Z"), "jpeg", Some("/h"));
+        let z_raw = s3_insert_shaped(&conn, "/h/Z.nef", Some("Z"), "raw", Some("/h"));
+        expected.push((z_raw, z_jpeg));
+        expected.push((z_heif, z_heif));
+        // Two HEIFs, no JPEG: the lower HEIF.
+        let w_heif_low = s3_insert_shaped(&conn, "/h/W.hif", Some("W"), "heif", Some("/h"));
+        let w_heif_high = s3_insert_shaped(&conn, "/h/W.HEIC", Some("W"), "heif", Some("/h"));
+        let w_raw = s3_insert_shaped(&conn, "/h/W.nef", Some("W"), "raw", Some("/h"));
+        expected.push((w_raw, w_heif_low));
+        expected.push((w_heif_high, w_heif_high));
+        // Two RAWs sharing one JPEG; a TIFF and an unknown kind are never twins.
+        let k_raw = s3_insert_shaped(&conn, "/k/K.nef", Some("K"), "raw", Some("/k"));
+        let k_raw2 = s3_insert_shaped(&conn, "/k/K.cr3", Some("K"), "raw", Some("/k"));
+        let k_jpeg = s3_insert_shaped(&conn, "/k/K.jpg", Some("K"), "jpeg", Some("/k"));
+        expected.push((k_raw, k_jpeg));
+        expected.push((k_raw2, k_jpeg));
+        let _t_tif = s3_insert_shaped(&conn, "/k/T.tif", Some("T"), "tiff", Some("/k"));
+        let t_raw = s3_insert_shaped(&conn, "/k/T.nef", Some("T"), "raw", Some("/k"));
+        expected.push((t_raw, t_raw));
+        let _u_odd = s3_insert_shaped(&conn, "/k/U.xyz", Some("U"), "unknownkind", Some("/k"));
+        let u_raw = s3_insert_shaped(&conn, "/k/U.nef", Some("U"), "raw", Some("/k"));
+        expected.push((u_raw, u_raw));
+        let _installed = Installed::new(&fixture, conn);
+        for order in [false, true]
+        {
+            let mut asked = expected.clone();
+            if order
+            {
+                asked.reverse();
+            }
+            let result = presence(&asked.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+            assert!(result.store_ok, "{:?}", result.error);
+            let got = result.items.iter().map(|item| (item.image_id, item.resolved_id)).collect::<Vec<_>>();
+            assert_eq!(got, asked, "⭐ MED-1: the explicit (asked, resolved) pairs through the presence statement");
+        }
+        with_global(|conn|
+        {
+            for (asked, resolves_to) in &expected
+            {
+                assert_eq!(
+                    semantic_resolve_seed(conn, *asked).expect("seed"),
+                    SemanticSeed::Indexed(*resolves_to),
+                    "⭐ MED-1: the job's single-id path, id {}",
+                    asked
+                );
+                assert_eq!(s3_pre_slice_rule(conn, *asked), Some(*resolves_to), "the pre-slice rule agrees, id {}", asked);
+            }
+        });
+    }
+
+    /// An instrument, not a gate: the presence catalogue half at real catalogue
+    /// size (541,082 rows; REVIEW-RUST-1 LOW-1). Run:
+    ///   cargo test --release --lib s3_timing_at_real_catalogue_size -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn s3_timing_at_real_catalogue_size()
+    {
+        let (_fixture, conn) = fresh("s3-timing-541k");
+        // 200,000 RAW+JPEG pairs + 141,082 lone JPEGs over 6,000 directories.
+        conn.execute_batch(
+            "INSERT INTO images (file_path, file_size, file_name, file_stem, image_kind, directory_path, \
+             created_timestamp, modified_timestamp, is_video, capture_datetime, camera_model, pixel_width, pixel_height) \
+             SELECT '/bulk/d' || ((i // 2) % 6000) || '/' || CASE WHEN i < 400000 THEN 'p' || (i // 2) || CASE WHEN i % 2 = 1 THEN '.nef' ELSE '.jpg' END ELSE 'q' || i || '.jpg' END, \
+                    10, CASE WHEN i < 400000 THEN 'p' || (i // 2) || CASE WHEN i % 2 = 1 THEN '.nef' ELSE '.jpg' END ELSE 'q' || i || '.jpg' END, \
+                    CASE WHEN i < 400000 THEN 'p' || (i // 2) ELSE 'q' || i END, \
+                    CASE WHEN i < 400000 AND i % 2 = 1 THEN 'raw' ELSE 'jpeg' END, \
+                    '/bulk/d' || ((i // 2) % 6000), 0, 0, FALSE, '2026:01:01 10:00:00', 'cam', 100, 100 \
+               FROM range(541082) r(i); CHECKPOINT;",
+        )
+        .expect("bulk photos");
+        let raws = {
+            let mut statement = conn.prepare("SELECT id FROM images WHERE image_kind = 'raw' ORDER BY id DESC LIMIT 500").expect("prepare");
+            let rows = statement.query_map([], |row| row.get::<_, i64>(0)).expect("query");
+            rows.map(|row| row.expect("row")).collect::<Vec<i64>>()
+        };
+        for round in 0..3
+        {
+            let started = std::time::Instant::now();
+            let (resolved, _) = semantic_presence_catalogue_read(&conn, &raws, None).expect("read");
+            let hold = started.elapsed();
+            assert_eq!(resolved.len(), 500);
+            let started = std::time::Instant::now();
+            for id in &raws[..20]
+            {
+                semantic_resolve_seed(&conn, *id).expect("seed");
+            }
+            let single = started.elapsed() / 20;
+            println!(
+                "S3-TIMING-541K round {}: catalogue half (500 ids) {:.1} ms; single-id resolve {:.2} ms ({})",
+                round,
+                hold.as_secs_f64() * 1000.0,
+                single.as_secs_f64() * 1000.0,
+                if cfg!(debug_assertions) { "dev profile" } else { "release profile" }
+            );
+        }
+        let plan = {
+            let mut statement = conn.prepare(&format!("EXPLAIN {}", semantic_twin_resolution_sql(&raws[0].to_string()))).expect("prepare");
+            let rows = statement.query_map([], |row| row.get::<_, String>(1)).expect("query");
+            rows.map(|row| row.expect("row")).collect::<Vec<String>>().join("\n")
+        };
+        println!("S3-TIMING-541K plan joins: hash={} blockwise_nl={}", plan.matches("HASH_JOIN").count(), plan.matches("BLOCKWISE_NL_JOIN").count());
+    }
+
+    #[test]
+    fn s3_presence_of_an_empty_store_an_unreadable_one_a_closed_catalog_and_the_bound()
+    {
+        let _serial = serial();
+        // Catalog closed: a catalog failure, prefixed "catalog:".
+        let closed = presence(&[1]);
+        assert!(!closed.store_ok && closed.items.is_empty(), "{:?}", closed.error);
+        assert!(closed.error.as_deref().unwrap_or("").starts_with("catalog:"), "{:?}", closed.error);
+        {
+            let (fixture, conn) = fresh("s3-never");
+            let photo = insert(&conn, "/n/p.jpg", "jpeg", "2026:01:01 10:00:00");
+            let _installed = Installed::new(&fixture, conn);
+            let never = presence(&[photo, 424242]);
+            assert!(never.store_ok, "never built is an honest answer: {:?}", never.error);
+            assert_eq!(never.store_count, 0);
+            assert_eq!(
+                states(&never),
+                vec![(photo, photo, SEMANTIC_PRESENCE_NOT_INDEXED.to_string()), (424242, 424242, SEMANTIC_PRESENCE_MISSING.to_string())]
+            );
+            let empty = presence(&[]);
+            assert!(empty.store_ok && empty.items.is_empty() && empty.error.is_none());
+            let at_bound = presence(&vec![photo; SEMANTIC_PRESENCE_MAX_IDS]);
+            assert!(at_bound.store_ok && at_bound.items.len() == 500, "500 ids answer: {:?}", at_bound.error);
+            let over = presence(&vec![photo; SEMANTIC_PRESENCE_MAX_IDS + 1]);
+            assert!(!over.store_ok && over.items.is_empty(), "501 ids is an error");
+            assert!(over.error.as_deref().unwrap_or("").starts_with("request:"), "{:?}", over.error);
+        }
+        {
+            let (fixture, conn) = fresh("s3-unreadable");
+            let photo = insert(&conn, "/u/p.jpg", "jpeg", "2026:01:01 10:00:00");
+            std::fs::write(fixture.vectors(), b"not a directory").expect("a file where the store goes");
+            let _installed = Installed::new(&fixture, conn);
+            let unreadable = presence(&[photo]);
+            assert!(!unreadable.store_ok && unreadable.items.is_empty(), "⭐ an unreadable index is store_ok false");
+            let error = unreadable.error.as_deref().unwrap_or("");
+            assert!(error.starts_with("index:") && !error.starts_with("catalog:"), "{:?}", unreadable.error);
+        }
+    }
+
+    #[test]
+    fn s3_presence_resolves_500_ids_in_one_catalogue_hold()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh("s3-timing");
+        // 20,000 photos: 10,000 RAW + JPEG pairs over 100 directories.
+        conn.execute_batch(
+            "INSERT INTO images (file_path, file_size, file_name, file_stem, image_kind, directory_path, \
+             created_timestamp, modified_timestamp, is_video, capture_datetime, camera_model, pixel_width, pixel_height) \
+             SELECT '/bulk/d' || ((i // 2) % 100) || '/p' || (i // 2) || CASE WHEN i % 2 = 0 THEN '.jpg' ELSE '.nef' END, \
+                    10, \
+                    'p' || (i // 2) || CASE WHEN i % 2 = 0 THEN '.jpg' ELSE '.nef' END, \
+                    'p' || (i // 2), \
+                    CASE WHEN i % 2 = 0 THEN 'jpeg' ELSE 'raw' END, \
+                    '/bulk/d' || ((i // 2) % 100), \
+                    0, 0, FALSE, '2026:01:01 10:00:00', 'cam', 100, 100 \
+               FROM range(20000) r(i);",
+        )
+        .expect("bulk photos");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM images"), 20_000);
+        let raws = {
+            let mut statement = conn
+                .prepare("SELECT id FROM images WHERE image_kind = 'raw' ORDER BY id LIMIT 500")
+                .expect("prepare");
+            let rows = statement.query_map([], |row| row.get::<_, i64>(0)).expect("query");
+            rows.map(|row| row.expect("row")).collect::<Vec<i64>>()
+        };
+        assert_eq!(raws.len(), 500);
+        mark_image_vectors_stale_impl(&conn, &raws[..50]).expect("stale");
+        // The catalogue half alone = the one lock hold's work.
+        let started = std::time::Instant::now();
+        let statements = std::cell::Cell::new(0u32);
+        let (resolved, stale) = semantic_presence_catalogue_read(&conn, &raws, Some(&statements)).expect("read");
+        let hold = started.elapsed();
+        assert_eq!(statements.get(), 2, "⭐ S3-RUNTIME: exactly two catalogue statements for 500 ids");
+        for n in [1usize, 2, 37]
+        {
+            let few = std::cell::Cell::new(0u32);
+            let (resolved_few, _) = semantic_presence_catalogue_read(&conn, &raws[..n], Some(&few)).expect("read");
+            assert_eq!(resolved_few.len(), n);
+            assert_eq!(few.get(), 2, "⭐ S3-RUNTIME: exactly two statements for {} id(s) — the count never depends on N", n);
+        }
+        assert_eq!(resolved.len(), 500, "every RAW resolved in one statement");
+        assert!(resolved.iter().all(|(raw, jpeg)| raw != jpeg), "each RAW maps to its JPEG twin");
+        assert_eq!(stale.len(), 50, "the stale marks went to the twins and were read in one statement");
+        // ⭐ LOW-1: the twin statement plans as a hash join, never a blockwise
+        // nested loop (a left-side-only predicate in the ON clause forces one).
+        let plan = {
+            let csv = raws.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+            let mut statement = conn.prepare(&format!("EXPLAIN {}", semantic_twin_resolution_sql(&csv))).expect("explain");
+            let rows = statement.query_map([], |row| row.get::<_, String>(1)).expect("explain rows");
+            rows.map(|row| row.expect("plan row")).collect::<Vec<String>>().join("\n")
+        };
+        assert!(plan.contains("HASH_JOIN") && !plan.contains("NL_JOIN"), "⭐ S3-PLAN: the twin statement is a hash join:\n{}", plan);
+        let _installed = Installed::new(&fixture, conn);
+        let started = std::time::Instant::now();
+        let result = presence(&raws);
+        let whole = started.elapsed();
+        assert!(result.store_ok && result.items.len() == 500, "{:?}", result.error);
+        assert!(result.items.iter().all(|item| item.state == SEMANTIC_PRESENCE_NOT_INDEXED && item.resolved_id != item.image_id));
+        println!(
+            "S3-TIMING: 500 ids over a 20,000-photo catalogue — catalogue hold {:.1} ms, whole presence call {:.1} ms ({})",
+            hold.as_secs_f64() * 1000.0,
+            whole.as_secs_f64() * 1000.0,
+            if cfg!(debug_assertions) { "dev profile: DuckDB at -O0" } else { "release profile" }
+        );
+        // ⭐ The shape, read from the source: ONE `lock_catalogue()` in the
+        // spawned body, released (block closed) before the index await; the
+        // catalogue half is exactly two prepared statements and no point query.
+        let checked = s3_code_only(&s3_product_body("async fn semantic_vector_presence_checked"));
+        assert_eq!(checked.matches("lock_catalogue()").count(), 1, "S3-SOURCE: one catalogue hold");
+        let block_start = checked.find("let catalogue_read = {").expect("S3-SOURCE: the lock block");
+        let block_end = block_start + checked[block_start..].find("\n    };").expect("S3-SOURCE: the block closes");
+        assert!(!checked[block_start..block_end].contains(".await"), "S3-SOURCE: no await under the catalogue lock");
+        let index_call = checked.find("semantic_presence_index_read(").expect("S3-SOURCE: the index half");
+        assert!(index_call > block_end, "S3-SOURCE: the index half runs after the lock block closed");
+        let read = s3_code_only(&s3_product_body("fn semantic_presence_catalogue_read"));
+        assert_eq!(read.matches("semantic_presence_prepare(").count(), 2, "S3-SOURCE: exactly two statements (twins, stale)");
+        assert_eq!(read.matches(".prepare(").count(), 0, "S3-SOURCE: every statement goes through the counted seam");
+        assert!(!read.contains("query_row") && !read.contains(".execute("), "S3-SOURCE: no point query");
+        for looping in [" for ", " while ", " loop"]
+        {
+            assert!(!read.contains(looping), "S3-SOURCE: no loop in the catalogue half (`{}`)", looping.trim());
+        }
+        assert!(read.contains("semantic_twin_resolution_sql("), "S3-SOURCE: the shared rule");
+        let index = s3_product_body("async fn semantic_presence_index_read");
+        assert!(s3_code_only(&index).contains("stored_image_vector_ids("), "S3-SOURCE: the index half is an id-only projection");
+        for forbidden in ["\"vector\"", "image_embedding_vectors_from_batch", "semantic_seed_vector"]
+        {
+            assert!(!index.contains(forbidden), "S3-SOURCE: the index half reads vectors (`{}`)", forbidden);
+        }
+        let seed = s3_product_body("fn semantic_resolve_seed");
+        assert!(s3_code_only(&seed).contains("semantic_twin_resolution_sql(\"\")"), "S3-SOURCE: the job's resolver uses the shared rule");
+        assert!(!seed.contains("FROM images"), "S3-SOURCE: no second copy of the rule in the job's resolver");
+    }
+
+    #[test]
+    fn s3_presence_runs_on_the_runtime_and_reports_every_failure()
+    {
+        let _serial = serial();
+        let (fixture, conn) = fresh("s3-panic");
+        let photo = insert(&conn, "/x/a.jpg", "jpeg", "2026:01:01 10:00:00");
+        let _installed = Installed::new(&fixture, conn);
+        store(vec![embedding(photo, &at(0.5))]);
+        // ⭐ The polled future does no work inline: the armed panic fires ONLY
+        // at a `lock_catalogue()` on a face-runtime WORKER, so it firing proves
+        // the catalogue half ran in the spawned task — and the panic there
+        // (a JoinError) answers store_ok false, never a crash.
+        FACE_WORKER_LOCK_PANIC_ARMED.store(true, Ordering::SeqCst);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| presence(&[photo])));
+        let still_armed = FACE_WORKER_LOCK_PANIC_ARMED.swap(false, Ordering::SeqCst);
+        let panicked = outcome.unwrap_or_else(|_| panic!("S3-PANIC: the task's panic ESCAPED"));
+        assert!(!still_armed, "S3-PANIC: vacuity guard — no face-runtime worker took the catalogue lock (work ran inline?)");
+        assert!(!panicked.store_ok && panicked.items.is_empty(), "S3-PANIC: reported");
+        assert!(panicked.error.as_deref().unwrap_or("").contains("lookup task failed"), "{:?}", panicked.error);
+        let healed = presence(&[photo]);
+        assert!(healed.store_ok && healed.items[0].state == SEMANTIC_PRESENCE_INDEXED, "S3-PANIC: the next call answers: {:?}", healed.error);
+
+        // A panic at the FFI boundary (the runtime accessor, the first probe).
+        let site = "semantic_vector_presence.panic.query_failed";
+        let before = s3_census(site);
+        FFI_PANIC_PROBE_COUNTDOWN.with(|countdown| countdown.set(1));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| presence(&[photo])));
+        let disarmed = FFI_PANIC_PROBE_COUNTDOWN.with(|countdown| countdown.replace(0));
+        let caught = outcome.unwrap_or_else(|_| panic!("S3-PANIC: the boundary panic ESCAPED"));
+        assert_eq!(disarmed, 0, "S3-PANIC: vacuity guard");
+        assert!(!caught.store_ok && caught.error.as_deref().unwrap_or("").contains("internal error"), "{:?}", caught.error);
+        assert_eq!(s3_census(site) - before, 1, "S3-PANIC: one census record");
+
+        // An unavailable runtime.
+        fn cannot_build() -> std::io::Result<tokio::runtime::Runtime>
+        {
+            Err(std::io::Error::other("S3: simulated runtime build failure"))
+        }
+        struct Restore;
+        impl Drop for Restore
+        {
+            fn drop(&mut self)
+            {
+                FACE_EMBEDDING_RUNTIME_OVERRIDE.with(|entry| entry.set(None));
+            }
+        }
+        let unavailable = {
+            let slot: &'static once_cell::sync::OnceCell<tokio::runtime::Runtime> =
+                Box::leak(Box::new(once_cell::sync::OnceCell::new()));
+            FACE_EMBEDDING_RUNTIME_OVERRIDE.with(|entry| entry.set(Some((slot, cannot_build as fn() -> std::io::Result<tokio::runtime::Runtime>))));
+            let _restore = Restore;
+            // Off the face runtime: `block` would build nothing here, the
+            // override only reaches this thread's accessor.
+            futures::executor::block_on(semantic_vector_presence(vec![photo]))
+        };
+        assert!(!unavailable.store_ok && unavailable.items.is_empty());
+        assert!(unavailable.error.as_deref().unwrap_or("").contains("unavailable"), "{:?}", unavailable.error);
+        assert!(presence(&[photo]).store_ok, "the real runtime answers again");
+
+        // The PUBLIC future: its only await is the task handle, and it reaches
+        // neither the catalogue nor the index itself.
+        let public = s3_code_only(&s3_product_body("pub async fn semantic_vector_presence"));
+        assert_eq!(public.matches(".await").count(), 1, "S3-SOURCE: only the join handle is awaited");
+        for forbidden in ["lock_catalogue", "open_image_embedding_table", "semantic_presence_catalogue_read", "semantic_presence_index_read"]
+        {
+            assert!(!public.contains(forbidden), "S3-SOURCE: the polled future calls `{}` inline", forbidden);
+        }
+        assert!(public.contains("runtime.spawn(semantic_vector_presence_checked("), "S3-SOURCE: the work is spawned");
+    }
+
+    #[test]
+    fn s3_match_scores_for_a_stored_key_an_absent_key_rows_missing_and_twins()
+    {
+        let (_fixture, conn) = fresh("s3-scores");
+        let a_jpeg = insert(&conn, "/m/A.jpg", "jpeg", "2026:01:01 10:00:00");
+        let a_raw = insert(&conn, "/m/A.nef", "raw", "2026:01:01 10:00:00");
+        let b = insert(&conn, "/m/B.jpg", "jpeg", "2026:01:01 10:00:00");
+        let none = insert(&conn, "/m/N.jpg", "jpeg", "2026:01:01 10:00:00");
+        let condition = looks("scored", None);
+        save(&conn, &key_of(&condition), &[(a_jpeg, 0.61), (b, 0.42)]).expect("save");
+        let scored = semantic_match_scores_impl(&conn, &condition, &[none, a_raw, b, a_jpeg, b, 999_999]);
+        assert!(scored.key_present && scored.error.is_none(), "{:?}", scored.error);
+        assert_eq!(
+            scored.scores,
+            vec![
+                SemanticMatchScore { image_id: a_raw, score: 0.61 },
+                SemanticMatchScore { image_id: b, score: 0.42 },
+                SemanticMatchScore { image_id: a_jpeg, score: 0.61 },
+            ],
+            "only ids with a stored row, once each, first-request order; the twin row carries its JPEG's score"
+        );
+        // num never changes the key: the filter-only copy reads the same rows.
+        let filter_only = semantic_match_scores_impl(&conn, &looks("scored", Some(0.0)), &[b]);
+        assert_eq!(filter_only.scores, vec![SemanticMatchScore { image_id: b, score: 0.42 }]);
+        // Another breadth is another key: absent, honestly.
+        let absent = semantic_match_scores_impl(&conn, &predicate(SEMANTIC_KIND_LOOKS_LIKE, "scored", "wide", None), &[b]);
+        assert!(!absent.key_present && absent.scores.is_empty() && absent.error.is_none());
+        let seed_key = predicate(SEMANTIC_KIND_SIMILAR_TO, &a_jpeg.to_string(), "medium", None);
+        save(&conn, &key_of(&seed_key), &[(a_jpeg, 1.0)]).expect("save similar");
+        let similar = semantic_match_scores_impl(&conn, &seed_key, &[a_raw, b]);
+        assert_eq!(similar.scores, vec![SemanticMatchScore { image_id: a_raw, score: 1.0 }], "similar_to keys read the same way");
+        let empty = semantic_match_scores_impl(&conn, &condition, &[]);
+        assert!(empty.key_present && empty.scores.is_empty() && empty.error.is_none());
+        for (bad, why) in [(keyword("x"), "not semantic"), (predicate(SEMANTIC_KIND_LOOKS_LIKE, "  ", "medium", None), "empty words"), (predicate(SEMANTIC_KIND_LOOKS_LIKE, "x", "huge", None), "bad breadth")]
+        {
+            let refused = semantic_match_scores_impl(&conn, &bad, &[b]);
+            assert!(!refused.key_present && refused.error.is_some(), "{}", why);
+        }
+        let at_bound = semantic_match_scores_impl(&conn, &condition, &vec![b; SEMANTIC_MATCH_SCORES_MAX_IDS]);
+        assert!(at_bound.error.is_none() && at_bound.scores.len() == 1, "1,500 ids answer");
+        let over = semantic_match_scores_impl(&conn, &condition, &vec![b; SEMANTIC_MATCH_SCORES_MAX_IDS + 1]);
+        assert!(!over.key_present && over.error.is_some(), "1,501 ids is an error");
+        let (_bare_fixture, bare) = fresh_without_temp_tables("s3-scores-bare");
+        let missing_tables = semantic_match_scores_impl(&bare, &condition, &[1]);
+        assert_eq!(missing_tables.error.as_deref(), Some(SEMANTIC_TABLES_MISSING_MESSAGE));
+    }
+
+    #[test]
+    fn s3_match_scores_through_the_ffi_and_a_panic_is_an_error()
+    {
+        let _serial = serial();
+        let closed = block(semantic_match_scores(looks("f", None), vec![1]));
+        assert!(!closed.key_present && closed.error.is_some(), "catalog closed");
+        let (fixture, conn) = fresh("s3-scores-ffi");
+        let a = insert(&conn, "/f/a.jpg", "jpeg", "2026:01:01 10:00:00");
+        save(&conn, &key_of(&looks("f", None)), &[(a, 0.25)]).expect("save");
+        let _installed = Installed::new(&fixture, conn);
+        let read = block(semantic_match_scores(looks("f", None), vec![a]));
+        assert!(read.key_present && read.scores == vec![SemanticMatchScore { image_id: a, score: 0.25 }], "{:?}", read.error);
+        let site = "semantic_match_scores.panic.query_failed";
+        let before = s3_census(site);
+        FFI_PANIC_PROBE_COUNTDOWN.with(|countdown| countdown.set(1)); // lock_catalogue
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| block(semantic_match_scores(looks("f", None), vec![a]))));
+        let disarmed = FFI_PANIC_PROBE_COUNTDOWN.with(|countdown| countdown.replace(0));
+        let caught = outcome.unwrap_or_else(|_| panic!("S3-PANIC: the scores panic ESCAPED"));
+        assert_eq!(disarmed, 0, "S3-PANIC: vacuity guard");
+        assert!(!caught.key_present && caught.error.as_deref().unwrap_or("").contains("internal error"), "{:?}", caught.error);
+        assert_eq!(s3_census(site) - before, 1, "S3-PANIC: one census record");
+        assert!(block(semantic_match_scores(looks("f", None), vec![a])).key_present, "the catalogue answers after the panic");
     }
 
     // ------------------------------------------------------------------

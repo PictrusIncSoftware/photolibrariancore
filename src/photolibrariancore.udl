@@ -1335,6 +1335,27 @@ namespace photolibrariancore {
     // face_embeddings.
     [Async]
     ImageEmbeddingResetResult reset_image_embeddings();
+
+    // ⭐ Semantic search, slice 3 (Oct 25, 2026; Docs/SemanticSearch-Slice3/
+    // PLAN.md §2.1) — the surfaces' two reads.
+    //
+    // Whether each photo can seed "Find Photos Like This One": one item per
+    // requested id, same order (a duplicate id gets its own item). "indexed" =
+    // the id's RAW -> JPEG/HEIF resolution (the search job's own rule) holds a
+    // vector for the current model AND no stale mark; "not_indexed" otherwise;
+    // "missing" = not in the catalog. Never reads a vector. All of its work runs
+    // on the core's private runtime. At most 500 ids per call (more = error).
+    // store_ok = false = the lookup could not answer (items empty); a catalog
+    // failure's error starts "catalog:".
+    [Async]
+    SemanticVectorPresenceResult semantic_vector_presence(sequence<i64> image_ids);
+
+    // Browse's Match column: the stored score of each requested photo under the
+    // predicate's result key (computed by the core from the predicate). Only ids
+    // with a stored row are returned, one per distinct id. key_present = false =
+    // no stored result for the key. At most 1,500 ids per call (more = error).
+    [Async]
+    SemanticMatchScoresResult semantic_match_scores(QueryPredicate predicate, sequence<i64> image_ids);
 };
 
 // Image classification categories for JPEG+RAW pair handling.
@@ -2602,5 +2623,37 @@ dictionary SemanticPrepareResult {
 
 dictionary ImageEmbeddingResetResult {
     boolean ok;
+    string? error;
+};
+
+// ⭐ Semantic search, slice 3 (Oct 25, 2026) — semantic_vector_presence.
+// state = "indexed" | "not_indexed" | "missing"; resolved_id = the id after
+// RAW -> JPEG twin, else HEIF twin, else itself.
+dictionary SemanticVectorPresence {
+    i64 image_id;
+    i64 resolved_id;
+    string state;
+};
+
+// store_ok = false = the lookup could not answer (items empty; a catalog
+// failure's error starts "catalog:"). store_count = vectors stored for the
+// CURRENT model/preprocessing (0 = never built).
+dictionary SemanticVectorPresenceResult {
+    boolean store_ok;
+    u64 store_count;
+    sequence<SemanticVectorPresence> items;
+    string? error;
+};
+
+// ⭐ Semantic search, slice 3 (Oct 25, 2026) — semantic_match_scores.
+dictionary SemanticMatchScore {
+    i64 image_id;
+    f64 score;
+};
+
+// key_present = false = no stored result for the predicate's key.
+dictionary SemanticMatchScoresResult {
+    boolean key_present;
+    sequence<SemanticMatchScore> scores;
     string? error;
 };
