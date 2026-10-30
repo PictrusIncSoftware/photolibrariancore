@@ -620,11 +620,20 @@ namespace photolibrariancore {
     [Async]
     CanonicalizeFaceEmbeddingsResult canonicalize_face_embeddings();
 
+    // ⭐ Oct 28, 2026 — `apply_raw_jpeg_collapse` appended LAST with a default
+    // (S65): with RAW+JPEG pairing on, a RAW member whose JPEG/HEIF twin is in
+    // the same folder is shown through that twin, so a stack's count and its
+    // members leave it out (the requested id itself always counts).
     [Async]
-    sequence<SimilarPhotoStackSummary> similar_photo_stack_summaries_for_ids(sequence<i64> ids, string algorithm_version);
+    sequence<SimilarPhotoStackSummary> similar_photo_stack_summaries_for_ids(sequence<i64> ids, string algorithm_version, optional boolean apply_raw_jpeg_collapse = false);
 
     [Async]
-    sequence<SimilarPhotoStackMember> similar_photo_stack_members_for_ids(sequence<i64> ids, string algorithm_version);
+    sequence<SimilarPhotoStackMember> similar_photo_stack_members_for_ids(sequence<i64> ids, string algorithm_version, optional boolean apply_raw_jpeg_collapse = false);
+
+    // ⭐ Oct 28, 2026 — one background step of splitting the existing stacks
+    // that mix file types (one file type per stack). max_groups = 0 only counts.
+    [Async]
+    SimilarStackFileTypeSplitStep similar_stack_file_type_split_step(u32 max_groups);
 
     [Async]
     u64 replace_similar_photo_groups(sequence<SimilarPhotoGroupMember> members, string algorithm_version);
@@ -1573,6 +1582,17 @@ dictionary SimilarPhotoStackMember {
     i64 group_id;
     i64 representative_id;
     u32 member_rank;
+};
+
+// ⭐ Oct 28, 2026 — one step of the background split of stacks that mix file
+// types. Counts come from the step's own plan, never from engine change counts.
+dictionary SimilarStackFileTypeSplitStep {
+    u64 split_groups;
+    u64 kept_photos;
+    u64 unstacked_photos;
+    u64 remaining_groups;
+    boolean ok;
+    string? message;
 };
 
 dictionary FocusAnalysisResult {

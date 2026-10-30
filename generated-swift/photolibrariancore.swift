@@ -6995,6 +6995,76 @@ public func FfiConverterTypeSimilarPhotoWorkUnit_lower(_ value: SimilarPhotoWork
 }
 
 
+public struct SimilarStackFileTypeSplitStep: Equatable, Hashable {
+    public var splitGroups: UInt64
+    public var keptPhotos: UInt64
+    public var unstackedPhotos: UInt64
+    public var remainingGroups: UInt64
+    public var ok: Bool
+    public var message: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(splitGroups: UInt64, keptPhotos: UInt64, unstackedPhotos: UInt64, remainingGroups: UInt64, ok: Bool, message: String?) {
+        self.splitGroups = splitGroups
+        self.keptPhotos = keptPhotos
+        self.unstackedPhotos = unstackedPhotos
+        self.remainingGroups = remainingGroups
+        self.ok = ok
+        self.message = message
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension SimilarStackFileTypeSplitStep: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSimilarStackFileTypeSplitStep: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SimilarStackFileTypeSplitStep {
+        return
+            try SimilarStackFileTypeSplitStep(
+                splitGroups: FfiConverterUInt64.read(from: &buf), 
+                keptPhotos: FfiConverterUInt64.read(from: &buf), 
+                unstackedPhotos: FfiConverterUInt64.read(from: &buf), 
+                remainingGroups: FfiConverterUInt64.read(from: &buf), 
+                ok: FfiConverterBool.read(from: &buf), 
+                message: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SimilarStackFileTypeSplitStep, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.splitGroups, into: &buf)
+        FfiConverterUInt64.write(value.keptPhotos, into: &buf)
+        FfiConverterUInt64.write(value.unstackedPhotos, into: &buf)
+        FfiConverterUInt64.write(value.remainingGroups, into: &buf)
+        FfiConverterBool.write(value.ok, into: &buf)
+        FfiConverterOptionString.write(value.message, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSimilarStackFileTypeSplitStep_lift(_ buf: RustBuffer) throws -> SimilarStackFileTypeSplitStep {
+    return try FfiConverterTypeSimilarStackFileTypeSplitStep.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSimilarStackFileTypeSplitStep_lower(_ value: SimilarStackFileTypeSplitStep) -> RustBuffer {
+    return FfiConverterTypeSimilarStackFileTypeSplitStep.lower(value)
+}
+
+
 public struct UnreadableFileProbe: Equatable, Hashable {
     public var filePath: String
     public var fileSize: UInt64
@@ -11830,11 +11900,11 @@ public func similarPhotoFeatureprintsForIds(ids: [Int64], algorithmVersion: Stri
             
         )
 }
-public func similarPhotoStackMembersForIds(ids: [Int64], algorithmVersion: String)async  -> [SimilarPhotoStackMember]  {
+public func similarPhotoStackMembersForIds(ids: [Int64], algorithmVersion: String, applyRawJpegCollapse: Bool = false)async  -> [SimilarPhotoStackMember]  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_photolibrariancore_fn_func_similar_photo_stack_members_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterString.lower(algorithmVersion)
+                uniffi_photolibrariancore_fn_func_similar_photo_stack_members_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterString.lower(algorithmVersion),FfiConverterBool.lower(applyRawJpegCollapse)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
@@ -11845,17 +11915,32 @@ public func similarPhotoStackMembersForIds(ids: [Int64], algorithmVersion: Strin
             
         )
 }
-public func similarPhotoStackSummariesForIds(ids: [Int64], algorithmVersion: String)async  -> [SimilarPhotoStackSummary]  {
+public func similarPhotoStackSummariesForIds(ids: [Int64], algorithmVersion: String, applyRawJpegCollapse: Bool = false)async  -> [SimilarPhotoStackSummary]  {
     return
         try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_photolibrariancore_fn_func_similar_photo_stack_summaries_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterString.lower(algorithmVersion)
+                uniffi_photolibrariancore_fn_func_similar_photo_stack_summaries_for_ids(FfiConverterSequenceInt64.lower(ids),FfiConverterString.lower(algorithmVersion),FfiConverterBool.lower(applyRawJpegCollapse)
                 )
             },
             pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
             completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
             freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
             liftFunc: FfiConverterSequenceTypeSimilarPhotoStackSummary.lift,
+            errorHandler: nil
+            
+        )
+}
+public func similarStackFileTypeSplitStep(maxGroups: UInt32)async  -> SimilarStackFileTypeSplitStep  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_similar_stack_file_type_split_step(FfiConverterUInt32.lower(maxGroups)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeSimilarStackFileTypeSplitStep_lift,
             errorHandler: nil
             
         )
@@ -12614,10 +12699,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_photolibrariancore_checksum_func_similar_photo_featureprints_for_ids() != 50110) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_photolibrariancore_checksum_func_similar_photo_stack_members_for_ids() != 48770) {
+    if (uniffi_photolibrariancore_checksum_func_similar_photo_stack_members_for_ids() != 42252) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_photolibrariancore_checksum_func_similar_photo_stack_summaries_for_ids() != 43301) {
+    if (uniffi_photolibrariancore_checksum_func_similar_photo_stack_summaries_for_ids() != 36313) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_similar_stack_file_type_split_step() != 60026) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_unreadable_files_matching() != 17872) {

@@ -1652,6 +1652,18 @@ pub struct SimilarPhotoStackMember {
     pub member_rank: u32,
 }
 
+/// ⭐ Oct 28, 2026 — one step of the background split of stacks that mix file
+/// types (`similar_stack_file_type_split_step`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimilarStackFileTypeSplitStep {
+    pub split_groups: u64,
+    pub kept_photos: u64,
+    pub unstacked_photos: u64,
+    pub remaining_groups: u64,
+    pub ok: bool,
+    pub message: Option<String>,
+}
+
 /// One focus-analysis writeback row.
 ///
 /// `status` is an allow-listed token owned by the analyzer:
@@ -28777,8 +28789,11 @@ fn similar_stack_probe_plan_sql(_probe: SimilarStackProbeRef<'_>) -> Option<Stri
 /// a row whose `image_id` is an incoming member (the write would absorb that
 /// photo into an automatic group) or whose `group_id` is an incoming group id
 /// (the write would key an automatic group on a hand-made group's id — the
-/// legacy malformed shape). No `representative_id` limb: every writer keeps
-/// `representative_id = group_id`, so it would be an equivalent mutant.
+/// legacy malformed shape). No `representative_id` limb: the writers keep
+/// `representative_id = group_id`. ⭐ Oct 28, 2026 — the one-file-type split
+/// can number a part apart from its representative when that number is taken
+/// (`split_mixed_similar_groups_in_transaction`); a representative is always a
+/// member, so a write naming it is still caught by the `image_id` limb.
 ///
 /// Returns `Ok(0)` for an empty member list (nothing can overlap). A census is
 /// a QUERY RESULT, not a reported change count, so branching on it is
@@ -29457,6 +29472,583 @@ fn similar_photo_member_is_valid(member: &SimilarPhotoGroupMember) -> bool {
             .unwrap_or(true)
 }
 
+/// ⭐ Oct 28, 2026 — Richard's ruling: a similar-photo stack holds ONE file
+/// type. *"When stacking is turned on, you stack NEFs and you stack JPGs. They
+/// have to be separate."* Every file type gets its own stacks (JPEG, HEIF, RAW,
+/// DNG, TIFF, PSD, PNG). Before this, the grouping pass stacked a NEF with its
+/// own JPEG (the same frame, featureprint distance ~1.4), the stack collapse
+/// then showed only the JPEG, and the NEF vanished even with RAW+JPEG pairing
+/// off — behind a stack the UI did not show as one (its `logical_count` is 1).
+///
+/// The file type is `images.image_kind`; a member whose image row is missing,
+/// or whose kind is empty, is its own type. A group holding a photo whose row
+/// exists but whose kind is NULL (not filled yet) is left as it is. Returns, for each input
+/// member in order, the member as it is to be written, or `None` when it is
+/// dropped. A group whose valid members already share one type passes through
+/// UNCHANGED. An invalid member (`similar_photo_member_is_valid`) passes
+/// through unchanged and is not counted, so the writer still skips it.
+///
+/// The rule, per (group, type) — mirrored in SQL by
+/// `split_mixed_similar_groups_in_transaction` (the background split of existing stacks)
+/// and proved equal to it by `similar_file_type_split_tests`:
+///   · fewer than two distinct photos → dropped (one photo is not a stack);
+///   · representative = the part's member that was its group's representative
+///     (`image_id = representative_id`) when the part holds it, else the part's
+///     lowest image id; the group id is the representative's id;
+///   · rank = 0, 1, 2 … in the old (rank, image id) order;
+///   · distance kept when the representative did not change, 0 for a new
+///     representative, NULL for the rest (nothing measured them against it).
+fn split_similar_members_by_file_type(
+    members: Vec<SimilarPhotoGroupMember>,
+    file_types: &std::collections::HashMap<i64, Option<String>>,
+) -> Vec<Option<SimilarPhotoGroupMember>>
+{
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    let type_of = |image_id: i64| -> Option<String>
+    {
+        file_types
+            .get(&image_id)
+            .cloned()
+            .flatten()
+            .filter(|kind| !kind.is_empty())
+    };
+
+    // Which groups mix types, counted over VALID members only. A group with a
+    // photo whose image row exists but whose kind is NULL is NOT split: its
+    // type is unknown until the row migration fills it — the same rule as the
+    // SQL split (`similar_mixed_groups_cte`; review round 2, LOW 1).
+    let mut types_by_group: HashMap<i64, BTreeSet<Option<String>>> = HashMap::new();
+    let mut unknown_groups: BTreeSet<i64> = BTreeSet::new();
+    for member in members.iter().filter(|m| similar_photo_member_is_valid(m))
+    {
+        if matches!(file_types.get(&member.image_id), Some(None))
+        {
+            unknown_groups.insert(member.group_id);
+        }
+        types_by_group
+            .entry(member.group_id)
+            .or_default()
+            .insert(type_of(member.image_id));
+    }
+
+    // The parts of every mixed group: (group, type) → input positions.
+    let mut parts: BTreeMap<(i64, Option<String>), Vec<usize>> = BTreeMap::new();
+    for (position, member) in members.iter().enumerate()
+    {
+        if !similar_photo_member_is_valid(member)
+        {
+            continue;
+        }
+        let mixed = !unknown_groups.contains(&member.group_id)
+            && types_by_group
+                .get(&member.group_id)
+                .map(|types| types.len() > 1)
+                .unwrap_or(false);
+        if mixed
+        {
+            parts
+                .entry((member.group_id, type_of(member.image_id)))
+                .or_default()
+                .push(position);
+        }
+    }
+
+    let mut decided: HashMap<usize, Option<SimilarPhotoGroupMember>> = HashMap::new();
+    for positions in parts.values()
+    {
+        let distinct: BTreeSet<i64> = positions.iter().map(|&p| members[p].image_id).collect();
+        if distinct.len() < 2
+        {
+            for &position in positions
+            {
+                decided.insert(position, None);
+            }
+            continue;
+        }
+
+        let held = positions
+            .iter()
+            .map(|&p| &members[p])
+            .filter(|m| m.image_id == m.representative_id)
+            .map(|m| m.image_id)
+            .max();
+        let lowest = *distinct.iter().next().expect("a part of two or more photos");
+        let representative = held.unwrap_or(lowest);
+
+        let mut ordered = positions.clone();
+        ordered.sort_by_key(|&p| (members[p].member_rank, members[p].image_id, p));
+        for (rank, &position) in ordered.iter().enumerate()
+        {
+            let old = &members[position];
+            let distance = if representative == old.representative_id
+            {
+                old.distance_to_representative
+            }
+            else if old.image_id == representative
+            {
+                Some(0.0)
+            }
+            else
+            {
+                None
+            };
+            decided.insert(
+                position,
+                Some(SimilarPhotoGroupMember
+                {
+                    image_id: old.image_id,
+                    group_id: representative,
+                    representative_id: representative,
+                    member_rank: u32::try_from(rank).unwrap_or(u32::MAX),
+                    distance_to_representative: distance,
+                    threshold: old.threshold,
+                }),
+            );
+        }
+    }
+
+    members
+        .into_iter()
+        .enumerate()
+        .map(|(position, member)| match decided.remove(&position)
+        {
+            Some(outcome) => outcome,
+            None => Some(member),
+        })
+        .collect()
+}
+
+/// Each member's file type for `split_similar_members_by_file_type`, read in
+/// the writer's own transaction, 5,000 ids a statement. A row the read could
+/// not decode fails the whole lookup — the writer then writes nothing rather
+/// than a stack whose types it could not check.
+fn similar_member_file_types(
+    conn: &Connection,
+    image_ids: &[i64],
+) -> Result<std::collections::HashMap<i64, Option<String>>, String>
+{
+    let mut file_types = std::collections::HashMap::with_capacity(image_ids.len());
+    for chunk in image_ids.chunks(5000)
+    {
+        let sql = format!(
+            "SELECT id, image_kind FROM images WHERE id IN ({})",
+            editor_saved_image_id_csv(chunk)
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("file-type read prepare failed: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)))
+            .map_err(|e| format!("file-type read failed: {}", e))?;
+        let (kept, dropped) = collect_rows_counted(rows, "similar_member_file_types");
+        if dropped > 0
+        {
+            return Err(format!("the file-type read lost {} row(s)", dropped));
+        }
+        for (id, kind) in kept
+        {
+            file_types.insert(id, kind);
+        }
+    }
+    Ok(file_types)
+}
+
+/// Which mixed stacks one SQL split pass takes (`split_mixed_similar_groups_in_transaction`).
+enum SimilarSplitScope<'a>
+{
+    /// The background step: the first `n` mixed stacks in (version, stack id) order.
+    First(usize),
+    /// A writer's own write: the stacks it just wrote, whatever their number.
+    Groups(&'a [i64]),
+}
+
+/// What one SQL split pass did — counted from its own plan tables (S179: never
+/// from an engine change count).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SimilarSplitCounts
+{
+    /// Mixed stacks split.
+    groups: i64,
+    /// Photos that stay stacked, by type.
+    kept: i64,
+    /// Photos left unstacked (their type had one photo in the stack).
+    unstacked: i64,
+}
+
+/// The mixed-stack test, shared by the split pass, the remaining count and the
+/// tests. `{scope}` filters the membership rows (empty for the whole table).
+/// A stack holding a photo whose image row exists but whose kind is NULL is
+/// NOT mixed yet: its type is unknown until the row migration fills it (review
+/// L4), so it is left exactly as it is. A missing image row (an orphan) is its
+/// own type, `''` — the `None` type of `split_similar_members_by_file_type`.
+fn similar_mixed_groups_cte(scope: &str, limit: &str) -> String
+{
+    format!(
+        "typed AS ( \
+             SELECT m.image_id, m.group_id, m.algorithm_version, \
+                    COALESCE(i.image_kind, '') AS file_type, \
+                    (i.id IS NOT NULL AND i.image_kind IS NULL) AS kind_unknown \
+             FROM similar_photo_group_member m \
+             LEFT JOIN images i ON i.id = m.image_id \
+             {scope} \
+         ), \
+         mixed AS ( \
+             SELECT algorithm_version, group_id \
+             FROM typed \
+             GROUP BY algorithm_version, group_id \
+             HAVING COUNT(DISTINCT file_type) > 1 AND NOT BOOL_OR(kind_unknown) \
+             ORDER BY algorithm_version, group_id \
+             {limit} \
+         )",
+        scope = scope,
+        limit = limit
+    )
+}
+
+/// How many stacks still mix file types (the background step's progress).
+fn similar_mixed_group_count(conn: &Connection) -> Result<i64, String>
+{
+    conn.query_row(
+        &format!("WITH {} SELECT COUNT(*) FROM mixed", similar_mixed_groups_cte("", "")),
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map_err(|e| format!("the mixed-stack count failed: {}", e))
+}
+
+/// ⭐ Oct 28, 2026 — ONE SQL split pass over the mixed stacks `scope` names,
+/// inside the CALLER's transaction (the caller owns BEGIN, COMMIT and the
+/// ROLLBACK an `Err` demands — never COMMIT after an error, S187). The rule is
+/// the SQL twin of `split_similar_members_by_file_type`
+/// (same parts, representatives, ranks and distances; proved equal by
+/// `similar_file_type_split_tests`) — with ONE addition the writers' pure rule
+/// does not need: a stack's new number never collides with a stack outside this
+/// pass (review M1). The number is the part's representative when no other
+/// stack uses it, else the part's lowest photo id no other stack uses, else a
+/// fresh number DRAWN FROM `images_id_seq` (review round 2, M-B: a number one
+/// above the highest photo id is the id the NEXT import gets, which would key
+/// that photo's future stack onto this one). Drawing it reserves it; the
+/// `GREATEST` with "above every stack and photo id" only matters where ids
+/// were written past the sequence (test fixtures). Before the end the table is
+/// checked: no stack this pass wrote mixes types, and every photo it kept is
+/// there.
+fn split_mixed_similar_groups_in_transaction(
+    conn: &Connection,
+    scope: SimilarSplitScope<'_>,
+) -> Result<SimilarSplitCounts, String>
+{
+    let (scope_sql, limit_sql) = match scope
+    {
+        SimilarSplitScope::First(n) => (String::new(), format!("LIMIT {}", n.max(1))),
+        SimilarSplitScope::Groups(ids) =>
+        {
+            if ids.is_empty()
+            {
+                return Ok(SimilarSplitCounts { groups: 0, kept: 0, unstacked: 0 });
+            }
+            (format!("WHERE m.group_id IN ({})", editor_saved_image_id_csv(ids)), String::new())
+        }
+    };
+
+    let run = |sql: &str, what: &str| -> Result<(), String>
+    {
+        conn.execute_batch(sql).map_err(|e| format!("{} failed: {}", what, e))
+    };
+
+    run(
+        &format!(
+            "CREATE OR REPLACE TEMP TABLE pl_split_mixed AS WITH {} SELECT * FROM mixed;",
+            similar_mixed_groups_cte(&scope_sql, &limit_sql)
+        ),
+        "the mixed-stack snapshot",
+    )?;
+    let groups: i64 = conn
+        .query_row("SELECT COUNT(*) FROM pl_split_mixed", [], |row| row.get(0))
+        .map_err(|e| format!("the mixed-stack snapshot count failed: {}", e))?;
+    if groups == 0
+    {
+        run("DROP TABLE pl_split_mixed;", "temp cleanup")?;
+        return Ok(SimilarSplitCounts { groups: 0, kept: 0, unstacked: 0 });
+    }
+
+    // Every row of the mixed stacks, with its part and the part's decisions.
+    run(
+        "CREATE OR REPLACE TEMP TABLE pl_split_parts AS \
+         WITH rows AS ( \
+             SELECT m.image_id, m.group_id, m.representative_id, m.member_rank, \
+                    m.distance_to_representative, m.algorithm_version, m.threshold, \
+                    m.created_at, m.origin, COALESCE(i.image_kind, '') AS file_type \
+             FROM similar_photo_group_member m \
+             JOIN pl_split_mixed g ON g.algorithm_version = m.algorithm_version AND g.group_id = m.group_id \
+             LEFT JOIN images i ON i.id = m.image_id \
+         ) \
+         SELECT r.*, \
+                COUNT(*) OVER (PARTITION BY r.algorithm_version, r.group_id, r.file_type) AS part_size, \
+                COALESCE( \
+                    MAX(CASE WHEN r.image_id = r.representative_id THEN r.image_id END) \
+                        OVER (PARTITION BY r.algorithm_version, r.group_id, r.file_type), \
+                    MIN(r.image_id) OVER (PARTITION BY r.algorithm_version, r.group_id, r.file_type)) AS rep, \
+                ROW_NUMBER() OVER (PARTITION BY r.algorithm_version, r.group_id, r.file_type \
+                                   ORDER BY r.member_rank, r.image_id) - 1 AS new_rank \
+         FROM rows r;",
+        "the split plan",
+    )?;
+
+    // Every stack number already used by a stack OUTSIDE this pass.
+    run(
+        "CREATE OR REPLACE TEMP TABLE pl_split_taken AS \
+         SELECT DISTINCT m.algorithm_version, m.group_id \
+         FROM similar_photo_group_member m \
+         WHERE NOT EXISTS (SELECT 1 FROM pl_split_mixed g \
+                           WHERE g.algorithm_version = m.algorithm_version AND g.group_id = m.group_id);",
+        "the used-number snapshot",
+    )?;
+
+    // Each kept part's new number (review M1).
+    run(
+        "CREATE OR REPLACE TEMP TABLE pl_split_ids AS \
+         WITH parts AS ( \
+             SELECT DISTINCT algorithm_version, group_id, file_type, rep \
+             FROM pl_split_parts WHERE part_size >= 2 \
+         ), \
+         free AS ( \
+             SELECT p.algorithm_version, p.group_id, p.file_type, MIN(p.image_id) AS lowest_free \
+             FROM pl_split_parts p \
+             WHERE p.part_size >= 2 \
+               AND NOT EXISTS (SELECT 1 FROM pl_split_taken t \
+                               WHERE t.algorithm_version = p.algorithm_version AND t.group_id = p.image_id) \
+             GROUP BY p.algorithm_version, p.group_id, p.file_type \
+         ), \
+         chosen AS ( \
+             SELECT parts.algorithm_version, parts.group_id, parts.file_type, parts.rep, \
+                    CASE WHEN NOT EXISTS (SELECT 1 FROM pl_split_taken t \
+                                          WHERE t.algorithm_version = parts.algorithm_version \
+                                            AND t.group_id = parts.rep) \
+                         THEN parts.rep ELSE free.lowest_free END AS chosen_id \
+             FROM parts \
+             LEFT JOIN free ON free.algorithm_version = parts.algorithm_version \
+                           AND free.group_id = parts.group_id AND free.file_type = parts.file_type \
+         ), \
+         base AS ( \
+             SELECT GREATEST( \
+                        (SELECT COALESCE(MAX(group_id), 0) FROM similar_photo_group_member), \
+                        (SELECT COALESCE(MAX(id), 0) FROM images)) AS above \
+         ) \
+         SELECT c.algorithm_version, c.group_id, c.file_type, c.rep, \
+                CASE WHEN c.chosen_id IS NOT NULL THEN c.chosen_id \
+                     ELSE GREATEST( \
+                              nextval('images_id_seq'), \
+                              (SELECT above FROM base) \
+                              + ROW_NUMBER() OVER (PARTITION BY c.chosen_id IS NULL \
+                                                   ORDER BY c.algorithm_version, c.group_id, c.file_type)) \
+                END AS new_group_id \
+         FROM chosen c;",
+        "the new stack numbers",
+    )?;
+
+    let (kept, unstacked): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*) FILTER (WHERE part_size >= 2), COUNT(*) FILTER (WHERE part_size < 2) \
+             FROM pl_split_parts",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| format!("the split plan count failed: {}", e))?;
+
+    run(
+        "DELETE FROM similar_photo_group_member \
+         WHERE image_id IN (SELECT image_id FROM pl_split_parts);",
+        "the delete",
+    )?;
+    run(
+        "INSERT INTO similar_photo_group_member ( \
+             image_id, group_id, representative_id, member_rank, \
+             distance_to_representative, algorithm_version, threshold, created_at, origin) \
+         SELECT p.image_id, s.new_group_id, p.rep, p.new_rank, \
+                CASE WHEN p.rep = p.representative_id THEN p.distance_to_representative \
+                     WHEN p.image_id = p.rep THEN 0.0 \
+                     ELSE NULL END, \
+                p.algorithm_version, p.threshold, p.created_at, p.origin \
+         FROM pl_split_parts p \
+         JOIN pl_split_ids s ON s.algorithm_version = p.algorithm_version \
+                            AND s.group_id = p.group_id AND s.file_type = p.file_type \
+         WHERE p.part_size >= 2;",
+        "the insert",
+    )?;
+
+    // The table itself, not a change count (S179). DISTINCT: a scan that
+    // returned both versions of a row this transaction rewrote must not fail a
+    // correct write.
+    let (still_mixed, present): (i64, i64) = conn
+        .query_row(
+            "SELECT \
+                 (SELECT COUNT(*) FROM ( \
+                      SELECT m.algorithm_version, m.group_id \
+                      FROM similar_photo_group_member m \
+                      LEFT JOIN images i ON i.id = m.image_id \
+                      WHERE EXISTS (SELECT 1 FROM pl_split_ids s \
+                                    WHERE s.algorithm_version = m.algorithm_version \
+                                      AND s.new_group_id = m.group_id) \
+                      GROUP BY m.algorithm_version, m.group_id \
+                      HAVING COUNT(DISTINCT COALESCE(i.image_kind, '')) > 1)), \
+                 (SELECT COUNT(DISTINCT image_id) FROM similar_photo_group_member \
+                  WHERE image_id IN (SELECT image_id FROM pl_split_parts WHERE part_size >= 2))",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| format!("the verification read failed: {}", e))?;
+    if still_mixed != 0 || present != kept
+    {
+        return Err(format!(
+            "verification failed: {} written stack(s) still mix types, {} of {} kept photo(s) present",
+            still_mixed, present, kept
+        ));
+    }
+
+    run(
+        "DROP TABLE pl_split_ids; DROP TABLE pl_split_taken; DROP TABLE pl_split_parts; DROP TABLE pl_split_mixed;",
+        "temp cleanup",
+    )?;
+    Ok(SimilarSplitCounts { groups, kept, unstacked })
+}
+
+/// ⭐ Oct 28, 2026 — one background step of the split of EXISTING stacks that
+/// mix file types (Richard's ruling, and his choice that it runs in the
+/// background after launch with a progress bar rather than inside the catalog
+/// open, where ~2 s of COMMIT on his 53,336 mixed stacks would freeze the
+/// window). Splits at most `max_groups` mixed stacks in ONE transaction (any
+/// error rolls back, never COMMIT after an error — S187), then counts what is
+/// left. `max_groups == 0` only counts. Hand-made stacks are split too and keep
+/// their mark (his ruling). Idempotent: a catalogue with nothing mixed writes
+/// nothing, so a restored older backup is converted the next time it runs.
+fn similar_stack_file_type_split_step_impl(conn: &Connection, max_groups: u32) -> SimilarStackFileTypeSplitStep
+{
+    let failed = |message: String, remaining: u64| SimilarStackFileTypeSplitStep
+    {
+        split_groups: 0,
+        kept_photos: 0,
+        unstacked_photos: 0,
+        remaining_groups: remaining,
+        ok: false,
+        message: Some(message),
+    };
+
+    let mut counts = SimilarSplitCounts { groups: 0, kept: 0, unstacked: 0 };
+    if max_groups > 0
+    {
+        if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
+        {
+            return failed(format!("begin failed: {}", e), 0);
+        }
+        match split_mixed_similar_groups_in_transaction(conn, SimilarSplitScope::First(max_groups as usize))
+        {
+            Ok(done) =>
+            {
+                if let Err(e) = conn.execute_batch("COMMIT;")
+                {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    return failed(format!("commit failed: {}", e), 0);
+                }
+                counts = done;
+            }
+            Err(message) =>
+            {
+                let rollback = conn
+                    .execute_batch("ROLLBACK;")
+                    .err()
+                    .map(|e| format!("; ROLLBACK failed: {}", e))
+                    .unwrap_or_default();
+                return failed(format!("{}{}; nothing changed", message, rollback), 0);
+            }
+        }
+    }
+
+    match similar_mixed_group_count(conn)
+    {
+        Ok(remaining) => SimilarStackFileTypeSplitStep
+        {
+            split_groups: counts.groups.max(0) as u64,
+            kept_photos: counts.kept.max(0) as u64,
+            unstacked_photos: counts.unstacked.max(0) as u64,
+            remaining_groups: remaining.max(0) as u64,
+            ok: true,
+            message: None,
+        },
+        Err(message) => failed(message, 0),
+    }
+}
+
+/// The FFI for `similar_stack_file_type_split_step_impl` — called by the app's
+/// background splitter in small steps so the window stays responsive.
+pub async fn similar_stack_file_type_split_step(max_groups: u32) -> SimilarStackFileTypeSplitStep
+{
+    let catalogue = lock_catalogue();
+    let conn = match catalogue.as_ref()
+    {
+        Some(c) => c,
+        None =>
+        {
+            return SimilarStackFileTypeSplitStep
+            {
+                split_groups: 0,
+                kept_photos: 0,
+                unstacked_photos: 0,
+                remaining_groups: 0,
+                ok: false,
+                message: Some("Catalogue not initialized".to_string()),
+            };
+        }
+    };
+    similar_stack_file_type_split_step_impl(conn, max_groups)
+}
+
+/// Re-split the stacks a writer just wrote when its rows met existing rows of
+/// another file type under the same stack number (review L2: an old stack whose
+/// number is no longer one of its own photos). Inside the writer's transaction.
+fn resplit_written_similar_groups(conn: &Connection, written_group_ids: &[i64]) -> Result<(), String>
+{
+    split_mixed_similar_groups_in_transaction(conn, SimilarSplitScope::Groups(written_group_ids)).map(|_| ())
+}
+
+/// The stack numbers a writer is about to write (valid members only), sorted.
+fn similar_written_group_ids(members: &[SimilarPhotoGroupMember]) -> Vec<i64>
+{
+    let mut groups: Vec<i64> = members
+        .iter()
+        .filter(|m| similar_photo_member_is_valid(m))
+        .map(|m| m.group_id)
+        .collect();
+    groups.sort_unstable();
+    groups.dedup();
+    groups
+}
+
+/// A writer's members with the one-file-type rule applied — the members it
+/// writes, dropped ones removed, in input order.
+fn split_similar_write_by_file_type(
+    conn: &Connection,
+    members: Vec<SimilarPhotoGroupMember>,
+) -> Result<Vec<SimilarPhotoGroupMember>, String>
+{
+    let mut ids: Vec<i64> = members
+        .iter()
+        .filter(|m| similar_photo_member_is_valid(m))
+        .map(|m| m.image_id)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty()
+    {
+        return Ok(members);
+    }
+    let file_types = similar_member_file_types(conn, &ids)?;
+    Ok(split_similar_members_by_file_type(members, &file_types)
+        .into_iter()
+        .flatten()
+        .collect())
+}
+
 /// ⭐ S24 — the WHOLE-CATALOGUE writer: an AUTOMATIC writer, protected exactly
 /// like the per-unit upsert. It has no Swift caller today (pinned by
 /// `Spikes/DurableStackGate/` L2) but stays on the wire, so it must not be able
@@ -29494,6 +30086,20 @@ fn replace_similar_photo_groups_whole_impl_with_probe(
         eprintln!("replace_similar_photo_groups: begin {}", e);
         return 0;
     }
+
+    // ⭐ Oct 28, 2026 — one file type per stack, decided before Guard 3 so the
+    // guard judges the groups that will actually be written.
+    let members = match split_similar_write_by_file_type(conn, members)
+    {
+        Ok(members) => members,
+        Err(e) =>
+        {
+            eprintln!("replace_similar_photo_groups: {}; nothing written", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return 0;
+        }
+    };
+    let written_group_ids = similar_written_group_ids(&members);
 
     let anchors: Vec<i64> = members.iter().map(|m| m.image_id).collect();
     if !similar_automatic_write_may_proceed(conn, &anchors, &members, "replace_similar_photo_groups", probe)
@@ -29558,6 +30164,16 @@ fn replace_similar_photo_groups_whole_impl_with_probe(
         }
     }
 
+    // ⭐ Oct 28, 2026 — rows this write met under the same stack number may
+    // be of another file type (an old stack whose number is no longer one of
+    // its own photos — review L2): split any such stack before COMMIT.
+    if let Err(e) = resplit_written_similar_groups(conn, &written_group_ids)
+    {
+        eprintln!("replace_similar_photo_groups: {}; nothing written", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return 0;
+    }
+
     if let Err(e) = conn.execute_batch("COMMIT;")
     {
         eprintln!("replace_similar_photo_groups: commit {}", e);
@@ -29620,18 +30236,70 @@ fn create_stack_writer_impl_with_probe(
         eprintln!("replace_similar_photo_groups: empty algorithm version");
         return 0;
     }
-    let Some(selection_filter) = id_in_list(ids) else
+    if id_in_list(ids).is_none()
     {
         return 0;
-    };
-    let selection_csv = editor_saved_image_id_csv(ids);
-    let selected: std::collections::HashSet<i64> = ids.iter().copied().collect();
+    }
 
     if let Err(e) = conn.execute_batch("BEGIN TRANSACTION;")
     {
         eprintln!("replace_similar_photo_groups: begin {}", e);
         return 0;
     }
+
+    // ⭐ Oct 28, 2026 — one file type per stack: a selection of JPEGs and NEFs
+    // becomes a JPEG stack and a NEF stack. When NO type has two photos (one
+    // JPEG and one NEF of different shots), nothing would be stacked but the
+    // leftover rules below would still take the photos out of their old
+    // stacks — so the whole Create Stack is refused and nothing changes.
+    let had_valid_member = members.iter().any(similar_photo_member_is_valid);
+    let offered: std::collections::HashSet<i64> = members
+        .iter()
+        .filter(|m| similar_photo_member_is_valid(m))
+        .map(|m| m.image_id)
+        .collect();
+    let members = match split_similar_write_by_file_type(conn, members)
+    {
+        Ok(members) => members,
+        Err(e) =>
+        {
+            eprintln!("replace_similar_photo_groups: {}; nothing written", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return 0;
+        }
+    };
+    if had_valid_member && !members.iter().any(similar_photo_member_is_valid)
+    {
+        eprintln!(
+            "replace_similar_photo_groups: no file type in the selection has two photos; \
+             nothing changed (one file type per stack)"
+        );
+        let _ = conn.execute_batch("ROLLBACK;");
+        return 0;
+    }
+    let mut written_group_ids = similar_written_group_ids(&members);
+
+    // ⭐ Review M3 — a photo the split dropped (its type has one photo in the
+    // selection) is not being stacked, so it is not part of the selection the
+    // leftover rules take out of old stacks: it keeps the stack it was in.
+    let kept: std::collections::HashSet<i64> = members
+        .iter()
+        .filter(|m| similar_photo_member_is_valid(m))
+        .map(|m| m.image_id)
+        .collect();
+    let ids: Vec<i64> = ids
+        .iter()
+        .copied()
+        .filter(|id| !(offered.contains(id) && !kept.contains(id)))
+        .collect();
+    let ids: &[i64] = &ids;
+    let Some(selection_filter) = id_in_list(ids) else
+    {
+        let _ = conn.execute_batch("ROLLBACK;");
+        return 0;
+    };
+    let selection_csv = editor_saved_image_id_csv(ids);
+    let selected: std::collections::HashSet<i64> = ids.iter().copied().collect();
 
     // --- The plan: every row of every group the selection touches — the
     // census is `editor_saved_image_collect_similar_groups`'s three limbs, as
@@ -29721,6 +30389,12 @@ fn create_stack_writer_impl_with_probe(
             }
         }
     }
+
+    // ⭐ Oct 28, 2026 (review round 2, LOW 3) — a leftover stack re-keyed onto
+    // its lowest photo is re-split too: that number may be another type's.
+    written_group_ids.extend(rekey.iter().map(|(_, new_group)| *new_group));
+    written_group_ids.sort_unstable();
+    written_group_ids.dedup();
 
     // --- (i) the selected photos' rows, then the touched groups' dangling rows.
     let mut writes: Vec<(String, Vec<i64>)> = vec![(
@@ -29818,6 +30492,16 @@ fn create_stack_writer_impl_with_probe(
                 return 0;
             }
         }
+    }
+
+    // ⭐ Oct 28, 2026 — rows this write met under the same stack number may
+    // be of another file type (an old stack whose number is no longer one of
+    // its own photos — review L2): split any such stack before COMMIT.
+    if let Err(e) = resplit_written_similar_groups(conn, &written_group_ids)
+    {
+        eprintln!("replace_similar_photo_groups: {}; nothing written", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return 0;
     }
 
     if let Err(e) = conn.execute_batch("COMMIT;")
@@ -29919,6 +30603,23 @@ fn upsert_similar_photo_groups_for_ids_impl_with_probe(
         eprintln!("upsert_similar_photo_groups_for_ids: begin {}", e);
         return 0;
     }
+
+    // ⭐ Oct 28, 2026 — one file type per stack, decided before Guard 3 so the
+    // guard judges the groups that will actually be written. A member dropped
+    // here (its type's share of its group is one photo) is simply not written;
+    // the anchor DELETE below still clears an anchor's old row, so it ends up
+    // unstacked.
+    let members = match split_similar_write_by_file_type(conn, members)
+    {
+        Ok(members) => members,
+        Err(e) =>
+        {
+            eprintln!("upsert_similar_photo_groups_for_ids: {}; nothing written", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return 0;
+        }
+    };
+    let written_group_ids = similar_written_group_ids(&members);
 
     if !similar_automatic_write_may_proceed(conn, ids, &members, "upsert_similar_photo_groups_for_ids", probe)
     {
@@ -30025,6 +30726,16 @@ fn upsert_similar_photo_groups_for_ids_impl_with_probe(
         }
     }
 
+    // ⭐ Oct 28, 2026 — rows this write met under the same stack number may
+    // be of another file type (an old stack whose number is no longer one of
+    // its own photos — review L2): split any such stack before COMMIT.
+    if let Err(e) = resplit_written_similar_groups(conn, &written_group_ids)
+    {
+        eprintln!("upsert_similar_photo_groups_for_ids: {}; nothing written", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return 0;
+    }
+
     if let Err(e) = conn.execute_batch("COMMIT;")
     {
         eprintln!("upsert_similar_photo_groups_for_ids: commit {}", e);
@@ -30064,6 +30775,23 @@ fn upsert_similar_photo_groups_for_ids_per_row_reference(
         eprintln!("upsert_similar_photo_groups_for_ids: begin {}", e);
         return 0;
     }
+
+    // ⭐ Oct 28, 2026 — one file type per stack, decided before Guard 3 so the
+    // guard judges the groups that will actually be written. A member dropped
+    // here (its type's share of its group is one photo) is simply not written;
+    // the anchor DELETE below still clears an anchor's old row, so it ends up
+    // unstacked.
+    let members = match split_similar_write_by_file_type(conn, members)
+    {
+        Ok(members) => members,
+        Err(e) =>
+        {
+            eprintln!("upsert_similar_photo_groups_for_ids: {}; nothing written", e);
+            let _ = conn.execute_batch("ROLLBACK;");
+            return 0;
+        }
+    };
+    let written_group_ids = similar_written_group_ids(&members);
 
     if !similar_automatic_write_may_proceed(conn, ids, &members, "upsert_similar_photo_groups_for_ids", probe)
     {
@@ -30137,6 +30865,16 @@ fn upsert_similar_photo_groups_for_ids_per_row_reference(
         }
     }
 
+    // ⭐ Oct 28, 2026 — rows this write met under the same stack number may
+    // be of another file type (an old stack whose number is no longer one of
+    // its own photos — review L2): split any such stack before COMMIT.
+    if let Err(e) = resplit_written_similar_groups(conn, &written_group_ids)
+    {
+        eprintln!("upsert_similar_photo_groups_for_ids: {}; nothing written", e);
+        let _ = conn.execute_batch("ROLLBACK;");
+        return 0;
+    }
+
     if let Err(e) = conn.execute_batch("COMMIT;")
     {
         eprintln!("upsert_similar_photo_groups_for_ids: commit {}", e);
@@ -30171,23 +30909,27 @@ pub async fn upsert_similar_photo_groups_for_ids(
 /// The caller passes page-visible ids. Each id is resolved to its durable
 /// similar-photo group, then counted two ways: physical image rows and logical
 /// photos where RAW/JPEG/HEIF siblings with the same directory/stem count once.
+/// ⭐ Oct 28, 2026 — with RAW+JPEG pairing on (`apply_raw_jpeg_collapse`), a
+/// RAW member whose JPEG/HEIF twin sits in the same folder is shown through
+/// that twin, so it is left out of the stack's count (Richard's ruling: a NEF
+/// stack's badge counts only the NEFs not already shown). The requested photo
+/// itself always counts. With pairing off the SQL is unchanged.
+pub(crate) const SIMILAR_MEMBER_SHOWN_BY_PAIRING_SQL: &str = "\
+    (COALESCE(i.image_kind, '') = 'raw' AND EXISTS ( \
+        SELECT 1 FROM images j \
+        WHERE j.image_kind IN ('jpeg', 'heif') \
+          AND j.file_stem = i.file_stem \
+          AND j.directory_path = i.directory_path \
+    ))";
+
 pub async fn similar_photo_stack_summaries_for_ids(
     ids: Vec<i64>,
     algorithm_version: String,
+    apply_raw_jpeg_collapse: bool,
 ) -> Vec<SimilarPhotoStackSummary> {
     if ids.is_empty() {
         return Vec::new();
     }
-
-    let algorithm_version = algorithm_version.trim().to_string();
-    if algorithm_version.is_empty() {
-        return Vec::new();
-    }
-
-    let id_filter = match id_in_list(&ids) {
-        Some(filter) => filter,
-        None => return Vec::new(),
-    };
 
     let catalogue = lock_catalogue();
     let conn = match catalogue.as_ref() {
@@ -30196,6 +30938,28 @@ pub async fn similar_photo_stack_summaries_for_ids(
             eprintln!("Catalogue not initialized");
             return Vec::new();
         }
+    };
+
+    similar_photo_stack_summaries_for_ids_impl(conn, &ids, &algorithm_version, apply_raw_jpeg_collapse)
+}
+
+fn similar_photo_stack_summaries_for_ids_impl(
+    conn: &Connection,
+    ids: &[i64],
+    algorithm_version: &str,
+    apply_raw_jpeg_collapse: bool,
+) -> Vec<SimilarPhotoStackSummary> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let algorithm_version = algorithm_version.trim().to_string();
+    if algorithm_version.is_empty() {
+        return Vec::new();
+    }
+
+    let id_filter = match id_in_list(ids) {
+        Some(filter) => filter,
+        None => return Vec::new(),
     };
 
     let sql = format!(
@@ -30225,9 +30989,18 @@ pub async fn similar_photo_stack_summaries_for_ids(
           ON gm.group_id = rm.group_id
          AND gm.algorithm_version = ?1
         JOIN images i ON i.id = gm.image_id
+        {}
         GROUP BY rm.image_id, rm.group_id
         "#,
-        id_filter
+        id_filter,
+        if apply_raw_jpeg_collapse
+        {
+            format!("WHERE (gm.image_id = rm.image_id OR NOT {})", SIMILAR_MEMBER_SHOWN_BY_PAIRING_SQL)
+        }
+        else
+        {
+            String::new()
+        }
     );
 
     let mut stmt = match conn.prepare(&sql) {
@@ -30267,6 +31040,7 @@ fn similar_photo_stack_members_for_ids_impl(
     conn: &Connection,
     ids: &[i64],
     algorithm_version: &str,
+    apply_raw_jpeg_collapse: bool,
 ) -> Vec<SimilarPhotoStackMember> {
     if ids.is_empty() {
         return Vec::new();
@@ -30317,6 +31091,7 @@ fn similar_photo_stack_members_for_ids_impl(
             JOIN similar_photo_group_member gm
               ON gm.group_id = rm.group_id
              AND gm.algorithm_version = ?1
+            {}
             UNION
             SELECT
                 rm.image_id,
@@ -30330,7 +31105,21 @@ fn similar_photo_stack_members_for_ids_impl(
         FROM expanded
         ORDER BY group_id, member_rank, image_id
         "#,
-        id_filter
+        id_filter,
+        // ⭐ Oct 28, 2026 — pairing on: a RAW member shown through its JPEG/HEIF
+        // twin is not a member of this stack's view (the requested photo stays).
+        if apply_raw_jpeg_collapse
+        {
+            format!(
+                "LEFT JOIN images i ON i.id = gm.image_id \
+                 WHERE (gm.image_id = rm.image_id OR NOT {})",
+                SIMILAR_MEMBER_SHOWN_BY_PAIRING_SQL
+            )
+        }
+        else
+        {
+            String::new()
+        }
     );
 
     let mut stmt = match conn.prepare(&sql) {
@@ -30370,6 +31159,7 @@ fn similar_photo_stack_members_for_ids_impl(
 pub async fn similar_photo_stack_members_for_ids(
     ids: Vec<i64>,
     algorithm_version: String,
+    apply_raw_jpeg_collapse: bool,
 ) -> Vec<SimilarPhotoStackMember> {
     if ids.is_empty() {
         return Vec::new();
@@ -30392,7 +31182,7 @@ pub async fn similar_photo_stack_members_for_ids(
         }
     };
 
-    similar_photo_stack_members_for_ids_impl(conn, &ids, &algorithm_version)
+    similar_photo_stack_members_for_ids_impl(conn, &ids, &algorithm_version, apply_raw_jpeg_collapse)
 }
 
 /// Distinct collection names — labels carrying `collection = TRUE` on any row,
@@ -34946,7 +35736,7 @@ mod durable_stack_tests
     /// (image_id, group_id) as the gallery's stack reader expands `id`'s stack.
     fn stack(conn: &Connection, id: i64) -> Vec<(i64, i64)>
     {
-        similar_photo_stack_members_for_ids_impl(conn, &[id], V)
+        similar_photo_stack_members_for_ids_impl(conn, &[id], V, false)
             .into_iter()
             .map(|m| (m.image_id, m.group_id))
             .collect()
@@ -35016,7 +35806,7 @@ mod durable_stack_tests
     fn stack_members_expand_selected_groups_and_keep_singletons()
     {
         let (path, conn) = legacy_setup("moved-members");
-        let members = similar_photo_stack_members_for_ids_impl(&conn, &[2, 4], "old-v1");
+        let members = similar_photo_stack_members_for_ids_impl(&conn, &[2, 4], "old-v1", false);
         let actual: Vec<(i64, i64, i64, u32)> = members
             .into_iter()
             .map(|m| (m.image_id, m.group_id, m.representative_id, m.member_rank))
@@ -43616,7 +44406,7 @@ mod removal_tombstone_tests
     fn stack_as_the_gallery_reads_it(conn: &Connection, image_id: i64) -> Vec<(i64, i64)>
     {
         let mut members: Vec<(i64, i64)> =
-            similar_photo_stack_members_for_ids_impl(conn, &[image_id], "similar-featureprint-v4")
+            similar_photo_stack_members_for_ids_impl(conn, &[image_id], "similar-featureprint-v4", false)
                 .into_iter()
                 .map(|member| (member.image_id, member.group_id))
                 .collect();
@@ -74539,5 +75329,913 @@ mod semantic_search_tests
         }
         drop(table);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// ⭐ Oct 28, 2026 — one file type per similar-photo stack (Richard's ruling;
+/// `split_similar_members_by_file_type`). Pins the rule, the three writers,
+/// the launch split, the SQL ⇄ Rust equivalence of the rule, and the gallery
+/// result Richard reported: a NEF beside its JPEG with RAW+JPEG pairing off.
+#[cfg(test)]
+mod similar_file_type_split_tests
+{
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    const V: &str = "similar-featureprint-v4";
+
+    fn fixture_path(tag: &str) -> std::path::PathBuf
+    {
+        let n = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "plcore-file-type-split-test-{}-{}-{}.db",
+            std::process::id(),
+            n,
+            tag
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+        path
+    }
+
+    fn open(path: &std::path::Path) -> Connection
+    {
+        let conn = open_and_migrate_catalogue(path).expect("fixture catalogue");
+        // ⭐ ENGINE TESTS NEVER FETCH.
+        fence_connection_against_extension_fetches(&conn);
+        conn
+    }
+
+    fn cleanup(path: &std::path::Path)
+    {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db.wal"));
+    }
+
+    /// Run the background step to completion, as the app's splitter does.
+    fn split_all(conn: &Connection, chunk: u32) -> (u64, u64, u64)
+    {
+        let (mut groups, mut kept, mut unstacked) = (0, 0, 0);
+        for _ in 0..10_000
+        {
+            let step = similar_stack_file_type_split_step_impl(conn, chunk);
+            assert!(step.ok, "step failed: {:?}", step.message);
+            groups += step.split_groups;
+            kept += step.kept_photos;
+            unstacked += step.unstacked_photos;
+            if step.remaining_groups == 0
+            {
+                return (groups, kept, unstacked);
+            }
+            assert!(step.split_groups > 0, "a step made no progress with {} left", step.remaining_groups);
+        }
+        panic!("the split did not finish");
+    }
+
+    fn mixed_left(conn: &Connection) -> i64
+    {
+        similar_mixed_group_count(conn).expect("mixed count")
+    }
+
+    /// An eligible still with an explicit id, kind and stem in directory `/d`.
+    fn insert_still(conn: &Connection, id: i64, kind: Option<&str>, stem: &str)
+    {
+        let extension = match kind
+        {
+            Some("raw") => "NEF",
+            Some("heif") => "HEIC",
+            Some("tiff") => "TIF",
+            Some("psd") => "PSD",
+            Some("png") => "PNG",
+            Some("dng") => "DNG",
+            _ => "JPG",
+        };
+        let name = format!("{}.{}", stem, extension);
+        conn.execute(
+            "INSERT INTO images (id, file_path, file_size, file_name, created_timestamp, \
+             modified_timestamp, image_kind, file_stem, directory_path, is_video) \
+             VALUES (?1, ?2, 1234, ?3, 0, 0, ?4, ?5, '/d', FALSE)",
+            params![id, format!("/d/{}", name), name, kind, stem],
+        )
+        .expect("insert still");
+    }
+
+    fn member(image_id: i64, group_id: i64, representative_id: i64, rank: u32, distance: Option<f64>) -> SimilarPhotoGroupMember
+    {
+        SimilarPhotoGroupMember
+        {
+            image_id,
+            group_id,
+            representative_id,
+            member_rank: rank,
+            distance_to_representative: distance,
+            threshold: 8.5,
+        }
+    }
+
+    fn insert_row(conn: &Connection, m: &SimilarPhotoGroupMember, origin: i32)
+    {
+        conn.execute(
+            "INSERT INTO similar_photo_group_member (image_id, group_id, representative_id, \
+             member_rank, distance_to_representative, algorithm_version, threshold, origin) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                m.image_id,
+                m.group_id,
+                m.representative_id,
+                m.member_rank as i64,
+                m.distance_to_representative,
+                V,
+                m.threshold,
+                origin
+            ],
+        )
+        .expect("insert membership row");
+    }
+
+    /// (image_id, group_id, representative_id, rank, distance, threshold, origin, created_at)
+    type Row = (i64, i64, i64, i64, Option<f64>, f64, Option<i64>, Option<String>);
+
+    fn dump(conn: &Connection) -> Vec<Row>
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT image_id, group_id, representative_id, member_rank, \
+                 distance_to_representative, threshold, origin, CAST(created_at AS VARCHAR) \
+                 FROM similar_photo_group_member ORDER BY image_id",
+            )
+            .expect("prepare dump");
+        stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        })
+        .expect("dump")
+        .map(|r| r.expect("dump row"))
+        .collect()
+    }
+
+    fn types(pairs: &[(i64, Option<&str>)]) -> HashMap<i64, Option<String>>
+    {
+        pairs.iter().map(|(id, kind)| (*id, kind.map(str::to_string))).collect()
+    }
+
+    fn same(a: &SimilarPhotoGroupMember, b: &SimilarPhotoGroupMember) -> bool
+    {
+        a.image_id == b.image_id
+            && a.group_id == b.group_id
+            && a.representative_id == b.representative_id
+            && a.member_rank == b.member_rank
+            && a.distance_to_representative == b.distance_to_representative
+            && a.threshold.to_bits() == b.threshold.to_bits()
+    }
+
+    #[test]
+    fn rule_separates_jpeg_from_raw_and_drops_one_photo_parts()
+    {
+        let members = vec![
+            member(10, 10, 10, 0, Some(0.0)),
+            member(11, 10, 10, 1, Some(1.4)),
+            member(12, 10, 10, 2, Some(3.0)),
+            member(13, 10, 10, 3, Some(3.2)),
+            // A shot's JPEG and its own NEF, nothing else: not a stack.
+            member(20, 20, 20, 0, Some(0.0)),
+            member(21, 20, 20, 1, Some(1.4)),
+            // One type already: passes through byte for byte (odd ranks kept).
+            member(30, 30, 30, 5, Some(0.0)),
+            member(31, 30, 30, 2, Some(2.0)),
+        ];
+        let file_types = types(&[
+            (10, Some("jpeg")), (11, Some("raw")), (12, Some("jpeg")), (13, Some("raw")),
+            (20, Some("jpeg")), (21, Some("raw")), (30, Some("jpeg")), (31, Some("jpeg")),
+        ]);
+        let out = split_similar_members_by_file_type(members.clone(), &file_types);
+
+        assert!(same(out[0].as_ref().unwrap(), &member(10, 10, 10, 0, Some(0.0))));
+        assert!(same(out[2].as_ref().unwrap(), &member(12, 10, 10, 1, Some(3.0))));
+        assert!(same(out[1].as_ref().unwrap(), &member(11, 11, 11, 0, Some(0.0))), "new representative measures 0");
+        assert!(same(out[3].as_ref().unwrap(), &member(13, 11, 11, 1, None)), "nothing measured it against the new representative");
+        assert!(out[4].is_none() && out[5].is_none(), "a JPEG and its own NEF alone are not a stack");
+        assert!(same(out[6].as_ref().unwrap(), &members[6]));
+        assert!(same(out[7].as_ref().unwrap(), &members[7]));
+    }
+
+    #[test]
+    fn rule_keeps_a_held_representative_and_splits_every_file_type()
+    {
+        let members = vec![
+            member(12, 15, 15, 1, Some(2.0)),
+            member(13, 15, 15, 2, Some(2.5)),
+            member(14, 15, 15, 3, Some(2.6)),
+            member(15, 15, 15, 0, Some(0.0)),
+            member(16, 15, 15, 4, Some(4.0)),
+            member(17, 15, 15, 5, Some(4.1)),
+        ];
+        let file_types = types(&[
+            (12, Some("jpeg")), (13, Some("raw")), (14, Some("raw")),
+            (15, Some("jpeg")), (16, Some("tiff")), (17, Some("psd")),
+        ]);
+        let out = split_similar_members_by_file_type(members, &file_types);
+        // JPEG part keeps its representative 15 although 12 is lower.
+        assert!(same(out[3].as_ref().unwrap(), &member(15, 15, 15, 0, Some(0.0))));
+        assert!(same(out[0].as_ref().unwrap(), &member(12, 15, 15, 1, Some(2.0))));
+        // RAW part: lowest id represents.
+        assert!(same(out[1].as_ref().unwrap(), &member(13, 13, 13, 0, Some(0.0))));
+        assert!(same(out[2].as_ref().unwrap(), &member(14, 13, 13, 1, None)));
+        // TIFF and PSD are different types — one photo each, no stack.
+        assert!(out[4].is_none() && out[5].is_none());
+    }
+
+    #[test]
+    fn rule_passes_invalid_members_through_and_does_not_count_them()
+    {
+        let mut invalid = member(42, 40, 40, 2, None);
+        invalid.threshold = f64::NAN;
+        let members = vec![member(40, 40, 40, 0, Some(0.0)), member(41, 40, 40, 1, Some(1.0)), invalid];
+        // Only the invalid member is a different type: the group is NOT mixed.
+        let file_types = types(&[(40, Some("jpeg")), (41, Some("jpeg")), (42, Some("raw"))]);
+        let out = split_similar_members_by_file_type(members.clone(), &file_types);
+        assert!(same(out[0].as_ref().unwrap(), &members[0]));
+        assert!(same(out[1].as_ref().unwrap(), &members[1]));
+        let passed = out[2].as_ref().expect("an invalid member passes through");
+        assert_eq!(passed.image_id, 42);
+        assert!(passed.threshold.is_nan());
+    }
+
+    #[test]
+    fn rule_treats_a_missing_or_empty_kind_as_its_own_type()
+    {
+        let members = vec![
+            member(50, 50, 50, 0, Some(0.0)),
+            member(51, 50, 50, 1, Some(1.0)),
+            member(52, 50, 50, 2, Some(1.5)),
+            member(53, 50, 50, 3, Some(1.6)),
+        ];
+        // 52 has an empty kind, 53 has no image row: both the None type.
+        let file_types = types(&[(50, Some("jpeg")), (51, Some("jpeg")), (52, Some(""))]);
+        let out = split_similar_members_by_file_type(members, &file_types);
+        assert!(same(out[0].as_ref().unwrap(), &member(50, 50, 50, 0, Some(0.0))));
+        assert!(same(out[1].as_ref().unwrap(), &member(51, 50, 50, 1, Some(1.0))));
+        assert!(same(out[2].as_ref().unwrap(), &member(52, 52, 52, 0, Some(0.0))));
+        assert!(same(out[3].as_ref().unwrap(), &member(53, 52, 52, 1, None)));
+    }
+
+    /// Two shots, each a JPEG and its own NEF: ids 1/2 = shot A, 3/4 = shot B.
+    fn two_paired_shots(conn: &Connection)
+    {
+        insert_still(conn, 1, Some("jpeg"), "_RW1");
+        insert_still(conn, 2, Some("raw"), "_RW1");
+        insert_still(conn, 3, Some("jpeg"), "_RW2");
+        insert_still(conn, 4, Some("raw"), "_RW2");
+    }
+
+    fn mixed_group(ids: &[i64]) -> Vec<SimilarPhotoGroupMember>
+    {
+        let key = *ids.iter().min().unwrap();
+        ids.iter()
+            .enumerate()
+            .map(|(rank, id)| member(*id, key, key, rank as u32, Some(if *id == key { 0.0 } else { 1.0 + rank as f64 })))
+            .collect()
+    }
+
+    #[test]
+    fn automatic_writer_writes_one_file_type_per_stack()
+    {
+        let path = fixture_path("auto");
+        let conn = open(&path);
+        two_paired_shots(&conn);
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &[1, 2, 3, 4], mixed_group(&[1, 2, 3, 4]), V), 4);
+        let rows = dump(&conn);
+        let groups: Vec<(i64, i64)> = rows.iter().map(|r| (r.0, r.1)).collect();
+        assert_eq!(groups, vec![(1, 1), (2, 2), (3, 1), (4, 2)], "JPEG stack 1, NEF stack 2");
+        assert!(rows.iter().all(|r| r.6 == Some(SIMILAR_STACK_ORIGIN_AUTO as i64)));
+
+        // A shot's JPEG and NEF alone are not a stack: an anchor that was
+        // stacked loses its row.
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &[1, 2], mixed_group(&[1, 2]), V), 0);
+        let left: Vec<i64> = dump(&conn).iter().map(|r| r.0).collect();
+        assert_eq!(left, vec![3, 4], "1 and 2 unstacked; 3 and 4 keep their old rows");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn whole_catalogue_writer_writes_one_file_type_per_stack()
+    {
+        let path = fixture_path("whole");
+        let conn = open(&path);
+        two_paired_shots(&conn);
+        assert_eq!(replace_similar_photo_groups_whole_impl(&conn, mixed_group(&[1, 2, 3, 4]), V), 4);
+        let groups: Vec<(i64, i64)> = dump(&conn).iter().map(|r| (r.0, r.1)).collect();
+        assert_eq!(groups, vec![(1, 1), (2, 2), (3, 1), (4, 2)]);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn create_stack_splits_by_file_type_and_keeps_its_hand_made_mark()
+    {
+        let path = fixture_path("create");
+        let conn = open(&path);
+        two_paired_shots(&conn);
+        // Create Stack's own shape: the first id represents.
+        let members: Vec<SimilarPhotoGroupMember> = [3, 1, 4, 2]
+            .iter()
+            .enumerate()
+            .map(|(rank, id)| member(*id, 3, 3, rank as u32, if *id == 3 { Some(0.0) } else { None }))
+            .collect();
+        assert_eq!(create_stack_writer_impl(&conn, &[3, 1, 4, 2], members, V), 4);
+        let rows = dump(&conn);
+        let groups: Vec<(i64, i64, i64)> = rows.iter().map(|r| (r.0, r.1, r.3)).collect();
+        // JPEG part keeps the chosen representative 3; NEF part: lowest id 2
+        // represents, ranks keep the selection's order (4 before 2).
+        assert_eq!(groups, vec![(1, 3, 1), (2, 2, 1), (3, 3, 0), (4, 2, 0)]);
+        assert!(rows.iter().all(|r| r.6 == Some(SIMILAR_STACK_ORIGIN_USER as i64)));
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn create_stack_changes_nothing_when_no_file_type_has_two_photos()
+    {
+        let path = fixture_path("create-refused");
+        let conn = open(&path);
+        two_paired_shots(&conn);
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &[1, 2, 3, 4], mixed_group(&[1, 2, 3, 4]), V), 4);
+        let before = dump(&conn);
+        // One JPEG and one NEF of different shots.
+        let members = vec![member(1, 1, 1, 0, Some(0.0)), member(4, 1, 1, 1, None)];
+        assert_eq!(create_stack_writer_impl(&conn, &[1, 4], members, V), 0);
+        assert_eq!(dump(&conn), before, "refused whole: nothing taken out of the old stacks");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn launch_split_rewrites_only_mixed_stacks_and_is_idempotent()
+    {
+        let path = fixture_path("launch");
+        let conn = open(&path);
+        two_paired_shots(&conn);
+        insert_still(&conn, 5, Some("jpeg"), "_RW5");
+        insert_still(&conn, 6, Some("jpeg"), "_RW6");
+        insert_still(&conn, 7, Some("jpeg"), "_RW7");
+        insert_still(&conn, 8, Some("raw"), "_RW7");
+        // An automatic mixed stack, a hand-made mixed stack of a shot and its
+        // NEF plus a JPEG, and a single-type stack with odd ranks.
+        let auto_rows = mixed_group(&[1, 2, 3, 4]);
+        let hand_rows = vec![member(6, 6, 6, 0, Some(0.0)), member(7, 6, 6, 1, None), member(8, 6, 6, 2, None)];
+        let same_type = vec![member(5, 9, 9, 3, Some(2.0))];
+        for m in &auto_rows
+        {
+            insert_row(&conn, m, SIMILAR_STACK_ORIGIN_AUTO);
+        }
+        for m in &hand_rows
+        {
+            insert_row(&conn, m, SIMILAR_STACK_ORIGIN_USER);
+        }
+        for m in &same_type
+        {
+            insert_row(&conn, m, SIMILAR_STACK_ORIGIN_AUTO);
+        }
+        let untouched_before: Vec<Row> = dump(&conn).into_iter().filter(|r| r.0 == 5).collect();
+        drop(conn);
+
+        // The open itself no longer splits (Richard chose the background
+        // step with a bar): the stacks are still mixed after it.
+        let conn = open(&path);
+        assert_eq!(mixed_left(&conn), 2);
+        assert_eq!(split_all(&conn, 1), (2, 6, 1));
+        let after = dump(&conn);
+        let brief: Vec<(i64, i64, i64, i64, Option<f64>, Option<i64>)> =
+            after.iter().map(|r| (r.0, r.1, r.2, r.3, r.4, r.6)).collect();
+        assert_eq!(
+            brief,
+            vec![
+                (1, 1, 1, 0, Some(0.0), Some(2)),
+                (2, 2, 2, 0, Some(0.0), Some(2)),
+                (3, 1, 1, 1, Some(3.0), Some(2)),
+                (4, 2, 2, 1, None, Some(2)),
+                (5, 9, 9, 3, Some(2.0), Some(2)),
+                // Hand-made stack: JPEGs 6 and 7 stay stacked by hand; its NEF 8
+                // is alone in its type, so it is unstacked.
+                (6, 6, 6, 0, Some(0.0), Some(1)),
+                (7, 6, 6, 1, None, Some(1)),
+            ]
+        );
+        let untouched_after: Vec<Row> = after.iter().filter(|r| r.0 == 5).cloned().collect();
+        assert_eq!(untouched_after, untouched_before, "a single-type stack's row is not rewritten");
+        assert!(after.iter().all(|r| r.7.is_some()), "created_at kept");
+        drop(conn);
+
+        // Idempotent: a reopen and a second run change nothing.
+        let conn = open(&path);
+        assert_eq!(dump(&conn), after);
+        let step = similar_stack_file_type_split_step_impl(&conn, 1000);
+        assert_eq!((step.ok, step.split_groups, step.remaining_groups), (true, 0, 0));
+        assert_eq!(dump(&conn), after);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// The launch split's SQL and the writers' Rust rule agree on randomized
+    /// stacks: ties in rank, representatives that are and are not members,
+    /// NULL and measured distances, every file type, a NULL kind, and orphan
+    /// rows whose image is gone.
+    #[test]
+    fn launch_split_sql_equals_the_rust_rule_on_random_stacks()
+    {
+        let path = fixture_path("equivalence");
+        let conn = open(&path);
+        let kinds: [Option<&str>; 8] =
+            [Some("jpeg"), Some("raw"), Some("heif"), Some("dng"), Some("tiff"), Some("psd"), Some("png"), None];
+        let mut seed: u64 = 0x5eed_2026_1028;
+        let mut next = |bound: u64| -> u64
+        {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % bound
+        };
+
+        let mut members: Vec<SimilarPhotoGroupMember> = Vec::new();
+        let mut file_types: HashMap<i64, Option<String>> = HashMap::new();
+        let mut next_id: i64 = 1000;
+        for group in 0..120
+        {
+            let size = 2 + next(6) as usize;
+            let ids: Vec<i64> = (0..size).map(|i| next_id + i as i64).collect();
+            next_id += size as i64 + 1;
+            let group_id = 100_000 + group;
+            // Representative: a member most of the time, sometimes not.
+            let representative = if next(5) == 0 { 999_000 + group } else { ids[next(size as u64) as usize] };
+            // Some groups single-type, most mixed.
+            let single_type = next(4) == 0;
+            let fixed_kind = kinds[next(7) as usize];
+            for (position, id) in ids.iter().enumerate()
+            {
+                let kind = if single_type { fixed_kind } else { kinds[next(8) as usize] };
+                // A None kind is either an orphan row (no image — its own
+                // type) or an image whose kind is NULL ("unknown" — both rules
+                // leave that whole stack alone, review round 2 LOW 1).
+                let orphan = !single_type && ((kind.is_none() && next(2) == 0) || next(15) == 0);
+                if !orphan
+                {
+                    insert_still(&conn, *id, kind, &format!("s{}", id));
+                    file_types.insert(*id, kind.map(str::to_string));
+                }
+                let distance = if *id == representative { Some(0.0) } else if next(3) == 0 { None } else { Some(next(900) as f64 / 100.0) };
+                let rank = if next(4) == 0 { 0 } else { position as u32 };
+                let m = member(*id, group_id, representative, rank, distance);
+                insert_row(&conn, &m, if next(2) == 0 { SIMILAR_STACK_ORIGIN_AUTO } else { SIMILAR_STACK_ORIGIN_USER });
+                members.push(m);
+            }
+        }
+
+        let expected: Vec<(i64, i64, i64, i64, Option<f64>)> = {
+            let mut rows: Vec<(i64, i64, i64, i64, Option<f64>)> =
+                split_similar_members_by_file_type(members, &file_types)
+                    .into_iter()
+                    .flatten()
+                    .map(|m| (m.image_id, m.group_id, m.representative_id, m.member_rank as i64, m.distance_to_representative))
+                    .collect();
+            rows.sort_by_key(|r| r.0);
+            rows
+        };
+
+        let (groups, _, _) = split_all(&conn, 7);
+        assert!(groups > 30, "a real number of mixed stacks ({})", groups);
+        let actual: Vec<(i64, i64, i64, i64, Option<f64>)> =
+            dump(&conn).into_iter().map(|r| (r.0, r.1, r.2, r.3, r.4)).collect();
+        assert_eq!(actual, expected);
+        assert!(expected.len() > 50, "the fixture keeps a real number of rows ({})", expected.len());
+
+        // A second run finds nothing to do.
+        assert_eq!(split_all(&conn, 1000), (0, 0, 0));
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// Live measurement on a COPY of a real catalogue (never the live file):
+    /// `PLDIAG_SPLIT_DB=/path/copy.db cargo test --release --lib
+    /// live_split_on_a_catalogue_copy -- --ignored --nocapture`. The open runs
+    /// the launch split; this prints its time and proves no mixed stack is left.
+    #[test]
+    #[ignore]
+    fn live_split_on_a_catalogue_copy()
+    {
+        let Ok(path) = std::env::var("PLDIAG_SPLIT_DB") else
+        {
+            eprintln!("PLDIAG_SPLIT_DB not set; nothing to do");
+            return;
+        };
+        let conn = open(std::path::Path::new(&path));
+        let chunk: u32 = std::env::var("PLDIAG_SPLIT_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+        let started = std::time::Instant::now();
+        let first = similar_stack_file_type_split_step_impl(&conn, 0);
+        eprintln!("[live split] {} mixed stacks to split (count {} ms)", first.remaining_groups, started.elapsed().as_millis());
+        let (mut steps, mut slowest) = (0u32, 0u128);
+        loop
+        {
+            let t = std::time::Instant::now();
+            let step = similar_stack_file_type_split_step_impl(&conn, chunk);
+            slowest = slowest.max(t.elapsed().as_millis());
+            steps += 1;
+            assert!(step.ok, "{:?}", step.message);
+            if step.remaining_groups == 0 || step.split_groups == 0
+            {
+                break;
+            }
+        }
+        eprintln!(
+            "[live split] {} steps of {} stacks, slowest step {} ms, total {} ms",
+            steps, chunk, slowest, started.elapsed().as_millis()
+        );
+        let (rows, groups): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT group_id) FROM similar_photo_group_member",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("census");
+        eprintln!("[live split] after: {} mixed stacks, {} rows in {} stacks", mixed_left(&conn), rows, groups);
+        assert_eq!(mixed_left(&conn), 0);
+    }
+
+    /// Richard's report, end to end: with RAW+JPEG pairing OFF and similar
+    /// stacks collapsed, the gallery shows the NEF beside the JPEG.
+    #[test]
+    fn gallery_shows_the_nef_beside_its_jpeg_once_stacks_hold_one_type()
+    {
+        let path = fixture_path("gallery");
+        let conn = open(&path);
+        two_paired_shots(&conn);
+        insert_still(&conn, 5, Some("jpeg"), "_RW5");
+        insert_still(&conn, 6, Some("raw"), "_RW5");
+        // The old mixed shape, as the grouping pass used to write it.
+        for m in mixed_group(&[1, 2, 3, 4]).iter().chain(mixed_group(&[5, 6]).iter())
+        {
+            insert_row(&conn, m, SIMILAR_STACK_ORIGIN_AUTO);
+        }
+        let visible = |conn: &Connection, raw_collapse: bool| -> Vec<i64>
+        {
+            execute_image_record_query(
+                conn, "directory_path = '/d'", "id ASC", 100, 0, false, raw_collapse, true, V,
+                MediaType::StillsOnly,
+            )
+            .into_iter()
+            .map(|r| r.id)
+            .collect()
+        };
+        // Before the split: the NEFs are hidden whatever the pairing switch says.
+        assert_eq!(visible(&conn, false), vec![1, 5]);
+        split_all(&conn, 1000);
+        // Pairing OFF: the JPEG stack's top and the NEF stack's top, and both
+        // halves of the shot that is no longer a stack.
+        assert_eq!(visible(&conn, false), vec![1, 2, 5, 6]);
+        // Pairing ON: the NEFs hide behind their JPEGs, as before.
+        assert_eq!(visible(&conn, true), vec![1, 5]);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// Review M1: a part's natural number (its lowest photo) is already the
+    /// number of an OLD stack that no longer holds that photo. The split must
+    /// pick another number, not merge into it and roll everything back.
+    #[test]
+    fn split_never_reuses_a_number_another_stack_holds()
+    {
+        let path = fixture_path("collision");
+        let conn = open(&path);
+        two_paired_shots(&conn);
+        insert_still(&conn, 30, Some("jpeg"), "_RW30");
+        insert_still(&conn, 31, Some("jpeg"), "_RW31");
+        insert_still(&conn, 40, Some("jpeg"), "_RW40");
+        insert_still(&conn, 41, Some("raw"), "_RW40");
+        insert_still(&conn, 42, Some("jpeg"), "_RW42");
+        insert_still(&conn, 43, Some("raw"), "_RW42");
+        // Mixed stack 1: its NEF part's lowest photo is 2.
+        for m in mixed_group(&[1, 2, 3, 4])
+        {
+            insert_row(&conn, &m, SIMILAR_STACK_ORIGIN_AUTO);
+        }
+        // An old JPEG stack numbered 2 that does not hold photo 2 ...
+        insert_row(&conn, &member(30, 2, 2, 0, None), SIMILAR_STACK_ORIGIN_AUTO);
+        insert_row(&conn, &member(31, 2, 2, 1, None), SIMILAR_STACK_ORIGIN_AUTO);
+        // ... and an unrelated mixed stack that must not be held hostage.
+        for m in mixed_group(&[40, 41, 42, 43])
+        {
+            insert_row(&conn, &m, SIMILAR_STACK_ORIGIN_AUTO);
+        }
+        let before_old: Vec<Row> = dump(&conn).into_iter().filter(|r| r.0 == 30 || r.0 == 31).collect();
+
+        assert_eq!(split_all(&conn, 1000), (2, 8, 0));
+        assert_eq!(mixed_left(&conn), 0);
+        let rows = dump(&conn);
+        let nef: Vec<(i64, i64, i64)> = rows.iter().filter(|r| r.0 == 2 || r.0 == 4).map(|r| (r.0, r.1, r.2)).collect();
+        // Number 2 is taken, so the NEF stack takes its next free photo id, 4;
+        // photo 2 stays its representative.
+        assert_eq!(nef, vec![(2, 4, 2), (4, 4, 2)]);
+        let after_old: Vec<Row> = rows.iter().filter(|r| r.0 == 30 || r.0 == 31).cloned().collect();
+        assert_eq!(after_old, before_old, "the old stack is untouched");
+        let other: Vec<(i64, i64)> = rows.iter().filter(|r| r.0 >= 40).map(|r| (r.0, r.1)).collect();
+        assert_eq!(other, vec![(40, 40), (41, 41), (42, 40), (43, 41)]);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// Review M1, the last resort: every photo id of the part is taken.
+    #[test]
+    fn split_takes_a_fresh_number_when_every_photo_id_is_taken()
+    {
+        let path = fixture_path("fresh");
+        let conn = open(&path);
+        two_paired_shots(&conn);
+        for id in [30, 31, 32, 33]
+        {
+            insert_still(&conn, id, Some("jpeg"), &format!("_RW{}", id));
+        }
+        for m in mixed_group(&[1, 2, 3, 4])
+        {
+            insert_row(&conn, &m, SIMILAR_STACK_ORIGIN_AUTO);
+        }
+        // Old stacks numbered 2 and 4 that hold neither photo.
+        for (id, group) in [(30, 2), (31, 2), (32, 4), (33, 4)]
+        {
+            insert_row(&conn, &member(id, group, group, 0, None), SIMILAR_STACK_ORIGIN_AUTO);
+        }
+        assert_eq!(split_all(&conn, 1000), (1, 4, 0));
+        assert_eq!(mixed_left(&conn), 0);
+        let rows = dump(&conn);
+        let nef: Vec<(i64, i64, i64)> = rows.iter().filter(|r| r.0 == 2 || r.0 == 4).map(|r| (r.0, r.1, r.2)).collect();
+        assert_eq!(nef[0].1, nef[1].1);
+        assert_eq!((nef[0].2, nef[1].2), (2, 2), "photo 2 still represents");
+        assert!(nef[0].1 > 33, "a number above every stack and photo id ({})", nef[0].1);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// Review L4: a stack holding a photo whose kind is not known yet is left
+    /// alone (not counted as mixed, so the background loop still ends).
+    #[test]
+    fn split_leaves_a_stack_with_an_unknown_kind_alone()
+    {
+        let path = fixture_path("unknown-kind");
+        let conn = open(&path);
+        two_paired_shots(&conn);
+        for m in mixed_group(&[1, 2, 3, 4])
+        {
+            insert_row(&conn, &m, SIMILAR_STACK_ORIGIN_AUTO);
+        }
+        conn.execute("UPDATE images SET image_kind = NULL WHERE id = 3", []).expect("unknown kind");
+        let before = dump(&conn);
+        assert_eq!(mixed_left(&conn), 0);
+        assert_eq!(split_all(&conn, 1000), (0, 0, 0));
+        assert_eq!(dump(&conn), before);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// Review L2: a unit write whose stack number is an OLD stack's number
+    /// (the old stack of another type no longer holds that photo) must not
+    /// leave a mixed stack behind.
+    #[test]
+    fn automatic_writer_resplits_a_stack_it_merged_into()
+    {
+        let path = fixture_path("writer-merge");
+        let conn = open(&path);
+        two_paired_shots(&conn);
+        insert_still(&conn, 40, Some("raw"), "_RW40");
+        insert_still(&conn, 41, Some("raw"), "_RW41");
+        // An old NEF stack numbered 1 that does not hold photo 1.
+        insert_row(&conn, &member(40, 1, 1, 0, None), SIMILAR_STACK_ORIGIN_AUTO);
+        insert_row(&conn, &member(41, 1, 1, 1, None), SIMILAR_STACK_ORIGIN_AUTO);
+        // The unit writes the JPEG stack {1, 3}, numbered 1.
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &[1, 3], mixed_group(&[1, 3]), V), 2);
+        assert_eq!(mixed_left(&conn), 0, "the write did not leave a mixed stack");
+        let rows = dump(&conn);
+        let group_of = |id: i64| rows.iter().find(|r| r.0 == id).unwrap().1;
+        assert_ne!(group_of(1), group_of(40));
+        assert_eq!(group_of(3), group_of(1));
+        assert_eq!(group_of(41), group_of(40));
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// Review M3: a photo the split drops from a Create Stack (its type has one
+    /// photo in the selection) keeps the stack it was in.
+    #[test]
+    fn create_stack_leaves_a_dropped_photo_in_its_old_stack()
+    {
+        let path = fixture_path("create-dropped");
+        let conn = open(&path);
+        two_paired_shots(&conn);
+        insert_still(&conn, 5, Some("raw"), "_RW5");
+        insert_still(&conn, 6, Some("raw"), "_RW6");
+        insert_still(&conn, 7, Some("jpeg"), "_RW7");
+        // A hand-made NEF stack {2, 5, 6}.
+        let hand: Vec<SimilarPhotoGroupMember> = [2, 5, 6]
+            .iter()
+            .enumerate()
+            .map(|(rank, id)| member(*id, 2, 2, rank as u32, if *id == 2 { Some(0.0) } else { None }))
+            .collect();
+        assert_eq!(create_stack_writer_impl(&conn, &[2, 5, 6], hand, V), 3);
+        // Create Stack on JPEG 1 (+ its NEF 2 through pairing) and JPEG 7.
+        let picks: Vec<SimilarPhotoGroupMember> = [1, 2, 7]
+            .iter()
+            .enumerate()
+            .map(|(rank, id)| member(*id, 1, 1, rank as u32, if *id == 1 { Some(0.0) } else { None }))
+            .collect();
+        assert_eq!(create_stack_writer_impl(&conn, &[1, 2, 7], picks, V), 2);
+        let groups: Vec<(i64, i64)> = dump(&conn).iter().map(|r| (r.0, r.1)).collect();
+        assert_eq!(groups, vec![(1, 1), (2, 2), (5, 2), (6, 2), (7, 1)], "NEF 2 keeps its hand-made stack");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// The step does at most `max_groups` stacks and reports what is left;
+    /// 0 only counts.
+    #[test]
+    fn step_splits_at_most_the_asked_number_and_reports_the_rest()
+    {
+        let path = fixture_path("step");
+        let conn = open(&path);
+        for shot in 0..3
+        {
+            let base = 10 * (shot + 1);
+            insert_still(&conn, base, Some("jpeg"), &format!("a{}", base));
+            insert_still(&conn, base + 1, Some("raw"), &format!("a{}", base));
+            insert_still(&conn, base + 2, Some("jpeg"), &format!("b{}", base));
+            insert_still(&conn, base + 3, Some("raw"), &format!("b{}", base));
+            for m in mixed_group(&[base, base + 1, base + 2, base + 3])
+            {
+                insert_row(&conn, &m, SIMILAR_STACK_ORIGIN_AUTO);
+            }
+        }
+        let count = similar_stack_file_type_split_step_impl(&conn, 0);
+        assert_eq!((count.ok, count.split_groups, count.remaining_groups), (true, 0, 3));
+        let one = similar_stack_file_type_split_step_impl(&conn, 1);
+        assert_eq!((one.ok, one.split_groups, one.kept_photos, one.remaining_groups), (true, 1, 4, 2));
+        let rest = similar_stack_file_type_split_step_impl(&conn, 50);
+        assert_eq!((rest.ok, rest.split_groups, rest.remaining_groups), (true, 2, 0));
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// Richard's badge ruling: with pairing on, a NEF stack counts (and
+    /// reaches) only the NEFs that are not shown through their JPEG.
+    #[test]
+    fn pairing_on_counts_and_reaches_only_the_unshown_nefs()
+    {
+        let path = fixture_path("pairing-counts");
+        let conn = open(&path);
+        two_paired_shots(&conn);
+        insert_still(&conn, 9, Some("raw"), "_RW9"); // a NEF with no JPEG
+        // NEF stack {2, 4, 9}; JPEG stack {1, 3}.
+        for m in [member(2, 2, 2, 0, Some(0.0)), member(4, 2, 2, 1, Some(1.0)), member(9, 2, 2, 2, Some(1.5))]
+        {
+            insert_row(&conn, &m, SIMILAR_STACK_ORIGIN_AUTO);
+        }
+        for m in [member(1, 1, 1, 0, Some(0.0)), member(3, 1, 1, 1, Some(1.0))]
+        {
+            insert_row(&conn, &m, SIMILAR_STACK_ORIGIN_AUTO);
+        }
+        let count_of = |id: i64, pairing: bool| -> u32
+        {
+            similar_photo_stack_summaries_for_ids_impl(&conn, &[id], V, pairing)
+                .into_iter()
+                .find(|s| s.image_id == id)
+                .map(|s| s.logical_count)
+                .unwrap_or(0)
+        };
+        let members_of = |id: i64, pairing: bool| -> Vec<i64>
+        {
+            let mut ids: Vec<i64> = similar_photo_stack_members_for_ids_impl(&conn, &[id], V, pairing)
+                .into_iter()
+                .map(|m| m.image_id)
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        // Pairing off: every NEF counts.
+        assert_eq!(count_of(9, false), 3);
+        assert_eq!(members_of(9, false), vec![2, 4, 9]);
+        // Pairing on: 2 and 4 are shown through JPEGs 1 and 3.
+        assert_eq!(count_of(9, true), 1);
+        assert_eq!(members_of(9, true), vec![9]);
+        // The JPEG stack is unchanged either way.
+        assert_eq!(count_of(1, true), 2);
+        assert_eq!(members_of(1, true), vec![1, 3]);
+        // A requested NEF always counts itself.
+        assert_eq!(members_of(2, true), vec![2, 9]);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// An eligible still whose id comes from `images_id_seq`, as every
+    /// production import's does.
+    fn insert_still_from_sequence(conn: &Connection, kind: &str, stem: &str) -> i64
+    {
+        let path = format!("/d/{}.{}", stem, if kind == "raw" { "NEF" } else { "JPG" });
+        conn.execute(
+            "INSERT INTO images (file_path, file_size, file_name, created_timestamp, \
+             modified_timestamp, image_kind, file_stem, directory_path, is_video) \
+             VALUES (?1, 1234, ?2, 0, 0, ?3, ?4, '/d', FALSE)",
+            params![path, path.rsplit('/').next().unwrap(), kind, stem],
+        )
+        .expect("insert still from the sequence");
+        conn.query_row("SELECT id FROM images WHERE file_path = ?1", params![path], |row| row.get(0))
+            .expect("its id")
+    }
+
+    /// Review round 2, M-B: a fresh stack number is RESERVED from the photo-id
+    /// sequence, so the next imported photo never receives it.
+    #[test]
+    fn a_fresh_number_is_never_the_next_imported_photos_id()
+    {
+        let path = fixture_path("fresh-sequence");
+        let conn = open(&path);
+        let j1 = insert_still_from_sequence(&conn, "jpeg", "a");
+        let r1 = insert_still_from_sequence(&conn, "raw", "a");
+        let j2 = insert_still_from_sequence(&conn, "jpeg", "b");
+        let r2 = insert_still_from_sequence(&conn, "raw", "b");
+        let olds: Vec<i64> = (0..4).map(|n| insert_still_from_sequence(&conn, "jpeg", &format!("o{}", n))).collect();
+        for m in mixed_group(&[j1, r1, j2, r2])
+        {
+            insert_row(&conn, &m, SIMILAR_STACK_ORIGIN_AUTO);
+        }
+        // Old JPEG stacks numbered with both RAW photo ids: the RAW part must
+        // take a fresh number.
+        for (id, group) in [(olds[0], r1), (olds[1], r1), (olds[2], r2), (olds[3], r2)]
+        {
+            insert_row(&conn, &member(id, group, group, 0, None), SIMILAR_STACK_ORIGIN_AUTO);
+        }
+        assert_eq!(split_all(&conn, 1000), (1, 4, 0));
+        let fresh = dump(&conn).into_iter().find(|r| r.0 == r1).unwrap().1;
+        assert!(fresh > olds[3], "fresh number {} above every photo id", fresh);
+        let next_photo = insert_still_from_sequence(&conn, "jpeg", "later");
+        assert_ne!(next_photo, fresh, "the next import does not receive the stack's number");
+        assert!(next_photo > fresh, "the sequence moved past the reserved number");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// Review round 2, LOW 1: the writers, like the background split, leave a
+    /// stack alone while one of its photos has an unknown (NULL) kind.
+    #[test]
+    fn writers_leave_a_stack_with_an_unknown_kind_as_written()
+    {
+        let path = fixture_path("writer-unknown-kind");
+        let conn = open(&path);
+        two_paired_shots(&conn);
+        conn.execute("UPDATE images SET image_kind = NULL WHERE id = 3", []).expect("unknown kind");
+        assert_eq!(upsert_similar_photo_groups_for_ids_impl(&conn, &[1, 2, 3, 4], mixed_group(&[1, 2, 3, 4]), V), 4);
+        let groups: Vec<(i64, i64)> = dump(&conn).iter().map(|r| (r.0, r.1)).collect();
+        assert_eq!(groups, vec![(1, 1), (2, 1), (3, 1), (4, 1)], "written as computed, split later");
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// Review round 2, LOW 3: Create Stack re-keys a leftover stack onto its
+    /// lowest photo; when another type's stack already carries that number the
+    /// merged stack is split again before COMMIT.
+    #[test]
+    fn create_stack_resplits_a_leftover_it_renumbered_onto_another_type()
+    {
+        let path = fixture_path("rekey-resplit");
+        let conn = open(&path);
+        insert_still(&conn, 1, Some("jpeg"), "k");
+        insert_still(&conn, 2, Some("jpeg"), "l1");
+        insert_still(&conn, 3, Some("jpeg"), "l2");
+        insert_still(&conn, 4, Some("raw"), "x");
+        insert_still(&conn, 5, Some("raw"), "y");
+        insert_still(&conn, 6, Some("jpeg"), "s");
+        // A JPEG stack keyed on photo 1, and an old RAW stack numbered 2 (the
+        // JPEG stack's lowest leftover once photo 1 is taken).
+        for m in [member(1, 1, 1, 0, Some(0.0)), member(2, 1, 1, 1, Some(1.0)), member(3, 1, 1, 2, Some(1.2))]
+        {
+            insert_row(&conn, &m, SIMILAR_STACK_ORIGIN_AUTO);
+        }
+        insert_row(&conn, &member(4, 2, 2, 0, None), SIMILAR_STACK_ORIGIN_AUTO);
+        insert_row(&conn, &member(5, 2, 2, 1, None), SIMILAR_STACK_ORIGIN_AUTO);
+        let picks = vec![member(1, 1, 1, 0, Some(0.0)), member(6, 1, 1, 1, None)];
+        assert_eq!(create_stack_writer_impl(&conn, &[1, 6], picks, V), 2);
+        assert_eq!(mixed_left(&conn), 0, "the renumbered leftover did not merge into the RAW stack");
+        let rows = dump(&conn);
+        let group_of = |id: i64| rows.iter().find(|r| r.0 == id).unwrap().1;
+        assert_eq!(group_of(1), group_of(6));
+        assert_eq!(group_of(2), group_of(3));
+        assert_eq!(group_of(4), group_of(5));
+        assert_ne!(group_of(2), group_of(4));
+        drop(conn);
+        cleanup(&path);
     }
 }
