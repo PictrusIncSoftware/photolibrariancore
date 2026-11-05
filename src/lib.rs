@@ -10400,15 +10400,34 @@ pub async fn query_image_ids_gallery(
         };
     }
 
-    execute_id_projection_query(
+    // Nov 4, 2026 (GalleryPlace review, finding 2): the ids come back in the
+    // GALLERY'S ORDER, the same `order_by_for_filter` the page query uses, so a
+    // caller may rank a picture by position (the Collapse switch finds the page
+    // the picture you are on lands on: position / page size). Select All never
+    // cared about order, so it is unchanged in effect. `execute_ordered_id_query`
+    // is the record query's own builder; the unordered projection stays for
+    // Browse and the other callers that only need the set.
+    let order_by = order_by_for_filter(&predicates);
+    match execute_ordered_id_query(
         conn,
         &where_clause,
+        &order_by,
         apply_duplicate_filter,
         apply_raw_jpeg_collapse,
         apply_similar_photo_collapse,
         &similar_algorithm_version,
         media_type,
+        None,
     )
+    {
+        Ok(ids) => ids,
+        Err(message) =>
+        {
+            eprintln!("query_image_ids_gallery: {}", message);
+            record_dropped_rows("query_image_ids_gallery.query_failed", 1);
+            Vec::new()
+        }
+    }
 }
 
 /// Resolve record IDs to full `ImageRecord`s — turns a Browse selection (which
