@@ -29573,7 +29573,11 @@ fn split_similar_members_by_file_type(
             .filter(|m| m.image_id == m.representative_id)
             .map(|m| m.image_id)
             .max();
-        let lowest = *distinct.iter().next().expect("a part of two or more photos");
+        // The `distinct.len() < 2` guard above makes this `else` unreachable.
+        let Some(&lowest) = distinct.iter().next() else
+        {
+            continue;
+        };
         let representative = held.unwrap_or(lowest);
 
         let mut ordered = positions.clone();
@@ -29981,26 +29985,39 @@ fn similar_stack_file_type_split_step_impl(conn: &Connection, max_groups: u32) -
 
 /// The FFI for `similar_stack_file_type_split_step_impl` — called by the app's
 /// background splitter in small steps so the window stays responsive.
+///
+/// ⭐ Nov 2, 2026 (hung sweep, slice 1 C; R-07) — the catalogue lock AND the
+/// step run inside `ffi_panic_boundary`, so a panic anywhere in the step
+/// answers `ok: false`, zeroed counts and a `message` (the splitter logs it and
+/// stops) instead of ending the app at its `try!`. A panic between the step's
+/// BEGIN and COMMIT drops the guard during the unwind, which poisons the lock,
+/// and the next `lock_catalogue()` (L1) rolls the open transaction back before
+/// anyone else reaches the connection — what every wrapped writer relies on.
+/// Proved by `similar_file_type_split_tests::the_ffi_step_reports_a_panic_and_leaves_no_transaction_open`.
 pub async fn similar_stack_file_type_split_step(max_groups: u32) -> SimilarStackFileTypeSplitStep
 {
-    let catalogue = lock_catalogue();
-    let conn = match catalogue.as_ref()
+    let failed = |message: String| SimilarStackFileTypeSplitStep
     {
-        Some(c) => c,
-        None =>
-        {
-            return SimilarStackFileTypeSplitStep
-            {
-                split_groups: 0,
-                kept_photos: 0,
-                unstacked_photos: 0,
-                remaining_groups: 0,
-                ok: false,
-                message: Some("Catalogue not initialized".to_string()),
-            };
-        }
+        split_groups: 0,
+        kept_photos: 0,
+        unstacked_photos: 0,
+        remaining_groups: 0,
+        ok: false,
+        message: Some(message),
     };
-    similar_stack_file_type_split_step_impl(conn, max_groups)
+    ffi_panic_boundary(
+        "similar_stack_file_type_split_step.panic.query_failed",
+        ||
+        {
+            let catalogue = lock_catalogue();
+            match catalogue.as_ref()
+            {
+                Some(conn) => similar_stack_file_type_split_step_impl(conn, max_groups),
+                None => failed("Catalogue not initialized".to_string()),
+            }
+        },
+        |panic| failed(ffi_panic_report("separate the similar-photo stacks that mix file types", &panic)),
+    )
 }
 
 /// Re-split the stacks a writer just wrote when its rows met existing rows of
@@ -76236,6 +76253,131 @@ mod similar_file_type_split_tests
         assert_eq!(group_of(4), group_of(5));
         assert_ne!(group_of(2), group_of(4));
         drop(conn);
+        cleanup(&path);
+    }
+
+    /// ⭐ Nov 2, 2026 (hung sweep, slice 1 C; R-07) — the background step's FFI
+    /// through its panic boundary. A panic inside the wrapped body (injected at
+    /// the existing test seam: `FFI_PANIC_PROBE_COUNTDOWN`'s `lock_catalogue`
+    /// probe, which fires with the guard held) answers `ok: false`, zeroed
+    /// counts and a message, never escapes, and leaves one census record. The
+    /// connection is mid-transaction when it panics — holding the step's own
+    /// uncommitted split — and no transaction is left open: L1 rolls it back at
+    /// the next acquisition, the table is exactly as before, and the next step
+    /// splits for real.
+    #[test]
+    fn the_ffi_step_reports_a_panic_and_leaves_no_transaction_open()
+    {
+        struct Uninstall;
+
+        impl Drop for Uninstall
+        {
+            fn drop(&mut self)
+            {
+                FFI_PANIC_PROBE_COUNTDOWN.with(|countdown| countdown.set(0));
+                *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                CATALOGUE.clear_poison();
+                CATALOGUE_PATH.clear_poison();
+            }
+        }
+
+        let _serial = super::swallowed_failure_tests::GLOBAL_CATALOGUE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let census = |site: &str| -> u64
+        {
+            DROPPED_ROW_CENSUS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(site)
+                .copied()
+                .unwrap_or(0)
+        };
+        let step = |max_groups: u32| futures::executor::block_on(similar_stack_file_type_split_step(max_groups));
+
+        // A closed catalogue is an honest failure, not a panic.
+        let closed = step(1);
+        assert!(!closed.ok && closed.message.is_some(), "catalog closed");
+
+        // Two mixed stacks, each a JPEG pair and a NEF pair.
+        let path = fixture_path("ffi-panic");
+        let conn = open(&path);
+        for shot in 0..2
+        {
+            let base = 10 * (shot + 1);
+            insert_still(&conn, base, Some("jpeg"), &format!("a{}", base));
+            insert_still(&conn, base + 1, Some("raw"), &format!("a{}", base));
+            insert_still(&conn, base + 2, Some("jpeg"), &format!("b{}", base));
+            insert_still(&conn, base + 3, Some("raw"), &format!("b{}", base));
+            for m in mixed_group(&[base, base + 1, base + 2, base + 3])
+            {
+                insert_row(&conn, &m, SIMILAR_STACK_ORIGIN_AUTO);
+            }
+        }
+        let before = dump(&conn);
+        *CATALOGUE.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(conn);
+        *CATALOGUE_PATH.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path.clone());
+        CATALOGUE.clear_poison();
+        CATALOGUE_PATH.clear_poison();
+        let _uninstall = Uninstall;
+
+        // The connection holds the step's own split, uncommitted.
+        {
+            let guard = lock_catalogue();
+            let conn = guard.as_ref().expect("installed catalogue");
+            conn.execute_batch("BEGIN TRANSACTION;").expect("begin");
+            let half = split_mixed_similar_groups_in_transaction(conn, SimilarSplitScope::First(1))
+                .expect("the step's split, uncommitted");
+            assert_eq!(half.groups, 1, "fixture: one stack split inside the open transaction");
+        }
+
+        // The panic, inside the boundary, with the guard held.
+        let site = "similar_stack_file_type_split_step.panic.query_failed";
+        let census_before = census(site);
+        let recovered_before = census(CATALOGUE_LOCK_RECOVERED_SITE);
+        FFI_PANIC_PROBE_COUNTDOWN.with(|countdown| countdown.set(1)); // lock_catalogue
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| step(50)));
+        let disarmed = FFI_PANIC_PROBE_COUNTDOWN.with(|countdown| countdown.replace(0));
+        let caught = outcome.unwrap_or_else(|_| panic!("the split step's panic ESCAPED the FFI boundary — the app would die at its `try!`"));
+        assert_eq!(disarmed, 0, "vacuity guard: the injected panic never fired");
+        assert!(!caught.ok, "a caught panic answers ok: false");
+        assert_eq!(
+            (caught.split_groups, caught.kept_photos, caught.unstacked_photos, caught.remaining_groups),
+            (0, 0, 0, 0),
+            "a caught panic answers zeroed counts"
+        );
+        let message = caught.message.as_deref().unwrap_or("");
+        assert!(
+            message.starts_with("PhotoLibrarian hit an internal error") && message.contains("an injected panic"),
+            "{}",
+            message
+        );
+        assert_eq!(census(site) - census_before, 1, "one census record under the step's site");
+        assert!(CATALOGUE.lock().is_err(), "the guard dropped during the unwind: the lock is poisoned for L1 to heal");
+
+        // No transaction is left open: L1 rolls it back at the next acquisition.
+        let counted = step(0);
+        assert!(counted.ok, "{:?}", counted.message);
+        assert_eq!(counted.remaining_groups, 2, "the uncommitted split was rolled back: both stacks still mix types");
+        assert_eq!(census(CATALOGUE_LOCK_RECOVERED_SITE) - recovered_before, 1, "L1 healed the lock once");
+        {
+            let guard = lock_catalogue();
+            let conn = guard.as_ref().expect("installed catalogue");
+            assert_eq!(dump(conn), before, "the table is exactly as it was before the panicked transaction");
+            conn.execute_batch("BEGIN TRANSACTION; ROLLBACK;")
+                .expect("no transaction is left open: a fresh BEGIN works");
+        }
+
+        // And the next step splits for real.
+        let done = step(50);
+        assert_eq!(
+            (done.ok, done.split_groups, done.kept_photos, done.unstacked_photos, done.remaining_groups),
+            (true, 2, 8, 0, 0),
+            "{:?}",
+            done.message
+        );
+        drop(_uninstall);
         cleanup(&path);
     }
 }
