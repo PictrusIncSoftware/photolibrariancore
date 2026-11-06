@@ -3913,6 +3913,60 @@ public func FfiConverterTypeImageVectorStaleMarkResult_lower(_ value: ImageVecto
 }
 
 
+public struct IngestMetadataResult: Equatable, Hashable {
+    public var insertedCount: UInt32
+    public var imageIds: [Int64]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(insertedCount: UInt32, imageIds: [Int64]) {
+        self.insertedCount = insertedCount
+        self.imageIds = imageIds
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension IngestMetadataResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeIngestMetadataResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> IngestMetadataResult {
+        return
+            try IngestMetadataResult(
+                insertedCount: FfiConverterUInt32.read(from: &buf), 
+                imageIds: FfiConverterSequenceInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: IngestMetadataResult, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.insertedCount, into: &buf)
+        FfiConverterSequenceInt64.write(value.imageIds, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIngestMetadataResult_lift(_ buf: RustBuffer) throws -> IngestMetadataResult {
+    return try FfiConverterTypeIngestMetadataResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeIngestMetadataResult_lower(_ value: IngestMetadataResult) -> RustBuffer {
+    return FfiConverterTypeIngestMetadataResult.lower(value)
+}
+
+
 public struct KeywordManagementRow: Equatable, Hashable {
     public var label: String
     public var path: String
@@ -10873,6 +10927,21 @@ public func ingestMetadata(metadata: [ImageMetadata])async  -> UInt32  {
             
         )
 }
+public func ingestMetadataWithResult(metadata: [ImageMetadata])async  -> IngestMetadataResult  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_photolibrariancore_fn_func_ingest_metadata_with_result(FfiConverterSequenceTypeImageMetadata.lower(metadata)
+                )
+            },
+            pollFunc: ffi_photolibrariancore_rust_future_poll_rust_buffer,
+            completeFunc: ffi_photolibrariancore_rust_future_complete_rust_buffer,
+            freeFunc: ffi_photolibrariancore_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeIngestMetadataResult_lift,
+            errorHandler: nil
+            
+        )
+}
 public func initializeCatalogue(cataloguePath: String)async  -> Bool  {
     return
         try!  await uniffiRustCallAsync(
@@ -12490,6 +12559,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_ingest_metadata() != 1621) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_photolibrariancore_checksum_func_ingest_metadata_with_result() != 51815) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_photolibrariancore_checksum_func_initialize_catalogue() != 29822) {

@@ -9,6 +9,11 @@ namespace photolibrariancore {
     [Async]
     u32 ingest_metadata(sequence<ImageMetadata> metadata);
 
+    // Same duplicate-skipping ingest, returning ONLY rows actually inserted.
+    // Existing/catalogue-neighbour rows are never part of image_ids.
+    [Async]
+    IngestMetadataResult ingest_metadata_with_result(sequence<ImageMetadata> metadata);
+
     // Editor save: unlike ordinary duplicate-skipping scan ingest, refresh an
     // existing path in place because its bytes changed. Insert only when the
     // caller explicitly requests it.
@@ -2676,4 +2681,11 @@ dictionary SemanticMatchScoresResult {
     boolean key_present;
     sequence<SemanticMatchScore> scores;
     string? error;
+};
+
+// Exact outcome of one ordinary scan ingest. The count retains legacy unreadable
+// RETURNING-row accounting; IDs contain only successfully decoded new inserts.
+dictionary IngestMetadataResult {
+    u32 inserted_count;
+    sequence<i64> image_ids;
 };

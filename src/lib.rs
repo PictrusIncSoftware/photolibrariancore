@@ -5476,23 +5476,57 @@ pub async fn ingest_metadata(metadata: Vec<ImageMetadata>) -> u32 {
     ingest_metadata_impl(conn, &metadata, None)
 }
 
+/// Exact rows inserted by this ingest call, never a directory/catalogue sweep.
+/// `inserted_count` retains the legacy count even if a returned row/ID could
+/// not be decoded; `image_ids` contains only positively identified inserts.
+#[derive(Debug, Clone, Default)]
+pub struct IngestMetadataResult
+{
+    pub inserted_count: u32,
+    pub image_ids: Vec<i64>,
+}
+
+pub async fn ingest_metadata_with_result(metadata: Vec<ImageMetadata>) -> IngestMetadataResult
+{
+    ffi_panic_boundary("ingest_metadata_with_result.panic.query_failed", ||
+    {
+        let catalogue = lock_catalogue();
+        let Some(conn) = catalogue.as_ref() else
+        {
+            eprintln!("Catalogue not initialized");
+            return IngestMetadataResult::default();
+        };
+        ingest_metadata_with_result_impl(conn, &metadata, None)
+    }, |_| IngestMetadataResult::default())
+}
+
 /// Body of `ingest_metadata` against an explicit connection (the impl/wrapper
 /// pattern — ⭐ slice B's tests drive the real scan insert through it on
 /// temp-file catalogues). The INSERT SQL, `build_ingest_insert_sql` and
 /// `push_ingest_row_params` are byte-unchanged; the statement now carries
-/// `RETURNING file_path` so the call knows EXACTLY which rows it inserted.
+/// `RETURNING file_path, id` so both APIs share EXACTLY the same insert set.
 fn ingest_metadata_impl(
     conn: &Connection,
     metadata: &[ImageMetadata],
     probe: RemovalProbeRef<'_>,
 ) -> u32
 {
+    ingest_metadata_with_result_impl(conn, metadata, probe).inserted_count
+}
+
+fn ingest_metadata_with_result_impl(
+    conn: &Connection,
+    metadata: &[ImageMetadata],
+    probe: RemovalProbeRef<'_>,
+) -> IngestMetadataResult
+{
     if metadata.is_empty()
     {
-        return 0;
+        return IngestMetadataResult::default();
     }
 
     let mut inserted_count = 0u32;
+    let mut image_ids = Vec::new();
 
     // ⭐ Slice B — one cheap read per call: when no removal has left a
     // tombstone (the common case), the per-chunk re-attach is skipped entirely.
@@ -5532,10 +5566,11 @@ fn ingest_metadata_impl(
         // statement, so this count stays exact and a re-scan stays safe.
         match ingest_insert_returning_paths(conn, chunk_sql, &values)
         {
-            Ok((paths, unreadable)) =>
+            Ok((paths, ids, unreadable)) =>
             {
                 inserted_count += (paths.len() as u64 + unreadable) as u32;
                 inserted_paths = paths;
+                image_ids.extend(ids);
             }
 
             // FALLBACK — this is the original per-record path, preserved so the
@@ -5559,10 +5594,11 @@ fn ingest_metadata_impl(
 
                     match ingest_insert_returning_paths(conn, &single_row_sql, &row_values)
                     {
-                        Ok((paths, unreadable)) =>
+                        Ok((paths, ids, unreadable)) =>
                         {
                             inserted_count += (paths.len() as u64 + unreadable) as u32;
                             inserted_paths.extend(paths);
+                            image_ids.extend(ids);
                         }
                         // Log error but continue processing remaining records.
                         Err(e) =>
@@ -5594,29 +5630,54 @@ fn ingest_metadata_impl(
 
     // Return count of successfully inserted records
     // Note: This excludes skipped duplicates (which contribute 0)
-    inserted_count
+    IngestMetadataResult { inserted_count, image_ids }
 }
 
 /// ⭐ Slice B — `build_ingest_insert_sql`, byte-unchanged, with
-/// `RETURNING file_path` appended. Probed on the bundled 1.5.5: an
+/// `RETURNING file_path, id` appended. Probed on the bundled 1.5.5: an
 /// `INSERT OR IGNORE … RETURNING` returns ONLY the rows it inserted, never the
 /// ones it ignored (`ingest_returning_names_only_the_rows_it_inserted`).
 fn ingest_insert_returning_sql(row_count: usize) -> String
 {
-    format!("{} RETURNING file_path", build_ingest_insert_sql(row_count))
+    format!("{} RETURNING file_path, id", build_ingest_insert_sql(row_count))
 }
 
-/// Run one ingest INSERT and return the paths it inserted, plus how many
-/// returned rows could not be read (counted as inserted, never re-attached).
+/// Run one ingest INSERT and return its paths and IDs, plus how many returned
+/// paths could not be read (counted as inserted, never re-attached). A failed
+/// ID decode omits that ID only; the path/count still follow the legacy rule.
 fn ingest_insert_returning_paths(
     conn: &Connection,
     sql: &str,
     values: &[Value],
-) -> Result<(Vec<String>, u64), duckdb::Error>
+) -> Result<(Vec<String>, Vec<i64>, u64), duckdb::Error>
 {
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(params_from_iter(values.iter()), |row| row.get::<_, String>(0))?;
-    Ok(collect_rows_counted(rows, "ingest_metadata.inserted_paths"))
+    let rows = stmt.query_map(params_from_iter(values.iter()), |row|
+    {
+        let path = row.get::<_, String>(0)?;
+        // Preserve a readable path for tombstone reattachment even if decoding
+        // its ID fails. No guessed IDs and no broad lookup fallback.
+        let id = match row.get::<_, i64>(1)
+        {
+            Ok(id) => Some(id),
+            Err(error) =>
+            {
+                eprintln!("ingest_metadata: returned ID for {} could not be read: {}", path, error);
+                record_dropped_rows("ingest_metadata.inserted_id", 1);
+                None
+            }
+        };
+        Ok((path, id))
+    })?;
+    let (rows, unreadable) = collect_rows_counted(rows, "ingest_metadata.inserted_paths");
+    let mut paths = Vec::with_capacity(rows.len());
+    let mut ids = Vec::with_capacity(rows.len());
+    for (path, id) in rows
+    {
+        paths.push(path);
+        if let Some(id) = id { ids.push(id); }
+    }
+    Ok((paths, ids, unreadable))
 }
 
 // === Editor-save catalogue refresh =========================================
@@ -44681,12 +44742,87 @@ mod removal_tombstone_tests
         {
             push_ingest_row_params(r, &mut values);
         }
-        let (paths, unreadable) =
+        let (paths, ids, unreadable) =
             ingest_insert_returning_paths(&conn, &ingest_insert_returning_sql(2), &values)
                 .expect("the RETURNING insert");
         assert_eq!(paths, vec!["/ret/new.jpg".to_string()], "only the inserted row is returned");
+        let inserted_id: i64 = conn.query_row("SELECT id FROM images WHERE file_path = '/ret/new.jpg'", [], |row| row.get(0)).unwrap();
+        assert_eq!(ids, vec![inserted_id]);
         assert_eq!(unreadable, 0);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM images"), 2);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn ingest_result_returns_only_exact_new_ids_across_batches()
+    {
+        let (path, conn) = fresh_catalogue("exact-ingest-ids");
+        let existing = insert_image(&conn, "/scope/present.jpg");
+        let unrelated = insert_image(&conn, "/scope/not-imported.jpg");
+        let mut records = vec![record("/scope/present.jpg", false)];
+        for index in 0..55
+        {
+            records.push(record(&format!("/scope/{}_new%'é.jpg", index), false));
+        }
+        records.push(record("/scope/0_new%'é.jpg", false));
+        records.push(record("/scope/54_new%'é.jpg", false));
+        let outcome = ingest_metadata_with_result_impl(&conn, &records, None);
+        assert_eq!(outcome.inserted_count, 55);
+        assert_eq!(outcome.image_ids.len(), 55);
+        let ids: std::collections::HashSet<i64> = outcome.image_ids.iter().copied().collect();
+        assert_eq!(ids.len(), 55, "duplicates never enter the returned set");
+        assert!(!ids.contains(&existing));
+        assert!(!ids.contains(&unrelated));
+        for index in 0..55
+        {
+            let file = format!("/scope/{}_new%'é.jpg", index);
+            let id: i64 = conn.query_row("SELECT id FROM images WHERE file_path = ?1", params![file], |row| row.get(0)).unwrap();
+            assert!(ids.contains(&id), "every successful insert is returned");
+        }
+        let repeated = ingest_metadata_with_result_impl(&conn, &records, None);
+        assert_eq!(repeated.inserted_count, 0);
+        assert!(repeated.image_ids.is_empty());
+        assert_eq!(ingest_metadata_impl(&conn, &records, None), 0, "legacy API retains count semantics");
+        let empty = ingest_metadata_with_result_impl(&conn, &[], None);
+        assert_eq!(empty.inserted_count, 0);
+        assert!(empty.image_ids.is_empty());
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn ingest_result_fallback_returns_good_rows_only()
+    {
+        let (path, conn) = fresh_catalogue("ingest-result-fallback");
+        let mut bad = record("/fallback/bad.jpg", false);
+        bad.pixel_width = Some(u32::MAX); // Cannot fit the images INTEGER column.
+        let outcome = ingest_metadata_with_result_impl(&conn, &[
+            record("/fallback/first.jpg", false), bad,
+            record("/fallback/last.jpg", false),
+        ], None);
+        assert_eq!(outcome.inserted_count, 2);
+        assert_eq!(outcome.image_ids.len(), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM images WHERE file_path = '/fallback/bad.jpg'"), 0);
+        for name in ["first", "last"]
+        {
+            let file = format!("/fallback/{}.jpg", name);
+            let id: i64 = conn.query_row("SELECT id FROM images WHERE file_path = ?1", params![file], |row| row.get(0)).unwrap();
+            assert!(outcome.image_ids.contains(&id));
+        }
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn ingest_result_id_decode_failure_keeps_path_and_count()
+    {
+        let (path, conn) = fresh_catalogue("ingest-result-id-decode");
+        let (paths, ids, unreadable) = ingest_insert_returning_paths(
+            &conn, "SELECT '/readable.jpg', 'not-an-integer'", &[]).unwrap();
+        assert_eq!(paths, vec!["/readable.jpg"]);
+        assert!(ids.is_empty());
+        assert_eq!(unreadable, 0, "readable path remains counted and eligible for reattachment");
         drop(conn);
         cleanup(&path);
     }
